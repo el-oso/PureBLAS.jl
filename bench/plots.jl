@@ -3243,10 +3243,14 @@ if "mtdraw" in ARGS
             end
             return keep
         end
-        # L1 is here because it threads: `dot`, `asum` and `nrm2` on the fixed-block reduction tree,
-        # `axpy`, `scal`, `blascopy` and `swap` elementwise. L2 and the complex groups have no splitter
-        # yet, so they would draw the flat lines the `_movers` filter exists to keep out.
-        for (gk, base, ttl) in (("L1", "l1", "BLAS-1"), ("L3", "l3", "BLAS-3"), ("LP", "lapack", "LAPACK"))
+        # L1 is here because it threads: `dot`, `asum`, `nrm2` and `iamax` on the fixed-block grid,
+        # `axpy`, `scal`, `blascopy` and `swap` elementwise. L2 JOINED IT once `ger`, both `gemv`
+        # directions, `symv` and `gbmv`-N got splitters — before that it drew exactly the flat lines
+        # the `_movers` filter exists to keep out, which is why it was absent rather than forgotten.
+        # The COMPLEX groups still have none: `_gemm_threaded!` is bounded `T <: BlasReal`, so every
+        # complex arm is the serial kernel and `pb_mt == pb` to within noise.
+        for (gk, base, ttl) in (("L1", "l1", "BLAS-1"), ("L2", "l2", "BLAS-2"),
+                ("L3", "l3", "BLAS-3"), ("LP", "lapack", "LAPACK"))
             p = joinpath(adir0, "perf_mt_$(base).svg")
             svg_panels(p, "$ttl — PureBLAS 6 threads / 1 thread", mtfleet, gk, _ARM_PB_MT;
                 only = _movers(mtfleet, gk))

@@ -345,7 +345,15 @@ end
     @test P._way_doubles(32 * 1024, 8) == 512       # unchanged on the 8-way boxes
     # ONE derivation, not two: the live const must equal the pure function.
     @test P._L1_WAY_D == P._way_doubles(P._L1_BYTES, P._L1D_ASSOC)
-    @test P._L1_WAY_D * sizeof(Float64) == P._L1_WAY_BYTES
+    # TRUNCATION, NOT EQUALITY — and the difference is a whole associativity class. `_L1_WAY_D` is the
+    # WHOLE-DOUBLE count of a way, which is what the lda-alias guard needs; `_L1_WAY_BYTES` is the
+    # byte stride. The two agree exactly only when the stride divides by 8, i.e. for a power-of-two
+    # associativity. A 12-way 32 KiB L1 gives 32768÷12 = 2730 B and 341 doubles, and 341*8 = 2728 — so
+    # the old `* sizeof(Float64) ==` form FAILED on such a runner (observed 2026-10-04 on GitHub
+    # `main (shard 1/2)`: "Evaluated: 2728 == 2730") while the derivation it guards was correct. The
+    # fleet is all power-of-two assoc, which is why this sat green here and only ever broke on a
+    # runner we do not own. Keep the floor: `_way_doubles` clamps at 64.
+    @test P._L1_WAY_D == max(64, P._L1_WAY_BYTES ÷ sizeof(Float64))
     # and the guard it gates must catch a power-of-two lda on this machine
     @test P._alias_ld(P._L1_WAY_D)
     @test !P._alias_ld(P._L1_WAY_D + 1)

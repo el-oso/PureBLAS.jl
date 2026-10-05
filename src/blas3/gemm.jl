@@ -3924,6 +3924,12 @@ mutable struct GemmPool{T}
     # so the pair is bit-identical to the single update it replaces.
     lanroute::Int
     lainfo::Int                      # the look-ahead panel's `info`: the row of a zero pivot, or 0
+    # ⛔ NO FIELDS FOR gbmv's BAND HALF-WIDTHS, AND NO EXTRA DRIVER ARGUMENTS FOR THEM. Two trailing
+    # `bkl::Int = 0, bku::Int = 0` defaults on `_gemm_threaded!` were tried and REVERTED: they put 112
+    # BYTES on every `gemm!` call, which is req#10 on the one op that must never allocate, and
+    # `test/gemm_tests.jl` "threaded gemm: … and still 0 B" caught it. Bisected — the commit with
+    # `symv` but without those two parameters allocates 0.
+    # `gbmvN` carries `kl`/`ku` in the `A` SLOT's own dimensions instead; see `_gbmvn_threaded!`.
     # ── COOPERATIVE BARRIER ───────────────────────────────────────────────────────────────────────
     # A packed A block is a function of `(ic, pc)` and not of which columns of C a worker owns, so a
     # column-split gemm would have every worker pack the whole of A. Workers deal those blocks out
@@ -3991,11 +3997,58 @@ const _MT_KIND_COPY = 11
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_SWAP = 12
+# iamax — an ARGMAX, not a reduction: the chunks write block INDICES to `_REDI` and the driver's fold
+# is a strict-`>` scan rather than a sum. `Ap` is x.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_IAMAX = 13
+# ger — the first BLAS-2 kind. `Cp` is A, `Ap` is x, `Bp` is y. A column split, and the one op in the
+# library where the split needs no correctness argument at all: there is no accumulation chain, each
+# `A[i,j]` is written once, and both route arms fold α into `y[j]` identically.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_GER = 14
+# gemv-N — a ROW-BAND split. The matrix goes in the `C` slot so that `m`, `n` and `ldc` land in their
+# natural fields; `Ap` is x (handed over whole) and `Bp` is y (offset per band). `C` is read, not
+# written, which is a slot convention and not a claim about the op.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_GEMVN = 15
+# gemv-T — a COLUMN-BAND split, same slot convention as gemv-N: the matrix in `C`, x in `Ap` (whole),
+# y in `Bp` (offset per band). `up` carries `B0`.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_GEMVT = 16
+# symv — a COLUMN-BLOCK split with per-block private `y` ("notepads"). The matrix is in `C`, x in
+# `Ap`, y in `Bp`, and `up` is the stored triangle (its original meaning, unlike the gemv kinds where
+# it carries `B0`). The only kind whose chunks write to TWO different destinations: block 1 goes
+# straight into `y`, blocks 2..nblk into their notepad slot, and the driver folds in block order.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_SYMV = 17
+# gbmv-N — a ROW-BAND split of the output, and the cheapest threaded kind in BLAS-2: a band of a
+# BANDED matrix needs only the columns within `kl + ku` of its own rows, so there is no partial, no
+# fold and no route token. `Cp` is the banded store AB, `Ap` is x, `Bp` is y, and the half-widths ride
+# in the `A` slot's own dimensions (`A.n`, `A.ld`). β is already applied — the kernel accumulates.
+# PDM: Exempt — job-kind tag, not hardware tuning.
+# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
+const _MT_KIND_GBMVN = 18
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
 @inline _is_reduction(kind::Int) =
     kind == _MT_KIND_DOT || kind == _MT_KIND_ASUM || kind == _MT_KIND_SUMSQ
+
+# The argmax kinds, which have their OWN post-join fold. Separate from `_is_reduction` because the two
+# folds share nothing: a sum accumulates every partial, an argmax selects one and must see the block
+# order to break ties. Keeping them apart also keeps `_is_reduction`'s buffer contract intact — that
+# one sizes `_red_partials`, this one sizes `_REDI`.
+@inline _is_argmax(kind::Int) = kind == _MT_KIND_IAMAX
+
+# symv's fold is its own again: a block-ordered accumulate of private `y` vectors into the real one,
+# over only the rows each block can reach. Named separately for the same reason as the two above —
+# the three folds share no code and each sizes a different buffer.
+@inline _is_symv(kind::Int) = kind == _MT_KIND_SYMV
 
 """
     _syrk_workers(n, k) -> Int
@@ -4019,6 +4072,84 @@ the cap would trade a rare idle worker for narrower chunks everywhere.
     flops = n * (n + 1) * k
     (flops < _GEMM_MT_WORK || n < _NR) && return 1
     return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
+end
+
+"""
+    _ger_workers(m, n, ::Type{T}) -> Int
+
+Worker count for a column-split `ger`. `A` is read AND written, so its traffic is 2 bytes per element
+and that is what the admission floor should see — `x` and `y` are one vector each beside an m×n
+matrix. Capped by the COLUMN block count rather than the element count: a worker owns whole columns
+and `_gemm_chunk` hands them out in `_NR`-wide blocks, so asking for more workers than there are
+blocks leaves some of them with nothing to do and the join waits for a round trip that bought
+nothing.
+"""
+@inline function _ger_workers(m::Int, n::Int, ::Type{T}) where {T}
+    # THE EARLY-OUTS COME BEFORE THE DIVIDE, for the reason `_gemm_workers` records: this sits on the
+    # entry of every `ger`, including the ones that take tens of nanoseconds, and `cld` is a ~20-40
+    # cycle integer divide. One atomic read ends it on a single-threaded process, and `_l1_workers`
+    # itself reaches a decision with multiplies and compares only.
+    _MT_NTHREADS[] > 1 || return 1
+    nw = _l1_workers(2 * m * n * sizeof(T), m * n, T)
+    nw > 1 || return 1
+    return max(1, min(nw, cld(n, _NR)))
+end
+
+"""
+    _gemvn_workers(m, n, ::Type{T}) -> Int
+
+Worker count for a row-band `gemv-N`. A is read once and dominates the traffic — `x` is one vector of
+`n` and `y` one of `m` beside an m×n matrix — so its byte count is the admission floor's input.
+
+Capped by the number of whole ROW BLOCKS, because a band shorter than one `_GEMV_MR`-high block runs
+entirely in the masked remainder kernel: the band would be all tail and no body, which is the shape
+`_gemvn_rowblock_mr` exists to avoid. `min` with 0 is why the `max(1, …)` is there.
+"""
+@inline function _gemvn_workers(m::Int, n::Int, ::Type{T}) where {T}
+    # Early-outs before the divide, and here it matters more than for `ger`: LAPACK panel loops call
+    # `gemv` thousands of times on shapes far too small to thread, so the declining path must cost one
+    # atomic read and a few multiplies. Same discipline as `_gemm_workers`.
+    _MT_NTHREADS[] > 1 || return 1
+    nw = _l1_workers(m * n * sizeof(T), m * n, T)
+    nw > 1 || return 1
+    return max(1, min(nw, m ÷ (_GEMV_MR * _vwidth(T))))
+end
+
+"""
+    _gemvt_workers(m, n, ::Type{T}) -> Int
+
+Worker count for a column-band `gemv-T`. Same traffic argument as `_gemvn_workers` — A dominates —
+but capped by COLUMN blocks, because this is the transpose split: a worker owns whole columns of A
+and the matching entries of y.
+"""
+@inline function _gemvt_workers(m::Int, n::Int, ::Type{T}) where {T}
+    _MT_NTHREADS[] > 1 || return 1
+    nw = _l1_workers(m * n * sizeof(T), m * n, T)
+    nw > 1 || return 1
+    return max(1, min(nw, cld(n, _NR)))
+end
+
+# One notepad's stride, rounded UP to a whole cache line so block `b`'s tail and block `b+1`'s head
+# never share one. Unpadded it is only about two coherence misses per panel pass — measured
+# negligible — but the rounding costs at most one line per block and removes the question.
+@inline _symv_npad(n::Int, ::Type{T}) where {T} = cld(n * sizeof(T), _CACHELINE) * _CACHELINE ÷ sizeof(T)
+
+"""
+    _symv_workers(n, nblk, ::Type{T}) -> Int
+
+Worker count for a column-block `symv`. Traffic is the stored triangle, `n^2 * sizeof(T) / 2`.
+
+Capped by `nblk`, and that cap is the binding one: the grid is fixed by `(n, T)` so that the fold
+order cannot move, which means there is no way to make more blocks for more workers. A worker past
+`nblk` would get nothing and the join would still pay for it. Equal-width blocks of a triangle are
+also unequal in work — the heaviest is `2/(nblk+1)` — so the realised speedup is well under `nblk`;
+see `_SYMV_NBLK` for why eight is enough to cover six workers.
+"""
+@inline function _symv_workers(n::Int, nblk::Int, ::Type{T}) where {T}
+    _MT_NTHREADS[] > 1 || return 1
+    nw = _l1_workers((n * n * sizeof(T)) >> 1, n, T)
+    nw > 1 || return 1
+    return max(1, min(nw, nblk))
 end
 
 # Column range `[j0, j0+len)` (0-based start) for worker `i` of `nw`, rounded to whole `_NR` blocks so
@@ -4091,6 +4222,12 @@ end
     p.kind == _MT_KIND_SCAL && return _scal_run_chunk(p, nw, i)
     p.kind == _MT_KIND_COPY && return _copy_run_chunk(p, nw, i)
     p.kind == _MT_KIND_SWAP && return _swap_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_IAMAX && return _iamax_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_GER && return _ger_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_GEMVN && return _gemvn_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_GEMVT && return _gemvt_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_SYMV && return _symv_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_GBMVN && return _gbmvn_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4251,6 +4388,15 @@ const _REDP_F32 = Float32[]
 @inline _red_partials(::Type{Float64}) = _REDP_F64
 @inline _red_partials(::Type{Float32}) = _REDP_F32
 
+# The ARGMAX partials: one BLOCK INDEX per block, so a single `Int` buffer serves every element type.
+# Soundness is the argument above verbatim — one job at a time under `p.busy`, the driver sizes it
+# inside the claim, each worker writes only the block slots it owns, nothing is held across a yield.
+# It is deliberately NOT a second `Vector{T}` with the index stored as a float: the chunk needs no
+# float round-trip and the only conversion left is the driver's single return, which `_iamax_mt_nmax`
+# bounds.
+const _REDI = Int[]
+@inline _redi_partials() = _REDI
+
 # Grow the partials buffer before the job is published. CALLED FROM THE DRIVER, INSIDE THE CLAIM — never
 # from a chunk body, which must not allocate: the driver and every idle worker are in spin/wait loops
 # with nowhere for a GC to progress from, and the symptom is a swallowed worker exception or a silent
@@ -4269,6 +4415,22 @@ const _REDP_F32 = Float32[]
 # lifted, and nothing today — do not cite it as the reason the proof holds.
 @inline function _red_prefit!(::Type{T}, nblk::Int) where {T}
     _ws_grow!(_red_partials(T), nblk)
+    return nothing
+end
+
+# Same contract, same call site, for the argmax buffer. The slots are ZEROED here rather than in the
+# chunks: a worker writes only the blocks it owns, and `_red_chunk` hands out every block, but a
+# chunk that threw would leave a stale index from an earlier, longer job behind — which the fold
+# would then read as a live candidate pointing outside this vector. The driver re-throws before it
+# folds, so this is belt-and-braces; it costs one pass over at most a few hundred `Int`s.
+@inline function _redi_prefit!(nblk::Int)
+    v = _redi_partials()
+    _ws_grow!(v, nblk)
+    # A plain loop, not `fill!(view(v, 1:nblk), 0)`: the `SubArray` is a heap object unless the
+    # optimiser elides it, and this runs on a path an all-paths allocation proof reaches.
+    @inbounds for b in 1:nblk
+        v[b] = 0
+    end
     return nothing
 end
 
@@ -4325,6 +4487,131 @@ end
         off = (b - 1) * B
         len = min(B, p.m - off)
         prt[b] = _sumsq_simd(len, p.Ap + off * sz, T)
+    end
+    return nothing
+end
+
+# iamax over this worker's share of the block grid. Writes a 1-based index into the WHOLE vector, or 0
+# for "nothing in this block beat the seed"; the driver's fold selects among them.
+#
+# `g` is recomputed per worker rather than carried in a pool field. It is one scalar load of the same
+# element for everybody, and every worker must agree on it — see `_iamax_blocked_serial` for why the
+# shared seed is what preserves netlib's NaN and tie semantics across the grid.
+#
+# `p.m` is the route token, exactly as `_scal_run_chunk` passes it: compute on the block, route from
+# the whole. `_iamax_route!`'s three arms are keyed on a working-set size, so routing from `len` would
+# put every block on the mid-size tree form and lose the past-L2 arm the undivided size selects.
+@noinline function _iamax_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    B = _red_block(T)
+    nblk = cld(p.m, B)
+    b0, cnt = _red_chunk(nblk, nw, i)
+    cnt > 0 || return nothing
+    idx = _redi_partials()
+    sz = sizeof(T)
+    g = abs(unsafe_load(p.Ap, 1))
+    for b in b0:(b0 + cnt - 1)
+        off = (b - 1) * B
+        len = min(B, p.m - off)
+        v = _iamax_route!(p.m, len, p.Ap + off * sz, g)
+        idx[b] = iszero(v) ? 0 : off + v
+    end
+    return nothing
+end
+
+# ger over this worker's columns. `x` is handed over WHOLE — every column of the rank-1 update needs
+# all of it — while `y` and `A` are offset to the worker's column range. `p.n` goes in as the route
+# token so the arm matches the undivided problem's; see `_ger_simd!` for why that is a performance
+# concern here and not a correctness one.
+@noinline function _ger_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    sz = sizeof(T)
+    _ger_simd!(
+        p.m, len, p.alpha, p.Ap, p.Bp + j0 * sz,
+        PtrMatrix{T}(p.Cp + j0 * p.ldc * sz, p.m, len, p.ldc), p.n
+    )
+    return nothing
+end
+
+# gemv-N over this worker's ROW BAND. A row band of a column-major matrix is a pointer bump and
+# nothing else — the leading dimension is unchanged — so the band is a `PtrMatrix` over the same
+# storage. `x` is whole, because every row needs all of it; `y` is offset, and each `y[i]` keeps its
+# entire n-chain on one worker, so there is no partial to fold and nothing to combine after the join.
+#
+# β IS THE BAND'S OWN, and that is safe without any extra care because both panel drivers pre-scale
+# the y-block they are about to accumulate into, right where they start. Two workers therefore cannot
+# double-scale: each one touches only its own rows.
+#
+# `p.m` is the route token, and `p.up` carries `B0` — see `_gemvn_threaded!` for why it is passed
+# rather than re-derived from `β`.
+@noinline function _gemvn_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    sz = sizeof(T)
+    Ab = PtrMatrix{T}(p.Cp + i0 * sz, len, p.n, p.ldc)
+    yb = p.Bp + i0 * sz
+    if p.up
+        _gemv_n_simd!(len, p.n, p.alpha, Ab, p.Ap, yb, p.beta, Val(true), p.m)
+    else
+        _gemv_n_simd!(len, p.n, p.alpha, Ab, p.Ap, yb, p.beta, Val(false), p.m)
+    end
+    return nothing
+end
+
+# gemv-T over this worker's COLUMN BAND. A column band is a pointer bump of `j0 * ldc`, and y is
+# offset to match: each `y[j]` keeps its entire m-chain on one worker, so the bands are
+# write-disjoint and nothing is folded after the join.
+#
+# `blk` is computed from `p.n` — the UNDIVIDED column count — not from `len`. That mirrors what the
+# 8-argument `_gemv_t_simd!` does for an unsplit call, and it is the first half of the route token;
+# `p.n` is passed again as `nroute` so `_gemvt_deep` reads it too. Deriving `blk` from `len` would
+# let a band take the per-column kernel where the whole problem is NC-blocked, which is a different
+# accumulation, not just a different speed.
+@noinline function _gemvt_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    sz = sizeof(T)
+    Ab = PtrMatrix{T}(p.Cp + j0 * p.ldc * sz, p.m, len, p.ldc)
+    yb = p.Bp + j0 * sz
+    blk = !_gemvt_perscan(p.m, p.n, T)
+    if p.up
+        _gemv_t_simd!(p.m, len, p.alpha, Ab, p.Ap, p.beta, yb, Val(true), blk, p.n)
+    else
+        _gemv_t_simd!(p.m, len, p.alpha, Ab, p.Ap, p.beta, yb, Val(false), blk, p.n)
+    end
+    return nothing
+end
+
+# symv over this worker's share of the FIXED column-block grid. Two destinations, and which one is
+# decided by the block index rather than by the worker: block 1 accumulates straight into `y` (nothing
+# else writes `y` during compute, and the driver's fold runs after the join), every other block zeroes
+# and fills its own notepad slot. A worker holding several blocks therefore does both.
+#
+# The zeroing lives HERE and not in the driver on purpose: it is per-block over exactly the rows
+# `_symv_rows` allows, which is what makes this identical to `_symv_blocked!`'s serial loop. Doing it
+# in the driver would sweep all of `n` per block and cost more than the fold.
+@noinline function _symv_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    n = p.m
+    nblk = _symv_nblk(n, T)
+    NB = min(_SYMV_NB, _vwidth(T))
+    b0, cnt = _red_chunk(nblk, nw, i)
+    cnt > 0 || return nothing
+    part = _red_partials(T)
+    npad = _symv_npad(n, T)
+    Am = PtrMatrix{T}(p.Cp, n, n, p.ldc)
+    for b in b0:(b0 + cnt - 1)
+        j0, j1 = _symv_cols(b, nblk, n, NB)
+        j1 > j0 || continue
+        if isone(b)
+            _symv_simd_cols!(p.up, n, p.alpha, Am, p.Ap, p.Bp, j0, j1)
+        else
+            zp = pointer(part, (b - 1) * npad + 1)
+            lo, hi = _symv_rows(p.up, n, j0, j1)
+            @inbounds for k in lo:hi
+                unsafe_store!(zp, zero(T), k)
+            end
+            _symv_simd_cols!(p.up, n, p.alpha, Am, p.Ap, zp, j0, j1)
+        end
     end
     return nothing
 end
@@ -4670,6 +4957,45 @@ end
             return _asum_blocked_serial(A.m, A.ptr, T)   # same reasoning as the dot branch above
         elseif kind == _MT_KIND_SUMSQ
             return _sumsq_blocked_serial(A.m, A.ptr, T)
+        elseif kind == _MT_KIND_IAMAX
+            # A loser scans the WHOLE vector locally, over the same grid, seeded the same way, folded
+            # in the same block order — so it returns the same index the winner would have. It must
+            # not touch `_REDI` for the reason stated in the dot branch. The index leaves as `T`
+            # because that is this function's return type; `_iamax_mt_nmax` bounds the conversion.
+            return T(_iamax_blocked_serial(A.m, A.ptr))
+        elseif kind == _MT_KIND_GER
+            # A loser does the whole rank-1 update itself. Its own column count IS the route width,
+            # so it reaches the same arm the winner's chunks reach — they route from `p.n`, which is
+            # this `C.n`.
+            _ger_simd!(C.m, C.n, alpha, A.ptr, B.ptr, C, C.n)
+        elseif kind == _MT_KIND_GEMVN
+            # A loser does the whole gemv-N itself, so its own row count IS the route width and it
+            # reaches the arm the winner's chunks reach — they route from `p.m`, which is this `C.m`.
+            # `C` is the matrix for this kind, hence its appearance in the operand position, and `up`
+            # is `B0`, read here from the argument rather than the pool because nothing was published.
+            up ?
+                _gemv_n_simd!(C.m, C.n, alpha, C, A.ptr, B.ptr, beta, Val(true), C.m) :
+                _gemv_n_simd!(C.m, C.n, alpha, C, A.ptr, B.ptr, beta, Val(false), C.m)
+        elseif kind == _MT_KIND_GEMVT
+            # As above, transposed: the loser's own column count IS the route width, and `blk` comes
+            # from it for the same reason the chunks take theirs from `p.n`.
+            blk = !_gemvt_perscan(C.m, C.n, T)
+            up ?
+                _gemv_t_simd!(C.m, C.n, alpha, C, A.ptr, beta, B.ptr, Val(true), blk, C.n) :
+                _gemv_t_simd!(C.m, C.n, alpha, C, A.ptr, beta, B.ptr, Val(false), blk, C.n)
+        elseif kind == _MT_KIND_SYMV
+            # A loser runs the blocked form over the WHOLE grid with its OWN arena notepad, which is
+            # the one case where the fallback must not reuse the pool buffer and also must not skip
+            # the blocking: `_symv_blocked!` folds in the same block order the driver above does, so
+            # the two return the same bits. It opens its own `@scope`, so the scratch is a nested
+            # arena interval on this thread that exits before returning — `_gemm_threaded!` itself
+            # still holds none.
+            _symv_blocked!(up, C.m, alpha, C, A.ptr, B.ptr, _symv_nblk(C.m, T))
+        elseif kind == _MT_KIND_GBMVN
+            # A loser does the whole output. Its band IS `[0, m)`, which is what the unsplit kernel
+            # already runs, and the arm choice reads `kl + ku + 1` only — so there is nothing to route
+            # and nothing that can differ from the winner's bands.
+            _gbmv_n_simd!(C.m, C.n, A.n, A.ld, alpha, C, A.ptr, B.ptr, 0, C.m)
         elseif kind == _MT_KIND_SCAL
             # A loser scales the whole vector. Elementwise, so no route token and no grouping to preserve.
             _scal_simd!(C.m, alpha, C.ptr)
@@ -4755,6 +5081,14 @@ end
         # One partial per BLOCK, sized here for the same reason: a worker that grew it would allocate
         # inside a published job, and a loser that grew it could move storage a winner is writing.
         _is_reduction(kind) && _red_prefit!(T, cld(A.m, _red_block(T)))
+        _is_argmax(kind) && _redi_prefit!(cld(A.m, _red_block(T)))
+        # symv's notepads: `nblk` padded slots of length `n`, in the SAME process-global the
+        # reductions use (rung 2 — one buffer, one soundness argument: sized by the driver inside the
+        # claim, each worker writes only its own block's slots). Slot 1 is never written — block 1
+        # goes straight into `y` — and is left in the count so the index arithmetic is `b - 1` with no
+        # special case. NOT zeroed here: the chunks zero their own rows, which is what keeps them
+        # identical to `_symv_blocked!`.
+        _is_symv(kind) && _red_prefit!(T, _symv_nblk(C.m, T) * _symv_npad(C.m, T))
         # Side-R trmm packs op(A) per worker, and the size is a function of `k` alone, so every band
         # needs exactly what the unsplit problem does. Sized HERE for the same reason as the line above
         # and with more at stake: a worker that grew its own slot would allocate inside the published
@@ -4839,6 +5173,49 @@ end
             end
             red = s
         end
+        # THE ARGMAX FOLD, in the same window and for the same reasons: joined, so no worker is
+        # writing `_REDI`, and still claimed, so no other caller can resize it.
+        #
+        # A strict `>` scan in BLOCK ORDER. That is what makes the worker count decide only who
+        # computed a candidate: a later block must beat the running maximum outright to displace an
+        # earlier one, so ties go to the lower index at any `nw`, matching the sequential kernel.
+        # Re-loading `|x[idx]|` here is exact — it is the same element the chunk already compared —
+        # and it is why no second float buffer is needed.
+        if _is_argmax(kind)
+            nblk = cld(A.m, _red_block(T))
+            idx = _redi_partials()
+            bi = 1
+            best = abs(unsafe_load(A.ptr, 1))
+            for b in 1:nblk
+                j = idx[b]
+                iszero(j) && continue
+                a = abs(unsafe_load(A.ptr, j))
+                a > best && (best = a; bi = j)
+            end
+            # The index leaves as a `T`; `_iamax_mt_nmax` is the admission cap that keeps this exact.
+            red = T(bi)
+        end
+        # THE symv FOLD, in the same window and for the same two reasons. Block order, starting from
+        # whatever block 1 already put in `y`, over only the rows each block can reach — the exact
+        # sequence `_symv_blocked!` performs serially, which is what makes the two agree bit for bit
+        # and what makes the worker count decide only WHO filled a notepad.
+        if _is_symv(kind)
+            n = C.m
+            nblk = _symv_nblk(n, T)
+            NB = min(_SYMV_NB, _vwidth(T))
+            part = _red_partials(T)
+            npad = _symv_npad(n, T)
+            yp = B.ptr
+            for b in 2:nblk
+                j0, j1 = _symv_cols(b, nblk, n, NB)
+                j1 > j0 || continue
+                lo, hi = _symv_rows(up, n, j0, j1)
+                zoff = (b - 1) * npad
+                @inbounds for k in lo:hi
+                    unsafe_store!(yp, unsafe_load(yp, k) + part[zoff + k], k)
+                end
+            end
+        end
     finally
         # RELEASE THE POOL UNLESS A WORKER MIGHT STILL BE RUNNING. That is the question, and the two
         # flags answer it between them.
@@ -4922,6 +5299,133 @@ end
 end
 @noinline function _sumsq_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
     return GC.@preserve x _sumsq_threaded(n, pointer(x), nw)
+end
+
+# iamax rides the same one-operand shape as asum. The pool's return type is `T`, so the winning index
+# comes home as a float and is converted once here; `_iamax_blocked` declines the pool past
+# `_iamax_mt_nmax(T)` so that conversion is always exact.
+@noinline function _iamax_threaded(n::Int, x::Ptr{T}, nw::Int) where {T <: BlasReal}
+    v = _gemm_threaded!(
+        PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_IAMAX
+    )
+    return Int(v)
+end
+@noinline function _iamax_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+    return GC.@preserve x _iamax_threaded(n, pointer(x), nw)
+end
+
+# ger: `C` is the m×n matrix the chunks write, `A` is x and `B` is y. The caller holds the
+# `GC.@preserve`, so this takes bare pointers and never a container.
+@noinline function _ger_threaded!(
+        m::Int, n::Int, α::T, xp::Ptr{T}, yp::Ptr{T}, Ap::Ptr{T}, lda::Int, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, m, 1, m), PtrMatrix{T}(yp, n, 1, n),
+        α, zero(T), false, false, false, false, nw, _MT_KIND_GER
+    )
+    return nothing
+end
+
+# gemv-N: `C` is the m×n matrix, `A` is x (length n) and `B` is y (length m).
+#
+# `B0` RIDES IN THE `up` FIELD rather than being re-derived from `β`. At the public entry B0 is always
+# `iszero(β)`, so a chunk could infer it — but that is an invariant held by one caller rather than by
+# the data, and `up` is already an unused Bool for this kind. Carrying it explicitly means a future
+# caller that pairs `Val(true)` with a nonzero β gets the same answer threaded as serially instead of
+# a silently different one.
+@noinline function _gemvn_threaded!(
+        m::Int, n::Int, α::T, Ap::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T}, β::T, b0::Bool, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, n, 1, n), PtrMatrix{T}(yp, m, 1, m),
+        α, β, false, false, false, false, nw, _MT_KIND_GEMVN, b0
+    )
+    return nothing
+end
+
+# gemv-T: `C` is the m×n matrix, `A` is x (length m) and `B` is y (length n) — the transpose of
+# gemv-N's operand lengths, same slots.
+@noinline function _gemvt_threaded!(
+        m::Int, n::Int, α::T, Ap::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T}, β::T, b0::Bool, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, m, 1, m), PtrMatrix{T}(yp, n, 1, n),
+        α, β, false, false, false, false, nw, _MT_KIND_GEMVT, b0
+    )
+    return nothing
+end
+
+# symv: `C` is the n×n matrix, `A` is x and `B` is y. β is NOT passed — `_symv!` has already applied
+# it with `_scale_y!` before any of this, and the kernel is pure accumulate, which is what lets the
+# notepads start at zero. `up` keeps its original meaning here: the stored triangle.
+"""
+    _gbmvn_workers(m, n, kl, ku, ::Type{T}) -> Int
+
+Worker count for a row-band `gbmv-N`. The traffic is the banded store, `n * (kl+ku+1) * sizeof(T)`,
+not `m*n` — a band holds a vanishing fraction of the dense shape and admitting on `m*n` would thread
+calls that have almost no work in them.
+
+Capped by whole output row blocks of `_vwidth(T)`, because `_gbmv_conv!` accumulates one W-row block
+at a time and a band shorter than one block would be all masked tail.
+"""
+@inline function _gbmvn_workers(m::Int, n::Int, kl::Int, ku::Int, ::Type{T}) where {T}
+    _MT_NTHREADS[] > 1 || return 1
+    nw = _l1_workers(n * (kl + ku + 1) * sizeof(T), m, T)
+    nw > 1 || return 1
+    return max(1, min(nw, m ÷ _vwidth(T)))
+end
+
+# gbmv-N over this worker's OUTPUT ROW BAND. `_l1_chunk` hands out whole-vector-width extents, which
+# is what `_gbmv_conv!` wants: its W-row blocks then line up with the unsplit sweep's. `m` and `n`
+# stay whole because the masks and column extents are expressed against them.
+@noinline function _gbmvn_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    i0, len = _l1_chunk(p.m, nw, i, T)
+    len > 0 || return nothing
+    # `kl` AND `ku` RIDE IN THE `A` SLOT'S DIMENSIONS — `p.k` is `A.n` and `p.lda` is `A.ld`, both
+    # published for every kind. `_gbmvn_threaded!` encodes them there precisely so this kind needs no
+    # pool field and no extra driver parameter; two such parameters cost 112 bytes on every `gemm!`
+    # call and were reverted. `A.ptr` is still x, which is all the kernel reads from that slot.
+    kl = p.k; ku = p.lda
+    ABm = PtrMatrix{T}(p.Cp, kl + ku + 1, p.n, p.ldc)
+    _gbmv_n_simd!(p.m, p.n, kl, ku, p.alpha, ABm, p.Ap, p.Bp, i0, i0 + len)
+    return nothing
+end
+
+# gbmv-N: `C` carries the banded store's POINTER and leading dimension, `A` is x and `B` is y. β is
+# NOT passed — the caller has pre-scaled `y` and this kernel accumulates, which is also what makes the
+# row bands write-disjoint with nothing to fold.
+#
+# ⚠ TWO DELIBERATE SLOT CHOICES, BOTH SIGNED BECAUSE THEY READ WRONG OTHERWISE.
+#
+# `C`'s `m` is the OUTPUT ROW COUNT, not AB's `kl+ku+1`. The driver publishes `p.m = C.m` and `m` is
+# what the chunks split; AB's own height is rebuilt from the half-widths.
+#
+# `kl` AND `ku` RIDE IN THE `A` SLOT'S DIMENSIONS — `A.n` and `A.ld` — because `p.k = A.n` and
+# `p.lda = A.ld` are published for every kind, so this needs no pool field and no extra driver
+# parameter. That is not tidiness: two trailing `bkl`/`bku` defaults on `_gemm_threaded!` were tried
+# and put 112 BYTES on every `gemm!` call, breaking req#10 on the one op that must never allocate
+# (`test/gemm_tests.jl` "threaded gemm: … and still 0 B"; bisected against the commit before them).
+# Only `A.ptr` is read as x, so `A.m` is free and `A.n`/`A.ld` carry the band.
+@noinline function _gbmvn_threaded!(
+        m::Int, n::Int, kl::Int, ku::Int, α::T, ABp::Ptr{T}, ldb::Int,
+        xp::Ptr{T}, yp::Ptr{T}, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(ABp, m, n, ldb), PtrMatrix{T}(xp, n, kl, ku), PtrMatrix{T}(yp, m, 1, m),
+        α, zero(T), false, false, false, false, nw, _MT_KIND_GBMVN
+    )
+    return nothing
+end
+
+@noinline function _symv_threaded!(
+        up::Bool, n::Int, α::T, Ap::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T}, nblk::Int, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(Ap, n, n, lda), PtrMatrix{T}(xp, n, 1, n), PtrMatrix{T}(yp, n, 1, n),
+        α, zero(T), false, false, false, false, nw, _MT_KIND_SYMV, up
+    )
+    return nothing
 end
 
 # `x .*= a`. `C` is the operand the chunk writes, so x goes in the C slot.

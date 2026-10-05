@@ -28,6 +28,25 @@ end
     unsafe_store!(A.ptr, convert(T, v), (j - 1) * A.ld + i)
     return v
 end
+# A `PtrMatrix` CARRIES ITS BOUNDS — `m`, `n` and the leading dimension — so `_seg` can check it
+# properly rather than wave it through the way it must for a bare `Ptr`. `core.jl` has only an
+# `::Array` method plus that `::Ptr` passthrough, and nothing for this type. The backing region spans
+# `(n-1)*ld + m` elements: columns start `ld` apart and the last one is `m` tall.
+#
+# THIS EXISTS BECAUSE A THREADED CHUNK HANDS KERNELS A `PtrMatrix` WHERE THE SERIAL ENTRY HANDS AN
+# `Array`. `_gbmvn_run_chunk` rebuilds the banded store as a `PtrMatrix` over the pool's published
+# pointer, and `_gbmv_n_simd!`'s wide-band arm validates each column segment through `_seg`. With no
+# method for this type that is a MethodError inside a pool worker, which kills the task, leaves the
+# driver parked in its join, and reaches CI as signal 11 — and only under `--check-bounds=yes`, so a
+# release-mode probe never sees it. CI found this class twice in two different helpers; the sibling
+# is `_carrier_arr` at the masked store in `_gbmv_conv!`.
+@noinline function _seg_check(a::PtrMatrix, off::Integer, len::Integer)
+    len <= 0 && return nothing                                   # empty segment: nothing dereferenced
+    lim = (a.n - 1) * a.ld + a.m
+    (off >= 0 && off + len <= lim) || throw(BoundsError(a, (off + 1):(off + len)))
+    return nothing
+end
+
 @inline Base.pointer(A::PtrMatrix) = A.ptr
 @inline Base.pointer(A::PtrMatrix{T}, k::Integer) where {T} = A.ptr + (k - 1) * sizeof(T)
 @inline Base.strides(A::PtrMatrix) = (1, A.ld)
