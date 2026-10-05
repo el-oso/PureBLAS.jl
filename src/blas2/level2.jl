@@ -519,10 +519,19 @@ end
     return
 end
 
-@inline function _gemv_n_paneldrv_minner!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
+@inline _gemv_n_paneldrv_minner!(m::Int, n::Int, α::T, A, x, y, β::T, b0::Val{B0}) where {T <: BlasReal, B0} =
+    _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, b0, m)
+
+# `mroute` is the UNDIVIDED row count, and here it is a req#11 REQUIREMENT rather than a tuning
+# nicety. `_gemvn_minner_np` returns the PANEL WIDTH — the number of columns that share one pass —
+# so it re-chunks the n-chain, and a row-band worker seeing 1/nw of the bytes would pick a different
+# width and accumulate each `y[i]` in a different order. Row-band callers pass the whole `m`.
+@inline function _gemv_n_paneldrv_minner!(
+        m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}, mroute::Int
+    ) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
         Aptr = pointer(A); yptr = _ptr(y); xptr = _ptr(x); lda = stride(A, 2); sz = sizeof(T)
-        np = _gemvn_minner_np(m, n, lda, T)      # regime-selected panel width (consts → Val below is static)
+        np = _gemvn_minner_np(mroute, n, lda, T) # regime-selected panel width (consts → Val below is static)
         i0 = 0
         while i0 < m
             mb = min(_gemvn_mb(), m - i0)
@@ -549,7 +558,28 @@ end
     return y
 end
 
-@inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
+# THE PUBLIC gemv-N DISPATCHER, and the threading seam. Threading belongs HERE and not one level down
+# in `_gemv_n_paneldrv!`, because `_tri_scat!` — the trmv/trsv scatter — calls that driver DIRECTLY to
+# dodge the row-block path and the kwarg layer. Four `test/perthread_lint_baseline.txt` entries
+# (`_TRSV_RRCP*`, `_TRSV_RCP*`, `_TRMV_ACC*`) are justified by exactly that: "`_tri_scat!` reaches
+# `_sme_gemv!` or `_gemv_n_paneldrv!` DIRECTLY, not the public `gemv!`, and neither those kernels nor
+# anything else in blas2/level2.jl forks a task." Putting the pool in the paneldrv would make those
+# per-thread owners reachable across a fork and silently invalidate all four. The cost is that
+# trmv/trsv do NOT inherit gemv-N's threading; that is the trade, and it is deliberate.
+@inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, b0::Val{B0}) where {T <: BlasReal, B0}
+    nw = _gemvn_workers(m, n, T)
+    if nw > 1
+        GC.@preserve A x y _gemvn_threaded!(
+            m, n, α, pointer(A), stride(A, 2), _ptr(x), _ptr(y), β, B0, nw
+        )
+        return y
+    end
+    return _gemv_n_simd!(m, n, α, A, x, y, β, b0, m)
+end
+
+@inline function _gemv_n_simd!(
+        m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}, mroute::Int
+    ) where {T <: BlasReal, B0}
     if n <= _gemvn_rb()
         # Per-call row-block height (see `_gemvn_rowblock_mr`). A pin disables the derivation, and
         # `isnothing(_GEMV_MR_PREF)` is a load-time const so the pinned build folds this away and
@@ -569,8 +599,11 @@ end
         else
             _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(_GEMV_MR))
         end
-    elseif _gemvn_minner() && m * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
-        _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, Val(B0))
+    # `mroute`, NOT `m`: this predicate selects between two drivers whose n-chunking differs — minner
+    # uses `_gemvn_minner_np` columns per panel, the old path a flat `_GEMV_NP` — so a row band that
+    # flipped it would accumulate `y[i]` in a different order. req#11, not tuning.
+    elseif _gemvn_minner() && mroute * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
+        _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, Val(B0), mroute)
     else
         _gemv_n_paneldrv!(m, n, α, A, x, y, β, Val(B0))
     end
@@ -1203,8 +1236,21 @@ end
     return j
 end
 
+@inline _gemv_t_simd!(
+    m::Int, n::Int, α::T, A, x, β::T, y, b0::Val{B0}, blk::Bool
+) where {T <: BlasReal, B0} = _gemv_t_simd!(m, n, α, A, x, β, y, b0, blk, n)
+
+# `nroute` is the UNDIVIDED COLUMN COUNT — gemv-T's mirror of gemv-N's `mroute`, and a req#11
+# requirement for the same reason. gemv-T splits COLUMNS (each `y[j]` owns its whole m-chain and the
+# bands are write-disjoint), and two decisions read the A byte count that a column split shrinks:
+# `_gemvt_perscan`, which chooses per-column against NC-blocked, and `_gemvt_deep` below, which
+# switches the ACCUMULATOR COUNT (`_GEMVT_NC_DEEP`/`_GEMVT_U_DEEP`) and so the fold tree. A band that
+# flipped either would reduce each `y[j]` by different arithmetic.
+#
+# The m-only checks beside them need nothing: `m * sizeof(T) <= _GEMVT_PERCOL_XMAX` and
+# `_gemvt_x_l1_resident(T, m, lda)` are keyed on `m`, which a column split does not move.
 @inline function _gemv_t_simd!(
-        m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}, blk::Bool
+        m::Int, n::Int, α::T, A, x, β::T, y, ::Val{B0}, blk::Bool, nroute::Int
     ) where {T <: BlasReal, B0}
     GC.@preserve A x y begin
         # `_ptr` not `pointer`: the C-ABI entry passes raw `Ptr` vectors (a pointer IS the densest
@@ -1283,7 +1329,8 @@ end
         # pf=128: 0.844 @64, 0.850 @128, 0.724 @256 (the gate cells were 0.855 / 0.737), while pf=128
         # wins where deep is ineligible, 1.025 @512, 1.044 @1024. So the prefetch distance applies only
         # to the non-deep kernel below (bench/probes: zen5_gemvt_pf.jl).
-        if _gemvt_deep(T, m, n, lda) && nc0 == 4 && u0 == 1
+        # `nroute`, NOT `n`: the deep shape changes the accumulator count, hence the fold tree.
+        if _gemvt_deep(T, m, nroute, lda) && nc0 == 4 && u0 == 1
             jd = !blk ? 0 : _gemvt_cols!(
                     Val(_GEMVT_NC_DEEP), Val(B0), _GEMVT_U_DEEP, 0,
                     yptr, Aptr, xptr, lda, m, n, α, β, sz
@@ -2015,6 +2062,21 @@ function _gemv!(
         end
         if _l2_simd_ok(A, x, y, incx, incy)
             αT = convert(eltype(A), α); βT = convert(eltype(A), β)
+            # THE gemv-T THREAD SEAM IS HERE, one level ABOVE `_gemv_t_simd!` — and that is the
+            # opposite of gemv-N, deliberately. `_tri_scat!` bypasses `_gemv_n_simd!` by calling the
+            # paneldrv directly, so gemv-N could take the pool inside its dispatcher; `_tri_scatT!`
+            # does NOT bypass `_gemv_t_simd!` — it calls that very entry (see its definition). The
+            # four `_TRSV_*`/`_TRMV_ACC*` entries in `test/perthread_lint_baseline.txt` are justified
+            # by trmv/trsv never forking a task, so the pool has to go where only the public gemv
+            # reaches it. That is this branch: `_gemv!` is the public and C-ABI entry, and the trmv
+            # scatters never call it.
+            nw = _gemvt_workers(Int(m), Int(n), eltype(A))
+            if nw > 1
+                GC.@preserve A x y _gemvt_threaded!(
+                    Int(m), Int(n), αT, pointer(A), stride(A, 2), _ptr(x), _ptr(y), βT, iszero(β), nw
+                )
+                return y
+            end
             return iszero(β) ? _gemv_t_simd!(Int(m), Int(n), αT, A, x, βT, y, Val(true)) :
                 _gemv_t_simd!(Int(m), Int(n), αT, A, x, βT, y, Val(false))
         end
@@ -2270,13 +2332,34 @@ end
         _ger_panel_driver!(m, n, α, x, y, A, Val(8))
 end
 
+# THE THREADING ENTRY. It sits here rather than in `_ger!` so that `_sme_ger_eligible` keeps its
+# position AHEAD of the pool without a second guard: `_ger!` asks SME first and only falls through to
+# this. That ordering is required, not incidental — the matrix unit is shared by the cluster, so an
+# SME-eligible call that took the pool would trade one fast engine for several slow ones.
 @inline function _ger_simd!(m::Int, n::Int, α::T, x, y, A) where {T <: BlasReal}
+    nw = _ger_workers(m, n, T)
+    if nw > 1
+        GC.@preserve A x y _ger_threaded!(m, n, α, _ptr(x), _ptr(y), pointer(A), stride(A, 2), nw)
+        return A
+    end
+    return _ger_simd!(m, n, α, x, y, A, n)
+end
+
+# `nroute` IS THE UNDIVIDED COLUMN COUNT, and for `ger` it is a PERFORMANCE token rather than a req#11
+# one — which is worth stating, because every other route token in this library is a correctness
+# device. The two arms below are bit-for-bit identical: each folds α into `y[j]` first (`ayj` here,
+# `ay$c` in `_ger_panel!`) and each `A[i,j]` is written exactly once, so there is no accumulation
+# order for a partition to change. What a column-split worker WOULD get wrong is the arm: holding
+# 1/nw of the columns it sees 1/nw of the bytes and takes the cache-resident per-column path where
+# the whole problem wants the DRAM panel. Threaded callers pass the whole `n`; everyone else passes
+# their own, which is the undivided case.
+@inline function _ger_simd!(m::Int, n::Int, α::T, x, y, A, nroute::Int) where {T <: BlasReal}
     # DRAM-bound (A > L3) → m-inner panel with a per-box stream count (`_ger_np()`: Preference or auto-measured). The optimal number
     # of concurrent wide-SIMD write-streams is an intrinsic per-core property with NO derivable formula and
     # OPPOSITE sign across µarchs (measured, prefetch off: Zen5→NP1, Zen3→NP4, Zen4→NP8; all external causes —
     # memory, DIMMs, OS, codegen, aliasing — eliminated). So it's calibrated per box (see bench/calibrate.jl),
     # not gated by a µarch `if`. Cache-resident A stays on the simple per-column axpy below (gates small-n).
-    m * n * sizeof(T) >= _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())  # ≥: A that fills L3 leaves no room for x/y ⇒ panel (Zen3 n=2048: A=L3 exactly, per-column 0.97 → panel 1.04)
+    m * nroute * sizeof(T) >= _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())  # ≥: A that fills L3 leaves no room for x/y ⇒ panel (Zen3 n=2048: A=L3 exactly, per-column 0.97 → panel 1.04)
     pf = 0                                               # cache-resident: prefetch never helped (regressed n=512)
     GC.@preserve A x y begin
         # `_ptr` not `pointer`: the C-ABI entry passes raw `Ptr` vectors (a pointer IS the densest
@@ -2727,6 +2810,75 @@ end
     return body
 end
 
+# THE TIER IS Literal AND THE CRITERION IS A GATE MARGIN, which is why it cannot be either of the
+# other two: a gate margin is not a detected hardware const (so not Derived) and no in-process probe
+# can measure it (so not Measured — there is no vendor reference in the process to compare against).
+#
+# What IS derivable bounds the shape: equal-width column blocks of a triangle carry work shares
+# nblk, nblk-1, …, 1, so the heaviest is `2/(nblk+1)` — 22% at eight, which caps any speedup at 4.5x
+# and therefore covers six workers with room over. Beyond that a larger nblk buys nothing, because
+# the ceiling is DRAM bandwidth (the note at `_symv_simd_cols!` has 1-core symv at 0.65 of a
+# same-bytes read stream, so six cores reach the wall near 2-3x), and it costs more fold.
+#
+# Measured fold tax at n=4096, blocked/plain, paired A-B-B-A, Chairmarks median of three rounds,
+# arms agreeing to rel 3e-15 — the fleet evidence a Literal owes:
+#     nblk   32      16      8       4       2
+#     tax    1.0087  1.0079  1.0068  1.0051  1.0023
+# TWO ANNOTATIONS, TWO LINTS, AND THEY CANNOT SHARE A LINE. `# PDM:` feeds test/knob_registry.jl,
+# whose syntax is strictly `# PDM: <Tier> — <one line>` with the tier word standing alone;
+# `# req8-ok:` feeds test/req8_lint.jl, which looks only on the literal's own line or THE LINE
+# DIRECTLY ABOVE IT. `# PDM: Literal, req8-ok — …` satisfies NEITHER — not a parseable tier for the
+# first, not an annotation for the second — and each lint has now been broken once, in opposite
+# directions, by trying to say it in one place. Hence the ordering below: PDM first, req8-ok last.
+# PDM: Literal — one value suits every µarch: the shape bound 2/(nblk+1) is arithmetic, and the fold tax table above is flat across nblk on all three boxes. | tune: n/a — a gate margin, not measurable in-process
+# req8-ok: the criterion is a GATE MARGIN — not a detected hardware const and not measurable by an in-process probe; the shape bound is arithmetic and the fold-tax table above is the fleet evidence.
+const _SYMV_NBLK = 8
+
+"""
+    _symv_nblk(n, ::Type{T}) -> Int
+
+How many COLUMN BLOCKS the fixed symv grid has, and 1 means "no grid at all". A function of `(n, T)`
+alone, which is the whole point: the grid fixes the order the partial `y` vectors fold in, so if it
+depended on the worker count then `set_num_threads` would change the answer.
+
+THE RESIDENCY CUT IS WHAT KEEPS THE SERIAL GATE GREEN, and that is a less obvious requirement than it
+sounds. Threading symv needs the blocked-and-folded form on EVERY path, because a caller that loses
+the pool claim runs serially and must return the winner's bits (req#11; the divergence shipped once,
+`6940a2d3`). So the fold is paid at ONE thread, on every call, and it lands on the SERIAL gate.
+
+Past roughly 2x L3 the sweep is deep-DRAM bound and symv's serial gate sits at parity — 0.995 on
+wintermute and 1.000 on galen at n=4096 — so `0.995 / 1.0023` rounds to 0.99 and even the cheapest
+grid turns two green cells red. Returning 1 there means block 1 writes `y` directly and no notepad is
+ever touched: bit-for-bit AND cycle-for-cycle the unblocked kernel. Within the cut there is about 1%
+of margin (1.01 wintermute, 1.012 neuromancer, galen already red at 0.987) and the tax measures as
+noise.
+
+The `2x` is slack over a residency boundary, the same shape as `_GEMVN_MINNER_MAXA`'s `4 * _L3_BYTES`
+and `_gemvn_minner_np`'s `2 * _L2_BYTES`. n=2048 F64 is a 16.8 MiB triangle against a 16 MiB L3 and
+must stay IN; n=4096 is 67 MiB and must stay out.
+"""
+@inline function _symv_nblk(n::Int, ::Type{T}) where {T}
+    tri = (n * n * sizeof(T)) >> 1
+    # BOTH ENDS, and the lower one is the easier mistake. Below the pool's own admission floor no
+    # worker count can ever be granted, so a grid there is pure fold with nothing to pay for it — at
+    # n=64 the fold is ~224 elements against 2048 of work, an 11% tax on a kernel that will never
+    # thread. `_L1_MT_MIN` is the floor `_l1_workers` applies, and both it and `tri` are functions of
+    # `(n, T)`, so keying on it leaves the grid thread-count independent exactly as req#11 needs.
+    tri < _L1_MT_MIN && return 1
+    tri <= 2 * _L3_BYTES || return 1
+    return _SYMV_NBLK
+end
+
+# Block `b` of that grid, as a half-open column range `[j0, j1)`, zero-based. Rounded to whole `NB`
+# panels so a block is never cut mid-panel: only the LAST block carries the ragged tail, exactly as
+# the unsplit sweep does, which keeps the per-element arithmetic the same as the serial blocked form.
+@inline function _symv_cols(b::Int, nblk::Int, n::Int, NB::Int)
+    cb = max(NB, cld(cld(n, nblk), NB) * NB)
+    j0 = (b - 1) * cb
+    j0 >= n && return (0, 0)
+    return (j0, b == nblk ? n : min(n, b * cb))
+end
+
 # ⛔ SPLITTING symv INTO SME gemv-N AND gemv-T OVER A BLOCK COVER IS A WASH. It is the obvious move
 # once trmv has `_trmv_split!`: every off-diagonal block `A[R,C]` feeds y twice — `y[R] += A[R,C]·x[C]`
 # and `y[C] += A[R,C]ᵀ·x[R]` — all contributions read the original x, so any order is legal and no
@@ -2744,7 +2896,64 @@ end
 #
 # So the route needs ONE kernel that reads a block and produces both products, not two calls over it.
 # Until that exists, this fused per-column form is the faster shape.
-@inline function _symv_simd!(up::Bool, n::Int, α::T, A, x, y, ::Val{MRP} = Val(_SYMV_MR)) where {T <: BlasReal, MRP}
+@inline _symv_simd!(up::Bool, n::Int, α::T, A, x, y, mrp::Val{MRP} = Val(_SYMV_MR)) where {T <: BlasReal, MRP} =
+    _symv_simd_cols!(up, n, α, A, x, y, 0, n, mrp)
+
+# The rows a column block `[j0, j1)` can write. Lower storage scatters DOWN from the diagonal, upper
+# scatters UP to it, and nothing outside this range is touched — which is what lets the fold and the
+# zeroing skip most of the notepad instead of sweeping all of `n` per block.
+@inline _symv_rows(up::Bool, n::Int, j0::Int, j1::Int) = up ? (1, j1) : (j0 + 1, n)
+
+"""
+    _symv_blocked!(up, n, α, A, x, y, nblk) -> y
+
+symv over the fixed block grid, folded in BLOCK order. Once `_symv_nblk` returns more than one this
+is THE form, at every thread count including one — that is exactly what makes the threaded path and
+the lost-claim fallback agree bit for bit, and `nblk == 1` collapses it to the unblocked kernel with
+no notepad touched at all.
+
+Block 1 accumulates straight into `y`: nothing else writes `y` while it runs, and under lower storage
+it is the block spanning all `n` rows, so this also avoids the largest notepad. Blocks 2..nblk reuse
+ONE arena notepad, zeroing and folding only the rows `_symv_rows` says they can reach.
+
+The fold order is `y`, then block 2, then block 3 … which is why the threaded driver must fold in the
+same block order rather than by worker.
+"""
+function _symv_blocked!(up::Bool, n::Int, α::T, A, x, y, nblk::Int) where {T <: BlasReal}
+    NB = min(_SYMV_NB, _vwidth(T))
+    j0, j1 = _symv_cols(1, nblk, n, NB)
+    j1 > j0 && _symv_simd_cols!(up, n, α, A, x, y, j0, j1)
+    nblk <= 1 && return y
+    # NOTHING ESCAPES: `z` is handed to `_symv_simd_cols!`, which only reads it through a raw pointer
+    # and writes it, and the fold below consumes it inside the same block. No closure, no return.
+    @scope arn begin
+        z = borrow!(arn, T, n)
+        GC.@preserve y begin
+            yp = _ptr(y)
+            for b in 2:nblk
+                jb0, jb1 = _symv_cols(b, nblk, n, NB)
+                jb1 > jb0 || continue
+                lo, hi = _symv_rows(up, n, jb0, jb1)
+                @inbounds for i in lo:hi
+                    z[i] = zero(T)
+                end
+                _symv_simd_cols!(up, n, α, A, x, z, jb0, jb1)
+                @inbounds for i in lo:hi
+                    unsafe_store!(yp, unsafe_load(yp, i) + z[i], i)
+                end
+            end
+        end
+    end
+    return y
+end
+
+# `[j0, j1)` IS THE COLUMN BAND THIS CALL OWNS, and `n` stays the WHOLE matrix order — the panel
+# kernels sweep rows outside the band (every column of a symmetric matrix touches `y` above and below
+# its diagonal), so the band bounds the columns read and never the rows written. That is also why a
+# threaded symv needs a private `y` per block rather than a disjoint slice of the real one.
+@inline function _symv_simd_cols!(
+        up::Bool, n::Int, α::T, A, x, y, j0::Int, j1::Int, ::Val{MRP} = Val(_SYMV_MR)
+    ) where {T <: BlasReal, MRP}
     # NB must not exceed the vector width: the panel kernels handle the NB×NB diagonal block as ONE
     # masked vector (`lanes < NB`). NB=8 on W=4 (AVX2 F64) silently truncated the block → WRONG RESULTS
     # (latent bug caught by CI's AVX2 runner lottery; W and _SYMV_NB are consts, so this folds statically).
@@ -2766,8 +2975,8 @@ end
     NB = min(_SYMV_NB, _vwidth(T))
     GC.@preserve A x y begin
         base = pointer(A); xp = _ptr(x); yp = _ptr(y); lda = stride(A, 2); sz = sizeof(T)
-        jb = 0
-        while jb + NB <= n                                  # full column panels (unified kernel)
+        jb = j0
+        while jb + NB <= j1                                 # full column panels (unified kernel)
             if up
                 _symv_upperpanel!(jb + NB, α, base + jb * lda * sz, lda, xp, yp, Val(MRP), Val(NB))
             else
@@ -2775,7 +2984,7 @@ end
             end
             jb += NB
         end
-        @inbounds while jb < n                              # last partial panel: naive full column
+        @inbounds while jb < j1                             # last partial panel: naive full column
             axj = α * unsafe_load(xp, jb + 1)
             colp = base + jb * lda * sz                     # A[0,jb]
             ajj = unsafe_load(colp + jb * sz)               # A[jb,jb]
@@ -2858,7 +3067,20 @@ function _symv!(up::Bool, n::Integer, α::Number, A, x, incx::Integer, β::Numbe
         if eltype(A) === Float64 && Int(n) >= _SYMV_SME_MIN
             return _symv_split!(up, Int(n), Float64(α), A, x, y)
         end
-        return _symv_simd!(up, Int(n), convert(eltype(A), α), A, x, y)
+        # THE BLOCKED FORM IS THE ONLY FORM wherever the grid exists, which is what req#11 needs: the
+        # threaded path, this serial entry and the lost-claim fallback all fold in the same block
+        # order. `_symv_nblk` returns 1 where the serial gate cannot afford the fold, and there this
+        # collapses to the unblocked kernel untouched.
+        nb = _symv_nblk(Int(n), eltype(A))
+        αT = convert(eltype(A), α)
+        nw = nb > 1 ? _symv_workers(Int(n), nb, eltype(A)) : 1
+        if nw > 1
+            GC.@preserve A x y _symv_threaded!(
+                up, Int(n), αT, pointer(A), stride(A, 2), _ptr(x), _ptr(y), nb, nw
+            )
+            return y
+        end
+        return _symv_blocked!(up, Int(n), αT, A, x, y, nb)
     end
     sx = _start(Int(n), incx); sy = _start(Int(n), incy)
     s0 = zero(_et(A)) * zero(_et(x))

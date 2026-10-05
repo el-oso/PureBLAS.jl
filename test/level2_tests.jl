@@ -290,3 +290,459 @@ end
         @test norm(Ap .- Ar) / max(norm(Ar), eps(Float64)) < tol(real(T))
     end
 end
+
+# ── req#11 FOR ger: bitwise reproducibility across thread counts ───────────────────────────────────
+#
+# ger is the one threaded op whose invariance needs no argument about accumulation order: there is no
+# reduction anywhere, every `A[i,j]` is written exactly once, and both route arms fold α into `y[j]`
+# before touching `x`, so a column partition cannot change a single bit. The test still earns its
+# place, because the things that CAN go wrong are not about arithmetic:
+#
+#   * a column split that overlaps (a write race) or leaves a gap (a stale element), which is what
+#     `_gemm_chunk`'s `_NR` rounding has to get right at the ragged end;
+#   * the ROUTE, which is keyed on the A byte count and so moves under a split — bits are safe either
+#     way, but the sizes below straddle `_L3_BYTES` deliberately so both arms are exercised;
+#   * the lost-claim fallback, which must reach the same arm as the winner's chunks.
+#
+# Sizes: `n` large enough that `_ger_workers` admits every worker, and an `n` that is NOT a multiple
+# of `_NR` so the last chunk is ragged.
+@testitem "ger: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
+        @testset "$T" for T in (Float64, Float32)
+            L3 = P._L3_BYTES
+            # One shape comfortably inside L3 (the per-column arm) and one past it (the panel arm),
+            # each in a square-ish and a ragged-n variant.
+            # `s` is the square side whose A is exactly L3, so `s ÷ 2` is a quarter of L3 — safely on
+            # the per-column arm — and `s` itself trips the `>= _L3_BYTES` panel predicate. Kept AT
+            # the boundary rather than a multiple past it: four copies of a 4x-L3 matrix is half a
+            # gigabyte and buys no coverage the boundary shape does not already give.
+            mns = let s = isqrt(L3 ÷ sizeof(T))
+                ((s ÷ 2, s ÷ 2), (s ÷ 2, s ÷ 2 + 7), (s, s), (s, s + 7))
+            end
+            @testset "m=$m n=$n" for (m, n) in mns
+                A0 = randn(T, m, n)
+                x = randn(T, m)
+                y = randn(T, n)
+                α = T(0.75)                      # NOT a power of two
+                P.set_num_threads(1)
+                want = (t = copy(A0); P.ger!(α, x, y, t); t)
+                for nw in (2, nt)
+                    P.set_num_threads(nw)
+                    @test bitsame((t = copy(A0); P.ger!(α, x, y, t); t), want)
+                end
+                P.set_num_threads(1)
+            end
+        end
+    end
+end
+
+# The invariant item above passes for a library that ignores every thread it is given, so it needs a
+# liveness gate — the same `p.gen` witness the L1 items use — and a concurrent exercise of the
+# lost-claim path, which is the branch a worker count can reach that is NOT the happy one.
+@testitem "ger: the pool runs, and losing the claim gives the same answer" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        # AT the L3 boundary, with a ragged `n`: enough to admit every worker and to take the panel
+        # arm, while keeping one copy near L3 rather than a multiple of it. The concurrent block
+        # below holds `nt + 1` copies live at once, so the per-copy footprint is the binding cost.
+        s = isqrt(P._L3_BYTES ÷ sizeof(Float64))
+        m, n = s, s + 7
+        A0 = randn(m, n); x = randn(m); y = randn(n)
+        g0 = @atomic p.gen
+        A1 = copy(A0); P.ger!(0.75, x, y, A1)
+        @test (@atomic p.gen) != g0                    # the pool was actually dispatched
+        P.set_num_threads(1)
+        A2 = copy(A0); P.ger!(0.75, x, y, A2)          # serial reference
+        @test A1 == A2
+        # CONCURRENT: several callers at once, so all but one LOSE the claim and run the fallback.
+        # Every result must equal the serial one, which is what pins the fallback to the same arm.
+        P.set_num_threads(nt)
+        tasks = [@spawn (t = copy(A0); P.ger!(0.75, x, y, t); t) for _ in 1:(nt + 1)]
+        for t in tasks
+            @test fetch(t) == A2
+        end
+        P.set_num_threads(1)
+    end
+end
+
+# ── req#11 FOR gemv-N: bitwise reproducibility across thread counts ────────────────────────────────
+#
+# UNLIKE ger, THIS ONE IS A REAL CORRECTNESS GATE, and the sizes are chosen to make it bite. gemv-N
+# splits ROWS, and two of its route decisions are keyed on the A byte count `m * n * sizeof(T)`:
+#
+#   * `_gemvn_minner() && m*n*sizeof(T) <= _GEMVN_MINNER_MAXA` picks between the minner driver (panel
+#     width from `_gemvn_minner_np`) and the old one (a flat `_GEMV_NP`). Different column chunking,
+#     so each `y[i]` accumulates its n-chain in a different ORDER.
+#   * inside minner, `_gemvn_minner_np` itself flips NARROW/WIDE at `2 * _L2_BYTES` — again a panel
+#     width, again the n-chain's grouping.
+#
+# A row band holds 1/nw of the bytes, so without the `mroute` token a worker flips either predicate
+# and returns different bits from the undivided problem. The two "flip" sizes below sit JUST ABOVE
+# each threshold, so the whole problem is on one side and every band is on the other — which is
+# exactly the case that fails if the token is dropped. The row-block size is there because
+# `n <= _gemvn_rb()` is keyed on `n`, which a row split does NOT move: it must keep working, and
+# `_gemvn_rowblock_mr` picking a different block height per band must stay bit-neutral.
+#
+# β is swept because each band pre-scales its OWN rows. Two workers double-scaling, or a band
+# skipping the scale, shows up here and nowhere else.
+@testitem "gemv-N: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
+        @testset "$T" for T in (Float64, Float32)
+            sz = sizeof(T)
+            # Just past `2 * _L2_BYTES` with a modest `n`, so the undivided problem is WIDE and every
+            # band is NARROW.
+            n_np = 160
+            m_np = (5 * P._L2_BYTES) ÷ (2 * n_np * sz)
+            # Just past `_GEMVN_MINNER_MAXA` (= 4·L3), so the undivided problem leaves minner and
+            # every band would re-enter it. One allocation of a little over 4·L3 is the price of
+            # covering this predicate at all; there is no smaller shape that straddles it.
+            n_mx = 1024
+            m_mx = (P._GEMVN_MINNER_MAXA ÷ (n_mx * sz)) + 64
+            cases = (
+                ("rowblock n<=rb", 8192, min(64, P._gemvn_rb())),
+                ("np narrow/wide flip", m_np, n_np),
+                ("minner/paneldrv flip", m_mx, n_mx),
+            )
+            @testset "$nm m=$m n=$n" for (nm, m, n) in cases
+                A = randn(T, m, n)
+                x = randn(T, n)
+                y0 = randn(T, m)
+                α = T(0.75)                                  # NOT a power of two
+                @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
+                    P.set_num_threads(1)
+                    want = (t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β); t)
+                    for nw in (2, nt)
+                        P.set_num_threads(nw)
+                        @test bitsame((t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β); t), want)
+                    end
+                    P.set_num_threads(1)
+                end
+            end
+        end
+    end
+end
+
+# Liveness plus the lost-claim path, as for ger. The extra assertion here is that `trmv` must NOT
+# reach the pool: `_tri_scat!` calls `_gemv_n_paneldrv!` directly precisely so the `_TRMV_ACC*` and
+# `_TRSV_*` per-thread owners in `test/perthread_lint_baseline.txt` stay un-forked, and that
+# justification is now load-bearing rather than incidental.
+@testitem "gemv-N: the pool runs, trmv stays out of it, and losing the claim agrees" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        m, n = 8192, 512
+        A = randn(m, n); x = randn(n); y0 = randn(m)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        @test ran(() -> P.gemv!(copy(y0), A, x; alpha = 0.75, beta = 2.5))
+        # trmv over a matrix big enough that a threaded gemv-N WOULD have been admitted. If this ever
+        # reports true, the four per-thread baseline entries lost their justification.
+        Tri = randn(2048, 2048) + 2048I
+        v = randn(2048)
+        @test !ran(() -> P.trmv!(Tri, copy(v)))
+        y1 = copy(y0); P.gemv!(y1, A, x; alpha = 0.75, beta = 2.5)
+        P.set_num_threads(1)
+        y2 = copy(y0); P.gemv!(y2, A, x; alpha = 0.75, beta = 2.5)
+        @test y1 == y2
+        # CONCURRENT: all but one caller loses the claim and runs the fallback, which must reach the
+        # same route as the winner's chunks.
+        P.set_num_threads(nt)
+        tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
+        for t in tasks
+            @test fetch(t) == y2
+        end
+        P.set_num_threads(1)
+    end
+end
+
+# ── req#11 FOR gemv-T: bitwise reproducibility across thread counts ────────────────────────────────
+#
+# The mirror of the gemv-N item. gemv-T splits COLUMNS, and two decisions read the A byte count that a
+# column split shrinks:
+#
+#   * `_gemvt_perscan` — `m*n*sizeof(T) > _GEMVT_PERCOL_AMIN` chooses per-column over NC-blocked, and
+#     the two reduce each `y[j]` by different arithmetic, not merely at a different speed;
+#   * `_gemvt_deep` — `m*n*sizeof(T) <= _L2_BYTES` switches the ACCUMULATOR COUNT
+#     (`_GEMVT_NC_DEEP`/`_GEMVT_U_DEEP`), which is a different fold tree.
+#
+# The sizes sit JUST ABOVE each threshold so the undivided problem is on one side and every band on
+# the other. Both predicates also carry an m-only term (`m*sizeof(T) <= _GEMVT_PERCOL_XMAX`,
+# `_gemvt_x_l1_resident(T, m, lda)`) which a column split does not move — so `m` is kept inside those
+# bounds, otherwise the case is decided by the m term and the n flip is never reached.
+#
+# A µarch where `_gemvt_perscan_mode() != 1` makes the first predicate constant, and a pinned
+# `gemvt_deep = false` does the same for the second. The item still asserts invariance there; it just
+# stops being the test that would catch a dropped token. That is why BOTH are present.
+@testitem "gemv-T: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
+        @testset "$T" for T in (Float64, Float32)
+            sz = sizeof(T)
+            # Keep m under _GEMVT_PERCOL_XMAX so the perscan decision turns on the n term.
+            m_ps = min(4096, P._GEMVT_PERCOL_XMAX ÷ sz)
+            n_ps = max(2 * P._NR, (5 * P._GEMVT_PERCOL_AMIN) ÷ (4 * m_ps * sz))
+            # Just past L2, so the undivided problem leaves `_gemvt_deep`'s size branch and every band
+            # re-enters it.
+            m_dp = 2048
+            n_dp = max(2 * P._NR, (5 * P._L2_BYTES) ÷ (4 * m_dp * sz))
+            cases = (("perscan flip", m_ps, n_ps), ("deep flip", m_dp, n_dp))
+            @testset "$nm m=$m n=$n" for (nm, m, n) in cases
+                A = randn(T, m, n)
+                x = randn(T, m)            # gemv-T consumes m and produces n
+                y0 = randn(T, n)
+                α = T(0.75)
+                @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
+                    P.set_num_threads(1)
+                    want = (t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β, trans = 'T'); t)
+                    for nw in (2, nt)
+                        P.set_num_threads(nw)
+                        @test bitsame((t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β, trans = 'T'); t), want)
+                    end
+                    P.set_num_threads(1)
+                end
+            end
+        end
+    end
+end
+
+# Liveness, the trmv exclusion, and the lost-claim path — as for gemv-N. The trmv assertion matters
+# MORE here than there: `_tri_scatT!` calls `_gemv_t_simd!` itself, so the thread seam had to go one
+# level up into `_gemv!`. If that ever slips back down, this is what notices.
+@testitem "gemv-T: the pool runs, trmv-T stays out, and losing the claim agrees" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        m, n = 4096, 1024
+        A = randn(m, n); x = randn(m); y0 = randn(n)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        @test ran(() -> P.gemv!(copy(y0), A, x; alpha = 0.75, beta = 2.5, trans = 'T'))
+        # trmv with trans='T' routes through `_tri_scatT!`, which calls `_gemv_t_simd!` directly. It
+        # must not reach the pool, or the `_TRMV_ACC*` / `_TRSV_*` per-thread owners in
+        # test/perthread_lint_baseline.txt lose the justification they are listed under.
+        Tri = randn(2048, 2048) + 2048I
+        v = randn(2048)
+        @test !ran(() -> P.trmv!(Tri, copy(v); trans = 'T'))
+        @test !ran(() -> P.trsv!(Tri, copy(v); trans = 'T'))
+        y1 = copy(y0); P.gemv!(y1, A, x; alpha = 0.75, beta = 2.5, trans = 'T')
+        P.set_num_threads(1)
+        y2 = copy(y0); P.gemv!(y2, A, x; alpha = 0.75, beta = 2.5, trans = 'T')
+        @test y1 == y2
+        P.set_num_threads(nt)
+        tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = 0.75, beta = 2.5, trans = 'T'); t) for _ in 1:(2 * nt)]
+        for t in tasks
+            @test fetch(t) == y2
+        end
+        P.set_num_threads(1)
+    end
+end
+
+# ── req#11 FOR symv: bitwise reproducibility across thread counts ──────────────────────────────────
+#
+# symv is the one threaded op whose PARALLEL form had to be pushed back onto the SERIAL path, and that
+# is what this item guards. It splits columns, but a column block writes `y` rows OUTSIDE its own
+# range (every column of a symmetric matrix scatters across the diagonal), so workers need private
+# `y` vectors — "notepads" — folded afterwards in BLOCK order.
+#
+# A notepad starts at ZERO, so the folded form computes `y0 + (0+c1+c2)` where an unblocked sweep
+# computes `((y0+c1)+c2)`. Different bits. A caller that LOSES the pool claim runs serially, so unless
+# the serial path is ALSO blocked-and-folded, the same call returns different bits depending on a race
+# — the defect `6940a2d3` shipped. Hence `_symv_blocked!` is the only form wherever `_symv_nblk > 1`,
+# at every thread count including one, and the lost-claim branch calls it with its own arena notepad.
+#
+# `_symv_nblk` returns 1 past about 2x L3, because the fold costs 0.2-0.9% and symv's SERIAL gate at
+# n=4096 is 0.995 on wintermute and 1.000 on galen — it cannot afford it. So the sizes below must
+# straddle that cut: one inside (grid live, notepads used, pool admitted) and one outside (grid
+# collapsed to 1, not a single notepad touched, byte-identical to the unblocked kernel).
+@testitem "symv: bit-identical at every thread count, both sides of the nblk cut" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
+        @testset "$T" for T in (Float64, Float32)
+            # `nin` sits inside the residency cut, `nout` beyond it. Derived from the same expression
+            # `_symv_nblk` uses, so the pair keeps straddling the cut if that constant ever moves.
+            ncut = isqrt((2 * P._L3_BYTES * 2) ÷ sizeof(T))
+            nin = max(64, (ncut * 3) ÷ 4)
+            nout = ncut * 2
+            @test P._symv_nblk(nin, T) > 1        # the grid is live here …
+            @test P._symv_nblk(nout, T) == 1      # … and collapsed here
+            @testset "uplo=$ul n=$n" for ul in ('U', 'L'), n in (nin, nout)
+                A = randn(T, n, n)
+                x = randn(T, n)
+                y0 = randn(T, n)
+                α = T(0.75)                        # NOT a power of two
+                @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
+                    P.set_num_threads(1)
+                    want = (t = copy(y0); P.symv!(t, A, x; uplo = ul, alpha = α, beta = β); t)
+                    for nw in (2, nt)
+                        P.set_num_threads(nw)
+                        @test bitsame((t = copy(y0); P.symv!(t, A, x; uplo = ul, alpha = α, beta = β); t), want)
+                    end
+                    P.set_num_threads(1)
+                end
+            end
+        end
+    end
+end
+
+# Liveness, plus the two properties that only hold if the nblk cut works: the pool IS dispatched
+# inside the cut, and it is NOT dispatched outside it — the latter being what protects the serial gate
+# cells at n=4096 that A-restricted exists to keep green.
+@testitem "symv: the pool runs inside the nblk cut and not outside it" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        ncut = isqrt((2 * P._L3_BYTES * 2) ÷ sizeof(Float64))
+        nin = (ncut * 3) ÷ 4
+        nout = ncut * 2
+        Ai = randn(nin, nin); xi = randn(nin); yi = randn(nin)
+        @test ran(() -> P.symv!(copy(yi), Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5))
+        # OUTSIDE the cut `_symv_nblk` is 1, so there is no grid to split and the pool must stay out.
+        # If this ever reports true, the fold is being paid at n=4096 and two serial gate cells go red.
+        Ao = randn(nout, nout); xo = randn(nout); yo = randn(nout)
+        @test !ran(() -> P.symv!(copy(yo), Ao, xo; uplo = 'L', alpha = 0.75, beta = 2.5))
+        # The threaded answer must equal the serial one, and the CONCURRENT case must too — all but
+        # one caller loses the claim and runs `_symv_blocked!` with its own arena notepad.
+        y1 = copy(yi); P.symv!(y1, Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5)
+        P.set_num_threads(1)
+        y2 = copy(yi); P.symv!(y2, Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5)
+        @test y1 == y2
+        P.set_num_threads(nt)
+        tasks = [@spawn (t = copy(yi); P.symv!(t, Ai, xi; uplo = 'L', alpha = 0.75, beta = 2.5); t) for _ in 1:(nt + 1)]
+        for t in tasks
+            @test fetch(t) == y2
+        end
+        P.set_num_threads(1)
+    end
+end
+
+# ── req#11 FOR gbmv-N: bitwise reproducibility across thread counts ────────────────────────────────
+#
+# The cheapest threaded op in BLAS-2, and the item records WHY so the next reader does not reach for
+# symv's machinery. gbmv-N splits OUTPUT ROW BANDS. A band of a BANDED matrix needs only the columns
+# within `kl + ku` of its own rows — not a strided sweep of whole rows, which is what made row bands
+# wrong for symv — so the bands are write-disjoint in `y`, every `y[i]` keeps its whole column chain
+# on one worker in ascending column order, and there is no partial, no fold and no route token.
+#
+# Two arms must both be covered, because the kernel picks between them on `kl + ku + 1` against
+# `_GBMV_CONV_MAX` (48 on AVX-512, 20 on AVX2): the row-blocked convolution for a narrow band and the
+# per-column axpy for a wide one. The benched band of 33 is CONV on AVX-512 and AXPY on AVX2, so a
+# test that pinned one width would silently cover only one arm on each box.
+#
+# Sizes: `n` past the pool's admission floor — with band `b` the traffic is `n*b*sizeof(T)` against
+# `_L1_MT_MIN` — and an `m` that is not a multiple of the vector width so the masked tail block runs.
+@testitem "gbmv-N: bit-identical at every thread count, both band arms" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
+        @testset "$T" for T in (Float64, Float32)
+            cmax = P._GBMV_CONV_MAX
+            # One band comfortably inside the conv cutoff, one comfortably outside it.
+            @testset "band=$(2k + 1) arm=$arm" for (k, arm) in ((max(1, (cmax - 1) ÷ 4), "conv"),
+                                                                (cmax, "axpy"))
+                b = 2k + 1
+                @test (b <= cmax) == (arm == "conv")      # the intended arm is really taken
+                # Past `_L1_MT_MIN` for this band, and m deliberately off a vector-width multiple.
+                n = max(512, cld(2 * P._L1_MT_MIN, b * sizeof(T)))
+                m = n + 3
+                AB = randn(T, b, n); x = randn(T, n); y0 = randn(T, m)
+                α = T(0.75)
+                @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
+                    P.set_num_threads(1)
+                    want = (t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = α, beta = β); t)
+                    for nw in (2, nt)
+                        P.set_num_threads(nw)
+                        @test bitsame((t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = α, beta = β); t), want)
+                    end
+                    P.set_num_threads(1)
+                end
+            end
+        end
+    end
+end
+
+# Liveness plus the lost-claim path. gbmv-N has no partial buffer, so the fallback is simply the
+# unsplit kernel over `[0, m)` — the assertion here is that this really does equal the banded result,
+# which is the property that lets the fallback stay that simple.
+@testitem "gbmv-N: the pool runs and losing the claim agrees" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        k = 16; b = 2k + 1
+        n = max(512, cld(2 * P._L1_MT_MIN, b * sizeof(Float64)))
+        m = n + 3
+        AB = randn(b, n); x = randn(n); y0 = randn(m)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        @test ran(() -> P.gbmv!(copy(y0), AB, x, m, k, k; alpha = 0.75, beta = 2.5))
+        y1 = copy(y0); P.gbmv!(y1, AB, x, m, k, k; alpha = 0.75, beta = 2.5)
+        P.set_num_threads(1)
+        y2 = copy(y0); P.gbmv!(y2, AB, x, m, k, k; alpha = 0.75, beta = 2.5)
+        @test y1 == y2
+        P.set_num_threads(nt)
+        tasks = [@spawn (t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
+        for t in tasks
+            @test fetch(t) == y2
+        end
+        P.set_num_threads(1)
+    end
+end

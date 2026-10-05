@@ -149,8 +149,10 @@ function page(io)
     println(io, """
 # Multi-threading
 
-PureBLAS threads `gemm`, `symm`, `syrk`, `syr2k`, both sides of `trsm`, and — through them —
-`getrf` and `potrf`. Threading is **off** until you ask for it:
+PureBLAS threads most of BLAS-1 and BLAS-2 and the bulk of BLAS-3: `axpy`, `scal`, `blascopy`,
+`swap`, `dot`, `asum`, `nrm2`, `iamax`; `ger`, `gemv` both ways, `symv`, `gbmv` non-transposed;
+`gemm`, `symm`, `syrk`, `syr2k`, both sides of `trsm`, `trmm` side R; and — through those — `getrf`
+and `potrf`. Threading is **off** until you ask for it:
 
 
 ```julia
@@ -195,7 +197,9 @@ julia --project=bench bench/mt_summary.jl bench/mt_data_*.txt
 
 ## What is threaded
 
-The worker pool runs five kinds of job. `gemm` splits the columns of C. `syrk`, `syr2k` and `symm`
+### BLAS-3 and LAPACK
+
+`gemm` splits the columns of C. `syrk`, `syr2k` and `symm`
 reach the kernel below that split point, so they carry their own kind: a triangular output needs a
 flop-balanced column split, since equal widths hand the first worker roughly twice the work of the
 last. `trsm` splits the columns of B on side L and its rows on side R — every column of one and
@@ -211,6 +215,47 @@ routes its trailing update through the public `syrk!` rather than a private kern
 from the call it belongs to. That is not a slower answer, it is a different one, and it is why the
 route token reaches the kernel switches themselves — `getrf` lost its thread-count invariance until
 it did.
+
+### Reductions: a fixed block grid
+
+`dot`, `asum` and `nrm2` cut `n` into blocks whose size is a function of `(n, T)` alone, reduce each
+with the unchanged serial kernel, and have the **driver** fold the partials in index order after the
+join. A worker count therefore decides who computes a partial and never how the partials combine,
+which is what makes the answer identical at every thread count. The blocked form is the only form,
+used at one thread too.
+
+`iamax` rides the same grid with a different fold — a strict `>` scan in block order, so ties go to
+the lower index — and every block is seeded from the same `|x[1]|`, which is what preserves netlib's
+NaN contract under a split.
+
+### BLAS-2: the partition follows how far the scatter reaches
+
+Three shapes, and which one applies is decided by the kernel, not by taste.
+
+**No scatter.** `ger` writes each `A[i,j]` once, and `gemv` gives each output element its own
+accumulation chain. Bands are write-disjoint already, so only the *route* needs guarding: `gemv-N`
+splits rows and `gemv-T` columns, and both carry the undivided dimension because two of their kernel
+choices read the A byte count — one of them selects a panel width, which re-chunks the chain and so
+changes the arithmetic rather than just the speed.
+
+**Bounded scatter.** `gbmv` non-transposed writes only within `kl + ku` of its own rows, so output
+row bands are write-disjoint and bit-identical for free. Nothing is folded and no token is needed —
+the arm choice reads `kl + ku + 1`, which a row split cannot move.
+
+**Full scatter.** `symv` reads each stored element once and uses it twice, so a column block writes
+`y` rows outside its own range. Workers need private `y` vectors folded in block order. That fold is
+the interesting part: a private vector starts at zero, so the folded form rounds differently from an
+unblocked sweep, and since a caller that loses the pool claim runs serially, the blocked form has to
+be the **only** form — at one thread as well. The fold is therefore a cost on the *serial* path, and
+`symv`'s serial margin at n=4096 is 0.995 on one box and 1.000 on another. So the grid is cut by
+residency: past roughly twice L3 it collapses to one block, `y` is written directly, and not one
+private vector is touched. Below the pool's own admission floor it collapses for the same reason —
+there a grid would be pure fold with no worker to pay for it.
+
+`trmv`, `trsv` and the packed and banded triangular ops are **not** threaded, and that is a decision
+rather than an omission: a triangular sweep and a substitution are sequential. They also reach the
+gemv panel drivers directly rather than through the public entry, which is what keeps their
+per-thread scratch un-forked.
 
 ## Plots
 
@@ -261,6 +306,7 @@ Read the SHAPE, not just the peak: a curve that climbs with `n` is a routine amo
 fork-join correctly.
 
 ![BLAS-1 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l1.svg)
+![BLAS-2 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l2.svg)
 ![BLAS-3 — PureBLAS 6 threads / 1 thread](assets/perf_mt_l3.svg)
 ![LAPACK — PureBLAS 6 threads / 1 thread](assets/perf_mt_lapack.svg)
 

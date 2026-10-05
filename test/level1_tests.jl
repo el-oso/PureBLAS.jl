@@ -332,9 +332,15 @@ end
     for T in (Float32, Float64)
         W = _vwidth(T)
         nan, inf = T(NaN), T(Inf)
-        kernels = (("tree", (n, p) -> _iamax_tree!(Val(_IAMAX_NB_TREE), n, p)),
-                   ("thresh_resident", (n, p) -> _iamax_thresh!(Val(_IAMAX_NB_RESIDENT), n, p)),
-                   ("thresh_stream", (n, p) -> _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, p)),
+        # The tree and threshold kernels take the running-maximum SEED and report 0 for "nothing in
+        # this range beat it". The netlib contract is seed-from-|x[1]| with 0 mapped back to 1, which
+        # is what `_iamax_simd!` does — reproduce it here so each kernel is still measured against the
+        # netlib oracle rather than against its own raw convention. `_iamax_chain4!` still seeds
+        # internally and keeps the plain two-argument shape.
+        nl(f) = (n, p) -> (v = f(n, p, abs(unsafe_load(p, 1))); iszero(v) ? 1 : v)
+        kernels = (("tree", nl((n, p, s) -> _iamax_tree!(Val(_IAMAX_NB_TREE), n, p, s))),
+                   ("thresh_resident", nl((n, p, s) -> _iamax_thresh!(Val(_IAMAX_NB_RESIDENT), n, p, s))),
+                   ("thresh_stream", nl((n, p, s) -> _iamax_thresh!(Val(_IAMAX_NB_STREAM), n, p, s))),
                    ("chain4", (n, p) -> _iamax_chain4!(n, p)))
         run(k, x) = GC.@preserve x k(length(x), pointer(x))
 
@@ -435,6 +441,7 @@ end
                 r_cp = (t = similar(y); P.blascopy!(t, x); t)
                 r_swx = copy(y)                              # after swap!(x, y), x holds y's values
                 r_swy = copy(x)
+                r_iamax = P.iamax(x)                         # an INDEX, so equality is already exact
                 for nw in (2, nt)
                     P.set_num_threads(nw)
                     @test bitsame(P.dot(x, y), r_dot)
@@ -443,6 +450,7 @@ end
                     @test bitsame((t = copy(y); P.axpy!(t, α, x); t), r_axpy)
                     @test bitsame((t = copy(x); P.scal!(β, t); t), r_scal)
                     @test bitsame((t = similar(y); P.blascopy!(t, x); t), r_cp)
+                    @test P.iamax(x) == r_iamax
                     let a = copy(x), b = copy(y)
                         P.swap!(a, b)
                         @test bitsame(a, r_swx)
@@ -464,6 +472,43 @@ end
                     @test bitsame(P.nrm2(x), want)
                 end
                 P.set_num_threads(1)
+            end
+            # iamax seeds EVERY block of its grid from |x[1]|, and that is what keeps netlib's NaN and
+            # tie semantics whole under a split. Both hazards are data-dependent rather than
+            # size-dependent, so neither is reachable from the random vectors above and both need
+            # their own case. Each is checked against the netlib oracle at one thread AND for
+            # invariance across worker counts — the oracle alone would pass a library that returns
+            # the same wrong index everywhere, and invariance alone would pass one that is
+            # consistently wrong.
+            let n = 2 * nt * B + 3
+                nlref(v) = (d = abs(v[1]); ix = 1;
+                    for k in 2:length(v)
+                        abs(v[k]) > d && (d = abs(v[k]); ix = k)
+                    end; ix)
+                cases = (
+                    # Equal maxima in different blocks: the lower index must win, which is the fold's
+                    # strict `>` in block order rather than any per-block property.
+                    ("tie across blocks", (t = fill(one(T), n); t[3] = T(9); t[B + 7] = T(9); t)),
+                    # A NaN AFTER the max, same shape that broke the tree kernel's fold.
+                    ("NaN after the max", (t = fill(one(T), n); t[5] = T(9); t[B + 11] = T(NaN); t)),
+                    # A NaN BEFORE the max, in an earlier block: seeding that block from its own first
+                    # element would make it report the NaN and the fold would then drop a real maximum
+                    # living later in the SAME block.
+                    ("NaN before the max", (t = fill(one(T), n); t[B + 11] = T(NaN); t[B + 19] = T(9); t)),
+                    # A NaN at position 1 poisons the seed, so no compare can succeed and the answer is
+                    # 1 — netlib's behaviour, and every block must report "nothing beat the seed".
+                    ("NaN at position 1", (t = fill(one(T), n); t[1] = T(NaN); t[7] = T(9); t)),
+                )
+                @testset "$nm" for (nm, v) in cases
+                    P.set_num_threads(1)
+                    want = P.iamax(v)
+                    @test want == nlref(v)
+                    for nw in (2, nt)
+                        P.set_num_threads(nw)
+                        @test P.iamax(v) == want
+                    end
+                    P.set_num_threads(1)
+                end
             end
         end
     end
@@ -508,6 +553,10 @@ end
         @test pooled(() -> P.scal!(2.5, copy(x)),     P._sme_scal_ok(Float64, n, x))
         @test pooled(() -> P.blascopy!(similar(y), x), false)
         @test pooled(() -> P.swap!(copy(x), copy(y)), false)
+        # `iamax` has NO SME route — there is no `_sme_iamax_ok` — so it always uses the pool, on
+        # every platform. It is an argmax rather than a reduction: the chunks write block indices and
+        # the driver selects with a strict `>` scan in block order.
+        @test pooled(() -> P.iamax(x), false)
         P.set_num_threads(1)
     end
 end
