@@ -134,7 +134,13 @@ end
 #
 # A worker does walk columns whose extent misses its band entirely and skips them; the cost is the
 # `kl + ku` columns of overlap at each boundary, which is negligible against a band block many
-# thousands of columns wide. The arm choice reads `kl + ku + 1` only, so it cannot move under a split.
+# thousands of columns wide.
+#
+# TWO ARM CHOICES, AND ONLY ONE OF THEM IS SAFE BY ITSELF. This kernel's own conv-vs-wide branch reads
+# `kl + ku + 1`, which no split can move. The wide arm's nested `_axpy_simd!` routes on the length it
+# is handed, and a band CLAMPS the boundary columns' extents — so it gets the column's UNDIVIDED
+# extent as `nroute`, per the rule `_axpy_simd!` states for itself: a partitioned caller passes the
+# whole problem's length and computes on its slice.
 @inline function _gbmv_n_simd!(
         m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y, ib0::Int, ib1::Int
     ) where {T <: BlasReal}
@@ -142,14 +148,15 @@ end
     GC.@preserve AB x y begin
         Ap = pointer(AB); xp = _ptr(x); yp = _ptr(y); ldb = stride(AB, 2); sz = sizeof(T)
         @inbounds for j in 1:n
-            ilo = max(max(1, j - ku), ib0 + 1); ihi = min(min(m, j + kl), ib1); len = ihi - ilo + 1
+            ulo = max(1, j - ku); uhi = min(m, j + kl)            # the column's UNDIVIDED extent
+            ilo = max(ulo, ib0 + 1); ihi = min(uhi, ib1); len = ihi - ilo + 1
             len <= 0 && continue
             # SEGMENT VALIDATION (2026-08-17). Both operands are built here and handed to a shared
             # kernel as raw Ptrs — `_axpy_simd!` cannot see past them, which is why the per-store
             # carrier approach could not cover this write at all. `_seg` validates each extent at the
             # point the offset arithmetic happens; in release it IS the pointer arithmetic it replaces.
             segp = _seg(AB, Ap, (ku + ilo - j) + (j - 1) * ldb, len)
-            _axpy_simd!(len, α * unsafe_load(xp, j), segp, _seg(y, yp, ilo - 1, len))
+            _axpy_simd!(len, α * unsafe_load(xp, j), segp, _seg(y, yp, ilo - 1, len), 0, uhi - ulo + 1)
         end
     end
     return y

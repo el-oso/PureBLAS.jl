@@ -4080,9 +4080,9 @@ end
 Worker count for a column-split `ger`. `A` is read AND written, so its traffic is 2 bytes per element
 and that is what the admission floor should see — `x` and `y` are one vector each beside an m×n
 matrix. Capped by the COLUMN block count rather than the element count: a worker owns whole columns
-and `_gemm_chunk` hands them out in `_NR`-wide blocks, so asking for more workers than there are
-blocks leaves some of them with nothing to do and the join waits for a round trip that bought
-nothing.
+and `_gemm_chunk` hands them out in blocks `lcm(_NR, _ger_np())` wide — the panel granularity req#11
+needs, see `_ger_run_chunk` — so asking for more workers than there are blocks leaves some of them
+with nothing to do and the join waits for a round trip that bought nothing.
 """
 @inline function _ger_workers(m::Int, n::Int, ::Type{T}) where {T}
     # THE EARLY-OUTS COME BEFORE THE DIVIDE, for the reason `_gemm_workers` records: this sits on the
@@ -4092,7 +4092,7 @@ nothing.
     _MT_NTHREADS[] > 1 || return 1
     nw = _l1_workers(2 * m * n * sizeof(T), m * n, T)
     nw > 1 || return 1
-    return max(1, min(nw, cld(n, _NR)))
+    return max(1, min(nw, cld(n, lcm(_NR, _ger_np()))))
 end
 
 """
@@ -4126,7 +4126,7 @@ and the matching entries of y.
     _MT_NTHREADS[] > 1 || return 1
     nw = _l1_workers(m * n * sizeof(T), m * n, T)
     nw > 1 || return 1
-    return max(1, min(nw, cld(n, _NR)))
+    return max(1, min(nw, cld(n, _GEMVT_BAND)))
 end
 
 # One notepad's stride, rounded UP to a whole cache line so block `b`'s tail and block `b+1`'s head
@@ -4152,15 +4152,33 @@ see `_SYMV_NBLK` for why eight is enough to cover six workers.
     return max(1, min(nw, nblk))
 end
 
-# Column range `[j0, j0+len)` (0-based start) for worker `i` of `nw`, rounded to whole `_NR` blocks so
-# every worker but the last drives full-width microkernel tiles.
-@inline function _gemm_chunk(n::Int, nw::Int, i::Int)
-    blocks = cld(n, _NR)
+# Column range `[j0, j0+len)` (0-based start) for worker `i` of `nw`, rounded to whole `g`-column
+# blocks (default `_NR`) so every worker but the last drives full-width microkernel tiles.
+#
+# `g` IS A req#11 PARAMETER, NOT A TUNING ONE. A kernel that sweeps its columns in fixed-width groups
+# and sends the `n mod group` tail to a DIFFERENT kernel reproduces the undivided grouping only if
+# every band boundary is a multiple of that group width — otherwise a column moves between the two
+# kernels, which are different reduction trees, and the bits change. `_NR` is not always that width:
+# `_at_gemm_nr` gives 4 for AVX2 Float64 while gemv-T's deep sweep groups 8, so a 4-rounded band
+# regroups on every AVX2 box. Callers whose kernel groups pass their own `g`.
+@inline function _gemm_chunk(n::Int, nw::Int, i::Int, g::Int)
+    blocks = cld(n, g)
     b0 = ((i - 1) * blocks) ÷ nw
     b1 = (i * blocks) ÷ nw
-    j0 = b0 * _NR
-    return j0, min(n, b1 * _NR) - j0
+    j0 = b0 * g
+    return j0, min(n, b1 * g) - j0
 end
+@inline _gemm_chunk(n::Int, nw::Int, i::Int) = _gemm_chunk(n, nw, i, _NR)
+
+# The band granularity gemv-T needs: a multiple of every NC its sweep can select. `_gemvt_cols!` is
+# called with `Val(16)`, `Val(8)` or `Val(4)` — whatever `_gemvt_nc()` resolves to is snapped to one
+# of those three — and the deep arm always takes `_GEMVT_NC_DEEP`, so 16 covers the lot and is also a
+# multiple of `_NR` on every width this library builds for.
+# ponytail: one constant for all arms; compute the exact NC in the driver if small-`n` gemv-T ever
+# needs the finer split that a 16-column granularity denies it.
+# PDM: Exempt — not a performance value. It is the least common multiple of the column-group widths `_gemvt_cols!` can be called with (4, 8, 16), so it is fixed by the kernel's own shape and tuning it would break req#11.
+# req8-ok: req#11 granularity, lcm of the NC values `_gemvt_cols!` dispatches to — not a tuning literal
+const _GEMVT_BAND = 16
 
 # ── FLOP-BALANCED COLUMN SPLIT FOR A TRIANGULAR OUTPUT (syrk / syr2k / herk / her2k) ────────────────
 # `_gemm_chunk`'s equal-WIDTH split is wrong for a triangle. Column j of a lower-triangular C has n − j
@@ -4520,10 +4538,16 @@ end
 
 # ger over this worker's columns. `x` is handed over WHOLE — every column of the rank-1 update needs
 # all of it — while `y` and `A` are offset to the worker's column range. `p.n` goes in as the route
-# token so the arm matches the undivided problem's; see `_ger_simd!` for why that is a performance
-# concern here and not a correctness one.
+# token so the arm matches the undivided problem's; see `_ger_simd!` for why the ARM choice is a
+# performance concern rather than a correctness one.
+#
+# THE BAND GRANULARITY, HOWEVER, IS req#11. The panel arm's NP-column panels run unguarded `muladd`s
+# while its `len mod NP` remainder goes to `_axpy_simd!`, which SKIPS a column whose `α·y[j]` is zero
+# — so the two disagree on `-0.0` destinations and non-finite `x`. Rounding the bands to whole panels
+# keeps every column on the side the undivided sweep put it on. `lcm` because the band must satisfy
+# the microkernel width too; both are powers of two in practice, so this is a `max`.
 @noinline function _ger_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
-    j0, len = _gemm_chunk(p.n, nw, i)
+    j0, len = _gemm_chunk(p.n, nw, i, lcm(_NR, _ger_np()))
     len > 0 || return nothing
     sz = sizeof(T)
     _ger_simd!(
@@ -4568,7 +4592,7 @@ end
 # let a band take the per-column kernel where the whole problem is NC-blocked, which is a different
 # accumulation, not just a different speed.
 @noinline function _gemvt_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
-    j0, len = _gemm_chunk(p.n, nw, i)
+    j0, len = _gemm_chunk(p.n, nw, i, _GEMVT_BAND)
     len > 0 || return nothing
     sz = sizeof(T)
     Ab = PtrMatrix{T}(p.Cp + j0 * p.ldc * sz, p.m, len, p.ldc)
@@ -4821,6 +4845,12 @@ const _GEMM_POOL_F32 = GemmPool{Float32}[]
 # Workers a threaded call may use, 1 = off. One atomic integer so the gemm entry costs a single load.
 const _MT_NTHREADS = Threads.Atomic{Int}(1)
 
+# How many callers have LOST the pool claim and run the serial fallback. A test witness and nothing
+# else: the fallback for each job kind must return the winner's bits, and a concurrency test that
+# asserts only agreement passes vacuously when the scheduler serialises its tasks and no caller ever
+# loses. Bumped on the lost path only, which already pays for a full serial computation.
+const _MT_LOST = Threads.Atomic{Int}(0)
+
 """
     set_num_threads(n::Integer) -> Int
 
@@ -4919,6 +4949,12 @@ end
     # matters is that the type is the SAME on both paths: a union return propagates into every caller's
     # inference (it failed trmm!'s `@assert_typestable` dogfood exactly that way).
     if !won
+        # WITNESS THAT THE CLAIM WAS ACTUALLY LOST. A concurrency test that only asserts "both answers
+        # agree" passes when the scheduler happens to serialise its tasks, every caller wins, and this
+        # branch never runs — so the branch where a wrong-kind fallback hides (see below) is certified
+        # by a test that could not have executed it. One relaxed increment, on a path that is about to
+        # do a whole serial computation.
+        Threads.atomic_add!(_MT_LOST, 1)
         # THE FALLBACK MUST MATCH THE JOB KIND. This ran `_gemm_core!` unconditionally, which is right
         # for a gemm and CATASTROPHIC for a syrk: it computes a full rectangular A·Bᵀ over the whole
         # matrix instead of a triangular rank-k update — wrong triangle, wrong values, and β already
@@ -4995,7 +5031,16 @@ end
             # A loser does the whole output. Its band IS `[0, m)`, which is what the unsplit kernel
             # already runs, and the arm choice reads `kl + ku + 1` only — so there is nothing to route
             # and nothing that can differ from the winner's bands.
-            _gbmv_n_simd!(C.m, C.n, A.n, A.ld, alpha, C, A.ptr, B.ptr, 0, C.m)
+            #
+            # THE BANDED STORE IS REBUILT AT ITS OWN HEIGHT, exactly as `_gbmvn_run_chunk` does. `C.m`
+            # is the OUTPUT ROW COUNT, so handing `C` over unchanged describes a store `m` tall where
+            # it is `kl+ku+1` tall, and `_seg_check` bounds the wide arm's stores against `C.m`. With
+            # `kl+ku+1 > m` that raises a BoundsError on an access that is in range (m=300, n=64,
+            # kl=0, ku=399), and with `kl+ku+1 < m` it silently stops checking.
+            _gbmv_n_simd!(
+                C.m, C.n, A.n, A.ld, alpha,
+                PtrMatrix{T}(C.ptr, A.n + A.ld + 1, C.n, C.ld), A.ptr, B.ptr, 0, C.m
+            )
         elseif kind == _MT_KIND_SCAL
             # A loser scales the whole vector. Elementwise, so no route token and no grouping to preserve.
             _scal_simd!(C.m, alpha, C.ptr)

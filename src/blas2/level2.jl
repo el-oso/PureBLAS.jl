@@ -2865,13 +2865,20 @@ must stay IN; n=4096 is 67 MiB and must stay out.
     # thread. `_L1_MT_MIN` is the floor `_l1_workers` applies, and both it and `tri` are functions of
     # `(n, T)`, so keying on it leaves the grid thread-count independent exactly as req#11 needs.
     tri < _L1_MT_MIN && return 1
-    tri <= 2 * _L3_BYTES || return 1
+    # STRICT `<`, like `_axpy_simd!`'s residency arms: a triangle whose size EQUALS the bound behaves
+    # as non-resident, and the equality is hit exactly — a 32 MiB L3 puts F64 n=4096 at precisely
+    # `2 * _L3_BYTES`, which is the cell this cut exists to keep out.
+    tri < 2 * _L3_BYTES || return 1
     return _SYMV_NBLK
 end
 
 # Block `b` of that grid, as a half-open column range `[j0, j1)`, zero-based. Rounded to whole `NB`
-# panels so a block is never cut mid-panel: only the LAST block carries the ragged tail, exactly as
-# the unsplit sweep does, which keeps the per-element arithmetic the same as the serial blocked form.
+# panels so a block is never cut mid-panel: the ragged tail falls to the last NON-EMPTY block, exactly
+# as the unsplit sweep does, which keeps the per-element arithmetic the same as the serial blocked
+# form. Rounding up to whole panels means the cover can run out of columns early — n=200 with NB=8
+# gives `cb = 32` and only 7 of 8 blocks are inhabited — so `(0, 0)` is a normal return, not an edge
+# case, and a worker holding only empty blocks does nothing. That costs a little parallelism and keeps
+# the block-to-column map a function of `(b, nblk, n, NB)` alone, which is what req#11 needs.
 @inline function _symv_cols(b::Int, nblk::Int, n::Int, NB::Int)
     cb = max(NB, cld(cld(n, nblk), NB) * NB)
     j0 = (b - 1) * cb
