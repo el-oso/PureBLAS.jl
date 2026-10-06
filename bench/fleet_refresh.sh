@@ -131,15 +131,51 @@ if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | gre
     # SWEEP_EXTRA. Measured on wintermute (6 cores), gemm n=1000, pb_mt over pb: `-t 6` gave 0.36x,
     # `-t 7` gave 1.38x under the old one-hyperthread pin, and 3.61x once the pin was corrected to
     # cover the whole core. The 2026-10-03 sweep ran `-t 6` and its entire pb_mt arm was unusable.
-    # DISTINCT (socket, core) pairs — not a line count. `lscpu -p` prints one row per LOGICAL cpu, so
-    # counting rows gives the SMT-inflated number (12 where this box has 6) and the guard then demands
-    # a thread count it never needed. Socket is included because core ids restart per socket.
-    _ncore=$(lscpu -p=Socket,Core 2>/dev/null | grep -v '^#' | sort -u | grep -c . || echo 0)
+    # DISTINCT PHYSICAL CORES INSIDE THE SWEEP'S MASK, which is the number `_pin_threads!` will pin:
+    # it reads `Cpus_allowed_list` and takes one CPU per `topology/core_id`, so the mask bounds it, not
+    # the box. Counting the whole box instead refuses galen's documented recipe — 12 cores, swept at
+    # `-t 7 mt=6` on CCD1's six so the three boxes stay comparable.
+    #
+    # Counting rows of `lscpu -p` is wrong for a second reason: one row per LOGICAL cpu gives the
+    # SMT-inflated figure (12 where a box has 6). Both counts here are per physical core.
+    _mask_cores() {
+        local n=0 seen=" " c id lo hi
+        for part in $(printf '%s' "$1" | tr ',' ' '); do
+            case "$part" in
+                *-*) lo=${part%-*}; hi=${part#*-} ;;
+                *)   lo=$part; hi=$part ;;
+            esac
+            for c in $(seq "$lo" "$hi"); do
+                id=$(cat "/sys/devices/system/cpu/cpu$c/topology/core_id" 2>/dev/null || echo "$c")
+                case "$seen" in *" $id "*) continue ;; esac
+                seen="$seen$id "
+                n=$((n + 1))
+            done
+        done
+        echo "$n"
+    }
+    if [ -n "$CORE" ]; then
+        _ncore=$(_mask_cores "$CORE")
+    else
+        _ncore=$(lscpu -p=Socket,Core 2>/dev/null | grep -v '^#' | sort -u | grep -c . || echo 0)
+    fi
     _jlnt=$(printf '%s' "${JL_FLAGS:-}" | sed -n 's/.*-t[ =]*\([0-9]\+\).*/\1/p')
     if [ -n "$_jlnt" ] && [ "$_ncore" -gt 0 ] && [ "$_jlnt" -le "$_ncore" ]; then
-        echo "=== ABORT: JL_FLAGS has -t $_jlnt on a $_ncore-core box. A threaded sweep needs at"
-        echo "    least -t $((_ncore + 1)) so one thread stays unpinned for the runtime; set the POOL"
-        echo "    size separately with SWEEP_EXTRA=\"mt=$_ncore\". See the note above. ==="
+        echo "=== ABORT: JL_FLAGS has -t $_jlnt against a mask holding $_ncore physical core(s)."
+        echo "    A threaded sweep needs at least -t $((_ncore + 1)) so one thread stays unpinned for"
+        echo "    the runtime; set the POOL size separately with SWEEP_EXTRA=\"mt=$_ncore\"."
+        echo "    Mask: BENCH_CORE=$CORE. See the note above. ==="
+        exit 2
+    fi
+    # AND THE MASK MUST BE WIDE ENOUGH FOR THE POOL. The default `CORE` is a SINGLE core (the serial
+    # bench core), so a threaded sweep launched without BENCH_CORE pins one thread and the other five
+    # workers share it — a legal-looking run whose pb_mt arm measures nothing but contention.
+    _pool=$(printf '%s' "${SWEEP_EXTRA:-}" | sed -n 's/.*mt=\([0-9]\+\).*/\1/p')
+    _pool=${_pool:-6}
+    if [ "$_ncore" -gt 0 ] && [ "$_ncore" -lt "$_pool" ]; then
+        echo "=== ABORT: the pool is mt=$_pool but BENCH_CORE=$CORE holds only $_ncore physical"
+        echo "    core(s). Widen the mask to one CPU per pooled core PLUS one spare for the runtime —"
+        echo "    the per-box masks are in bench/plots.jl's _ARM_PB_MT comment. ==="
         exit 2
     fi
     echo "=== PRE-LOCK (all cores) ==="

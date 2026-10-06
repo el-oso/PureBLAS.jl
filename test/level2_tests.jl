@@ -101,6 +101,30 @@ end
     @test ForwardDiff.derivative(h, 0.0) ≈ a * sum(xx) * sum(dy)
 end
 
+# WHICH BOUNDS-CHECK MODE THIS RUN IS IN, stated out loud rather than assumed.
+#
+# Several of this package's correctness guarantees are `@boundscheck`-shaped — `_seg`, `_stc!`,
+# `_vstc!`, `_seg_check` — and they are COMPILED OUT unless julia runs with `--check-bounds=yes`. A
+# suite that passes with them off is silent about exactly the faults they exist to catch: a gbmv-N
+# fallback describing its banded store at the wrong height passed 478/478 both before and after the
+# missing method was added, twice, because nothing in the log said which mode was in force.
+#
+# `Pkg.test()` here does NOT pass the flag (measured: `check_bounds == 0` inside the test process), so
+# the honest local invocation is
+#     Pkg.test(julia_args = ["--check-bounds=yes"])
+# and this item is how a reader of the log knows which one was used. `PUREBLAS_REQUIRE_CHECKED=1` turns
+# the report into a demand, which is what CI sets.
+# Tagged `:checks` so it rides with the strict-guarantee job, which is the one whose items the flag
+# actually governs — an untagged item is filtered OUT of that group, which is how the first version of
+# this witness printed nothing at all.
+@testitem "bounds-check mode is on the record" tags = [:checks] begin
+    cb = Base.JLOptions().check_bounds
+    @info "bounds-check mode" check_bounds = cb mode = (cb == 1 ? "yes" : cb == 2 ? "no" : "auto (compiled out)")
+    # A demand where it is set, a report everywhere else — and visibly so, rather than an assertion
+    # that looks like a gate and is not one.
+    @test get(ENV, "PUREBLAS_REQUIRE_CHECKED", "0") != "1" || cb == 1
+end
+
 @testitem "gemv/ger dimension mismatch is caught" begin
     using PureBLAS
     @test_throws DimensionMismatch PureBLAS.gemv!(zeros(3), zeros(3, 4), zeros(3))
@@ -109,8 +133,18 @@ end
 
 @testitem "symv vs Symmetric·x" setup = [L2Oracle] begin
     using PureBLAS, LinearAlgebra
+    # THE LARGE SIZES ARE NOT REDUNDANT. Past `_L1_MT_MIN` bytes of triangle, `_symv_nblk` returns a
+    # column-block grid and symv runs the blocked-and-folded form on EVERY path, one thread included —
+    # new arithmetic, with a private notepad per block folded in block order. Below that it runs the
+    # unblocked sweep. With only small sizes here the blocked form had no oracle at all: the threading
+    # tests compare it against the serial blocked form, which is itself.
+    #
+    # `_L1_MT_MIN` is `4 * _L1_BYTES`, so the entry size is per box (48 KiB L1 ⇒ Float32 needs n ≥ 314).
+    # 320 clears it for every element type on every box in the fleet; 333 adds a ragged tail that is not
+    # a whole number of blocks; 200 puts the grid in a regime where the cover leaves trailing blocks
+    # EMPTY on a 32 KiB-L1 box, which is a different path through `_symv_cols`.
     @testset "$T uplo=$ul n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
-            ul in ('U', 'L'), n in (1, 5, 16, 17, 40)
+            ul in ('U', 'L'), n in (1, 5, 16, 17, 40, 200, 320, 333)
 
         A = randn(T, n, n); x = randn(T, n); y0 = randn(T, n)
         S = Symmetric(A, ul == 'U' ? :U : :L)   # oracle reads the same triangle PureBLAS does
@@ -368,9 +402,21 @@ end
         P.set_num_threads(1)
         A2 = copy(A0); P.ger!(0.75, x, y, A2)          # serial reference
         @test A1 == A2
+        # FORCED LOSS, and it is forced on purpose. Spawning N callers and asserting they all agree
+        # passes when the scheduler happens to run them one after another, every caller wins the claim
+        # and the fallback never executes — the branch the test exists for. Holding the claim here
+        # makes the loss certain, and `_MT_LOST` distinguishes "took the fallback" from "never tried to
+        # thread" (the `p.gen` witness cannot: the lost path does not bump it).
+        P.set_num_threads(nt)
+        lost0 = P._MT_LOST[]
+        _, held = @atomicreplace p.busy false => true
+        @test held
+        Af = copy(A0); P.ger!(0.75, x, y, Af)
+        @atomic p.busy = false
+        @test P._MT_LOST[] == lost0 + 1
+        @test Af == A2
         # CONCURRENT: several callers at once, so all but one LOSE the claim and run the fallback.
         # Every result must equal the serial one, which is what pins the fallback to the same arm.
-        P.set_num_threads(nt)
         tasks = [@spawn (t = copy(A0); P.ger!(0.75, x, y, t); t) for _ in 1:(nt + 1)]
         for t in tasks
             @test fetch(t) == A2
@@ -412,7 +458,13 @@ end
             sz = sizeof(T)
             # Just past `2 * _L2_BYTES` with a modest `n`, so the undivided problem is WIDE and every
             # band is NARROW.
-            n_np = 160
+            #
+            # `n` MUST CLEAR `_gemvn_rb()` OR THIS COVERS NOTHING. `_gemvn_minner_np` lives on the
+            # column-PANEL path, and `n <= _gemvn_rb()` routes to row-block instead. The cut is 64 on
+            # AVX2 but 448 on AVX-512, so a fixed `n = 160` exercised the predicate on Zen3 and sent
+            # Zen4/Zen5 down a path that never reads it. Keyed off the cut, it lands on the panel path
+            # everywhere.
+            n_np = P._gemvn_rb() + 32
             m_np = (5 * P._L2_BYTES) ÷ (2 * n_np * sz)
             # Just past `_GEMVN_MINNER_MAXA` (= 4·L3), so the undivided problem leaves minner and
             # every band would re-enter it. One allocation of a little over 4·L3 is the price of
@@ -486,9 +538,21 @@ end
             P.set_num_threads(1)
             y2 = copy(y0); P.gemv!(y2, A, x; alpha = α, beta = β)
             @test y1 == y2
+            P.set_num_threads(nt)
+            # FORCE THE LOSS rather than hoping for it — see the ger item. Skipped where the SME arm
+            # owns the call: it returns before the thread seam, so there is no claim to lose and
+            # `_MT_LOST` would not move.
+            if !sme
+                lost0 = P._MT_LOST[]
+                _, held = @atomicreplace p.busy false => true
+                @test held
+                yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β)
+                @atomic p.busy = false
+                @test P._MT_LOST[] == lost0 + 1
+                @test yf == y2
+            end
             # CONCURRENT: all but one caller loses the claim and runs the fallback, which must reach
             # the same route as the winner's chunks.
-            P.set_num_threads(nt)
             tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β); t) for _ in 1:(2 * nt)]
             for t in tasks
                 @test fetch(t) == y2
@@ -528,12 +592,16 @@ end
         @testset "$T" for T in (Float64, Float32)
             sz = sizeof(T)
             # Keep m under _GEMVT_PERCOL_XMAX so the perscan decision turns on the n term.
+            # THE FLOOR IS `2 * _GEMVT_BAND`, NOT `2 * _NR`. gemv-T's bands are rounded to the column
+            # GROUP width its sweep can select, not to the microkernel tile — so below two of those
+            # there is one band, no split happens, and the case asserts invariance over a partition
+            # that never occurred. `_NR` is 4 on AVX2 Float64 against a 16-column band.
             m_ps = min(4096, P._GEMVT_PERCOL_XMAX ÷ sz)
-            n_ps = max(2 * P._NR, (5 * P._GEMVT_PERCOL_AMIN) ÷ (4 * m_ps * sz))
+            n_ps = max(2 * P._GEMVT_BAND, (5 * P._GEMVT_PERCOL_AMIN) ÷ (4 * m_ps * sz))
             # Just past L2, so the undivided problem leaves `_gemvt_deep`'s size branch and every band
             # re-enters it.
             m_dp = 2048
-            n_dp = max(2 * P._NR, (5 * P._L2_BYTES) ÷ (4 * m_dp * sz))
+            n_dp = max(2 * P._GEMVT_BAND, (5 * P._L2_BYTES) ÷ (4 * m_dp * sz))
             cases = (("perscan flip", m_ps, n_ps), ("deep flip", m_dp, n_dp))
             @testset "$nm m=$m n=$n" for (nm, m, n) in cases
                 A = randn(T, m, n)
@@ -591,6 +659,17 @@ end
             y2 = copy(y0); P.gemv!(y2, A, x; alpha = α, beta = β, trans = 'T')
             @test y1 == y2
             P.set_num_threads(nt)
+            # FORCE THE LOSS rather than hoping for it — see the ger item. Skipped under SME for the
+            # reason the gemv-N item gives: the call never reaches the claim.
+            if !sme
+                lost0 = P._MT_LOST[]
+                _, held = @atomicreplace p.busy false => true
+                @test held
+                yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β, trans = 'T')
+                @atomic p.busy = false
+                @test P._MT_LOST[] == lost0 + 1
+                @test yf == y2
+            end
             tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β, trans = 'T'); t) for _ in 1:(2 * nt)]
             for t in tasks
                 @test fetch(t) == y2
@@ -695,6 +774,19 @@ end
             y2 = copy(yi); P.symv!(y2, Ai, xi; uplo = 'L', alpha = α, beta = β)
             @test y1 == y2
             P.set_num_threads(nt)
+            # FORCE THE LOSS rather than hoping for it. This is the branch that runs `_symv_blocked!`
+            # on its OWN arena notepad instead of the pool buffer, so it is the one symv path with
+            # distinct scratch ownership — and a spawn storm that happens to serialise never enters
+            # it. Skipped under SME, which returns before the claim.
+            if !sme
+                lost0 = P._MT_LOST[]
+                _, held = @atomicreplace p.busy false => true
+                @test held
+                yf = copy(yi); P.symv!(yf, Ai, xi; uplo = 'L', alpha = α, beta = β)
+                @atomic p.busy = false
+                @test P._MT_LOST[] == lost0 + 1
+                @test yf == y2
+            end
             tasks = [@spawn (t = copy(yi); P.symv!(t, Ai, xi; uplo = 'L', alpha = α, beta = β); t) for _ in 1:(nt + 1)]
             for t in tasks
                 @test fetch(t) == y2
@@ -740,6 +832,15 @@ end
                 m = n + 3
                 AB = randn(T, b, n); x = randn(T, n); y0 = randn(T, m)
                 α = T(0.75)
+                # AND THE ADMISSION RULE ITSELF, which is what makes the axpy half of this item
+                # non-vacuous: that arm is deliberately NOT threaded, so its invariance holds
+                # trivially, and the assertion that carries information is the route.
+                # `set_num_threads` FIRST — `_gbmvn_workers` early-outs on `_MT_NTHREADS[] > 1`
+                # before it looks at the band, so asking it while threading is off answers 1 for
+                # every shape and the assertion reads as a guard that rejected the conv arm.
+                P.set_num_threads(nt)
+                @test (P._gbmvn_workers(m, n, k, k, T) > 1) == (arm == "conv")
+                P.set_num_threads(1)
                 @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
                     P.set_num_threads(1)
                     want = (t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = α, beta = β); t)
@@ -767,21 +868,131 @@ end
     else
         P.set_num_threads(nt)
         p = P._gemm_pool(Float64)
-        k = 16; b = 2k + 1
+        # THE BAND IS DERIVED FROM THE ARM CUT, AND ASYMMETRIC. Only the convolution arm is admitted
+        # to the pool (`_gbmvn_workers` declines anything wider than `_GBMV_CONV_MAX`, which is 48 on
+        # AVX-512 and 20 on AVX2), so a fixed band of 33 threaded on one ISA and not the other — it
+        # has to come from the cut. `kl != ku` because the half-widths ride in the `A` slot's `n` and
+        # `ld`: with a symmetric band a swapped pair reads identically.
+        cmax = P._GBMV_CONV_MAX
+        ku = max(2, (cmax - 1) ÷ 2); kl = max(1, ku ÷ 2); b = kl + ku + 1
+        @test b <= cmax && kl != ku                   # conv arm, and the pair is distinguishable
         n = max(512, cld(2 * P._L1_MT_MIN, b * sizeof(Float64)))
         m = n + 3
         AB = randn(b, n); x = randn(n); y0 = randn(m)
         ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
-        @test ran(() -> P.gbmv!(copy(y0), AB, x, m, k, k; alpha = 0.75, beta = 2.5))
-        y1 = copy(y0); P.gbmv!(y1, AB, x, m, k, k; alpha = 0.75, beta = 2.5)
+        @test P._gbmvn_workers(m, n, kl, ku, Float64) > 1
+        @test ran(() -> P.gbmv!(copy(y0), AB, x, m, kl, ku; alpha = 0.75, beta = 2.5))
+        y1 = copy(y0); P.gbmv!(y1, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
         P.set_num_threads(1)
-        y2 = copy(y0); P.gbmv!(y2, AB, x, m, k, k; alpha = 0.75, beta = 2.5)
+        y2 = copy(y0); P.gbmv!(y2, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
         @test y1 == y2
+        # FORCED LOSS FIRST. The gbmv-N fallback is the one that must rebuild the banded store at its
+        # OWN height — `C.m` is the output row count, not `kl+ku+1` — so it is exactly the branch a
+        # serialised spawn storm would skip. See the ger item.
         P.set_num_threads(nt)
-        tasks = [@spawn (t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
+        lost0 = P._MT_LOST[]
+        _, held = @atomicreplace p.busy false => true
+        @test held
+        yf = copy(y0); P.gbmv!(yf, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
+        @atomic p.busy = false
+        @test P._MT_LOST[] == lost0 + 1
+        @test yf == y2
+        tasks = [@spawn (t = copy(y0); P.gbmv!(t, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
         for t in tasks
             @test fetch(t) == y2
         end
+        # THE WIDE ARM MUST DECLINE THE POOL, and this is the assertion that pins the admission rule
+        # rather than the speed that motivated it. Threading the per-column axpy arm measured 0.31x
+        # to 0.35x of its own serial path on AVX2 while the convolution arm gains 2.82x to 3.72x on
+        # AVX-512 — same code, same shapes, the cut decides. The shape here is also a band TALLER than
+        # the output (`kl+ku+1 > m`, asymmetric), which is what separates the banded store's height
+        # from `C.m`; it stays as a serial correctness case so that distinction keeps a test.
+        mt_, nt_, kl2, ku2 = 300, 64, 0, 399
+        @test (kl2 + ku2 + 1) > cmax && (kl2 + ku2 + 1) > mt_
+        ABt = randn(kl2 + ku2 + 1, nt_); xt = randn(nt_); yt0 = randn(mt_)
+        P.set_num_threads(1)
+        yt2 = copy(yt0); P.gbmv!(yt2, ABt, xt, mt_, kl2, ku2; alpha = 0.75, beta = 2.5)
+        P.set_num_threads(nt)
+        @test P._gbmvn_workers(mt_, nt_, kl2, ku2, Float64) == 1
+        @test !ran(() -> P.gbmv!(copy(yt0), ABt, xt, mt_, kl2, ku2; alpha = 0.75, beta = 2.5))
+        ytw = copy(yt0); P.gbmv!(ytw, ABt, xt, mt_, kl2, ku2; alpha = 0.75, beta = 2.5)
+        @test ytw == yt2
+        P.set_num_threads(1)
+    end
+end
+
+# ── req#10 FOR THE THREADED BLAS-2 ENTRIES ─────────────────────────────────────────────────────────
+#
+# Every threaded op added here had a bit-identity test and a liveness witness and NO allocation test.
+# That is the gap the gemm entry does not have, and it is the gap that caught a real regression there:
+# two trailing `Int` defaults on `_gemm_threaded!` put 112 bytes on every single `gemm!` call, found
+# only because `test/gemm_tests.jl` measures it. The band half-widths now ride in the `A` slot's `n`
+# and `ld` precisely to avoid re-adding those parameters, so this is the test that keeps them out.
+#
+# A LIVENESS WITNESS PER OP, not just the allocation count. `@allocated` reads 0 for a call that
+# declined to thread, so without `ran(...)` this item would certify the serial entries and say nothing
+# at all about the threaded ones.
+#
+# `@allocated` goes through a CONCRETELY TYPED function, never at testitem scope, where the
+# measurement reports phantom bytes for boxing the return value. Two warm-up passes with a sleep
+# between them: the first covers buffer growth on the first call at a given grid, the second wakes the
+# workers from a real park rather than from inside their spin window.
+@testitem "L2 real: threaded entries are allocation-free at steady state" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+
+        m, n = 2048, 512                       # 8.4 MB of A: past the admission floor on every box
+        A = randn(m, n); xn = randn(n); xm = randn(m)
+        yn = randn(n); ym = randn(m)
+        S = randn(1024, 1024); xs = randn(1024); ys = randn(1024)   # 4.2 MB triangle: inside the grid
+        # Band from the ARM CUT, not a literal: only the convolution arm is admitted to the pool, so a
+        # fixed 33 threaded on AVX-512 and not on AVX2 and the liveness witness below would fail there.
+        kl = ku = max(1, (P._GBMV_CONV_MAX - 1) ÷ 4)
+        mb, nb = 4096, 2048
+        AB = randn(kl + ku + 1, nb); xb = randn(nb); yb = randn(mb)
+        nv = max(2 * nt * P._red_block(Float64), cld(P._L1_MT_MIN, sizeof(Float64))) + 3
+        v = randn(nv)
+
+        a_ger(al, u, w, M) = @allocated P.ger!(al, u, w, M)
+        a_gemvn(y, M, u) = @allocated P.gemv!(y, M, u; alpha = 0.75, beta = 2.5)
+        a_gemvt(y, M, u) = @allocated P.gemv!(y, M, u; alpha = 0.75, beta = 2.5, trans = 'T')
+        a_symv(y, M, u) = @allocated P.symv!(y, M, u; uplo = 'L', alpha = 0.75, beta = 2.5)
+        a_gbmvn(y, M, u) = @allocated P.gbmv!(y, M, u, mb, kl, ku; alpha = 0.75, beta = 2.5)
+        a_iamax(u) = @allocated P.iamax(u)
+
+        for warm in 1:2
+            P.ger!(0.75, xm, yn, A)
+            P.gemv!(ym, A, xn; alpha = 0.75, beta = 2.5)
+            P.gemv!(yn, A, xm; alpha = 0.75, beta = 2.5, trans = 'T')
+            P.symv!(ys, S, xs; uplo = 'L', alpha = 0.75, beta = 2.5)
+            P.gbmv!(yb, AB, xb, mb, kl, ku; alpha = 0.75, beta = 2.5)
+            P.iamax(v)
+            warm == 1 && sleep(0.05)
+        end
+
+        # The split really happens for each one — otherwise the counts below describe the serial path.
+        @test ran(() -> P.ger!(0.75, xm, yn, A))
+        @test ran(() -> P.gemv!(ym, A, xn; alpha = 0.75, beta = 2.5))
+        @test ran(() -> P.gemv!(yn, A, xm; alpha = 0.75, beta = 2.5, trans = 'T'))
+        @test ran(() -> P.symv!(ys, S, xs; uplo = 'L', alpha = 0.75, beta = 2.5))
+        @test ran(() -> P.gbmv!(yb, AB, xb, mb, kl, ku; alpha = 0.75, beta = 2.5))
+        @test ran(() -> P.iamax(v))
+
+        @test minimum(a_ger(0.75, xm, yn, A) for _ in 1:8) == 0
+        @test minimum(a_gemvn(ym, A, xn) for _ in 1:8) == 0
+        @test minimum(a_gemvt(yn, A, xm) for _ in 1:8) == 0
+        @test minimum(a_symv(ys, S, xs) for _ in 1:8) == 0
+        @test minimum(a_gbmvn(yb, AB, xb) for _ in 1:8) == 0
+        @test minimum(a_iamax(v) for _ in 1:8) == 0
+
         P.set_num_threads(1)
     end
 end
