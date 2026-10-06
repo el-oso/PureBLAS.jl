@@ -832,6 +832,15 @@ end
                 m = n + 3
                 AB = randn(T, b, n); x = randn(T, n); y0 = randn(T, m)
                 α = T(0.75)
+                # AND THE ADMISSION RULE ITSELF, which is what makes the axpy half of this item
+                # non-vacuous: that arm is deliberately NOT threaded, so its invariance holds
+                # trivially, and the assertion that carries information is the route.
+                # `set_num_threads` FIRST — `_gbmvn_workers` early-outs on `_MT_NTHREADS[] > 1`
+                # before it looks at the band, so asking it while threading is off answers 1 for
+                # every shape and the assertion reads as a guard that rejected the conv arm.
+                P.set_num_threads(nt)
+                @test (P._gbmvn_workers(m, n, k, k, T) > 1) == (arm == "conv")
+                P.set_num_threads(1)
                 @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
                     P.set_num_threads(1)
                     want = (t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = α, beta = β); t)
@@ -859,15 +868,23 @@ end
     else
         P.set_num_threads(nt)
         p = P._gemm_pool(Float64)
-        k = 16; b = 2k + 1
+        # THE BAND IS DERIVED FROM THE ARM CUT, AND ASYMMETRIC. Only the convolution arm is admitted
+        # to the pool (`_gbmvn_workers` declines anything wider than `_GBMV_CONV_MAX`, which is 48 on
+        # AVX-512 and 20 on AVX2), so a fixed band of 33 threaded on one ISA and not the other — it
+        # has to come from the cut. `kl != ku` because the half-widths ride in the `A` slot's `n` and
+        # `ld`: with a symmetric band a swapped pair reads identically.
+        cmax = P._GBMV_CONV_MAX
+        ku = max(2, (cmax - 1) ÷ 2); kl = max(1, ku ÷ 2); b = kl + ku + 1
+        @test b <= cmax && kl != ku                   # conv arm, and the pair is distinguishable
         n = max(512, cld(2 * P._L1_MT_MIN, b * sizeof(Float64)))
         m = n + 3
         AB = randn(b, n); x = randn(n); y0 = randn(m)
         ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
-        @test ran(() -> P.gbmv!(copy(y0), AB, x, m, k, k; alpha = 0.75, beta = 2.5))
-        y1 = copy(y0); P.gbmv!(y1, AB, x, m, k, k; alpha = 0.75, beta = 2.5)
+        @test P._gbmvn_workers(m, n, kl, ku, Float64) > 1
+        @test ran(() -> P.gbmv!(copy(y0), AB, x, m, kl, ku; alpha = 0.75, beta = 2.5))
+        y1 = copy(y0); P.gbmv!(y1, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
         P.set_num_threads(1)
-        y2 = copy(y0); P.gbmv!(y2, AB, x, m, k, k; alpha = 0.75, beta = 2.5)
+        y2 = copy(y0); P.gbmv!(y2, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
         @test y1 == y2
         # FORCED LOSS FIRST. The gbmv-N fallback is the one that must rebuild the banded store at its
         # OWN height — `C.m` is the output row count, not `kl+ku+1` — so it is exactly the branch a
@@ -876,34 +893,30 @@ end
         lost0 = P._MT_LOST[]
         _, held = @atomicreplace p.busy false => true
         @test held
-        yf = copy(y0); P.gbmv!(yf, AB, x, m, k, k; alpha = 0.75, beta = 2.5)
+        yf = copy(y0); P.gbmv!(yf, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
         @atomic p.busy = false
         @test P._MT_LOST[] == lost0 + 1
         @test yf == y2
-        tasks = [@spawn (t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
+        tasks = [@spawn (t = copy(y0); P.gbmv!(t, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
         for t in tasks
             @test fetch(t) == y2
         end
-        # A BAND TALLER THAN THE OUTPUT, on the forced-loss path. `kl+ku+1 > m` is what separates the
-        # banded store's height from `C.m`, so it is the shape that catches a fallback describing the
-        # store at the wrong height. Asymmetric `kl != ku` as well: with the half-widths riding in the
-        # A slot's `n` and `ld`, a symmetric band cannot tell a swapped pair from a correct one.
-        # ⚠ The store-extent check this guards is compiled out unless julia runs with
-        # `--check-bounds=yes`; `Pkg.test()` here does NOT pass it, so a green local run is not
-        # evidence for this case.
-        mt, nt_, kl_, ku_ = 300, 64, 0, 399
-        ABt = randn(kl_ + ku_ + 1, nt_); xt = randn(nt_); yt0 = randn(mt)
+        # THE WIDE ARM MUST DECLINE THE POOL, and this is the assertion that pins the admission rule
+        # rather than the speed that motivated it. Threading the per-column axpy arm measured 0.31x
+        # to 0.35x of its own serial path on AVX2 while the convolution arm gains 2.82x to 3.72x on
+        # AVX-512 — same code, same shapes, the cut decides. The shape here is also a band TALLER than
+        # the output (`kl+ku+1 > m`, asymmetric), which is what separates the banded store's height
+        # from `C.m`; it stays as a serial correctness case so that distinction keeps a test.
+        mt_, nt_, kl2, ku2 = 300, 64, 0, 399
+        @test (kl2 + ku2 + 1) > cmax && (kl2 + ku2 + 1) > mt_
+        ABt = randn(kl2 + ku2 + 1, nt_); xt = randn(nt_); yt0 = randn(mt_)
         P.set_num_threads(1)
-        yt2 = copy(yt0); P.gbmv!(yt2, ABt, xt, mt, kl_, ku_; alpha = 0.75, beta = 2.5)
+        yt2 = copy(yt0); P.gbmv!(yt2, ABt, xt, mt_, kl2, ku2; alpha = 0.75, beta = 2.5)
         P.set_num_threads(nt)
-        @test ran(() -> P.gbmv!(copy(yt0), ABt, xt, mt, kl_, ku_; alpha = 0.75, beta = 2.5))
-        lost1 = P._MT_LOST[]
-        _, held2 = @atomicreplace p.busy false => true
-        @test held2
-        ytf = copy(yt0); P.gbmv!(ytf, ABt, xt, mt, kl_, ku_; alpha = 0.75, beta = 2.5)
-        @atomic p.busy = false
-        @test P._MT_LOST[] == lost1 + 1
-        @test ytf == yt2
+        @test P._gbmvn_workers(mt_, nt_, kl2, ku2, Float64) == 1
+        @test !ran(() -> P.gbmv!(copy(yt0), ABt, xt, mt_, kl2, ku2; alpha = 0.75, beta = 2.5))
+        ytw = copy(yt0); P.gbmv!(ytw, ABt, xt, mt_, kl2, ku2; alpha = 0.75, beta = 2.5)
+        @test ytw == yt2
         P.set_num_threads(1)
     end
 end
@@ -940,7 +953,9 @@ end
         A = randn(m, n); xn = randn(n); xm = randn(m)
         yn = randn(n); ym = randn(m)
         S = randn(1024, 1024); xs = randn(1024); ys = randn(1024)   # 4.2 MB triangle: inside the grid
-        kl = ku = 16
+        # Band from the ARM CUT, not a literal: only the convolution arm is admitted to the pool, so a
+        # fixed 33 threaded on AVX-512 and not on AVX2 and the liveness witness below would fail there.
+        kl = ku = max(1, (P._GBMV_CONV_MAX - 1) ÷ 4)
         mb, nb = 4096, 2048
         AB = randn(kl + ku + 1, nb); xb = randn(nb); yb = randn(mb)
         nv = max(2 * nt * P._red_block(Float64), cld(P._L1_MT_MIN, sizeof(Float64))) + 3

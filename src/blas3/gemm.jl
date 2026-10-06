@@ -5413,9 +5413,29 @@ calls that have almost no work in them.
 
 Capped by whole output row blocks of `_vwidth(T)`, because `_gbmv_conv!` accumulates one W-row block
 at a time and a band shorter than one block would be all masked tail.
+
+ONLY THE CONVOLUTION ARM IS THREADED, and the admission turns on the SAME predicate the kernel uses
+to pick its arm. `_gbmv_n_simd!` sends `kl + ku + 1 <= _GBMV_CONV_MAX` to the row-blocked convolution
+and everything wider to a per-column axpy, and a row band does very different things to the two:
+
+| band arm | threaded speedup over its own serial path |
+|---|---|
+| convolution (AVX-512, cut 48) | 2.82x / 2.82x / 2.96x / 3.01x / 3.72x at n = 1000…4096 |
+| per-column axpy (AVX2, cut 20) | **0.31x / 0.33x / 0.33x / 0.34x / 0.35x** at the same sizes |
+
+Same code, same shapes, same band of 33 — the two boxes differ only in which arm the cut selects, so
+threading is worth 3x on one and costs 3x on the other. The axpy arm's column loop runs over all `n`
+in every worker and keeps the small slice of each column that falls inside its row band, so each
+worker pays the whole sweep's column overhead for a fraction of the writes; why that is worth 3x
+rather than the ~1.5x that accounting predicts is not established, and the loss is reason enough to
+withdraw the claim without it.
+
+So this reads the arm, not the op: an admission rule derived from measuring one arm does not transfer
+to the other, and this op is the demonstration.
 """
 @inline function _gbmvn_workers(m::Int, n::Int, kl::Int, ku::Int, ::Type{T}) where {T}
     _MT_NTHREADS[] > 1 || return 1
+    (kl + ku + 1) <= _GBMV_CONV_MAX || return 1
     nw = _l1_workers(n * (kl + ku + 1) * sizeof(T), m, T)
     nw > 1 || return 1
     return max(1, min(nw, m ÷ _vwidth(T)))
