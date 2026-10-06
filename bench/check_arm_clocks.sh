@@ -18,11 +18,15 @@
 # Not a replacement for `fleet_freqlock.sh verify`, which is still the only pre-run check. This is the
 # post-hoc one that gates a publish.
 #
-# THE SECOND SIGNAL, and it is not cross-arm at all: each cell also records the MINIMUM clock seen
-# inside its own timing windows (`flo`). A box can hold its lock at every arm boundary and still spend
-# half a cell throttled — six cores under load reach a package power limit one core never does, and the
-# pin is not what gives way. Cross-arm cannot see it, because `flo|fhi` is stamped once per cell and
-# both arms of a same-run pair therefore carry the identical range and agree perfectly.
+# THE SECOND SIGNAL, and it is not cross-arm at all: each cell also records the MINIMUM clock sampled
+# around its timing windows (`flo`), compared against the box's own pinned base. Cross-arm cannot see a
+# whole-run droop, because `flo|fhi` is stamped once per cell and both arms of a same-run pair
+# therefore carry the identical range and agree perfectly.
+#
+# It is a BOUNDARY sampler, not a mid-window one: `_khz_sample!` runs immediately before and after each
+# arm's `@be` window, so what it catches is a droop still present at some boundary. A throttle that
+# begins and ends strictly inside a window is invisible to it. It runs for SERIAL arms only — see the
+# note at the check itself for why a threaded arm has no valid referent here.
 #
 #   bench/check_arm_clocks.sh [tol_pct]      # default 3; every plots_data_* AND mt_data_* cache
 set -u
@@ -72,16 +76,35 @@ for f in "${files[@]}"; do
                 #
                 # Restricted to `pb` for the same reason the rest of this script is: a cached vendor
                 # arm carries the state of the epoch it was measured in and is never re-run.
-                # WHICH SAMPLER wrote this range, read PER ARM: field 8 of a 9-field record. In an
-                # 8-field record field 8 is the csv, so the test is `n >= 9`; anything older is a
-                # single-core sample, which is what "core" means.
-                # (No apostrophes in this block: the awk program is single-quoted and one would end it.)
-                span = (n >= 9) ? a[8] : "core"
-                # The in-window check runs for the serial `pb` arm always, and for `pb_mt` only when
-                # THAT RECORD carries a range spanning the working cores. A pb_mt record written by the
-                # old single-core sampler stands down on its own merits, even inside a file where other
-                # cells were re-measured — which a header stamp could not express.
-                if (base > 0 && n >= 8 && ((a[1] == "pb" && !MT) || (a[1] == "pb_mt" && MT && span == "threads"))) {
+                # THE IN-WINDOW CHECK IS VALID ONLY FOR A SINGLE-THREADED RUN, because `flo` only
+                # describes the work when the sampled thread IS the work.
+                #
+                # `flo` is the minimum `scaling_cur_freq` over the threads `_cell_khz_span` admits, and
+                # that filter cannot do what it intends: `/proc/<tid>/stat` state `R` means running OR
+                # RUNNABLE, and field 39 is the CPU the thread LAST ran on, so a just-woken pool worker
+                # is sampled against a core that is still idle. On an idle core the value is the
+                # governor setpoint or a stale tick average, not a clock anything executed at. The
+                # signature: `flo` equal to the pin EXACTLY appears in threaded records and in no
+                # serial record on any box.
+                #
+                # Under a hard pin (`scaling_min_freq == scaling_max_freq`) there is no P-state to drop
+                # to, so a sub-pin reading on a threaded arm is the sampler, not a throttle. Serial
+                # records carry no such artifact — their `flo` stays within 2% of base across every
+                # cell on all three boxes — which is why the check runs there and only there.
+                #
+                # ⚠ CONSEQUENCE, stated because it is a real loss and not a tidy-up: a threaded cache
+                # now has NO check that compares its run to its pin FROM BELOW. The cross-arm check
+                # below is cross-EPOCH only — arms measured in the same run share one stamp and read
+                # ~0% against each other — and `check_clock_outliers.sh` scans the serial caches by
+                # default. Repairing that needs a clock measured in TIME on the cores that did the work
+                # (the `anchor` construction), not a kernel estimate read from sysfs.
+                #
+                # `MT` is derived from the filename, which is a PROXY for "this run had threads" and
+                # the weakest part of this: the range is stamped once per CELL (`_khz_range!` resets per
+                # cell and `_stamp` writes the same lo/hi to every arm record), so no per-record token
+                # can distinguish the arms until the range is stamped per ARM. That is the prerequisite
+                # for a finer rule here.
+                if (base > 0 && n >= 8 && a[1] == "pb" && !MT) {
                     flo = a[6] + 0
                     if (flo > 0) {
                         lotot++
@@ -109,8 +132,20 @@ for f in "${files[@]}"; do
                 tot++
                 if (d > TOL) {
                     off++
-                    if (off <= 3) printf "   %s/%s@%s  pb=%.0fMHz vs %s=%.0fMHz  (%.1f%%)\n", $1, $2, $3, pb/1000, refname, ref/1000, d
-                    badop[$1 "/" $2] = 1; badgrp[$1] = 1     # scope for a TARGETED re-measure
+                    # WHICH SIDE IS THE ODD ONE, because the remediation differs and only one of them
+                    # has a remediation at all. `base` is the box pin: the arm that AGREES with it is
+                    # the sound one. A pb-side mismatch is re-measurable with `arms=pb`; a REFERENCE
+                    # side one is not, because `arms=pb` never re-measures a reference, so printing
+                    # that advice for it sends the reader round a loop that can never clear the flag.
+                    side = "?"
+                    if (base > 0) {
+                        dpb = (pb - base) / base * 100; if (dpb < 0) dpb = -dpb
+                        drf = (ref - base) / base * 100; if (drf < 0) drf = -drf
+                        side = (dpb <= drf) ? "ref" : "pb"
+                    }
+                    if (side == "ref") nref++; else npb++
+                    if (off <= 3) printf "   %s/%s@%s  pb=%.0fMHz vs %s=%.0fMHz  (%.1f%%, %s-side)\n", $1, $2, $3, pb/1000, refname, ref/1000, d, side
+                    if (side != "ref") { badop[$1 "/" $2] = 1; badgrp[$1] = 1 }   # only pb-side is re-measurable
                 } else ok++
                 if (d > worst) { worst = d }
             }
@@ -120,20 +155,38 @@ for f in "${files[@]}"; do
                 if (looff == 0) printf "   => in-window clock: all %d PB cells held base (tolerance %s%%)\n", lotot, TOL
                 else            printf "   => in-window clock: %d/%d PB cells fell below base, worst -%.0f%% (tolerance %s%%)\n", looff, lotot, loworst, TOL
             }
+            # ABSTAIN OUT LOUD, on the line the verdict would have occupied. A skip that prints
+            # nothing is indistinguishable from a check that passed, and this project has a recorded
+            # case of a silently skipped group reporting success while 112 cells stayed stale and were
+            # published. A reader of this output must be able to see that the check did not run.
+            else if (MT) {
+                print "   => in-window clock: NOT RUN on a threaded cache — `flo` samples threads that may be"
+                print "      runnable-but-idle, so it does not describe the clock the work ran at (see the note in"
+                print "      this script). This cache therefore has NO below-pin check at all; the cross-arm result"
+                print "      below is cross-EPOCH only and does not substitute for one."
+            }
             if (tot == 0 && looff == 0) { print "   no cells carry both a pb and a reference clock — cross-arm check skipped"; exit 0 }
             if (tot > 0 && off == 0) printf "   => cross-arm: all %d cells within %s%% (worst %.1f%%)\n", tot, TOL, worst
-            if (off > 0) printf "   => cross-arm: %d/%d cells clock-mismatched (%d ok), worst %.1f%% (tolerance %s%%)\n", off, tot, ok, worst, TOL
+            if (off > 0) printf "   => cross-arm: %d/%d cells clock-mismatched (%d ok), worst %.1f%% (tolerance %s%%) — %d pb-side, %d reference-side\n", off, tot, ok, worst, TOL, npb+0, nref+0
+            # A REFERENCE-SIDE MISMATCH HAS NO REMEDIATION HERE, and saying so is the point. The arm
+            # that disagrees with the box pin is the cached one, measured in an earlier epoch and never
+            # re-run — `arms=pb` cannot touch it. Printing the re-measure advice for those cells sent a
+            # reader round a loop that could never clear the flag, which is how 8 of the 9 on galen read.
+            # (NO APOSTROPHES in this awk program: it is single-quoted and one would end the string.)
+            if (nref > 0) printf "   %d of those are REFERENCE-side: the cached arm disagrees with this box pin, so `arms=pb`\n      cannot clear them. Exclude those cells from a score, or re-measure the references, which needs\n      the user per-run authorization.\n", nref
             if (off == 0 && looff == 0) exit 0
             # THE POINT OF THE PER-CELL CLOCK: re-measure ONLY what is broken. A lock that floats
             # part-way through a sweep leaves most cells VALID; condemning the whole cache and
             # re-sweeping it wastes hours and is what this field exists to prevent.
             no = 0; for (o in badop) no++
-            ng = 0; gl = ""; for (g in badgrp) { ng++; gl = gl " " g }
-            printf "   affected: %d op(s) in %d group(s):%s\n", no, ng, gl
-            printf "   targeted re-measure (groups, fewest julia startups):\n     for g in%s; do julia --project=bench bench/plots.jl bench group=$g arms=pb nodraw; done\n", gl
-            printf "   per-op instead (finest scope, one startup each):\n    "
-            for (o in badop) { split(o, q, "/"); printf " op=%s", q[2] }
-            printf "\n"
+            if (no > 0) {
+                ng = 0; gl = ""; for (g in badgrp) { ng++; gl = gl " " g }
+                printf "   affected (pb-side, re-measurable): %d op(s) in %d group(s):%s\n", no, ng, gl
+                printf "   targeted re-measure (groups, fewest julia startups):\n     for g in%s; do julia --project=bench bench/plots.jl bench group=$g arms=pb nodraw; done\n", gl
+                printf "   per-op instead (finest scope, one startup each):\n    "
+                for (o in badop) { split(o, q, "/"); printf " op=%s", q[2] }
+                printf "\n"
+            }
             exit 1
         }' "$f")
     st=$?
