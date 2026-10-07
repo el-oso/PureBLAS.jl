@@ -1540,7 +1540,13 @@ const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 # ⛔ A NEUTRAL-OR-WORSE REWRITE OF THE DRAIN, measured as an in-process A/B against the other: folding
 # the drain's L lanes with a halving `llvm.vector.splice` tree (which lowers to `ext` and so CROSSES
 # the 128-bit segments `faddp` cannot) is correct to the same 2e-15 as `faddv` and measures
-# 0.76-0.90x of it. `faddv` in turn loses to the deferred arm, so the scratch round-trip stands.
+# 0.76-0.90x of it, so `faddv` stands as the lane fold wherever one is still needed.
+#
+# ⚠ THE "DEFERRED ARM" THE COMMENTS BELOW MEASURE NO LONGER EXISTS. It wrote one `_SME_L`-lane strip
+# per column to `_SME_GEMVT_SCR` and summed the lanes in the caller; the ZA-internal drain replaced
+# it, and `_SME_GEMVT_SCR` now holds only the ragged-row `x` window. Its measurements are kept
+# because they price a scratch round-trip, which is what any future arm that leaves streaming mode to
+# fold would pay again — not because the arm is a live alternative.
 
 # ══ gemv-T, ZA-internal drain ═══════════════════════════════════════════════════════════════════
 #
@@ -1718,13 +1724,13 @@ end
 # WINS, because it is plain IR: LLVM schedules its loads freely and keeps more of them in flight
 # against DRAM latency, where the asm loop's fixed sequence cannot. Measured in one process, same
 # buffers, medians of three 1-1.5 s windows (N = 4-18k one-call samples), this kernel fused against
-# the strided kernel's deferred arm:
+# the removed deferred arm of the strided kernel:
 #
 #     A MB      8    10    12    14    15    16    18    20    24.5   32 (2048^2)   134 (4096^2)
 #     ratio  0.83  0.84  0.89  0.91  1.06  1.03  1.18  1.17   1.10      1.13           1.04
 #
 # `_SME_GEMVT_RESIDENT_MAX` routes on that crossover. Only the fused epilogue exists here: in the
-# DRAM regime the deferred arm of this loop never beat it (0.90x at 16 MB, 0.96x at 32 MB wide,
+# DRAM regime the removed deferred arm of this loop never beat it (0.90x at 16 MB, 0.96x at 32 MB wide,
 # ties elsewhere), so there is nothing to defer.
 #
 # ⛔ Emitting all NC column loads before all NC `fmla`s gives the register allocator NC distinct z
