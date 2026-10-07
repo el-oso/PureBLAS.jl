@@ -137,6 +137,17 @@ for f in "${files[@]}"; do
             # cells of an mt file carry a `core`-sampled `pb` arm and are genuinely checkable, so a
             # "held base" verdict on them sits beside hundreds of refused threaded records and would
             # otherwise read as coverage of the whole file.
+            # A PLATFORM WITH NO FREQUENCY PIN HAS NOTHING TO COMPARE AGAINST, and must say so rather
+            # than skip. `FreqLock.lock_state` returns `(0, 0, -1)` where there is no cpufreq to pin —
+            # `fleet_freqlock.sh` is amd_pstate sysfs only — so the header carries `base=0kHz`, the
+            # probe returns 0, the field is empty and every pin-relative test below is vacuously
+            # skipped. Silently. On such a cache the gate figures are DIRECTIONAL, which a reader has
+            # to be told once rather than left to infer from an absent line.
+            if (base == 0) {
+                print "   => in-window clock: NO FREQUENCY PIN on this platform (header base=0), so there is"
+                print "      nothing to compare a clock against. Figures from this cache are directional, not"
+                print "      gate verdicts."
+            }
             if (refused > 0) {
                 printf "   => in-window clock: %d record(s) REFUSED — written by the retired sysfs min-over-threads\n", refused
                 print  "      sampler, whose values are not clocks (a runnable-but-idle core reads the setpoint). Those"
