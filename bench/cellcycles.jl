@@ -53,8 +53,29 @@ for ln in readlines(CACHE)
         khz1 = length(q) >= 6 ? something(tryparse(Float64, q[5]), NaN) : NaN
         lo = length(q) >= 8 ? something(tryparse(Float64, q[6]), NaN) : NaN
         hi = length(q) >= 8 ? something(tryparse(Float64, q[7]), NaN) : NaN
+        # A MIDPOINT IS ONLY A CLOCK WHEN THE RANGE IS TIGHT, and on a threaded arm it often is not.
+        # `flo` is the MINIMUM over every thread in state R, sampled at the window BOUNDARIES — the two
+        # instants at which the gemm pool's workers are most likely to be parked. A core caught coming
+        # out of idle reports a low `scaling_cur_freq` even under a hard pin, so the low end of the
+        # range can be a sleeping core rather than slow work. Measured, galen `L1/axpy@1000000` arm
+        # `pb_mt`: flo = 546664, fhi = 3675043 — a 6.7x range inside ONE cell, on a box pinned
+        # `scaling_min_freq == scaling_max_freq == 3701000` and POST-LOCK verified at 3674 MHz under
+        # load. The midpoint there is ~2111 MHz against a real ~3675, which put a 43% error straight
+        # into the cycle count, silently, in the one tool whose whole purpose is to be clock-invariant.
+        #
+        # So the range has to earn the midpoint. 3% is the tolerance the audit chain itself uses to
+        # decide whether two figures describe the same clock (`bench/check_arm_clocks.sh`, default
+        # `tol`), so a range wider than that is one the audit would already refuse to call a single
+        # clock, and averaging its ends cannot produce one either.
+        #
+        # ABSTAIN RATHER THAN SUBSTITUTE. The obvious fallback is `khz1` (field 5), which reads the pin
+        # correctly on the cell above — but whether it is sound FLEET-WIDE is unverified, and swapping
+        # one unvalidated clock for another is how the 43% got here. `NaN` is honest: the caller
+        # already filters it and prints "—", and the spread is still reported so a reader sees WHY the
+        # cycles are missing instead of finding a number that averaged a sleeping core.
         khz, spread = if !isnan(lo) && !isnan(hi) && lo > 0
-            ((lo + hi) / 2, 100 * (hi - lo) / lo)
+            sp = 100 * (hi - lo) / lo
+            sp <= 3.0 ? ((lo + hi) / 2, sp) : (NaN, sp)
         else
             (khz1, NaN)
         end
@@ -89,8 +110,11 @@ for (lvl, op, n, arms) in sort(rows, by = r -> (r[2], r[3]))
     wob = isempty(sp) ? NaN : maximum(sp)
     println(rpad(lvl, 5), rpad(op, 12), lpad(n, 7), lpad(fmt(pbc), 10), lpad(fmt(obc), 10),
             lpad(fmt(aoc), 10),
-            lpad(isnan(obc) ? "—" : string(round(obc / pbc; digits = 2)), 8),
-            lpad(isnan(aoc) ? "—" : string(round(aoc / pbc; digits = 2)), 9),
+            # A RATIO NEEDS BOTH SIDES. Testing only the reference printed `NaN` the moment PB's own
+            # clock became unknown — the reference cycles are fine, the denominator is not, and
+            # `NaN` in a column of ratios reads as a defect in the kernel rather than a missing clock.
+            lpad(isnan(obc) || isnan(pbc) ? "—" : string(round(obc / pbc; digits = 2)), 8),
+            lpad(isnan(aoc) || isnan(pbc) ? "—" : string(round(aoc / pbc; digits = 2)), 9),
             lpad(isnan(dclk) ? "—" : string(round(dclk; digits = 1), "%"), 7),
             lpad(isnan(wob) ? "?" : string(round(wob; digits = 1), "%"), 8))
 end
