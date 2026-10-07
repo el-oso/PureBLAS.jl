@@ -6,6 +6,26 @@
 # as a final scale (kept out of the recursion). Generic `T<:Number` path via the L2 generic kernels.
 
 const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ _L3_NB M scratch; coupled)
+# Side-L real recursion base. The recursion reaches `gemm!` for the off-diagonal and `_trmm_small!`
+# for the diagonal blocks, so this is the size below which the private triangular kernel beats a
+# split-plus-gemm. It is NOT the scratch coupling above: that only bounds it from above.
+# Measured on an M6, side-L square, GFLOP/s by base — the optimum is a plateau at 32-48 and the
+# shipped `_L3_NB` is far off it, because at k=256 a 128 base runs HALF the work on the private kernel:
+#
+#     k        b=8    b=16   b=32   b=48   b=64   b=128
+#     100      38.0   39.0   39.0   39.2   38.9   30.6
+#     128      72.4   75.2   78.8   77.8   65.1   41.4
+#     256     100.2  113.6  121.9  122.0  105.5   72.9
+#     512     134.7  160.8  179.0  179.3  168.1  125.6
+#     1024    186.1  217.8  250.0  249.8  239.9  192.1
+#
+# 32 is the same recursion-overhead floor `_POTRF_BASE` and `_CHOL_SB` already carry, and the plateau
+# is flat to 1% across 32-48, so the value is not fitted to a cell. ⚠ Apple has no frequency lock, so
+# these are directional. REAL SIDE-L ONLY: side R takes a flat panel loop and a packed route rather
+# than this recursion, and complex, generic and the trsm bases keep `_TRMM_BASE` — none of them is
+# measured here.
+# PDM: Literal — recursion-overhead floor, flat 32-48, the same floor `_POTRF_BASE` carries. | tune: candidate
+const _TRMM_BASE_R = min(@load_preference("trmm_base_r", 32)::Int, _L3_NB)
 # PDM: Literal — trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 64..1024 within noise on Zen3+Zen4+Zen5 except two non-replicating cells <=2.5% (2026-08-21)
 const _TRMM_RPANEL = @load_preference("trmm_rpanel", 512)::Int
 @inline _trmm_rpanel() = (f = _FKR_trmm_rpanel[]; f >= 0 ? f : _TRMM_RPANEL)
@@ -802,14 +822,17 @@ end
 
 function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
-    if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
+    if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE_R
         return k <= _fh_trmm_ddirect() ? _trmm_dense_L!(up, tr, unit, A, B) :
             _trmm_small!(true, up, tr, unit, A, B)
     elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE     # complex: K-TRIM small kernel (half flops);
         return !_strided1(B) ? _trmm_cmplx_base_L!(up, tr, cj, unit, k, A, B) :            # strided B → base
             (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up, tr, cj, unit, k, A, B) :
             _trmm_cmplx_small_L!(up, tr, cj, unit, k, A, B)     # AVX-512 / tiny-k → unpacked
-    elseif k <= _TRMM_BASE                          # AD/generic: trmv on each B column (contiguous)
+    elseif !(eltype(B) <: Union{BlasReal, BlasComplex}) && k <= _TRMM_BASE   # AD/generic: trmv per B column.
+        # TYPE-GUARDED, not a bare size test: a real operand above `_TRMM_BASE_R` must fall through to
+        # the split below, and without this guard it lands here instead and runs the scalar per-column
+        # loop — 25 GFLOP/s against 78 for the split at k=128.
         @inbounds for c in axes(B, 2)
             _trmv!(up, tr, cj, unit, k, A, view(B, :, c), 1)
         end
@@ -1426,7 +1449,7 @@ function trmm!(
     # TINY real trmm: go straight to the base kernel, skipping the `_trmm!`→`_trmm_left!/_trmm_right!`
     # wrapper chain (ROADMAP: adds ~16% on a ~50 ns 8×8 op — trmm@8 0.84 via chain vs 0.999 direct). The
     # dispatch below MIRRORS the k≤_TRMM_BASE branches of `_trmm_left!`/`_trmm_right!` exactly.
-    if eltype(B) <: BlasReal && transA != 'C' && k <= _TRMM_BASE
+    if eltype(B) <: BlasReal && transA != 'C' && k <= (sl ? _TRMM_BASE_R : _TRMM_BASE)
         up_ = uplo == 'U'; tr_ = transA != 'N'; unit_ = diag == 'U'
         if sl
             k <= _fh_trmm_ddirect() ? _trmm_dense_L!(up_, tr_, unit_, A, B) : _trmm_small!(true, up_, tr_, unit_, A, B)
