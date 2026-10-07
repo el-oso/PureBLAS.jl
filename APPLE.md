@@ -28,21 +28,24 @@ the existing worker pool work there. It is not urgent for the M6 and it must not
 
 ## Step 0 — three blockers, and none of them is a kernel
 
-Nothing on Apple can be scored until these land. Do them before any kernel work.
+All three have landed; a threaded Apple cell is expressible and one exists. They are kept here
+because each records a trap that is invisible until it bites.
 
-- [ ] **`accelerate_mt` does not exist as an arm.** `_REF_MT` in `bench/plots.jl` is
-      `{"openblas_mt", "aocl_mt"}` only. On Apple a threaded gate is not merely unmeasured, it is
-      **unexpressible**. Add the arm.
-- [ ] **Accelerate ignores `BLAS.set_num_threads`.** It reads `VECLIB_MAXIMUM_THREADS` **once, at
-      first use**, so the variable must be set at file-load time before the library is touched — the
-      same shape as the existing single-thread pin at `bench/plots.jl:155-175`. Getting this wrong
-      does not error; it silently measures the wrong thread count.
+- [x] **`accelerate_mt` exists.** `_REF_MT_ARMS` in `bench/plots.jl` carries it, and a threaded Apple
+      gate is expressible.
+- [x] **Accelerate ignores `BLAS.set_num_threads`, and `bench/plots.jl` handles it.** It reads
+      `VECLIB_MAXIMUM_THREADS` **once, at first use**, so `_VECLIB_NT` is decided from the arm
+      selection and exported before any forward into the library. Getting this wrong does not error;
+      it silently measures the wrong thread count. The two Accelerate arms therefore cannot share a
+      process, and a run requesting both is refused with the mechanism named.
       ⚠ Related trap already paid for once: the Accelerate dylib needs
       `suffix_hint = "\x1a$NEWLAPACK$ILP64"`. Without the leading `0x1A`, LBT falls back to LP64 and
       `dgemm_64_` **returns zeros rather than raising**.
-- [ ] **Measure `openblas_mt` across every group.** `ROADMAP.md` Step 0 says this and it is still
-      true: the per-cell reference rule needs *both* OpenBLAS arms present, because a single op draws
-      on each depending on size. There is **no `mt_data_neon_*.txt` cache at all** today.
+- [x] **`openblas_mt` is measured across every group.** `bench/mt_data_neon_mac.home.txt` holds 937
+      cells with all three threaded arms — `accelerate_mt`, `openblas_mt`, `pb_mt` — so the per-cell
+      reference rule has both reference arms it needs.
+      ⚠ The cache header records `freq=0kHz base=0kHz boost=-1`: this platform reports no pin, so
+      every figure drawn from it is directional. See the caveats section below.
 
 ---
 
@@ -61,7 +64,13 @@ Follow `ROADMAP.md` phases 1→3 (real → complex → dual). Additions from the
 - [ ] **`_gemv!`'s first branch is `_sme_gemv_eligible`.** A threaded gemv-N must decline for the
       same reason gemm does. The MT campaign's Phase 2 threads gemv-N on AMD; that change must not
       capture SME-eligible calls here.
-- [ ] **SME covers Float64 gemm plus one gemv kernel and nothing else.** Extending it is pass-1 work.
+- [ ] **SME covers Float64 gemm, BOTH gemv arms and `ger`, plus four BLAS-1 kernels.** In
+      `src/blas3/sme_kernel.jl`: gemm, gemv-N, gemv-T (whose ZA-resident and multi-by-multi inner arms
+      split on `_SME_GEMVT_RESIDENT_MAX`), and `ger`. In `src/blas1/sme_l1.jl`: `dot`, `asum`, `axpy!`,
+      `scal!`, with `src/blas1/sme_l1_cf.jl` holding their `@cfunction` trampolines because a constant
+      `@cfunction` binds its callee at method-definition time. `symv` and `trmv` reach SME through
+      their own cuts in `src/blas2/level2.jl`. Float32 is NOT covered anywhere; extending it is
+      pass-1 work.
       SME is Float64-only (`FEAT_SME_F64F64`), but complex and dual decompose into *real* products,
       so they inherit SME iff those products reach an eligible call — routing, not kernels.
 
@@ -155,3 +164,24 @@ expect that test to pick it up and require a reproducibility proof for it.
 - **Sync the fleet with git, never rsync** (`bench/fleet_sync.sh`). rsync copies the code but not its
   identity, and the cache header then lies about which commit produced the numbers.
 - **Fable reviews adversarially at the end of each phase**, before it is committed.
+
+- **There is no core pinning either, and `bench/probe.sh` is right to leave this host unpinned.**
+  macOS exposes no `sched_setaffinity` equivalent that binds a thread to a core, so `probe.sh`'s
+  `*) MASK="" ;;` default is the correct behavior here rather than a missing entry. Worker placement
+  across the three core tiers — 2 "Super" and 4 "Performance" cores sharing 20 MB of L2, 6
+  "Efficiency" cores on 8 MB — is a request, not a guarantee, so a threaded Apple cell must carry its
+  spread rather than a single ratio, and self-speedup is not a quantity this box can report honestly.
+
+- **`bench/fleet_sync.sh` does not cover this host** (`BOXES_ALL=(galen neuromancer)`), so the Apple
+  cache is carried by hand. The caches are untracked, so nothing here reaches the AMD fleet's agent
+  except through a committed file.
+
+- **An Apple instrument can be validated for DETECTION but never for linearity.**
+  `/usr/sbin/taskpolicy -b` moves work to the Efficiency cluster and gives a repeatable 5.4x
+  degradation (single-threaded `asum` on 8 MB: 204.0–204.2 GB/s normal, 36.8–38.4 background, the
+  nominal arm reproducing to 0.1%), which is enough to confirm an instrument notices a slower machine
+  — the half a broken probe fails while passing its one-sided test. But there is nothing between:
+  `-c utility` and `-t 0|1|2` all read 204.0–204.2 unchanged. Two levels, 1x and 5.4x. So no
+  "tracks an induced pin within two points" calibration is possible, and because the fault changes
+  **which core runs** rather than the clock, it validates a throughput instrument and nothing that
+  claims to read a frequency.
