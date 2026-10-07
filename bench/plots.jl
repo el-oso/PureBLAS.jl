@@ -548,6 +548,46 @@ end
 # One array per thread, L2-resident, so each core is compute-bound on its own data rather than the set
 # of them being memory-bound together — a bandwidth-bound probe would report contention as throttling.
 const _ANCHOR_MT_N = 1 << 14                      # 16K Float64 = 128 KB per thread
+# THE COMPUTE MUST DOMINATE THE FORK-JOIN, or the probe measures thread wake latency instead of the
+# clock — and wake latency neither scales with frequency nor recovers promptly, so a probe dominated by
+# it reports a throttle that has already ended. Decomposed on neuromancer, 7 threads, same work each:
+#
+#   serial, one thread                24.8 us      <- the compute
+#   @threads with an EMPTY body      118.1 us      <- fork/join alone
+#   @threads full                    163.8 us
+#   @threads full, sink padded       165.5 us      <- false sharing is NOT a factor
+#
+# One pass was 24.8 us of compute behind 118 us of join: 83% of the figure was not the quantity. The
+# first version of this probe therefore read 0.975 of base unthrottled and 0.274 at a 60% pin — it
+# noticed a throttle but could not measure one — and still read 0.401 after the pin was restored.
+#
+# Passes are chosen so the compute is an order of magnitude over the measured join cost: 48 x 24.8 us
+# is ~1.2 ms against ~118 us. At two probes per arm-round that is tens of milliseconds per cell
+# against windows of 0.15-2 s, and about a minute over a full sweep.
+const _ANCHOR_MT_PASSES = 48
+
+# A TOP-LEVEL FUNCTION WITH CONCRETE ARGUMENTS, not a closure over locals. As an inner closure
+# capturing variables assigned in the enclosing scope, Julia boxes those captures and the hot loop
+# goes through a dynamic access per element: 48 passes that should cost ~1.2 ms measured 188 ms, 158x
+# too slow. That also made the probe useless for its purpose — boxed access is latency-bound, so it
+# degraded WORSE than compute when the clock dropped, reading 0.33 of base at a 0.60 pin and
+# saturating at the same figure for a 0.40 pin.
+#
+# The passes are INSIDE the threaded region so the fork/join is paid once for all of them, and `s`
+# carries across passes so the inner loop cannot be hoisted out.
+function _mt_anchor_kernel!(sink::Vector{Float64}, bufs::Vector{Vector{Float64}}, nt::Int)
+    Threads.@threads :static for i in 1:nt
+        s = 0.0
+        b = bufs[i]
+        for _ in 1:_ANCHOR_MT_PASSES
+            for j in eachindex(b)
+                s += b[j] * b[j]
+            end
+        end
+        sink[i] = s
+    end
+    return nothing
+end
 const _MT_ANCHOR_BUFS = Vector{Vector{Float64}}()
 const _MT_ANCHOR_SINK = Ref(zeros(Float64, 0))
 function _anchor_mt_secs()
@@ -561,21 +601,10 @@ function _anchor_mt_secs()
     end
     bufs = _MT_ANCHOR_BUFS
     sink = _MT_ANCHOR_SINK[]
-    function once()
-        Threads.@threads :static for i in 1:nt
-            s = 0.0
-            b = bufs[i]
-            for j in eachindex(b)
-                s += b[j] * b[j]
-            end
-            sink[i] = s
-        end
-        return nothing
-    end
-    once()                                         # warm: first touch compiles and faults the pages
-    # SMALL BUDGET ON PURPOSE: this runs twice per arm-round, so 8 samples of a ~10 µs reduction is
-    # tens of microseconds against windows of 0.15-2 s. A larger budget would start to matter.
-    b = @be once() evals = 1 samples = 8 seconds = 0.02
+    _mt_anchor_kernel!(sink, bufs, nt)             # warm: compiles and faults the pages
+    # THE BUDGET HAS TO CLEAR THE FIRST-CALL COSTS. At `samples = 8, seconds = 0.02` this reported
+    # 2483 µs where steady state is far lower — the budget was too small to get past them.
+    b = @be _mt_anchor_kernel!(sink, bufs, nt) evals = 1 samples = 16 seconds = 0.2
     return median(Float64[s.time for s in b.samples])
 end
 # Reference value for the ratio, measured once per process on the first threaded window — the same
