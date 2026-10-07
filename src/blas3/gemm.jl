@@ -2770,8 +2770,9 @@ end
     _uker_sweep!(nr, Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tb, sa, sb, ov, a1v, Val(false))
 function _gemm_cmplx_unpacked!(
         ::Val{SA}, ::Val{SB}, tB::Bool, m::Int, n::Int, k::Int,
-        alpha, A, B, beta, C
+        alpha, A, B, beta, C, nroute::Int
     ) where {SA, SB}
+    nrt = nroute < 0 ? n : nroute
     Tc = eltype(C); T = real(Tc)
     b0 = iszero(beta)
     a = convert(Tc, alpha); alr = real(a); ali = imag(a)
@@ -2798,7 +2799,11 @@ function _gemm_cmplx_unpacked!(
             _res_tb!(Val(8), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
         elseif nrsel == 12
             _res_tb!(Val(12), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
-        elseif max(m, n, k) >= _CUKER_NR6_MIN     # full-tile mid-n: NR=6 (latency slack). tiny-n: NR=4.
+        # FROM `nrt`: this selects the microkernel's COLUMN TILE WIDTH, so a column band that picked a
+        # different one would group its accumulators differently from the undivided problem. Live only
+        # where `_CNR != _CNR_SMALL` (AVX2); on AVX-512 `_CUKER_NR6_MIN` is `typemax` and both arms are
+        # the same width, which is why wintermute cannot witness this one.
+        elseif max(m, nrt, k) >= _CUKER_NR6_MIN   # full-tile mid-n: NR=6 (latency slack). tiny-n: NR=4.
             _res_tb!(Val(_CNR), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
         else
             _res_tb!(Val(_CNR_SMALL), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
@@ -2807,9 +2812,10 @@ function _gemm_cmplx_unpacked!(
     return C
 end
 # tA='N' ⇒ SA=1 (conj only rides transA='C', which sets tA); only cB matters.
-function _gemm_cmplx_unpacked_go!(tB::Bool, cB::Bool, m::Int, n::Int, k::Int, alpha, A, B, beta, C)
-    return cB ? _gemm_cmplx_unpacked!(Val(1), Val(-1), tB, m, n, k, alpha, A, B, beta, C) :
-        _gemm_cmplx_unpacked!(Val(1), Val(1), tB, m, n, k, alpha, A, B, beta, C)
+function _gemm_cmplx_unpacked_go!(tB::Bool, cB::Bool, m::Int, n::Int, k::Int, alpha, A, B, beta, C,
+        nroute::Int)
+    return cB ? _gemm_cmplx_unpacked!(Val(1), Val(-1), tB, m, n, k, alpha, A, B, beta, C, nroute) :
+        _gemm_cmplx_unpacked!(Val(1), Val(1), tB, m, n, k, alpha, A, B, beta, C, nroute)
 end
 
 # ── Karatsuba 3M complex GEMM ────────────────────────────────────────────────────────────────
@@ -2925,8 +2931,15 @@ end
     end
     return C
 end
-function _gemm_3m!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::Int, alpha, A, B, beta, C)
+# `nroute` reaches the three plane products because each is a full real gemm with its own size-keyed
+# routing: `_gemm_real_dims!` asks `_use_unpacked`, whose unpacked and blocked arms differ in alpha
+# placement, beta handling and `kc` chunking. A caller computing a column band of a 3M product must
+# route the planes from the undivided width or the band's planes are computed by different arithmetic
+# than the whole product's. Explicit, not defaulted, for the reason given at `_gemm_cmplx_blocked!`.
+function _gemm_3m!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::Int, alpha, A, B, beta, C,
+        nroute::Int)
     Tc = eltype(C); Tr = real(Tc)
+    nrt = nroute < 0 ? n : nroute
     ra = size(A, 1); ca = size(A, 2); rb = size(B, 1); cb = size(B, 2)   # stored dims (trans folded by sub-gemm)
     t = _gemm_3m_scratch(Tr, ra * ca, rb * cb, m * n)   # grow-only flat buffers
     GC.@preserve t begin      # view the first r·c as a CONTIGUOUS r×c matrix (ld=r; no strided top-left)
@@ -2946,9 +2959,9 @@ function _gemm_3m!(tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::In
         P1 = w(7, m, n); P2 = w(8, m, n); P3 = w(9, m, n)
         _split3!(Ar, Ai, As, A, cA, ra, ca); _split3!(Br, Bi, Bs, B, cB, rb, cb)
         o = one(Tr); z = zero(Tr)
-        _gemm_real_dims!(tA, tB, m, n, k, o, z, Ar, Br, P1)
-        _gemm_real_dims!(tA, tB, m, n, k, o, z, Ai, Bi, P2)
-        _gemm_real_dims!(tA, tB, m, n, k, o, z, As, Bs, P3)
+        _gemm_real_dims!(tA, tB, m, n, k, o, z, Ar, Br, P1, nrt)
+        _gemm_real_dims!(tA, tB, m, n, k, o, z, Ai, Bi, P2, nrt)
+        _gemm_real_dims!(tA, tB, m, n, k, o, z, As, Bs, P3, nrt)
         _combine3!(C, P1, P2, P3, convert(Tc, alpha), convert(Tc, beta), m, n)
     end
     return C
@@ -3569,7 +3582,7 @@ end
                 if _CGEMM_3M && !_EXPFLAG[_EXP12] &&
                         (@inbounds(_EXPINT[7]) > 0 ? @inbounds(_EXPINT[7]) : _fh_cgemm_3m_min()) <= max(m, nrt, k) <= _fh_cgemm_3m_max() &&
                         min(m, nrt, k) >= _fh_cgemm_3m_kmin()
-                    _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
+                    _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt)
                     # `_CGEMM_UNPACK_MAX` is CORRECTLY placed for complex — do not re-chase it. Measured
                     # packed/unpacked on Zen4 (bench/probes/zg2_unpacked_vs_packed.jl): 2.698 at n=8,
                     # 1.483 / 1.662 / 1.237 / 1.336 at n=16/24/32/40, and 1.000 from 48 (where both arms
@@ -3578,7 +3591,7 @@ end
                     # problem. Its fixed-cost share is 4.5% at the gate shape (zg1_tiny_decomp.jl), so it
                     # is not entry overhead either — the unpacked complex microkernel itself is the gap.
                 elseif !tA && max(m, nrt, k) <= _CGEMM_UNPACK_MAX
-                    _gemm_cmplx_unpacked_go!(tB, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
+                    _gemm_cmplx_unpacked_go!(tB, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt)
                 else
                     _gemm_cmplx_blocked!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt)
                 end
