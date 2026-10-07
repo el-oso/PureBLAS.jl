@@ -56,6 +56,97 @@
     end
 end
 
+# THE PACKED AND BANDED L2 SURFACE, which carried NO strict guarantee of any kind — not typestable,
+# not noalloc, not trim, in src or in test. Thirteen entry points: the packed symmetric/Hermitian
+# matrix-vector products and their triangular siblings, the four packed rank updates, and the banded
+# general/symmetric/Hermitian/triangular products.
+#
+# They are a separate item from the dense L2 surface rather than extra lines in it, so a failure names
+# which surface broke. They are also the surface with the least coverage behind it, so this is the item
+# most likely to find something rather than confirm it.
+#
+# `hpr!` takes a REAL alpha and `hpr2!` a complex one, which is the reference ?hpr/?hpr2 convention: a
+# Hermitian rank-1 update with a complex scale would not keep the diagonal real.
+#
+# A THROW FROM `@verify_strict` IS A TRIM OR ALLOCATION PROBLEM — it is the signal, not an ambiguity,
+# and it needs no positive control to interpret. Per call the macro expands to two checks
+# (StrictMode/src/macros.jl `_strict_expr`):
+#
+#   local T = promote_op(checkfn, types...)
+#   _is_typestable_return(T) || _stable_violation(target, T)   # (1) inference: concrete return or throw
+#   ...
+#   _strict_scan(target, checkfn, types)                       # (2) IR scan: allocation/boxing/trim
+#
+# The inference check runs UNCONDITIONALLY on every listed call, and the IR scan runs once per
+# (site, specialization). So the item cannot pass by examining nothing: if any of these thirteen
+# entries had an abstract inferred return, or allocated or boxed on a path the scan reaches, this item
+# would throw and name the call. `@test_noalloc`'s vacuity hazard — which is what the `gemm!` item's
+# positive control answers — does not apply to this macro.
+#
+# The `applicable` block below is therefore NOT a stand-in for a control. It covers a different and
+# narrower failure: an op whose keyword or operand order I got wrong would not dispatch to the backend
+# at all, so the verified block would silently cover twelve ops while claiming thirteen.
+@testitem "StrictMode dogfood: packed and banded L2 strict contract" tags = [:checks] begin
+    using StrictModeTest, StrictMode, StrictMode.TypeContracts
+    if !StrictMode.checks_enabled()
+        @info "StrictMode checks disabled — skipping packed/banded L2 dogfood"
+        @test_skip StrictMode.checks_enabled()
+    else
+        bk = PureBLAS.DEFAULT_BACKEND
+        n = 64
+        np = (n * (n + 1)) ÷ 2
+        APd = randn(np); APz = randn(ComplexF64, np)
+        um = randn(n); vm = randn(n); uz = randn(ComplexF64, n); wz = randn(ComplexF64, n)
+        kb = 8
+        ABs = randn(kb + 1, n); ABz = randn(ComplexF64, kb + 1, n)   # symmetric/triangular band
+        kl = 3; ku = 5
+        ABg = randn(kl + ku + 1, n); ABgz = randn(ComplexF64, kl + ku + 1, n)
+        @verify_strict PureBLAS.SIMDBackend begin
+            # packed matrix-vector
+            PureBLAS.spmv!(bk, vm, APd, um; uplo = 'U', alpha = 2.0, beta = 1.0)
+            PureBLAS.spmv!(bk, vm, APd, um; uplo = 'L', alpha = 2.0, beta = 1.0)
+            PureBLAS.hpmv!(bk, wz, APz, uz; uplo = 'U', alpha = 2.0 + 0im, beta = 1.0 + 0im)
+            PureBLAS.tpmv!(bk, APd, um; uplo = 'U', trans = 'N')
+            PureBLAS.tpmv!(bk, APd, um; uplo = 'L', trans = 'T')
+            PureBLAS.tpsv!(bk, APd, um; uplo = 'U', trans = 'N')
+            PureBLAS.tpmv!(bk, APz, uz; uplo = 'U', trans = 'C')      # complex packed triangular
+            PureBLAS.tpsv!(bk, APz, uz; uplo = 'U', trans = 'C')
+            # packed rank updates
+            PureBLAS.spr!(bk, 1.5, um, APd; uplo = 'U')
+            PureBLAS.spr2!(bk, 1.5, um, vm, APd; uplo = 'U')
+            PureBLAS.hpr!(bk, 1.5, uz, APz; uplo = 'U')               # REAL alpha, per ?hpr
+            PureBLAS.hpr2!(bk, 1.5 + 0.5im, uz, wz, APz; uplo = 'U')
+            # banded
+            PureBLAS.gbmv!(bk, vm, ABg, um, n, kl, ku; trans = 'N', alpha = 2.0, beta = 1.0)
+            PureBLAS.gbmv!(bk, vm, ABg, um, n, kl, ku; trans = 'T', alpha = 2.0, beta = 1.0)
+            PureBLAS.gbmv!(bk, wz, ABgz, uz, n, kl, ku; trans = 'C', alpha = 2.0 + 0im, beta = 1.0 + 0im)
+            PureBLAS.sbmv!(bk, vm, ABs, um; uplo = 'U', alpha = 2.0, beta = 1.0)
+            PureBLAS.hbmv!(bk, wz, ABz, uz; uplo = 'U', alpha = 2.0 + 0im, beta = 1.0 + 0im)
+            PureBLAS.tbmv!(bk, ABs, um; uplo = 'U', trans = 'N')
+            PureBLAS.tbsv!(bk, ABs, um; uplo = 'U', trans = 'N')
+        end
+        # EVERY OP ABOVE REALLY HAS A SIMDBackend METHOD. The block above throws on a type-instability,
+        # an allocation or a trim violation, but a call that never dispatched to the backend is simply
+        # absent from what it examined — a thirteen-op item quietly checking twelve. Positional surface
+        # only; the keywords are exercised by the calls themselves.
+        SB = PureBLAS.SIMDBackend
+        @test applicable(PureBLAS.spmv!, bk, vm, APd, um)
+        @test applicable(PureBLAS.hpmv!, bk, wz, APz, uz)
+        @test applicable(PureBLAS.tpmv!, bk, APd, um)
+        @test applicable(PureBLAS.tpsv!, bk, APd, um)
+        @test applicable(PureBLAS.spr!, bk, 1.5, um, APd)
+        @test applicable(PureBLAS.spr2!, bk, 1.5, um, vm, APd)
+        @test applicable(PureBLAS.hpr!, bk, 1.5, uz, APz)
+        @test applicable(PureBLAS.hpr2!, bk, 1.5 + 0.5im, uz, wz, APz)
+        @test applicable(PureBLAS.gbmv!, bk, vm, ABg, um, n, kl, ku)
+        @test applicable(PureBLAS.sbmv!, bk, vm, ABs, um)
+        @test applicable(PureBLAS.hbmv!, bk, wz, ABz, uz)
+        @test applicable(PureBLAS.tbmv!, bk, ABs, um)
+        @test applicable(PureBLAS.tbsv!, bk, ABs, um)
+        @test bk isa SB                      # the block above verified THIS backend, not another
+    end
+end
+
 @testitem "StrictMode dogfood: BLAS-2 strict contract" tags = [:checks] begin
     # StrictMode.TypeContracts: see the BLAS-1 item — @verify_strict's forwarded @verify (TypeContracts
     # 0.14.0) seals into this module, so `TypeContracts` must resolve here.
