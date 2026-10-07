@@ -18,11 +18,18 @@
 # Not a replacement for `fleet_freqlock.sh verify`, which is still the only pre-run check. This is the
 # post-hoc one that gates a publish.
 #
-# THE SECOND SIGNAL, and it is not cross-arm at all: each cell also records the MINIMUM clock seen
-# inside its own timing windows (`flo`). A box can hold its lock at every arm boundary and still spend
-# half a cell throttled — six cores under load reach a package power limit one core never does, and the
-# pin is not what gives way. Cross-arm cannot see it, because `flo|fhi` is stamped once per cell and
-# both arms of a same-run pair therefore carry the identical range and agree perfectly.
+# THE SECOND SIGNAL, and it is not cross-arm at all: each arm records the MINIMUM clock sampled around
+# its own timing windows (`flo`), compared against the box's pinned base. Cross-arm cannot see a
+# whole-run droop, because the arms of a same-run pair are measured minutes apart at the same clock and
+# agree with each other perfectly while both sit below the pin.
+#
+# It is a BOUNDARY sampler, not a mid-window one: `_khz_sample!` runs immediately before and after each
+# arm's `@be` window, so what it catches is a droop still present at some boundary. A throttle that
+# begins and ends strictly inside a window is invisible to it.
+#
+# WHICH RECORDS QUALIFY is decided by each record's own `span` token, never by the filename — see the
+# token table at the check itself. A `threads` record is refused and counted, because its figure is a
+# sysfs reading that can come from an idle core rather than a clock anything ran at.
 #
 #   bench/check_arm_clocks.sh [tol_pct]      # default 3; every plots_data_* AND mt_data_* cache
 set -u
@@ -43,10 +50,10 @@ fi
 bad=0
 for f in "${files[@]}"; do
     printf '── %s\n' "$(basename "$f" .txt | sed 's/^plots_data_//')"
-    # A threaded cache: its PB arms ran on workers, so the per-cell clock samples a core that was not
-    # doing the work. The in-window check below stands down for those; the cross-arm check does not.
-    mt=0; case "$f" in *mt_data_*) mt=1 ;; esac
-    out=$(awk -F'\t' -v TOL="$tol" -v MT="$mt" '
+    # NOTHING IS KEYED ON THE FILENAME. Which check a record qualifies for is decided by the record own
+    # `span` token, so a mixed cache — an mt file still holds `core`-sampled dual cells — is judged
+    # row by row, and a cache passed under another name cannot flip a check on.
+    out=$(awk -F'\t' -v TOL="$tol" '
         /^#pbbench/ { if (match($0, /base=[0-9]+kHz/)) base = substr($0, RSTART + 5, RLENGTH - 8) + 0; next }
         /^#/ { next }
         NF >= 4 {
@@ -58,30 +65,24 @@ for f in "${files[@]}"; do
                 # Counting from the end lands on `fhi`, the in-window MAXIMUM — the one clock field a
                 # throttle cannot move, so a cell that ran at half speed reads as perfectly locked.
                 fq = a[5] + 0
-                # In-window MINIMUM against this box own base clock.
+                # In-window MINIMUM against this box own base clock, for the PB arms only — a cached
+                # vendor arm carries the state of the epoch it was measured in and is never re-run.
                 #
-                # SERIAL ARMS ONLY, and that is a correctness limit rather than a scoping preference.
-                # `_cell_khz`/`_khz_range!` read `/proc/self/stat` field 39 — the MAIN thread current
-                # CPU. For a serial arm the main thread IS the work, so the reading is the work clock.
-                # For a threaded arm the workers are on other cores and the driver spins then yields,
-                # so the sampled core can report its IDLE frequency while every worker runs at base.
-                # Measured: galen `trsmR@512` records flo = 1066 MHz against a 3701 MHz base while
-                # every arm in that cell posts full throughput, and `trsm@1000` records 1714 MHz while
-                # OpenBLAS and AOCL post the HIGHEST figures of their ladder. A real drop would slow
-                # every arm in the window; these slow none of them.
+                # THE TOKEN DECIDES, PER RECORD, because it names how the figure was obtained:
+                #   core      — one sysfs read of the core the main thread is on. Valid for a SERIAL
+                #               arm, where that core is the work.
+                #   mtanchor  — a fixed pure-Julia reduction run on every pinned core and timed, scaled
+                #               against its own first-window reference. Valid for a THREADED arm: it
+                #               wakes the cores and measures them, so an idle core cannot fake it.
+                #   threads   — RETIRED sysfs min-over-threads. NOT a clock, and refused below.
                 #
-                # Restricted to `pb` for the same reason the rest of this script is: a cached vendor
-                # arm carries the state of the epoch it was measured in and is never re-run.
-                # WHICH SAMPLER wrote this range, read PER ARM: field 8 of a 9-field record. In an
-                # 8-field record field 8 is the csv, so the test is `n >= 9`; anything older is a
-                # single-core sample, which is what "core" means.
-                # (No apostrophes in this block: the awk program is single-quoted and one would end it.)
+                # (NO APOSTROPHES in this awk program: it is single-quoted and one would end the string.)
                 span = (n >= 9) ? a[8] : "core"
-                # The in-window check runs for the serial `pb` arm always, and for `pb_mt` only when
-                # THAT RECORD carries a range spanning the working cores. A pb_mt record written by the
-                # old single-core sampler stands down on its own merits, even inside a file where other
-                # cells were re-measured — which a header stamp could not express.
-                if (base > 0 && n >= 8 && ((a[1] == "pb" && !MT) || (a[1] == "pb_mt" && MT && span == "threads"))) {
+                # A `threads` record is counted so the summary can say how many were refused and why,
+                # rather than leaving the reader to wonder where the cells went.
+                if (a[1] == "pb_mt" && span == "threads") refused++
+                if (base > 0 && n >= 8 && \
+                    ((a[1] == "pb" && span == "core") || (a[1] == "pb_mt" && span == "mtanchor"))) {
                     flo = a[6] + 0
                     if (flo > 0) {
                         lotot++
@@ -109,8 +110,20 @@ for f in "${files[@]}"; do
                 tot++
                 if (d > TOL) {
                     off++
-                    if (off <= 3) printf "   %s/%s@%s  pb=%.0fMHz vs %s=%.0fMHz  (%.1f%%)\n", $1, $2, $3, pb/1000, refname, ref/1000, d
-                    badop[$1 "/" $2] = 1; badgrp[$1] = 1     # scope for a TARGETED re-measure
+                    # WHICH SIDE IS THE ODD ONE, because the remediation differs and only one of them
+                    # has a remediation at all. `base` is the box pin: the arm that AGREES with it is
+                    # the sound one. A pb-side mismatch is re-measurable with `arms=pb`; a REFERENCE
+                    # side one is not, because `arms=pb` never re-measures a reference, so printing
+                    # that advice for it sends the reader round a loop that can never clear the flag.
+                    side = "?"
+                    if (base > 0) {
+                        dpb = (pb - base) / base * 100; if (dpb < 0) dpb = -dpb
+                        drf = (ref - base) / base * 100; if (drf < 0) drf = -drf
+                        side = (dpb <= drf) ? "ref" : "pb"
+                    }
+                    if (side == "ref") nref++; else npb++
+                    if (off <= 3) printf "   %s/%s@%s  pb=%.0fMHz vs %s=%.0fMHz  (%.1f%%, %s-side)\n", $1, $2, $3, pb/1000, refname, ref/1000, d, side
+                    if (side != "ref") { badop[$1 "/" $2] = 1; badgrp[$1] = 1 }   # only pb-side is re-measurable
                 } else ok++
                 if (d > worst) { worst = d }
             }
@@ -120,20 +133,38 @@ for f in "${files[@]}"; do
                 if (looff == 0) printf "   => in-window clock: all %d PB cells held base (tolerance %s%%)\n", lotot, TOL
                 else            printf "   => in-window clock: %d/%d PB cells fell below base, worst -%.0f%% (tolerance %s%%)\n", looff, lotot, loworst, TOL
             }
+            # ALWAYS, not only when nothing was checked. A mixed cache reports both lines: the dual
+            # cells of an mt file carry a `core`-sampled `pb` arm and are genuinely checkable, so a
+            # "held base" verdict on them sits beside hundreds of refused threaded records and would
+            # otherwise read as coverage of the whole file.
+            if (refused > 0) {
+                printf "   => in-window clock: %d record(s) REFUSED — written by the retired sysfs min-over-threads\n", refused
+                print  "      sampler, whose values are not clocks (a runnable-but-idle core reads the setpoint). Those"
+                print  "      cells have NO below-pin check; re-sweep to get `mtanchor` records, which this check does"
+                print  "      accept. The cross-arm result below is cross-EPOCH only and is not a substitute."
+            }
             if (tot == 0 && looff == 0) { print "   no cells carry both a pb and a reference clock — cross-arm check skipped"; exit 0 }
             if (tot > 0 && off == 0) printf "   => cross-arm: all %d cells within %s%% (worst %.1f%%)\n", tot, TOL, worst
-            if (off > 0) printf "   => cross-arm: %d/%d cells clock-mismatched (%d ok), worst %.1f%% (tolerance %s%%)\n", off, tot, ok, worst, TOL
+            if (off > 0) printf "   => cross-arm: %d/%d cells clock-mismatched (%d ok), worst %.1f%% (tolerance %s%%) — %d pb-side, %d reference-side\n", off, tot, ok, worst, TOL, npb+0, nref+0
+            # A REFERENCE-SIDE MISMATCH HAS NO REMEDIATION HERE, and saying so is the point. The arm
+            # that disagrees with the box pin is the cached one, measured in an earlier epoch and never
+            # re-run — `arms=pb` cannot touch it. Printing the re-measure advice for those cells sent a
+            # reader round a loop that could never clear the flag, which is how 8 of the 9 on galen read.
+            # (NO APOSTROPHES in this awk program: it is single-quoted and one would end the string.)
+            if (nref > 0) printf "   %d of those are REFERENCE-side: the cached arm disagrees with this box pin, so `arms=pb`\n      cannot clear them. Exclude those cells from a score, or re-measure the references, which needs\n      the user per-run authorization.\n", nref
             if (off == 0 && looff == 0) exit 0
             # THE POINT OF THE PER-CELL CLOCK: re-measure ONLY what is broken. A lock that floats
             # part-way through a sweep leaves most cells VALID; condemning the whole cache and
             # re-sweeping it wastes hours and is what this field exists to prevent.
             no = 0; for (o in badop) no++
-            ng = 0; gl = ""; for (g in badgrp) { ng++; gl = gl " " g }
-            printf "   affected: %d op(s) in %d group(s):%s\n", no, ng, gl
-            printf "   targeted re-measure (groups, fewest julia startups):\n     for g in%s; do julia --project=bench bench/plots.jl bench group=$g arms=pb nodraw; done\n", gl
-            printf "   per-op instead (finest scope, one startup each):\n    "
-            for (o in badop) { split(o, q, "/"); printf " op=%s", q[2] }
-            printf "\n"
+            if (no > 0) {
+                ng = 0; gl = ""; for (g in badgrp) { ng++; gl = gl " " g }
+                printf "   affected (pb-side, re-measurable): %d op(s) in %d group(s):%s\n", no, ng, gl
+                printf "   targeted re-measure (groups, fewest julia startups):\n     for g in%s; do julia --project=bench bench/plots.jl bench group=$g arms=pb nodraw; done\n", gl
+                printf "   per-op instead (finest scope, one startup each):\n    "
+                for (o in badop) { split(o, q, "/"); printf " op=%s", q[2] }
+                printf "\n"
+            }
             exit 1
         }' "$f")
     st=$?
