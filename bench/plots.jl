@@ -925,8 +925,13 @@ _ratio(qref::Vector{Float64}, qpb::Vector{Float64}) = qref ./ qpb
 # it must not be recorded under `openblas`/`aocl`, which would write false provenance into the cache.
 function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15, refs = nothing)
     out = Tuple{Int, CellData}[]
+    # `pb_mt` must appear here, not only `pb`: an explicit `refs` replaces the default arm list
+    # wholesale, so any PB arm left out of this `vcat` is dropped from the run without a diagnostic.
+    # The dual groups are the rows that override `refs`, and their L3 paths do thread — through the
+    # public real entries.
     armlist = isnothing(refs) ? nothing :
-        vcat(_DO_PB ? [_ARM_PB] : String[], [a for a in refs if isnothing(_ARMS_SEL) || a in _ARMS_SEL])
+        vcat(_DO_PB ? [_ARM_PB] : String[], _DO_PB_MT ? [_ARM_PB_MT] : String[],
+            [a for a in refs if isnothing(_ARMS_SEL) || a in _ARMS_SEL])
     for s in sizes
         !isnothing(_SELSIZE) && s != _SELSIZE && continue     # `size=` selects ONE cell
         reps = repfn(s)
@@ -1012,8 +1017,10 @@ _reps_quadratic(s) = clamp(20_000_000 ÷ (s * s), 1, 512)
 # performance governor) so the fixed clock keeps OB vs PB comparable. See memory dev-fleet.
                                        # `refs` mirrors `sweep`'s override, for DL3 — see the note there.
 function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = _reps_cubic, refs = nothing)
+    # Both PB arms belong in an explicit list — see the note in `sweep`.
     armlist = isnothing(refs) ? nothing :
-        vcat(_DO_PB ? [_ARM_PB] : String[], [a for a in refs if isnothing(_ARMS_SEL) || a in _ARMS_SEL])
+        vcat(_DO_PB ? [_ARM_PB] : String[], _DO_PB_MT ? [_ARM_PB_MT] : String[],
+            [a for a in refs if isnothing(_ARMS_SEL) || a in _ARMS_SEL])
     out = Tuple{Int, CellData}[]
     for s in sizes
         !isnothing(_SELSIZE) && s != _SELSIZE && continue     # `size=` selects ONE cell
