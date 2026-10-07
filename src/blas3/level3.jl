@@ -5198,9 +5198,11 @@ function trsm!(
     # THREADED SIDE-L: split B's columns. Placed here, below every staging branch above, because each
     # of those either returns or rewrites the operands — a split above them would hand workers a B the
     # serial path would not have solved. Below this point the operands are final.
-    # `BlasReal`, not `BlasFloat`: the pool exists only for the two real types, and the route
-    # predicates on the complex path read their own width rather than `nroute`, so a complex column
-    # split would not be reproducible even once a pool existed.
+    # `BlasReal`, not `BlasFloat`. The pool itself carries complex (`_gemm_poolvec`) and the complex
+    # gemm route predicates do read the undivided width, so neither is the obstacle any more: what a
+    # complex side-L split needs is the `_MT_KIND_TRSM` chunk seam and its lost-claim fallback — which
+    # re-solves the WHOLE of B through `_trsm!` — shown to agree bit-for-bit on the complex routes, the
+    # way `_trgemm_packed!`'s seam was shown for the real packed path.
     # THREADED SIDE-R: split B's rows. `potrf`'s lower factorization is the caller that needs this —
     # it solves `A21·L11⁻ᵀ` with A21 tall and narrow, and that solve does not thread without it.
     if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
@@ -7028,9 +7030,16 @@ end
     size(m, 1) < n && (m = Matrix{Float32}(undef, n, n); r[] = m)
     return m
 end
-# Only the two real types ever thread (`_gemm_workers` is gated on them), so every other element type
-# resolves to the per-thread owner and this method is never reached from a threaded call. It exists so
-# the call site stays ONE type-stable expression instead of a branch inference has to prove unreachable.
+# THIS FALLBACK IS A PER-THREAD OWNER AND MUST NEVER BE REACHED FROM A THREADED CALL. `Ad` is handed
+# to the workers as an operand and so is held across the join; guarantee 3 puts such a buffer in the
+# `OncePerTask` tier, which the two methods above satisfy and this one does not. What keeps it safe is
+# `_symm!`'s OWN admission guard below, which admits `Float64`/`Float32` only — not `_gemm_threaded!`,
+# whose bound now also admits complex. So admitting another element type to the symm split requires a
+# `OncePerTask` owner for it HERE, in the same edit, or a threaded complex symm shares one buffer
+# between tasks.
+#
+# It exists so the call site stays ONE type-stable expression instead of a branch inference has to
+# prove unreachable.
 @inline _symm_scr_mt(::Type{T}, n::Int) where {T} = _symm_scr(T, n)
 
 @inline function _symm_scr(::Type{Float64}, n::Int)

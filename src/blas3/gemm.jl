@@ -2711,6 +2711,12 @@ end
 # (zero slack). NR=6 → 12 chains (fits 16 ymm: 12 accs + ar/ai + br/bi) hides the FMA latency. Tiny-n
 # keeps NR=4 (NR=6's column remainder wastes more than the extra chains buy). Cutoff is per-box.
 # PDM: Derived — formula over detected consts: `_W64 == 4 ? 48 : typemax(Int`
+# ⚠ UNREACHABLE THROUGH THE ROUTE ON EVERY FLEET BOX, so tuning it changes nothing by itself. The
+# unpacked kernel is selected first, by `max(m, n, k) <= _CGEMM_UNPACK_MAX`, and only then does this
+# cut pick the tile width — so the NR=6 arm needs `_CGEMM_UNPACK_MAX >= _CUKER_NR6_MIN`. Measured:
+# AVX2 40 < 48, AVX-512 and NEON `typemax`. The arm is still reached by `_EXPINT[3]`, which names a
+# width directly, and by direct callers such as `src/verify.jl`. Raising it requires raising
+# `_CGEMM_UNPACK_MAX` past it in the same change, or the knob is inert.
 const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typemax(Int))::Int
 # TB/OV/A1/AR are Val TYPE-PARAMS (not value args) so the trimmer union-splits _uker_sweep! into concrete
 # methods — a value `tB ? Val(true) : Val(false)` reaching `_uker_cmplx!`'s ::Val{TB} through an untyped
@@ -3434,8 +3440,10 @@ every piece to route from the undivided width; a caller whose `C` is the whole u
         C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cB::Bool = false; nroute::Int = -1
     ) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
-    # `T <: BlasReal` and `!cB`: the pool exists only for the two real types, and a conjugated operand
-    # is a complex-only shape. Both fall through to the serial call, which is what they did before.
+    # `T <: BlasReal` and `!cB`: THIS GUARD, not the pool, is what keeps the complex LAPACK trailing
+    # updates serial — `_gemm_threaded!` admits complex and `_gemm_poolvec` holds complex pools. The
+    # guard stands because no complex trailing update has a measured threaded figure, and req#9 makes
+    # an unmeasured path a liability rather than a feature.
     nw = (T <: BlasReal && !cB) ? _gemm_workers(m, nroute < 0 ? n : nroute, k) : 1
     if nw > 1 && _strided1(C) && _strided1(A) && _strided1(B)
         rA = _root(A); rB = _root(B); rC = _root(C)
@@ -3832,8 +3840,10 @@ is a worker running the scalar tail, which costs more than the thread saves.
 @inline function _l1_workers(bytes::Int, n::Int, ::Type{T}) where {T}
     nt = _MT_NTHREADS[]
     nt > 1 || return 1                       # the single atomic read that keeps the serial entry cheap
-    # The pool exists for Float64 and Float32 only (`_gemm_poolvec`), and this test const-folds, so a
-    # complex or Dual entry never reaches the compare below.
+    # BLAS-1 threads for the two real types only: the blocked reduction grid and its fixed-order fold
+    # (`_red_block`) are defined for them, and the complex reductions have no blocked form. The pool is
+    # not the limit — `_gemm_poolvec` holds complex pools. This test const-folds, so a complex or Dual
+    # entry never reaches the compare below.
     (T === Float64 || T === Float32) || return 1
     W = _vwidth(T)
     (bytes < _L1_MT_MIN || n < 2 * W) && return 1
@@ -4864,8 +4874,12 @@ end
 # consumer type-stable with no union in sight.
 const _GEMM_POOL_F64 = GemmPool{Float64}[]
 const _GEMM_POOL_F32 = GemmPool{Float32}[]
+const _GEMM_POOL_C64 = GemmPool{ComplexF64}[]
+const _GEMM_POOL_C32 = GemmPool{ComplexF32}[]
 @inline _gemm_poolvec(::Type{Float64}) = _GEMM_POOL_F64
 @inline _gemm_poolvec(::Type{Float32}) = _GEMM_POOL_F32
+@inline _gemm_poolvec(::Type{ComplexF64}) = _GEMM_POOL_C64
+@inline _gemm_poolvec(::Type{ComplexF32}) = _GEMM_POOL_C32
 @inline _gemm_pool(::Type{T}) where {T} = @inbounds _gemm_poolvec(T)[1]
 
 # Workers a threaded call may use, 1 = off. One atomic integer so the gemm entry costs a single load.
@@ -4906,6 +4920,8 @@ function set_num_threads(n::Integer)
         lock(_MT_SETUP_LOCK) do
             isempty(_GEMM_POOL_F64) && push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
             isempty(_GEMM_POOL_F32) && push!(_GEMM_POOL_F32, _gemm_pool_new(Float32))
+            isempty(_GEMM_POOL_C64) && push!(_GEMM_POOL_C64, _gemm_pool_new(ComplexF64))
+            isempty(_GEMM_POOL_C32) && push!(_GEMM_POOL_C32, _gemm_pool_new(ComplexF32))
         end
     end
     # The atomic store below is what publishes the pool: a reader that sees `nt > 1` here sees the
@@ -4939,21 +4955,25 @@ every path, never a union: a union here propagates into every caller's inference
 # dogfood fails on exactly that. Throwing keeps the diagnosis a caller wants: a type guard widened to
 # admit a type the pool has no registry for fails immediately, with a message, and BEFORE the claim.
 @noinline function _gemm_threaded!(::PtrMatrix{T}, args...) where {T}
-    throw(ArgumentError("threaded Level-3 supports Float32 and Float64 only, got $T. The pool " *
-        "registry, the shared-pack prefit and the `nroute` route discipline are all real-only; see " *
-        "the `where {T <: BlasReal}` method below."))
+    throw(ArgumentError("threaded Level-3 supports Float32, Float64, ComplexF32 and ComplexF64 " *
+        "only, got $T. `_gemm_poolvec` has no pool registry entry for any other type; see the " *
+        "bounded method below."))
 end
 
-# `T <: BlasReal` IS A REQUIREMENT OF THE BODY, NOT A CONVENIENCE. Exactly two things below are
-# real-only, and they are what a widening of this bound has to supply: `_gemm_poolvec`, which has no
-# registry entry for any other type, and `_gpack_prefit!`/`_gpack_shared_pool`, which size the shared
-# A-pack the real blocked kernel cooperates over. The `nroute` discipline is NOT one of them — the
-# complex branch of `_gemm_core_body!` routes on `nrt`, down to the tile width inside
-# `_gemm_cmplx_blocked!`, so a complex column band takes its parent's route.
+# THE BOUND IS A REQUIREMENT OF THE BODY, NOT A CONVENIENCE: it names exactly the types
+# `_gemm_poolvec` has a registry entry for. Declaring `where {T}` and relying on callers to check
+# would put the first unsupported call inside the pool claim before it failed; stating the bound here
+# makes widening a caller's type guard a dispatch error at the call site instead.
 #
-# Declaring `where {T}` and relying on callers to check would put the first unsupported call inside
-# the pool claim before it failed; stating the bound here makes widening a caller's type guard a
-# dispatch error at the call site instead.
+# WHAT A COMPLEX JOB DOES DIFFERENTLY, and there are only two things. `_gpack_prefit!` sizes the
+# shared A-pack that the real blocked kernel's workers cooperate over; no complex route packs A that
+# way, so the prefit is guarded on `T <: BlasReal` below rather than widened. And the route
+# discipline: every size-keyed predicate the complex branch of `_gemm_core_body!` reads comes from
+# `nrt`, the undivided width — the branch-entry tiny cut, both 3M bounds, the unpacked cut, the
+# unpacked tile width, the blocked tile width, and the 3M planes' own `_use_unpacked` — so a column
+# band takes its parent's route and arithmetic. Measured on AVX-512 under the existing `_NR` chunk
+# grouping: every complex route is bit-identical at nw = 1..6
+# (`bench/probes/cl3_split_groups.jl`).
 #
 # The operands are NORMALIZED to `PtrMatrix` by the caller, and the signature says so on purpose. It
 # gives the whole threaded path exactly ONE specialization per element type instead of one per
@@ -4966,7 +4986,7 @@ end
         alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, nw::Int,
         kind::Int = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false, unit::Bool = false,
         lup::LuPanel{T} = _lupanel_none(T)
-    ) where {T <: BlasReal}
+    ) where {T <: Union{BlasReal, BlasComplex}}
     p = _gemm_pool(T)
     # ONE claim, and a serial fallback if it fails. This is what keeps threading composable: a host that
     # runs `Threads.@threads` over many `mul!` calls has one caller win the pool and every other caller
@@ -5152,7 +5172,33 @@ end
         # `push!`/`resize!`, and doing that outside the claim lets two large callers race on the same
         # vector: they collide exactly at a new high-water mark, and a loser's `resize!` can move
         # storage the winner's workers already hold pointers into.
-        (kind == _MT_KIND_GEMM || kind == _MT_KIND_LUAHEAD) && _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
+        # `T <: BlasReal`: the shared A-pack is the real blocked kernel's, and no complex route packs A
+        # cooperatively, so there is no complex slot to size. `_gpack_prefit!` is real-only and this
+        # guard is what keeps the widened bound from reaching it.
+        #
+        # ⚠ A COMPLEX CHUNK THEREFORE GROWS ITS OWN PACK SCRATCH INSIDE THE PUBLISHED JOB.
+        # `_gemm_scratch_cmplx` grows four buffers and `_gemm_3m_scratch` nine, both from owners the
+        # driver cannot reach — `_l3ws` is `OncePerThread` and `_m3ws` is `OncePerTask` — so there is no
+        # prefit to write without first moving them to a worker-indexed process-wide pool, the shape
+        # `_gpack_shared`/`_trmmr_prefit!` use. That is a real exposure and it is stated rather than
+        # implied: the rule elsewhere in this driver is that a chunk body which grows a buffer
+        # allocates inside a published job, and the driver spins instead of yielding, so it never
+        # reaches a GC safepoint.
+        #
+        # It ships because the exposure is not new and was measured, not assumed. The REAL path already
+        # carries a narrower form of it: `_gemm_blocked!` takes `Ap` from the prefit shared pool when
+        # cooperating but still grows `Bp` from the per-task owner whenever `db` is false. Measured on
+        # the complex path (`bench/probes/cl3_growth_stress.jl`, 6 threads): 16 iterations at sizes no
+        # earlier call had reached, so a worker grows mid-job every time, 24 concurrent callers per
+        # iteration of which 21-23 lose the claim, 768 results across both complex types — all
+        # bit-identical to serial, no hang. Steady-state allocation is zero on the warm call
+        # (`cl3_worker_growth.jl`); the first call at a new high-water mark allocates, which req#10
+        # permits.
+        #
+        # Nondeterministic by nature, so that is evidence and not a proof. Converting the two owners to
+        # worker-indexed slots and prefitting them here is the change that would make it one.
+        T <: BlasReal && (kind == _MT_KIND_GEMM || kind == _MT_KIND_LUAHEAD) &&
+            _gpack_prefit!(T, tA ? A.n : A.m, tA ? A.m : A.n)
         # One partial per BLOCK, sized here for the same reason: a worker that grew it would allocate
         # inside a published job, and a loser that grew it could move storage a winner is writing.
         _is_reduction(kind) && _red_prefit!(T, cld(A.m, _red_block(T)))
@@ -5613,8 +5659,14 @@ function gemm!(
         # element type, and `_gemm_threaded!` takes three `PtrMatrix{T}`. A mixed-type call (`Float32` A
         # into a `Float64` C, which `_gemm_core!` promotes happily) would hand it a `PtrMatrix{Float32}`
         # and raise a MethodError where the serial path computed an answer.
-        nw = (T === Float64 || T === Float32) && eltype(A) === T && eltype(B) === T &&
-            _strided1(A) && _strided1(B) ?
+        # THE AMORTISATION FLOOR IS COUNTED IN COMPLEX CELLS, NOT REAL FLOPS. `_gemm_workers` divides
+        # `2*m*n*k` by `_GEMM_MT_WORK`, and one complex cell is three or four real products depending
+        # on the route, so a complex call carries several times the work the floor was calibrated on
+        # and declines the pool later than it needs to. Conservative in the safe direction — it never
+        # threads a call too small to pay the join — and a complex floor is a tuning question that
+        # needs its own measurement, not a guess here.
+        nw = (T === Float64 || T === Float32 || T === ComplexF64 || T === ComplexF32) &&
+            eltype(A) === T && eltype(B) === T && _strided1(A) && _strided1(B) ?
             _gemm_workers(m, n, k) : 1
         # A STRASSEN CALL IS NOT COLUMN-SPLIT, AND THAT IS WHAT KEEPS gemm REPRODUCIBLE.
         #
