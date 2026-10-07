@@ -2243,9 +2243,12 @@ function _gemm_cmplx_impl!(
     end
     return C
 end
+# `nroute` IS THE WHOLE PROBLEM'S COLUMN COUNT, and the tile-width choice below is why it has to reach
+# here. NOT a defaulted trailing argument: two of those on `_gemm_threaded!` put 112 bytes on every
+# `gemm!` call, so both call sites pass it explicitly and there is no wrapper method to specialize.
 function _gemm_cmplx_blocked!(
         tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::Int,
-        alpha, A, B, beta, C
+        alpha, A, B, beta, C, nroute::Int
     )
     # Size-adaptive tile width: mid-small n use a narrower nr (fewer column-mask waste tiles, since nr=6
     # doesn't divide most n), large n use the wider register-optimal nr. No-op where _CNR_SMALL==_CNR
@@ -2253,7 +2256,11 @@ function _gemm_cmplx_blocked!(
     ac = convert(eltype(C), alpha)
     a1 = isone(ac)              # alpha==1 ⇒ pure interleave store (no multiply)
     ar = iszero(imag(ac))       # alpha REAL (incl. −1, the subtract) ⇒ scale-only store (2 muls, no cross)
-    nr = (_CNR_SMALL != _CNR && max(m, n, k) <= _CGEMM_NRSMALL_MAX) ? Val(_CNR_SMALL) : Val(_CNR)
+    # FROM `nroute`, NOT `n`: this picks the microkernel's COLUMN TILE WIDTH, so a column band that
+    # chose a different one would group its accumulators differently and compute different bits from
+    # the undivided problem. The width is the same class of hazard as gemv-T's NC grouping.
+    nrt = nroute < 0 ? n : nroute
+    nr = (_CNR_SMALL != _CNR && max(m, nrt, k) <= _CGEMM_NRSMALL_MAX) ? Val(_CNR_SMALL) : Val(_CNR)
     return a1 ? _cmplx_blk_conj(nr, Val(true), Val(true), tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C) :
         ar ? _cmplx_blk_conj(nr, Val(false), Val(true), tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C) :
         _cmplx_blk_conj(nr, Val(false), Val(false), tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
@@ -3529,7 +3536,13 @@ end
         else
             _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C, nw, wi)
         end
-    elseif T <: BlasComplex && _strided1(C) && max(m, n, k) > _fh_cgemm_tiny()
+    # ROUTING USES `nrt`, THE WHOLE PROBLEM'S n, exactly as the real branch above does — a chunk must
+    # route as its parent did or it computes different arithmetic. All four predicates in this branch
+    # read it: the tiny cut here, the two 3M bounds, and the unpacked cut. Keyed on the band's own `n`
+    # instead, a column slice could enter 3M where the whole problem took the unpacked kernel, and
+    # Karatsuba's three-product form rounds differently from a direct complex multiply — so the split
+    # would not be bitwise reproducible across thread counts (req #11).
+    elseif T <: BlasComplex && _strided1(C) && max(m, nrt, k) > _fh_cgemm_tiny()
         # `_strided1(A)/(B)` is REQUIRED, not defensive: `_split3!` honours an arbitrary COLUMN stride via
         # `ldm` but hardcodes ROW stride 1 (`unsafe_load(pm, (j-1)*ldm*2 + 2i - 1)`). Its docstring says
         # "any column stride", which is exactly true and exactly why the row assumption reads as covered.
@@ -3554,8 +3567,8 @@ end
                 # untested mechanism for the tiny-n complex cluster (routing, entry overhead and NR
                 # width are all measured-dead — see the note below and zgemm32_nr_ab.jl).
                 if _CGEMM_3M && !_EXPFLAG[_EXP12] &&
-                        (@inbounds(_EXPINT[7]) > 0 ? @inbounds(_EXPINT[7]) : _fh_cgemm_3m_min()) <= max(m, n, k) <= _fh_cgemm_3m_max() &&
-                        min(m, n, k) >= _fh_cgemm_3m_kmin()
+                        (@inbounds(_EXPINT[7]) > 0 ? @inbounds(_EXPINT[7]) : _fh_cgemm_3m_min()) <= max(m, nrt, k) <= _fh_cgemm_3m_max() &&
+                        min(m, nrt, k) >= _fh_cgemm_3m_kmin()
                     _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
                     # `_CGEMM_UNPACK_MAX` is CORRECTLY placed for complex — do not re-chase it. Measured
                     # packed/unpacked on Zen4 (bench/probes/zg2_unpacked_vs_packed.jl): 2.698 at n=8,
@@ -3564,14 +3577,14 @@ end
                     # vs AOCL (0.825 Zen3, 0.902 Zen4, matching OpenBLAS on both) is NOT a routing
                     # problem. Its fixed-cost share is 4.5% at the gate shape (zg1_tiny_decomp.jl), so it
                     # is not entry overhead either — the unpacked complex microkernel itself is the gap.
-                elseif !tA && max(m, n, k) <= _CGEMM_UNPACK_MAX
+                elseif !tA && max(m, nrt, k) <= _CGEMM_UNPACK_MAX
                     _gemm_cmplx_unpacked_go!(tB, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
                 else
-                    _gemm_cmplx_blocked!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
+                    _gemm_cmplx_blocked!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt)
                 end
             end
         else
-            _gemm_cmplx_blocked!(tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
+            _gemm_cmplx_blocked!(tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C, nrt)
         end
     else
         _gemm_generic!(tA, tB, cA, cB, m, n, k, alpha, A, B, beta, C)
@@ -4918,12 +4931,16 @@ every path, never a union: a union here propagates into every caller's inference
         "the `where {T <: BlasReal}` method below."))
 end
 
-# `T <: BlasReal` IS A REQUIREMENT OF THE BODY, NOT A CONVENIENCE. Three things below exist only for
-# the real types: `_gemm_poolvec`, `_gpack_prefit!`/`_gpack_shared_pool`, and the `nroute` discipline
-# that keeps a column slice on the same route as the whole problem (the complex route predicates read
-# their own width instead). Declaring `where {T}` and relying on callers to check would put the first
-# complex call inside the pool claim before it failed; stating the bound here makes widening a
-# caller's type guard a dispatch error at the call site instead.
+# `T <: BlasReal` IS A REQUIREMENT OF THE BODY, NOT A CONVENIENCE. Exactly two things below are
+# real-only, and they are what a widening of this bound has to supply: `_gemm_poolvec`, which has no
+# registry entry for any other type, and `_gpack_prefit!`/`_gpack_shared_pool`, which size the shared
+# A-pack the real blocked kernel cooperates over. The `nroute` discipline is NOT one of them — the
+# complex branch of `_gemm_core_body!` routes on `nrt`, down to the tile width inside
+# `_gemm_cmplx_blocked!`, so a complex column band takes its parent's route.
+#
+# Declaring `where {T}` and relying on callers to check would put the first unsupported call inside
+# the pool claim before it failed; stating the bound here makes widening a caller's type guard a
+# dispatch error at the call site instead.
 #
 # The operands are NORMALIZED to `PtrMatrix` by the caller, and the signature says so on purpose. It
 # gives the whole threaded path exactly ONE specialization per element type instead of one per
