@@ -2181,6 +2181,14 @@ _SME_GEMVT_NC in _SME_GEMVT_NCS || throw(ArgumentError(
 # and the reason is structural rather than tunable: one ZA drain per column is irreducible, it costs
 # about 7.8 ns, and at 128 rows a column's own stream is only 4 KB. Narrowing the drain from four ZA
 # groups to one would remove three folds out of five ops and still land above the NEON time.
+# ⛔ HIDING THE DRAIN RATHER THAN NARROWING IT IS ALSO MEASURED AND ALSO LOSES. A pair-unrolled
+# variant accumulating even column blocks in ZA tiles 0-3 and odd blocks in the idle tiles 4-7, so a
+# block's windows carry no dependency on the previous block's vertical read, is bitwise identical and
+# reads 1.11-1.15x warm and 1.03x cold at this cell and 1.00 at every larger one. It confirms the
+# latency is real — about 74 cycles a group, hidden by 32 row windows and not by the 4 this cell has —
+# and prices recovering it at a tenth of what the cell needs. Five further mechanisms are measured
+# dead here: the ZA fold itself, the zero-mask width, the zero, loop unrolling, and explicit `prfm`
+# prefetch (1.002x here, 0.197x at m=1024).
 # Accelerate reaches about 457 GB/s here, which is matrix-unit throughput at a per-column cost this
 # kernel shape does not have. Moving this cell needs a different decomposition, not a better constant.
 #
