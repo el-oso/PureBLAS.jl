@@ -18,15 +18,18 @@
 # Not a replacement for `fleet_freqlock.sh verify`, which is still the only pre-run check. This is the
 # post-hoc one that gates a publish.
 #
-# THE SECOND SIGNAL, and it is not cross-arm at all: each cell also records the MINIMUM clock sampled
-# around its timing windows (`flo`), compared against the box's own pinned base. Cross-arm cannot see a
-# whole-run droop, because `flo|fhi` is stamped once per cell and both arms of a same-run pair
-# therefore carry the identical range and agree perfectly.
+# THE SECOND SIGNAL, and it is not cross-arm at all: each arm records the MINIMUM clock sampled around
+# its own timing windows (`flo`), compared against the box's pinned base. Cross-arm cannot see a
+# whole-run droop, because the arms of a same-run pair are measured minutes apart at the same clock and
+# agree with each other perfectly while both sit below the pin.
 #
 # It is a BOUNDARY sampler, not a mid-window one: `_khz_sample!` runs immediately before and after each
 # arm's `@be` window, so what it catches is a droop still present at some boundary. A throttle that
-# begins and ends strictly inside a window is invisible to it. It runs for SERIAL arms only — see the
-# note at the check itself for why a threaded arm has no valid referent here.
+# begins and ends strictly inside a window is invisible to it.
+#
+# WHICH RECORDS QUALIFY is decided by each record's own `span` token, never by the filename — see the
+# token table at the check itself. A `threads` record is refused and counted, because its figure is a
+# sysfs reading that can come from an idle core rather than a clock anything ran at.
 #
 #   bench/check_arm_clocks.sh [tol_pct]      # default 3; every plots_data_* AND mt_data_* cache
 set -u
@@ -47,10 +50,10 @@ fi
 bad=0
 for f in "${files[@]}"; do
     printf '── %s\n' "$(basename "$f" .txt | sed 's/^plots_data_//')"
-    # A threaded cache: its PB arms ran on workers, so the per-cell clock samples a core that was not
-    # doing the work. The in-window check below stands down for those; the cross-arm check does not.
-    mt=0; case "$f" in *mt_data_*) mt=1 ;; esac
-    out=$(awk -F'\t' -v TOL="$tol" -v MT="$mt" '
+    # NOTHING IS KEYED ON THE FILENAME. Which check a record qualifies for is decided by the record own
+    # `span` token, so a mixed cache — an mt file still holds `core`-sampled dual cells — is judged
+    # row by row, and a cache passed under another name cannot flip a check on.
+    out=$(awk -F'\t' -v TOL="$tol" '
         /^#pbbench/ { if (match($0, /base=[0-9]+kHz/)) base = substr($0, RSTART + 5, RLENGTH - 8) + 0; next }
         /^#/ { next }
         NF >= 4 {
@@ -62,49 +65,24 @@ for f in "${files[@]}"; do
                 # Counting from the end lands on `fhi`, the in-window MAXIMUM — the one clock field a
                 # throttle cannot move, so a cell that ran at half speed reads as perfectly locked.
                 fq = a[5] + 0
-                # In-window MINIMUM against this box own base clock.
+                # In-window MINIMUM against this box own base clock, for the PB arms only — a cached
+                # vendor arm carries the state of the epoch it was measured in and is never re-run.
                 #
-                # SERIAL ARMS ONLY, and that is a correctness limit rather than a scoping preference.
-                # `_cell_khz`/`_khz_range!` read `/proc/self/stat` field 39 — the MAIN thread current
-                # CPU. For a serial arm the main thread IS the work, so the reading is the work clock.
-                # For a threaded arm the workers are on other cores and the driver spins then yields,
-                # so the sampled core can report its IDLE frequency while every worker runs at base.
-                # Measured: galen `trsmR@512` records flo = 1066 MHz against a 3701 MHz base while
-                # every arm in that cell posts full throughput, and `trsm@1000` records 1714 MHz while
-                # OpenBLAS and AOCL post the HIGHEST figures of their ladder. A real drop would slow
-                # every arm in the window; these slow none of them.
+                # THE TOKEN DECIDES, PER RECORD, because it names how the figure was obtained:
+                #   core      — one sysfs read of the core the main thread is on. Valid for a SERIAL
+                #               arm, where that core is the work.
+                #   mtanchor  — a fixed pure-Julia reduction run on every pinned core and timed, scaled
+                #               against its own first-window reference. Valid for a THREADED arm: it
+                #               wakes the cores and measures them, so an idle core cannot fake it.
+                #   threads   — RETIRED sysfs min-over-threads. NOT a clock, and refused below.
                 #
-                # Restricted to `pb` for the same reason the rest of this script is: a cached vendor
-                # arm carries the state of the epoch it was measured in and is never re-run.
-                # THE IN-WINDOW CHECK IS VALID ONLY FOR A SINGLE-THREADED RUN, because `flo` only
-                # describes the work when the sampled thread IS the work.
-                #
-                # `flo` is the minimum `scaling_cur_freq` over the threads `_cell_khz_span` admits, and
-                # that filter cannot do what it intends: `/proc/<tid>/stat` state `R` means running OR
-                # RUNNABLE, and field 39 is the CPU the thread LAST ran on, so a just-woken pool worker
-                # is sampled against a core that is still idle. On an idle core the value is the
-                # governor setpoint or a stale tick average, not a clock anything executed at. The
-                # signature: `flo` equal to the pin EXACTLY appears in threaded records and in no
-                # serial record on any box.
-                #
-                # Under a hard pin (`scaling_min_freq == scaling_max_freq`) there is no P-state to drop
-                # to, so a sub-pin reading on a threaded arm is the sampler, not a throttle. Serial
-                # records carry no such artifact — their `flo` stays within 2% of base across every
-                # cell on all three boxes — which is why the check runs there and only there.
-                #
-                # ⚠ CONSEQUENCE, stated because it is a real loss and not a tidy-up: a threaded cache
-                # now has NO check that compares its run to its pin FROM BELOW. The cross-arm check
-                # below is cross-EPOCH only — arms measured in the same run share one stamp and read
-                # ~0% against each other — and `check_clock_outliers.sh` scans the serial caches by
-                # default. Repairing that needs a clock measured in TIME on the cores that did the work
-                # (the `anchor` construction), not a kernel estimate read from sysfs.
-                #
-                # `MT` is derived from the filename, which is a PROXY for "this run had threads" and
-                # the weakest part of this: the range is stamped once per CELL (`_khz_range!` resets per
-                # cell and `_stamp` writes the same lo/hi to every arm record), so no per-record token
-                # can distinguish the arms until the range is stamped per ARM. That is the prerequisite
-                # for a finer rule here.
-                if (base > 0 && n >= 8 && a[1] == "pb" && !MT) {
+                # (NO APOSTROPHES in this awk program: it is single-quoted and one would end the string.)
+                span = (n >= 9) ? a[8] : "core"
+                # A `threads` record is counted so the summary can say how many were refused and why,
+                # rather than leaving the reader to wonder where the cells went.
+                if (a[1] == "pb_mt" && span == "threads") refused++
+                if (base > 0 && n >= 8 && \
+                    ((a[1] == "pb" && span == "core") || (a[1] == "pb_mt" && span == "mtanchor"))) {
                     flo = a[6] + 0
                     if (flo > 0) {
                         lotot++
@@ -155,15 +133,15 @@ for f in "${files[@]}"; do
                 if (looff == 0) printf "   => in-window clock: all %d PB cells held base (tolerance %s%%)\n", lotot, TOL
                 else            printf "   => in-window clock: %d/%d PB cells fell below base, worst -%.0f%% (tolerance %s%%)\n", looff, lotot, loworst, TOL
             }
-            # ABSTAIN OUT LOUD, on the line the verdict would have occupied. A skip that prints
-            # nothing is indistinguishable from a check that passed, and this project has a recorded
-            # case of a silently skipped group reporting success while 112 cells stayed stale and were
-            # published. A reader of this output must be able to see that the check did not run.
-            else if (MT) {
-                print "   => in-window clock: NOT RUN on a threaded cache — `flo` samples threads that may be"
-                print "      runnable-but-idle, so it does not describe the clock the work ran at (see the note in"
-                print "      this script). This cache therefore has NO below-pin check at all; the cross-arm result"
-                print "      below is cross-EPOCH only and does not substitute for one."
+            # ALWAYS, not only when nothing was checked. A mixed cache reports both lines: the dual
+            # cells of an mt file carry a `core`-sampled `pb` arm and are genuinely checkable, so a
+            # "held base" verdict on them sits beside hundreds of refused threaded records and would
+            # otherwise read as coverage of the whole file.
+            if (refused > 0) {
+                printf "   => in-window clock: %d record(s) REFUSED — written by the retired sysfs min-over-threads\n", refused
+                print  "      sampler, whose values are not clocks (a runnable-but-idle core reads the setpoint). Those"
+                print  "      cells have NO below-pin check; re-sweep to get `mtanchor` records, which this check does"
+                print  "      accept. The cross-arm result below is cross-EPOCH only and is not a substitute."
             }
             if (tot == 0 && looff == 0) { print "   no cells carry both a pb and a reference clock — cross-arm check skipped"; exit 0 }
             if (tot > 0 && off == 0) printf "   => cross-arm: all %d cells within %s%% (worst %.1f%%)\n", tot, TOL, worst

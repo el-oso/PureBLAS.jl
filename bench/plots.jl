@@ -500,13 +500,22 @@ _round_arms(r::Int) = circshift(_ACTIVE_ARMS, r - 1)
 # measurement, rather than at save time: a run that measures L1 at 14:00 and CL3 at 17:00 must not write
 # 17:00 against the L1 cells, which is exactly the imprecision the v2 single header commit had.
 function _stamp(acc::ArmData)
-    lo, hi = _khz_range!()          # observed across THIS cell's windows; resets for the next cell
-    return CellData(
-        a => ArmRec(
+    clo, chi = _khz_range!()         # the cell-wide fallback, for an arm that took no sample
+    out = CellData()
+    for (a, q) in acc
+        lo, hi = get(_ARM_KHZ, a, (clo, chi))
+        out[a] = ArmRec(
             Libc.strftime("%Y-%m-%dT%H:%M", time()), _COMMIT, _run_anchor(), _cell_khz(), lo, hi,
-            _ANY_MT ? "threads" : "core", q
-        ) for (a, q) in acc
-    )
+            # THE TOKEN NAMES THE QUANTITY, so a reader can tell a figure it can trust from one it
+            # cannot. `mtanchor` is the time-based all-cores probe; `threads` is the retired sysfs
+            # min-over-threads sampler, whose values are not clocks (a parked core reads the setpoint)
+            # and which readers must refuse; `core` is the single-core sysfs read, valid for a serial
+            # run because there the sampled core IS the work.
+            _ANY_MT ? "mtanchor" : "core", q
+        )
+    end
+    _arm_khz_reset!()
+    return out
 end
 
 # Achieved clock of the core THIS PROCESS is currently on, in kHz. Reads `/proc/self/stat` field 39 for
@@ -522,6 +531,83 @@ end
 # and after every arm's timing window (see the measurement loop); `_khz_range!` returns the observed
 # (min, max) and resets for the next cell. A zero sample means "unreadable" and is ignored rather than
 # treated as a 0 Hz clock.
+# ── THE THREADED CLOCK, MEASURED IN TIME ─────────────────────────────────────────────────────────────
+#
+# `scaling_cur_freq` cannot answer "what clock did the WORKERS run at". `/proc/<tid>/stat` state `R`
+# means running OR RUNNABLE and field 39 is the CPU a thread LAST ran on, so a just-woken pool worker is
+# sampled against a core that is still idle, where the file reports the governor setpoint or a stale
+# tick average. The signature that proves it: a sampled value equal to the pin EXACTLY appears in
+# threaded records on all three fleet boxes and in zero serial records.
+#
+# So do what `_anchor_secs` already does for the serial case and measure the machine in TIME instead —
+# but on every pinned core at once. A fixed, PURE-JULIA reduction per thread, joined: the join waits for
+# the slowest core, so the figure is the achieved speed of the worst core, which is exactly the quantity
+# a throttle check wants. Pure Julia for the same reason the serial anchor is: it must move with the
+# MACHINE, not with the library under test.
+#
+# One array per thread, L2-resident, so each core is compute-bound on its own data rather than the set
+# of them being memory-bound together — a bandwidth-bound probe would report contention as throttling.
+const _ANCHOR_MT_N = 1 << 14                      # 16K Float64 = 128 KB per thread
+const _MT_ANCHOR_BUFS = Vector{Vector{Float64}}()
+const _MT_ANCHOR_SINK = Ref(zeros(Float64, 0))
+function _anchor_mt_secs()
+    nt = Threads.nthreads()
+    if length(_MT_ANCHOR_BUFS) != nt
+        resize!(_MT_ANCHOR_BUFS, nt)
+        for i in 1:nt
+            _MT_ANCHOR_BUFS[i] = fill(1.0000001, _ANCHOR_MT_N)
+        end
+        _MT_ANCHOR_SINK[] = zeros(Float64, nt)
+    end
+    bufs = _MT_ANCHOR_BUFS
+    sink = _MT_ANCHOR_SINK[]
+    function once()
+        Threads.@threads :static for i in 1:nt
+            s = 0.0
+            b = bufs[i]
+            for j in eachindex(b)
+                s += b[j] * b[j]
+            end
+            sink[i] = s
+        end
+        return nothing
+    end
+    once()                                         # warm: first touch compiles and faults the pages
+    # SMALL BUDGET ON PURPOSE: this runs twice per arm-round, so 8 samples of a ~10 µs reduction is
+    # tens of microseconds against windows of 0.15-2 s. A larger budget would start to matter.
+    b = @be once() evals = 1 samples = 8 seconds = 0.02
+    return median(Float64[s.time for s in b.samples])
+end
+# Reference value for the ratio, measured once per process on the first threaded window — the same
+# lazily-measured shape as `_run_anchor`.
+const _MT_ANCHOR_REF = Ref{Union{Nothing, Float64}}(nothing)
+function _mt_anchor_ref()
+    isnothing(_MT_ANCHOR_REF[]) && (_MT_ANCHOR_REF[] = try
+            _anchor_mt_secs()
+        catch
+            0.0
+        end)
+    return _MT_ANCHOR_REF[]::Float64
+end
+# An EFFECTIVE kHz for a threaded window, so the stored field keeps its unit and every existing reader
+# keeps working: the cores ran `ref/now` as fast as they did at the reference, so scale the pin by that.
+# `base` here is the setpoint the box is pinned to, which is what the audit compares against.
+#
+# ⚠ WHAT THIS CANNOT SEE: a box throttled for its WHOLE run throttles the reference too, so the ratio
+# reads 1.0. That case is `fleet_freqlock.sh verify` pre-run, the POST-LOCK check after, and the
+# across-run serial `anchor` comparison — not this field.
+function _mt_effective_khz(base_khz::Int)
+    ref = _mt_anchor_ref()
+    (ref > 0 && base_khz > 0) || return 0
+    now = try
+        _anchor_mt_secs()
+    catch
+        return 0
+    end
+    now > 0 || return 0
+    return round(Int, base_khz * min(1.0, ref / now))
+end
+
 const _KHZ_LO = Ref(typemax(Int))
 const _KHZ_HI = Ref(0)
 function _khz_obs!(v::Int)
@@ -546,76 +632,26 @@ function _cell_khz()
     end
 end
 
-# THE THREADED SAMPLER. `_cell_khz` reads the core the MAIN thread is on, which is the core under test
-# for a serial window and an idling spectator for a threaded one: the pool driver spins then yields
-# while its workers do the work. So a threaded `pb_mt` window records the lock and can never be flagged
-# — measured on mt_data_avx512_wintermute, 0 of 937 cells.
-#
-# The workers are threads of THIS process, and so are OpenBLAS's and AOCL's, so `/proc/self/task/*/stat`
-# field 39 names every core actually in use. Reading each one's `scaling_cur_freq` and keeping the
-# EXTREMES gives a range that a package power limit shows up in.
-#
-# ONLY THREADS IN STATE `R` COUNT, and that filter is the difference between a signal and noise. A
-# PARKED thread's core reads LOW, not the setpoint, so a minimum over every thread reports a throttle on
-# a serial arm that cannot possibly have one — measured in a live `arms=pb,pb_mt` run, the serial `pb`
-# arm recorded flo 2475745 against a 2813000 setpoint, 12% down, with one thread doing the work.
-# Filtering `/proc/<tid>/stat` field 3 to `R` separates them cleanly, same box, axpy over 8 MB:
-#
-#                       every thread        RUNNING only
-#     serial            2784997  -1.0%      2793382  -0.7%
-#     6 threads         2083225 -25.9%      2261582 -19.6%
-#
-# (An earlier control claimed a blocked core reads the SETPOINT. It does — but only while its siblings
-# are SPINNING and keeping the package awake. Genuinely parked threads are the case that matters and
-# they read low. Do not re-derive that the unfiltered minimum is usable.)
-#
-# WHAT IT CATCHES, reproduced with a 6-thread Julia axpy against a 2813000 kHz setpoint: L1-resident
-# 32 KB -6.4%, L2-resident 512 KB -3.1%, L3-resident 8 MB -18.2%, DRAM 640 MB -0.7%. The signal is
-# cache-resident POWER, not memory traffic — a DRAM-bound loop is memory-stalled and draws little. The
-# single-core sampler reads -0.6% for every one of those, i.e. it sees none of it.
-#
-# COST, and why this is gated rather than universal: 522us against 33us for the single-core read, 16x.
-# Two samples per arm window over a full sweep is ~31s a box, which is 0.6% of a ~90 minute run — but
-# it also touches 15 files between windows, and a tiny-n cell's timing is cache-sensitive enough that
-# perturbing the serial gate for data it does not need would be the wrong trade. Threaded runs pay it;
-# serial runs keep the single read and are byte-for-byte unaffected.
-function _cell_khz_span()
-    lo = typemax(Int); hi = 0
-    try
-        seen = Set{Int}()
-        for d in readdir("/proc/self/task")
-            fs = try
-                split(read("/proc/self/task/$(d)/stat", String))
-            catch
-                continue                         # thread exited between readdir and read — normal
-            end
-            length(fs) >= 39 || continue
-            fs[3] == "R" || continue             # RUNNING only — a parked thread's core reads low
-            c = something(tryparse(Int, fs[39]), -1)
-            c < 0 && continue
-            c in seen && continue
-            push!(seen, c)
-            f = "/sys/devices/system/cpu/cpu$(c)/cpufreq/scaling_cur_freq"
-            isfile(f) || continue
-            v = something(tryparse(Int, strip(read(f, String))), 0)
-            v > 0 || continue
-            lo = min(lo, v); hi = max(hi, v)
-        end
-    catch
-        return (0, 0)                            # no cpufreq (ARM) — degrades to "unknown", never off-lock
-    end
-    return hi == 0 ? (0, 0) : (lo, hi)
-end
 
 # The one call the measurement loops make. A threaded run widens the observed range to every core its
 # own threads sat on; a serial run keeps the single-core read it has always taken.
-function _khz_sample!()
-    if _ANY_MT
-        lo, hi = _cell_khz_span()
-        _khz_obs!(lo); _khz_obs!(hi)
-    else
-        _khz_obs!(_cell_khz())
-    end
+#
+# PER ARM, because the record is per arm. `_khz_range!` resets per CELL, so a single range was written
+# to every arm of a cell and `pb`/`pb_mt` came out byte-identical in these fields across all 951 cells
+# of a sweep — which made any per-record interpretation of them fiction. The accumulator below is keyed
+# by arm name and reset per cell, so each record carries the windows that measured THAT arm.
+const _ARM_KHZ = Dict{String, Tuple{Int, Int}}()
+_arm_khz_reset!() = (empty!(_ARM_KHZ); nothing)
+function _khz_sample!(arm::AbstractString)
+    # THREADED: time the cores. SERIAL: read the one core that is the work. A threaded run gets the
+    # time-based probe because `scaling_cur_freq` on a worker thread can be an idle core's reading; the
+    # probe does not care whether the cores were idle a moment ago, because it wakes them and times
+    # them. That is what makes it valid at a window BOUNDARY, where the sysfs read is not.
+    v = _ANY_MT ? _mt_effective_khz(_lock_state()[2]) : _cell_khz()
+    v > 0 || return nothing
+    lo, hi = get(_ARM_KHZ, arm, (typemax(Int), 0))
+    _ARM_KHZ[arm] = (min(lo, v), max(hi, v))
+    _khz_obs!(v)                    # the cell-wide range still feeds the header's own summary
     return nothing
 end
 # Measured ONCE per run, lazily, on the first cell stamped — not at save time. Save time is the END of a
@@ -913,9 +949,9 @@ function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15
                 # the field was present, the samples were never taken, and `cellcycles.jl` correctly
                 # reported `wobble ?` for cells that had in fact just been measured. If a third
                 # measurement path is ever added it needs these two calls too.
-                _khz_sample!()
+                _khz_sample!(a)
                 b = @be mk(s) (c -> w(c, reps)) evals = 1 samples = samples seconds = seconds
-                _khz_sample!()
+                _khz_sample!(a)
                 qs[a] = _qvec(b)
             end
             for (a, q) in qs
@@ -1002,7 +1038,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
                 # range, so a cell that drifted mid-measurement says so instead of silently reporting a
                 # single number that was never true. Two /sys reads per arm-round against a ≥0.5 s
                 # window is unmeasurable overhead.
-                _khz_sample!()
+                _khz_sample!(a)
                 b = @be [mk(s) for _ in 1:reps] (
                     cs -> (
                         v = 0.0; for c in cs
@@ -1010,7 +1046,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
                         end; v
                     )
                 ) evals = 1 samples = samples seconds = secs
-                _khz_sample!()
+                _khz_sample!(a)
                 qs[a] = _qvec(b)
             end
             for (a, q) in qs
