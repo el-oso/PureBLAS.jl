@@ -78,6 +78,18 @@ Follow `ROADMAP.md` phases 1→3 (real → complex → dual). Additions from the
 
 ## Pass 2 — NEON-MT
 
+- [ ] ⛔ **THREADING `symv`, `trmv` OR `trsv` NEEDS THE gemv-T SCRATCH PREFIT IN THE SAME CHANGE.**
+      `_SME_GEMVT_SCR` (`src/blas3/sme_kernel.jl`) is a per-thread strip grown by `_ws_grow!` inside
+      `_sme_gemvt_cabi`. It is safe today only because **SME eligibility is decided at the threaded
+      entry and never inside a chunk, so every SME route declines the worker pool before a worker
+      exists** — `_gemv!` tests `_sme_gemvt_eligible` ahead of its thread seam, `_symv_split!` is
+      selected ahead of symv's, and `trmv`/`trsv` fork no task. Measured: symv at n=2428 with four
+      workers available dispatches no pool. Thread any of those three and the growth happens inside a
+      published job, where the driver spins rather than yields and so reaches no GC safepoint — a
+      swallowed worker exception or a silent hang, by interleaving. The fix is a driver-sized,
+      worker-indexed strip prefit before publishing, as `_trmmr_prefit!` does. A different owner does
+      not fix it: the growth is the hazard, not the ownership.
+
 - [ ] **The pool has no architecture guard anywhere.** No `isapple`/`aarch64`/`Sys.ARCH` in
       `src/blas3/gemm.jl`, `src/arena.jl` or `src/workspace.jl` — it is plain Julia tasks and should
       run as-is. Verify that before assuming it needs porting.
