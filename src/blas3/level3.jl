@@ -24,8 +24,24 @@ const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ 
 # these are directional. REAL SIDE-L ONLY: side R takes a flat panel loop and a packed route rather
 # than this recursion, and complex, generic and the trsm bases keep `_TRMM_BASE` — none of them is
 # measured here.
-# PDM: Literal — recursion-overhead floor, flat 32-48, the same floor `_POTRF_BASE` carries. | tune: candidate
-const _TRMM_BASE_R = min(@load_preference("trmm_base_r", 32)::Int, _L3_NB)
+# ⛔ SME ONLY, AND MEASURED SO — OFF SME THIS COSTS 35.5% AT A RAGGED k. On Zen3 (locked 3701 MHz,
+# 10 rounds of 60 samples, fresh operands per sample, the probe reporting the base it compiled with),
+# side-L real square Float64 through the public entry:
+#
+#     k        base 128    base 32     verdict
+#     64        7.808 us    7.671 us   base 32 1.8% faster, distributions do not overlap
+#     100       2.596 us    3.519 us   base 32 35.5% SLOWER, distributions do not overlap
+#     128      52.82 us    51.62 us    base 32 2.3% faster, no overlap
+#     256     377.5 us    375.1 us     wash, overlapping
+#
+# The win above depends on the off-diagonal gemms being dramatically faster than `_trmm_small!`, which
+# is an SME property: 166-417 GFLOP/s against 40-46. Without a matrix unit they are not faster, and at
+# k=100 the recursion reaches them RAGGED (100 -> 50+50 -> 25+25), where they are worse. So the
+# justification is not merely unproven off Apple, it is false there, and specifically at sizes that are
+# not powers of two — 64, 128 and 256 all read favourably on that box and only n=100 exposes it.
+# Hence `_L3_NB` off SME, which keeps every non-SME box bit-for-bit on the path it has today.
+# PDM: Literal — recursion-overhead floor, flat 32-48, the same floor `_POTRF_BASE` carries; SME-only, the x86 side measured and regressing. | tune: candidate
+const _TRMM_BASE_R = min(@load_preference("trmm_base_r", _SME_F64 ? 32 : _L3_NB)::Int, _L3_NB)
 # PDM: Literal — trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 64..1024 within noise on Zen3+Zen4+Zen5 except two non-replicating cells <=2.5% (2026-08-21)
 const _TRMM_RPANEL = @load_preference("trmm_rpanel", 512)::Int
 @inline _trmm_rpanel() = (f = _FKR_trmm_rpanel[]; f >= 0 ? f : _TRMM_RPANEL)
