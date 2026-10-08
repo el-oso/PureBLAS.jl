@@ -197,25 +197,36 @@
     @test P._CPOTRF_BASE == P._at_cpotrf_base(P._HW)
     @test P._CPOTRF_NBMAX == P._at_cpotrf_nbmax(P._HW)
     @test P._CPOTF2_MR == P._at_cpotf2_mr(P._HW)
-# ── strassen_min / trmm_rpack: FLAT LITERALS — the datapath predicate was FALSIFIED ──────────────
+# ── strassen_min / trmm_rpack: the datapath predicate was FALSIFIED for both ─────────────────────
 # These used to key on `_datapath_bytes >= 64`, on the reasoning that "Zen3 and Zen4 measured FLAT
 # while Zen5 wants very different values". The 2026-09-09 datapath fix destroyed that argument: the
 # "Zen5" box supplying the native-512 optimum is Zen5, which reads FP256 from CPUID
-# Fn8000_001A — a 32 B datapath, the SAME side as Zen3/Zen4. So the fleet evidence is really
-# "flat on two boxes, 256/1792 wins on the third", which is a literal, and the old predicate would now
-# hand Zen5 the arm it measured as WORSE.
+# Fn8000_001A — a 32 B datapath, the SAME side as Zen3/Zen4. So the old predicate would now hand Zen5
+# the arm it measured as WORSE, and no descriptor field belongs in either value.
 @test P._datapath_bytes(zen3) == 32
 @test P._datapath_bytes(zen4) == 32
 @test P._datapath_bytes(zen5) == 64      # Granite Ridge / Turin: genuinely native
 @test P._datapath_bytes(zen5m) == 32     # Strix / Krackan: FP256, lands with zen4
-# One value everywhere — no descriptor changes it.
+# `trmm_rpack` is one value everywhere. `strassen_min` is DERIVED from the gemm blocking width: a
+# Strassen leaf is `n ÷ 2`, so the floor is the smallest `n` whose leaf clears `_at_l3_nb`, which is
+# the criterion the deeper levels already apply through `_STRASSEN_BASE`.
 for d in (zen3, zen4, zen5, zen5m, tigerlake)
-    @test P._at_strassen_min(d) == 256
+    @test P._at_strassen_min(d) == 2 * P._at_l3_nb(d) + 1
     @test P._at_trmm_rpack(d) == 1792
 end
-# Live machine agrees with the formula applied to its own detected _HW.
+# Every fleet descriptor has 512 KB or more of L2, so the blocking width caps at 128 and the floor is
+# 257 — a SMALL-L2 descriptor must move it, or the derivation is a literal wearing a formula.
+for d in (zen3, zen4, zen5, zen5m, tigerlake)
+    @test P._at_l3_nb(d) == 128
+    @test P._at_strassen_min(d) == 257
+end
+@test P._at_l3_nb((; zen3..., l2 = 128 * 1024)) == 64       # 64 KB tile: leaf must clear 64
+@test P._at_strassen_min((; zen3..., l2 = 128 * 1024)) == 129
+# Live machine agrees with the formula applied to its own detected _HW, and `_L3_NB` resolves through
+# the same function so the two cannot drift.
 @test P._STRASSEN_MIN == P._at_strassen_min(P._HW)
 @test P._TRMM_RPACK == P._at_trmm_rpack(P._HW)
+@test P._L3_NB == P._at_l3_nb(P._HW)
 # gemv-N m-inner: was an UNCONVERTED Measure-tier knob (a datapath-gated boolean the PDM ladder flags
 # as a violation) because the Zen5 negative justifying it had been measured at 4841 MHz against a
 # 2000 MHz base. Re-measured on all three boxes freq-locked and VERIFIED before/after, quiet: Zen3 and
