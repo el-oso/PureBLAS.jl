@@ -111,9 +111,12 @@ Follow `ROADMAP.md` phases 1→3 (real → complex → dual). Additions from the
   0.04% on the anchor, 0.3–1.7% on gemm cells, so the noise is small but the guarantee is absent.
 - **`bench/probe.sh` gives `MASK=""` for an unknown host** — pinning is `taskset`, which is Linux.
   A thread-count-sensitive measurement here has no affinity control.
-- **`bench/apple/` holds only a `Project.toml`** (the AMD-free bench env). No sync script, no lock,
-  no Apple-specific tooling. PR #4 (`bench-portable-references`) generalized `plots.jl` and
-  `probe.sh` for this box — build on that, do not re-fork them.
+- ⛔ **THERE IS NO `bench/apple/` DIRECTORY.** `git ls-tree origin/master bench/` returns nothing for
+  it; what exists for this box is this file and `docs/src/assets/apple/*.svg`. The AMD-free bench env
+  is `bench/Project.toml`, which `julia --project=bench` already uses. PR #4
+  (`bench-portable-references`) generalized `plots.jl` and `probe.sh` for this box — build on that,
+  do not re-fork them. There is also no sync path: `bench/fleet_sync.sh` has
+  `BOXES_ALL=(galen neuromancer)`, so the Apple cache is carried by hand.
 - **Two harness bugs were found on this path and fixed**; both may still bite elsewhere. `_L1REP`'s
   reps loop measured a warm buffer (a `cold` flag was added, and the fix is **unconfirmed on x86** —
   Zen3's 32 MiB L3 is the candidate). And `BLAS.set_num_threads(1)` not constraining Accelerate, per
@@ -260,3 +263,52 @@ fresh checkout.
   staggering of the 8 streams' row offsets is the only unfalsified mitigation and is unmeasured.
 - ⚠ The ragged-row window, the strided-register load and the ZA-internal drain are all SHIPPED and
   measured; `sme_kernel.jl` carries their numbers. The remaining gemv-T lever is the lda one above.
+
+## Reading the Apple caches
+
+Two conventions here will produce a wrong number quietly. Both were hit in one sitting.
+
+- ⛔ **THE TWO APPLE CACHES SIT AT DIFFERENT COMMITS, AND A SELF-SPEEDUP ACROSS THEM IS A
+  CROSS-COMMIT RATIO.** The serial arms live in `bench/plots_data_neon_*.txt` and the threaded arms
+  in `bench/mt_data_neon_*.txt`, and the two are swept separately, so their `commit=` stamps drift
+  apart. Measured 2026-10-08: `plots_data` at `cc154a7d` (2026-10-04) against `mt_data` at
+  `ca717b40` (2026-10-07) — eight days and many merges. Dividing a `pb` arm from the first by a
+  `pb_mt` arm from the second compares two different libraries. **Read both `commit=` stamps before
+  computing any self-speedup, and discard the figure if they differ.**
+  This is a property of the Apple cache LAYOUT rather than of self-speedup: the AMD `mt_data_*`
+  caches carry their own `pb` arm in the same file, so the ratio is same-commit there by
+  construction. Here it is cross-commit by default.
+  ✅ AND IT IS AN `arms=` SELECTION, NOT A CODE CHANGE. `_ANY_MT` (`plots.jl:287`) sends a run to
+  `mt_data_*` when ANY threaded arm is selected, while `_DO_PB` independently decides whether the
+  serial `pb` arm is measured — so `arms=pb,pb_mt` writes BOTH arms into `mt_data_*` and a
+  self-speedup from it is same-commit by construction. That is how the AMD caches came to carry their
+  own serial arm: an arms selection, not a layout decision. The Apple mt sweep selected `pb_mt`
+  without `pb`.
+  ⛔ IF THE APPLE mt CACHE IS EVER REFRESHED, INCLUDE `pb` IN THE SAME RUN. Re-sweeping `pb_mt` alone
+  is what produced 110 per-cell cross-commit cells in one AMD cache, and that is WORSE than drifting
+  across two files: the file header then reads a single commit while individual cells disagree. The
+  per-arm stamp is the evidence; the file header is not.
+  ✅ AND IT IS AN `arms=` SELECTION, NOT A CODE CHANGE. `_ANY_MT` (plots.jl:287) sends a run to
+  `mt_data_*` when ANY threaded arm is selected, while `_DO_PB` independently decides whether the
+  serial `pb` arm is measured — so `arms=pb,pb_mt` writes BOTH arms into `mt_data_*` and the ratio is
+  same-commit by construction. That is how the AMD caches came to carry their own serial arm; it was
+  an arms selection, not a layout decision. The Apple mt sweep selected `pb_mt` without `pb`.
+  ⛔ IF THE APPLE mt CACHE IS EVER REFRESHED, INCLUDE `pb` IN THE SAME RUN. Re-sweeping `pb_mt`
+  alone is what produced 110 per-cell cross-commit cells in one AMD cache — and that is WORSE than
+  drifting across two files, because the file header then reads one commit while individual cells
+  disagree. The per-arm stamp is the evidence; the file header is not.
+- ⚠ **A CACHED SAMPLE IS `reps` CALLS, NOT ONE.** `bench/plots.jl` builds each sample from
+  `reps = repsof(s)` fresh contexts, default `_reps_cubic(s) = clamp(20_000_000 ÷ s^3, 1, 512)` —
+  20 at n=100, 9 at n=128, 1 from n=256 up. So a cached figure compared against a per-call probe is
+  wrong by that factor: cached `syrk` n=100 reads 304.61 us against a probe's 15.5, and 304.61/15.5
+  is 19.65. ✅ It CANNOT affect a ratio: `reps` is a pure function of the size, computed once per
+  cell and passed to every arm, so it cancels exactly in a self-speedup or a gate ratio. It bites
+  only a cache-against-probe ABSOLUTE comparison.
+  ⚠ The tell is cheap and worth looking for first: a cached `zgemm` at n=8 reads 5.6e-5 s, absurd
+  for one 8x8 product and unremarkable for 500 of them.
+- **Pair every threaded arm with the serial arm of the SAME cell and commit before believing
+  either.** On the 2026-10-07 `mt_data` cache, 15 of 591 cells have a threaded arm whose own samples
+  span more than 1.5x — worst `LP potrsU` 256 at 4.71x, `LP gttrf` 256 at 2.55x, `LP potrfU` 256 at
+  2.19x, `LP trtrs` 1024 at 2.09x, `L3 syr2k` 128 at 2.03x, `L3 symm` 100 at 1.95x. Each published
+  median there sits inside one mode of a bimodal arm. That spread is internal to one arm at one
+  commit, so it survives both errors above.
