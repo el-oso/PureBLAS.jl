@@ -1946,12 +1946,35 @@ two sets of figures are not comparable row by row:
      `gemvT 0.34` describe code that no longer runs. L2 needs re-measuring before any gemv gap is
      ranked or worked on. (`bench/cache_staleness.sh` reports this now that it runs on macOS at all;
      it was silently answering "no cache files found" on this box until #19.)
+     **Re-measured: L2 median 0.930, 62 of 109 cells at or above 0.9, `gemvT`'s worst cell 0.335.** So
+     L2 is close to this phase's 0.9 target, and any table above that still ranks it the worst group
+     in the library is reading the pre-integration figures.
 
-1.2  **Re-derive the Level-3 pack cutoffs.** `syrk` and `syr2k` did not move at all when gemm went
-     from 44 to 500 GFLOP/s — 0.13 and 0.14 before and after. They take a private packed path above a
-     size cutoff and never reach gemm. `_symm!` documents the same trade in its own comment: it chose
-     the packed path because materialize-plus-gemm was slower, which was true at 44 GFLOP/s.
-     No new kernel. Re-derive, then measure.
+1.2  **~~Re-derive the Level-3 pack cutoffs~~ — BOTH HALVES LANDED, in opposite senses. What remains
+     is a different item; see below.** The original read: `syrk`/`syr2k` did not move when gemm went
+     from 44 to 500 GFLOP/s (0.13 and 0.14 before and after) because they take a private packed path
+     above a size cutoff, and `_symm!` chose the packed path for the same reason.
+
+     **symm — the packed route is GONE, not re-cut.** `level3.jl:7388` is now a header on the
+     dispatch: *"REAL symm ALWAYS MATERIALIZES, and the packed symmetric kernel is not on its route at
+     all."* symm has gemm's flop count (2·n²·m — symmetry saves A-traffic, not arithmetic) and the
+     packed kernel measured 16.8% slower than gemm at n=2048 and 30.4% at 4096; re-measured on the
+     gate 2026-09-20, packed against materialize read 1.041 / 1.133 / 1.278 at n=1024/2048/4096, all
+     against packed. The replacement is the unconditional `_symm_materialize!` at `level3.jl:7420`,
+     whose O(n²) cost against an O(n³) product is ~0.7 ms of 415 ms at n=2048, i.e. 0.16%. Complex
+     keeps packed paths; the real ones are gone (`level3.jl:7400`). ⚠ `_symm_packed` does not appear
+     anywhere in `src/` — not even as dead code — so this item as written sends a reader looking for a
+     route that does not exist.
+
+     **syrk — the cut was re-derived, and the remaining work is a KERNEL, not a cutoff.**
+     `_SYRK_SME_MIN` is `2 * _SME_MIN_EXACT` = 96 (`level3.jl:6822`), derived rather than fitted:
+     `_rksplit` halves n onto a whole SME tile, so the first off-diagonal block clears the tile-exact
+     floor exactly when n ≥ 2·`_SME_MIN_EXACT` (`level3.jl:6795`). Measured against Accelerate: n=128
+     went 0.13 → 0.26, n=256 0.15 → 0.41, nothing regressed. **What is left is raggedness, not
+     sizing:** a ragged n hands its first block a non-tile-multiple width which the floor rejects
+     again — n=100 splits 48+52 and misses where n=128 splits 64+64 and does not, and n=100 moved only
+     0.13 → 0.14. Closing it needs a kernel that accepts a non-tile-multiple shape. That is a larger
+     item than this one was.
 
 1.3  **ROUTE `trmv`'s off-diagonal to the ZA-accumulate kernel — do not port a second one.**
      Amended 2026-09-26 after measuring; the original read "port the ZA-accumulate kernel to `symv`
@@ -1993,7 +2016,15 @@ two sets of figures are not comparable row by row:
      only L1 candidates. `axpy`/`scal`/`copy`/`swap` hold nothing in ZA and are out of scope.
 
 1.5  **LP routing.** `getrf` is already 1.41 and `geqrf`/`gesvd` 0.99, all inherited through gemm.
-     `potrf` at 0.55 has private leaf kernels — the same class of problem as syrk.
+     ⚠ **The `potrf` half of this item rests on a false premise.** It read *"`potrf` at 0.55 has
+     private leaf kernels — the same class of problem as syrk."* The cell the gate reads does not go
+     through those kernels: `lapack.jl:13` states that *"the GATED F64-lower-strided path uses
+     `_potrf_f64_lower!` (faer) and NEVER reads this"* of `_POTRF_BASE`. That path reaches `trsm!` and
+     `syrk!` through `_chol_hyb_f64!`, and syrk has had an SME route from n ≥ 96 since 1.2 landed — so
+     potrf's large trailing updates already inherit SME. The quoted 0.55 is also from `cc154a7d`
+     (2026-10-04) and predates nothing relevant, but the diagnosis is wrong even where the number
+     stands: it is not a measurement of a serial private-kernel path. Re-rank this against the current
+     cache before working it.
 
 **Exit:** L3 and LP medians ≥ 0.9; gemv/symv/trmv ≥ 0.9; L1 and ger reported with evidence either
 way, including a negative result.
