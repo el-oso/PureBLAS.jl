@@ -1,0 +1,22 @@
+# pool-liveness lint baseline — witnesses that predate the lint (2026-10-08).
+# The lint fails on any flagged witness NOT listed here. Do not add to it: a NEW witness derives its
+# size from `_L1_MT_MIN` or asserts a route with an `_sme_*` predicate.
+#
+# Both entries were measured on SME hardware and both PASS there, so neither is a live defect. They
+# stay listed because each picks its size by eye, and the reason each one survives is a fact about the
+# machine rather than anything the test states.
+#
+#   * level2_tests.jl ger — PASSES, and for the reason the witness assumes. At the item's own size,
+#     `isqrt(_L3_BYTES / 8)` = 1619, `_sme_ger_eligible` is false and `_ger_workers` is 4, so the SME
+#     route declines and the pool legitimately runs.
+#
+#   * gemm_tests.jl LAPACK drivers — PASSES, but NOT because the pool always wins at that size.
+#     ⚠ At the witness size n = 2048, `_sme_owns(Float64, 2048, 2048, 2048, …)` is TRUE and a bare
+#     `gemm!` there does NOT reach the pool — SME takes the call, by design. The item survives only
+#     because its witness is `potrf!`, which reaches the pool by another route. So adding a direct
+#     `gemm!` liveness assertion at n >= 2048 beside it would fail on SME hardware, and the hardcoded
+#     2048 carries none of that.
+#
+# Retiring an entry means deriving the size or asserting the route, not deleting the line.
+level2_tests.jl::ger: the pool runs, and losing the claim gives the same answer
+gemm_tests.jl::LAPACK drivers: bit-identical at every thread count

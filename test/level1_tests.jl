@@ -668,16 +668,6 @@ end
                 P.set_num_threads(1)
                 r_asum = P.asum(x)
                 r_nrm2 = P.nrm2(x)
-                # A WITNESS THAT THE SPLIT RAN, at the one size where it must. Without it every
-                # assertion below passes on a library that declined to thread, which is how a silent
-                # gap reports green.
-                if n == 2B
-                    p = P._gemm_pool(R)
-                    P.set_num_threads(nt)
-                    g0 = @atomic p.gen
-                    P.asum(x)
-                    @test (@atomic p.gen) != g0
-                end
                 for nw in (2, nt)
                     P.set_num_threads(nw)
                     @test bitsame(P.asum(x), r_asum)
@@ -685,6 +675,33 @@ end
                 end
                 P.set_num_threads(1)
             end
+            # A WITNESS THAT THE SPLIT RAN. Without it every assertion above passes on a library that
+            # declined to thread, which is how a silent gap reports green.
+            #
+            # SIZE FROM BOTH CONSTANTS THAT GATE THREADING, as in the real item above. `_red_block`
+            # only buys enough blocks to divide between workers; `_l1_workers` refuses to thread at
+            # all below `_L1_MT_MIN` bytes, and that floor is `4 * _L1_BYTES`, so it scales with the
+            # machine — 128 KB where L1 is 32 KB, 512 KB where L1 is 128 KB. The ladder's `2B` clears
+            # the block requirement and misses the byte floor by 8x on a large-L1 box, where both
+            # types then witnessed nothing.
+            #
+            # The grid acts on the REINTERPRETED 2n reals, so the byte floor is `2n * sizeof(R)` and
+            # the size solves for `n`. No route predicate belongs here, unlike the real item:
+            # `_asum` consults `_sme_asum_ok(_et(x), …)` with the COMPLEX element type and that
+            # predicate requires `Float64`, so a complex reduction cannot take the SME path on any
+            # machine and `!sme` would be a constant.
+            # One block of margin past the floor: solving it exactly puts the witness on the cut it
+            # depends on, where `bytes < _L1_MT_MIN` decides on a single byte.
+            nwit = max(2B, cld(P._L1_MT_MIN, 2 * sizeof(R)) + B)
+            @test 2 * nwit * sizeof(R) > P._L1_MT_MIN   # clears the byte floor `_l1_workers` applies
+            @test cld(2 * nwit, B) ÷ 2 >= 2             # enough whole blocks for two workers
+            xw = randn(T, nwit)
+            p = P._gemm_pool(R)
+            P.set_num_threads(nt)
+            g0 = @atomic p.gen
+            P.asum(xw)
+            @test (@atomic p.gen) != g0
+            P.set_num_threads(1)
         end
         P.set_num_threads(1)
     end
