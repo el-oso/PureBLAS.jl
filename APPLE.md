@@ -312,3 +312,74 @@ Two conventions here will produce a wrong number quietly. Both were hit in one s
   2.19x, `LP trtrs` 1024 at 2.09x, `L3 syr2k` 128 at 2.03x, `L3 symm` 100 at 1.95x. Each published
   median there sits inside one mode of a bimodal arm. That spread is internal to one arm at one
   commit, so it survives both errors above.
+## What can run beside the matrix unit, and what it costs
+
+Measured on this box, n=2048 Float64, serial SME `gemm!` on the main thread with the pool off, timed
+while five raw `Threads.@spawn` tasks stream a NEON reduction over private buffers of one size.
+Neighbour placement verified per condition, idle control first and last, medians over 36-167 draws.
+⚠ Directional: no frequency lock exists here.
+
+| neighbours (5 cores) | what they touch | SME GFLOP/s | of alone |
+|---|---|---|---|
+| none (first / repeated) | — | 495.5 / 493.2 | 1.000 (1.005x drift) |
+| 64 KB each | ~93 GB/s each, L1-resident, **nothing below L1** | 474.5 | 0.960 |
+| 256 KB each | ~90 GB/s each, L2 port | 433.9 | 0.878 |
+| 1 MB each | ~90 GB/s each, L2 port | 432.5 | 0.875 |
+| 3 MB each (15 MB live) | exceeds L2 beside the SME panels | 231.3 | **0.468** |
+| 64 MB each | ~23 GB/s each, DRAM | 101.3 | **0.205** |
+
+Read by mechanism: **five cores busy but touching nothing below L1 cost 4%** — power and clock, and
+with no frequency lock that is the FLOOR of any six-core composition here. Adding ~450 GB/s of
+L2-port traffic that still fits beside the SME panels costs a further 8%, flat from 256 KB to 1 MB:
+that is the shared-path tax, real but modest. **L2 CAPACITY is the first-order term and the shared
+port is second-order** — pushing the SME call's own working set out of the 20 MB L2 halves it, and
+DRAM streaming from the neighbours cuts it to a fifth. The 3 MB row reproduced at 0.431x and 0.468x
+across two probes.
+
+**So side work beside an SME gemm is viable only with a small L2 footprint and no DRAM stream.** A
+gemm column chunk is the opposite on both counts — it holds its own A block at 0.3·L2 and streams B
+from memory — and so is any BLAS-2 kernel. On this cluster there is essentially nothing useful to run
+beside the matrix unit without taxing it.
+
+### ⛔ The heterogeneous SME+NEON split is falsified on throughput
+
+The idea — give the coprocessor part of a gemm and let NEON threads take the rest, on disjoint work —
+is dead before any split logic, join, or imbalance is written. Five neighbours running disjoint NEON
+gemms through `_gemm_blocked!` directly (`_SME_CALLS` delta 0 on those arms, results agreeing to
+3.5e-15):
+
+| arm | GFLOP/s |
+|---|---|
+| SME alone | 498.6 / 498.7 |
+| SME under 5 disjoint NEON gemms | 333.0 (0.668x) |
+| NEON, one thread alone | 43.3 |
+| NEON per thread under 4 NEON | 30.9 (x5 = 154.7) |
+| NEON per thread under 4 NEON + 1 SME | 26.2 (x5 = 131.1) |
+| **additive bound 333 + 131** | **464 = 0.931x of SME alone** |
+
+Both engines lose — SME by a third, NEON by 15% — and the BOUND is already below SME alone with
+nothing subtracted for the join. The noisiest arm spans 1.32x over 16 draws; its single best draw
+instead of its median gives 476 = 0.955x, so the sign does not depend on the spread. ⚠ The
+`503 + 177 = 680` arithmetic that motivated this assumed an independence the ladder above rules out:
+NEON gemm chunks sit between the "L2 port" and "L2 capacity" rows.
+
+### req#11 constrains the reduction TREE, not the engine
+
+Worth stating precisely, because the usual shorthand hides what would have to change. "Mixing
+engines violates req#11" is a CONSEQUENCE, not the axiom. req#11 fixes the ORDER in which each
+element of C accumulates its `k` chain and says nothing about which code performs it — so if two
+kernels agreed bit-for-bit per element, which engine computed a column would be irrelevant and a
+split could legally depend on `nw`.
+
+They do not agree, and the reason is locatable: `_mk_full_body` behind `_microkernel!` seeds every
+accumulator `zero(V)` (`gemm.jl:101`) and emits `vload(V, q) + cs` at tile exit (`:128`), so the
+whole `k` chain accumulates from zero and C is added ONCE at the end; the SME kernel preloads C into
+ZA and chains FMAs on top of it. Different first rounding on every tile, and no scheduling choice
+makes them equal. α placement also matches for N,N — both fold it into the A pack — but not for the
+transposed cases, where SME puts α on B.
+
+Closing it would need a C-seeded NEON tile variant, matched α placement per transpose case, and a
+bitwise test, since `test/sme_tests.jl` compares SME against a scalar reference to a TOLERANCE only.
+Whether bit-equality would then follow is unverified — kc-block boundaries, scratch edge tiles and
+the in-place routes are all unchecked. ⚠ And there is no reason to find out: what it gates loses on
+throughput by the table above. **Establish the prize before paying for the invariant.**
