@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 170 of them.
+Every `@load_preference` key in `src/` — 171 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 170 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 79 Derived · 22 Measured · 51 Literal · 18 Exempt.
-**Default form** (mechanical): 68 formula · 22 delegates · 8 sibling · 62 literal · 5 flag · 5 other.
+**Tier:** 79 Derived · 22 Measured · 52 Literal · 18 Exempt.
+**Default form** (mechanical): 68 formula · 22 delegates · 9 sibling · 62 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -114,6 +114,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_syrk_pack_cut(_HW)` | — |
 | `syrk_sme_min` | literal | Derived | the first split's off-diagonal block must clear the tile-exact floor: 2 x _SME_MIN_EXACT. | n/a, follows the tile |
 | `syrk_unified_max` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 48 : 0` | — |
+| `trmm_base_r` | sibling | Literal | recursion-overhead floor, flat 32-48, the same floor `_POTRF_BASE` carries; SME-only, the x86 side measured and regressing. | candidate |
 | `trmm_ddirect` | literal | Literal | wide-SIMD-safe default for the direct path; per-box override without a code push. | candidate |
 | `trmm_pack_min` | other | Derived | 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | n/a, follows gemm |
 | `trmm_rkc` | sibling | Literal | own k-block, borrows gemm's _KC; a triangular operand packs differently. | candidate |
