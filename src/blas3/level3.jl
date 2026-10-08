@@ -845,10 +845,14 @@ function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
         return !_strided1(B) ? _trmm_cmplx_base_L!(up, tr, cj, unit, k, A, B) :            # strided B → base
             (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_L!(up, tr, cj, unit, k, A, B) :
             _trmm_cmplx_small_L!(up, tr, cj, unit, k, A, B)     # AVX-512 / tiny-k → unpacked
-    elseif !(eltype(B) <: Union{BlasReal, BlasComplex}) && k <= _TRMM_BASE   # AD/generic: trmv per B column.
-        # TYPE-GUARDED, not a bare size test: a real operand above `_TRMM_BASE_R` must fall through to
-        # the split below, and without this guard it lands here instead and runs the scalar per-column
-        # loop — 25 GFLOP/s against 78 for the split at k=128.
+    elseif k <= _TRMM_BASE && !(eltype(B) <: BlasReal && !cj)   # AD/generic: trmv per B column.
+        # THE GUARD EXCLUDES EXACTLY WHAT THE FIRST BRANCH TAKES, no more. A real operand with `cj`
+        # false has its own smaller bound now and must fall through to the split above
+        # `_TRMM_BASE_R` — left here it runs the scalar per-column loop, 25 GFLOP/s against 78 at
+        # k=128. ⛔ But a REAL operand with `cj` TRUE — `transA='C'`, legal on a real matrix and the
+        # same as `'T'` — is not taken by that branch at any k, so it must still land here. Excluding
+        # all of BlasReal instead sends it to the split, where `_trsplit(1) = 0` gives halves 0 and 1
+        # and the k=1 recursion never terminates: a StackOverflowError, not a slow path.
         @inbounds for c in axes(B, 2)
             _trmv!(up, tr, cj, unit, k, A, view(B, :, c), 1)
         end
