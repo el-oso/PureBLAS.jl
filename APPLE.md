@@ -111,9 +111,12 @@ Follow `ROADMAP.md` phases 1→3 (real → complex → dual). Additions from the
   0.04% on the anchor, 0.3–1.7% on gemm cells, so the noise is small but the guarantee is absent.
 - **`bench/probe.sh` gives `MASK=""` for an unknown host** — pinning is `taskset`, which is Linux.
   A thread-count-sensitive measurement here has no affinity control.
-- **`bench/apple/` holds only a `Project.toml`** (the AMD-free bench env). No sync script, no lock,
-  no Apple-specific tooling. PR #4 (`bench-portable-references`) generalized `plots.jl` and
-  `probe.sh` for this box — build on that, do not re-fork them.
+- ⛔ **THERE IS NO `bench/apple/` DIRECTORY.** `git ls-tree origin/master bench/` returns nothing for
+  it; what exists for this box is this file and `docs/src/assets/apple/*.svg`. The AMD-free bench env
+  is `bench/Project.toml`, which `julia --project=bench` already uses. PR #4
+  (`bench-portable-references`) generalized `plots.jl` and `probe.sh` for this box — build on that,
+  do not re-fork them. There is also no sync path: `bench/fleet_sync.sh` has
+  `BOXES_ALL=(galen neuromancer)`, so the Apple cache is carried by hand.
 - **Two harness bugs were found on this path and fixed**; both may still bite elsewhere. `_L1REP`'s
   reps loop measured a warm buffer (a `cold` flag was added, and the fix is **unconfirmed on x86** —
   Zen3's 32 MiB L3 is the candidate). And `BLAS.set_num_threads(1)` not constraining Accelerate, per
