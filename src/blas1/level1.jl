@@ -216,7 +216,13 @@ end
         # ss is Inf (overflow) or 0 (all-zero, or underflow of tiny values) → use safe path
     elseif incx == 1 && _cplx_re(x)
         GC.@preserve x begin                               # Σ|xᵢ|² over the interleaved 2n-real buffer
-            ss = _sumsq_simd(2 * Int(n), _reptr(x), R)
+            # THE BLOCKED FORM, as the real branch above takes. Reinterpreting to 2n reals makes this an
+            # ordinary real sum of squares, so it is eligible for the pool — but the eligibility has to
+            # be asked for from the REAL element type, and the blocked entry is what asks. The grid is
+            # `_red_block(R)` = 1024·_vwidth(R), which is even, so every block boundary and the ragged
+            # tail land on a complex element boundary; and the fold is over block INDEX, so it depends
+            # on (2n, R) alone and never on the worker count (req #11).
+            ss = _sumsq_blocked(2 * Int(n), _reptr(x), R)
             (isfinite(ss) && !iszero(ss)) && return sqrt(ss)
         end                                                # non-finite/zero → complex lassq fallback below
     elseif incx == 1 && _pairalg(x)
@@ -272,8 +278,11 @@ end
     # SME first, same reason as `_dotc` above.
     (incx == 1 && _sme_asum_ok(_et(x), Int(n), x)) && return _sme_asum(Int(n), x)
     (incx == 1 && _simd1(x)) && return _asum_blocked(Int(n), x, _et(x))
-    (incx == 1 && _cplx_re(x)) &&                          # dzasum = Σ|Re|+|Im| = asum over the 2n reals
-        (GC.@preserve x return _asum_simd(2 * Int(n), _reptr(x), R))
+    # dzasum = Σ|Re|+|Im| = asum over the 2n reals, through the BLOCKED entry for the reason given at
+    # `_nrm2` above: the blocked form is what makes the call poolable, and its fold order is a function
+    # of (2n, R) alone.
+    (incx == 1 && _cplx_re(x)) &&
+        (GC.@preserve x return _asum_blocked(2 * Int(n), _reptr(x), R))
     if incx == 1 && _pairalg(x)                            # Dual: Σ|x_v| with partial Σ flipsign(x_p, x_v)
         GC.@preserve x begin
             sa, sp = _asum_dual_simd(Int(n), _pairreal(x))
