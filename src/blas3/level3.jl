@@ -1530,8 +1530,8 @@ const _TRTRI_BASE = @load_preference("trtri_base", 16)::Int
 # only AFTER both of its recursive calls have returned, so the deeper uses are finished.
 # ESCAPE AUDIT (@scope arn): `tmp` does not leave the block. It is passed DOWN into `_trtri_rec!`
 # (legal — handles travel, tokens do not), which uses it only as a `view(tmp, …)` gemm destination and
-# then as a gemm source; `gemm!` gates on `_strided1(C)` (gemm.jl:2949), true for `PtrMatrix`, so the
-# borrowed C keeps the SIMD path. Neither `gemm!` nor `fill!` retains a reference. `V` is the caller's.
+# then as a gemm source; `_gemm_core_out!` routes on `_strided1(C)`, true for `PtrMatrix`, so the
+# borrowed C keeps the SIMD path. Neither the gemm nor `fill!` retains a reference. `V` is the caller's.
 function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
     @scope arn begin
         _trtri_rec!(V, A, nb, up, unit, borrow!(arn, eltype(V), cld(nb, 2), cld(nb, 2)))
@@ -1555,17 +1555,31 @@ function _trtri_rec!(V, A, nb::Int, up::Bool, unit::Bool, tmp)
     # sizing argument on `_trtri!`). Each level slices the sub-block it needs out of it.
     _trtri_rec!(V11, A11, h, up, unit, tmp)
     _trtri_rec!(V22, A22, m, up, unit, tmp)
+    # THE OFF-BLOCK PRODUCTS GO STRAIGHT TO `_gemm_core_out!`, NOT THROUGH `gemm!`.
+    #
+    # A trsmR pool chunk reaches this function — `_trsmr_run_chunk` → `_trsm_right!` →
+    # `_trsm_cmplx_small_R!` → `_trtri!` — so the public entry here would close a call cycle
+    # `gemm!` → pool → chunk → `_trtri_rec!` → `gemm!`. Inference walks that cycle, hits its
+    # recursion limit and widens the inner call to `Any`; `juliac --trim` then rejects the
+    # unresolved invoke. `_gemm_core_out!` never requests workers, so the cycle terminates.
+    #
+    # Same arithmetic, so the result is bit-identical (req#11). The one route `gemm!` can take that
+    # this call cannot is Strassen, and it is unreachable here: `_strassen_owns` needs
+    # `min(m, n, k) >= 256`, hence an entry `nb >= 512`, while every caller sizes its inverse buffer
+    # at `_L3_NB` or at a `k` bounded by the trsm cuts — 128 at the widest. Strassen is also
+    # restricted to `T <: BlasReal`, and the complex callers are the ones that run inside a chunk.
+    # The outlined form is the right one for two products in one frame, per `_gemm_core_out!`.
     if up
         A12 = view(A, 1:h, (h + 1):nb); V12 = view(V, 1:h, (h + 1):nb)
         t = view(tmp, 1:h, 1:m)
-        gemm!(t, A12, V22; alpha = true, beta = false)            # t = A12·V22   (h×m)
-        gemm!(V12, V11, t; alpha = -one(T), beta = false)         # V12 = -V11·t
+        _gemm_core_out!(t, A12, V22, one(T), zero(T), false, false, false, false)   # t = A12·V22
+        _gemm_core_out!(V12, V11, t, -one(T), zero(T), false, false, false, false)  # V12 = -V11·t
         fill!(view(V, (h + 1):nb, 1:h), zero(T))                  # strict-lower stays 0
     else
         A21 = view(A, (h + 1):nb, 1:h); V21 = view(V, (h + 1):nb, 1:h)
         t = view(tmp, 1:m, 1:h)
-        gemm!(t, A21, V11; alpha = true, beta = false)            # t = A21·V11   (m×h)
-        gemm!(V21, V22, t; alpha = -one(T), beta = false)         # V21 = -V22·t
+        _gemm_core_out!(t, A21, V11, one(T), zero(T), false, false, false, false)   # t = A21·V11
+        _gemm_core_out!(V21, V22, t, -one(T), zero(T), false, false, false, false)  # V21 = -V22·t
         fill!(view(V, 1:h, (h + 1):nb), zero(T))                  # strict-upper stays 0
     end
     return V
