@@ -72,7 +72,19 @@ end
     if incx == 1 && _cplx_re(x)
         ac = convert(_et(x), a)
         if iszero(imag(ac))                                # real scalar × complex vec = real scal over 2n
-            GC.@preserve x _scal_simd!(2 * Int(n), real(ac), _reptr(x))   # reals (OB fast-paths this too)
+            # THREADED ON THE SAME TERMS AS THE REAL BRANCH ABOVE. Reinterpreting to 2n reals makes this
+            # an ordinary real scal, so it is eligible for the pool — but the admission has to be asked
+            # for, and asking it from the REAL element type is what makes it answerable: `_l1_workers`
+            # returns 1 for any complex `T` by construction, so a complex entry that reaches it is
+            # declined whatever its size. Elementwise, so the partition cannot change a bit and there is
+            # no reduction order to preserve — the same argument the real branch makes.
+            R = real(_et(x))
+            nw = _l1_workers(2 * Int(n) * sizeof(R), 2 * Int(n), R)
+            GC.@preserve x begin
+                p = _reptr(x)
+                nw > 1 ? _scal_threaded!(2 * Int(n), real(ac), p, nw) :
+                    _scal_simd!(2 * Int(n), real(ac), p)   # reals (OB fast-paths this too)
+            end
             return x
         end
         return _scal_cmplx_simd!(Int(n), real(ac), imag(ac), x)   # true complex → interleaved swap-multiply
@@ -127,7 +139,15 @@ end
     if incx == 1 && incy == 1 && _cplx2(x, y)
         ac = convert(_et(x), a)
         if iszero(imag(ac))                                # real scalar × complex vecs = real axpy over 2n
-            GC.@preserve x y _axpy_simd!(2 * Int(n), real(ac), _reptr(x), _reptr(y))   # mirrors _scal!
+            # Mirrors `_scal!`'s real-alpha branch, including why the admission is asked from `R`: two
+            # streams of 2n reals, so the working set is twice the one-stream figure.
+            R = real(_et(x))
+            nw = _l1_workers(2 * (2 * Int(n)) * sizeof(R), 2 * Int(n), R)
+            GC.@preserve x y begin
+                px = _reptr(x); py = _reptr(y)
+                nw > 1 ? _axpy_threaded!(2 * Int(n), real(ac), px, py, nw) :
+                    _axpy_simd!(2 * Int(n), real(ac), px, py)
+            end
             return y
         end
         return _axpy_cmplx_simd!(Int(n), real(ac), imag(ac), x, y)   # interleaved-complex SIMD axpy
