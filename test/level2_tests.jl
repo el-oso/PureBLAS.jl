@@ -956,7 +956,15 @@ end
         # Band from the ARM CUT, not a literal: only the convolution arm is admitted to the pool, so a
         # fixed 33 threaded on AVX-512 and not on AVX2 and the liveness witness below would fail there.
         kl = ku = max(1, (P._GBMV_CONV_MAX - 1) ÷ 4)
-        mb, nb = 4096, 2048
+        # SIZED FROM BOTH CONSTANTS THAT GATE THREADING, not just the band. Deriving the band from the
+        # arm cut is necessary and not sufficient: `_gbmvn_workers` also asks `_l1_workers`, which
+        # declines unless the column working set clears `_L1_MT_MIN`. That floor is MACHINE-SCALED —
+        # 128 KB on this fleet's x86, 512 KB on Apple silicon — so an `nb` that clears one box's floor
+        # can sit under another's, and then the liveness assertion below fails on the bigger-floor box
+        # while passing here. The ×2 is margin, and a larger working set clears a smaller floor too, so
+        # deriving it cannot cost coverage on any box.
+        mb = 4096
+        nb = max(2048, 2 * cld(P._L1_MT_MIN, (kl + ku + 1) * sizeof(Float64)))
         AB = randn(kl + ku + 1, nb); xb = randn(nb); yb = randn(mb)
         nv = max(2 * nt * P._red_block(Float64), cld(P._L1_MT_MIN, sizeof(Float64))) + 3
         v = randn(nv)
@@ -978,13 +986,32 @@ end
             warm == 1 && sleep(0.05)
         end
 
-        # The split really happens for each one — otherwise the counts below describe the serial path.
-        @test ran(() -> P.ger!(0.75, xm, yn, A))
-        @test ran(() -> P.gemv!(ym, A, xn; alpha = 0.75, beta = 2.5))
-        @test ran(() -> P.gemv!(yn, A, xm; alpha = 0.75, beta = 2.5, trans = 'T'))
-        @test ran(() -> P.symv!(ys, S, xs; uplo = 'L', alpha = 0.75, beta = 2.5))
+        # ASSERT THE ROUTE, NOT THE POOL. Each op below must take the path this item was written for,
+        # and on Apple silicon that path is NOT the pool: every SME route is selected at the threaded
+        # entry and declines the worker pool, so an unconditional `ran` is false there for the four
+        # SME-eligible ops. The failure mode that matters is the one it hides — a bare `ran` fails
+        # loudly, but the allocation minima below it would then be measuring whichever path DID run
+        # while still reporting green, which is the same vacuous-pass shape the dedicated witnesses
+        # above were fixed for.
+        #
+        # The predicates are the op's own, not a single host test: `_sme_ger_eligible` and the two
+        # gemv predicates read the operands, and symv's cut is a size. gbmv has no SME route at all,
+        # so it stays unconditional — a `!sme` written there would be a guess rather than a guard.
+        sme_ger = P._sme_ger_eligible(Float64, m, n, false, A, xm, yn, 1, 1)
+        sme_gemvn = P._sme_gemv_eligible(Float64, m, n, false, false, A, xn, ym, 1, 1, 2.5)
+        sme_gemvt = P._sme_gemvt_eligible(Float64, m, n, true, false, A, xm, yn, 1, 1)
+        sme_symv = size(S, 1) >= P._SYMV_SME_MIN
+        @test ran(() -> P.ger!(0.75, xm, yn, A)) == !sme_ger
+        @test ran(() -> P.gemv!(ym, A, xn; alpha = 0.75, beta = 2.5)) == !sme_gemvn
+        @test ran(() -> P.gemv!(yn, A, xm; alpha = 0.75, beta = 2.5, trans = 'T')) == !sme_gemvt
+        @test ran(() -> P.symv!(ys, S, xs; uplo = 'L', alpha = 0.75, beta = 2.5)) == !sme_symv
         @test ran(() -> P.gbmv!(yb, AB, xb, mb, kl, ku; alpha = 0.75, beta = 2.5))
         @test ran(() -> P.iamax(v))
+
+        # The minima below stand on either route. Allocation-free at steady state is required of a
+        # bang entry on EVERY path it can take (req#10), so where SME owns the call these measure the
+        # SME path's steady state rather than the pool's — a different question than the item's title
+        # suggests, and an equally required answer.
 
         @test minimum(a_ger(0.75, xm, yn, A) for _ in 1:8) == 0
         @test minimum(a_gemvn(ym, A, xn) for _ in 1:8) == 0
