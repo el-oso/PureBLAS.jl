@@ -275,6 +275,25 @@ Two conventions here will produce a wrong number quietly. Both were hit in one s
   This is a property of the Apple cache LAYOUT rather than of self-speedup: the AMD `mt_data_*`
   caches carry their own `pb` arm in the same file, so the ratio is same-commit there by
   construction. Here it is cross-commit by default.
+  ✅ AND IT IS AN `arms=` SELECTION, NOT A CODE CHANGE. `_ANY_MT` (`plots.jl:287`) sends a run to
+  `mt_data_*` when ANY threaded arm is selected, while `_DO_PB` independently decides whether the
+  serial `pb` arm is measured — so `arms=pb,pb_mt` writes BOTH arms into `mt_data_*` and a
+  self-speedup from it is same-commit by construction. That is how the AMD caches came to carry their
+  own serial arm: an arms selection, not a layout decision. The Apple mt sweep selected `pb_mt`
+  without `pb`.
+  ⛔ IF THE APPLE mt CACHE IS EVER REFRESHED, INCLUDE `pb` IN THE SAME RUN. Re-sweeping `pb_mt` alone
+  is what produced 110 per-cell cross-commit cells in one AMD cache, and that is WORSE than drifting
+  across two files: the file header then reads a single commit while individual cells disagree. The
+  per-arm stamp is the evidence; the file header is not.
+  ✅ AND IT IS AN `arms=` SELECTION, NOT A CODE CHANGE. `_ANY_MT` (plots.jl:287) sends a run to
+  `mt_data_*` when ANY threaded arm is selected, while `_DO_PB` independently decides whether the
+  serial `pb` arm is measured — so `arms=pb,pb_mt` writes BOTH arms into `mt_data_*` and the ratio is
+  same-commit by construction. That is how the AMD caches came to carry their own serial arm; it was
+  an arms selection, not a layout decision. The Apple mt sweep selected `pb_mt` without `pb`.
+  ⛔ IF THE APPLE mt CACHE IS EVER REFRESHED, INCLUDE `pb` IN THE SAME RUN. Re-sweeping `pb_mt`
+  alone is what produced 110 per-cell cross-commit cells in one AMD cache — and that is WORSE than
+  drifting across two files, because the file header then reads one commit while individual cells
+  disagree. The per-arm stamp is the evidence; the file header is not.
 - ⚠ **A CACHED SAMPLE IS `reps` CALLS, NOT ONE.** `bench/plots.jl` builds each sample from
   `reps = repsof(s)` fresh contexts, default `_reps_cubic(s) = clamp(20_000_000 ÷ s^3, 1, 512)` —
   20 at n=100, 9 at n=128, 1 from n=256 up. So a cached figure compared against a per-call probe is
