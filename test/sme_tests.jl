@@ -23,7 +23,9 @@ end
         @test 0 < MC <= max(m, P._SME_MR)
         @test 0 < NC
         @test 0 < KC <= k
-        @test MC % P._SME_MR == 0
+        # MC, like KC below, is tile-aligned ONLY when it is a genuine split: a single block takes the
+        # true m and the kernel predicates its last row tile, so m=100 here must NOT be rounded to 96.
+        @test MC == m || MC % P._SME_MR == 0
         # KC is lane-aligned ONLY when it is a genuine split. A single block takes the true k, and
         # rounding it there would turn any `k % _SME_L != 0` into two blocks — a second pack, a
         # second pass over C, and every ragged edge tile again. The pack zero-fills `kce` to `kpad`,
@@ -42,8 +44,8 @@ end
     if !P._SME_F64 || P._SME_ENTRY[] === C_NULL
         @test_skip "no SME on this machine"
     else
-        # Sizes deliberately off the tile so the zero-filled panel edges and the scratch-tile
-        # path are exercised, not just the straight-through one. beta == 0 takes the overwrite
+        # Sizes deliberately off the tile so the zero-filled panel edges and the predicated edge
+        # tiles are exercised, not just the straight-through one. beta == 0 takes the overwrite
         # path, which writes C directly instead of zeroing it first.
         @testset "m=$m n=$n k=$k alpha=$al beta=$be" for (m, n, k) in (
                 (64, 64, 64), (65, 67, 69), (100, 37, 53), (129, 130, 131), (300, 200, 150),
@@ -98,9 +100,9 @@ end
         @test !P._sme_eligible(Float32, n, n, n, false, false, false, false,
                                zeros(Float32, n, n), rand(Float32, n, n), rand(Float32, n, n))
         # Below the crossover the packed panels do not pay for themselves. The crossover is
-        # `_SME_MIN_EXACT` for EVERY operand, ragged or not: a ragged block is padded to whole
-        # tiles and issued as one call (`_sme_cpad_cap`), so it no longer pays a prologue per edge
-        # tile and no longer needs a higher floor. Measured at the sizes that separates — n=40
+        # `_SME_MIN_EXACT` for EVERY operand, ragged or not: a ragged block is one macrokernel call
+        # whose edge tiles are predicated, so it no longer pays a prologue per edge tile and no
+        # longer needs a higher floor. Measured at the sizes that separates — n=40
         # loses 0.81x and stays out, n=50 wins 1.25x and comes in.
         small = P._SME_MIN_EXACT - 1
         @test !P._sme_eligible(Float64, small, small, small, false, false, false, false,
@@ -118,7 +120,7 @@ end
     if !P._SME_F64 || P._SME_ENTRY[] === C_NULL
         @test_skip "no SME F64 on this machine"
     else
-        # Ragged as well as square: the edge macrokernel handles the m/n/k remainders, and a shape
+        # Ragged as well as square: the predicated edge tiles handle the m/n/k remainders, and a shape
         # that divides the block sizes exercises none of it.
         for (m, n, k) in ((300, 300, 300), (257, 193, 129), (512, 128, 320), (129, 512, 97))
             for ta in ('N', 'T'), tb in ('N', 'T')

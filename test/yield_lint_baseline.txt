@@ -69,8 +69,8 @@ blas3/gemm.jl:lock(_MT_SETUP_LOCK) do
 #              check fails even though this line stays baselined.
 blas3/gemm.jl:GC.safepoint(); Base.yield()
 
-# --- 2026-09-24, the SME IR generators. `sme_kernel.jl` is a kernel file, and these 22 lines are the
-#              only `print`/`println` in it, so read the reason before adding a twenty-third.
+# --- 2026-09-24, the SME IR generators. `sme_kernel.jl` is a kernel file, and these 36 lines are the
+#              only `print`/`println` in it, so read the reason before adding another.
 #
 #              They are not in a kernel. They are the LLVM IR *generator*: Julia functions that build
 #              the kernel's ~100 lines of IR as text, interpolating the detected tile geometry, and
@@ -88,21 +88,35 @@ blas3/sme_kernel.jl:println(io, "  %c$jj = add nsw i64 %colbase, $jj")
 blas3/sme_kernel.jl:println(io, "  %cs$jj = mul nsw i64 %c$jj, %ldb")
 blas3/sme_kernel.jl:println(io, "  %do$i = add nsw i64 %dstbase, %rn$i")
 blas3/sme_kernel.jl:println(io, "  %dp$i = getelementptr inbounds double, ptr %bp, i64 %do$i")
-blas3/sme_kernel.jl:println(io, "  %lo$n = mul nsw i64 %ldc, $col")
-blas3/sme_kernel.jl:println(io, "  %lp$n = getelementptr inbounds double, ptr %ci, i64 %lo$n")
-blas3/sme_kernel.jl:println(io, "  %lq$n = getelementptr inbounds double, ptr %lp$n, i64 $row")
 blas3/sme_kernel.jl:println(io, "  %r$i = add nsw i64 %p0, $i")
 blas3/sme_kernel.jl:println(io, "  %rn$i = mul nsw i64 %r$i, $(_SME_NR)")
 blas3/sme_kernel.jl:println(io, "  %so$jj = add nsw i64 %p0, %cs$jj")
-blas3/sme_kernel.jl:println(io, "  %so$n = mul nsw i64 %ldc, $col")
-blas3/sme_kernel.jl:println(io, "  %sp$jj = getelementptr inbounds double, ptr %b, i64 %so$jj")
-blas3/sme_kernel.jl:println(io, "  %sp$n = getelementptr inbounds double, ptr %ci, i64 %so$n")
-blas3/sme_kernel.jl:println(io, "  %sq$n = getelementptr inbounds double, ptr %sp$n, i64 $row")
-blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1> splat (i1 true), ptr %lq$n, i32 $tile, i32 $sl)")
-blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1> splat (i1 true), ptr %sp$jj, i32 0, i32 $jj)")
 blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.st1d.horiz(<vscale x 2 x i1> splat (i1 true), ptr %dp$i, i32 0, i32 $i)")
-blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.st1d.vert(<vscale x 2 x i1> splat (i1 true), ptr %sq$n, i32 $tile, i32 $sl)")
 blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.zero(i32 255)")
+blas3/sme_kernel.jl:println(io, "  %$(tag)o$s$n = mul nsw i64 %ldc, $col")
+blas3/sme_kernel.jl:println(io, "  %$(tag)p$s$n = getelementptr inbounds double, ptr %ci, i64 %$(tag)o$s$n")
+blas3/sme_kernel.jl:println(io, "  %$(tag)q$s$n = getelementptr inbounds double, ptr %$(tag)p$s$n, i64 $row")
+blas3/sme_kernel.jl:println(io, "  %ck$jj = icmp slt i64 %c$jj, %nce")
+blas3/sme_kernel.jl:println(io, "  %pg$jj = select i1 %ck$jj, <vscale x 2 x i1> %pk, <vscale x 2 x i1> zeroinitializer")
+blas3/sme_kernel.jl:println(io, "  %prhi = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 $L, i64 %rows)")
+blas3/sme_kernel.jl:println(io, "  %prlo = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 0, i64 %rows)")
+blas3/sme_kernel.jl:println(io, "  %sp$jj = getelementptr double, ptr %b, i64 %so$jj")
+blas3/sme_kernel.jl:println(io, "  %va0$s = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %prlo, ptr %pa0$s)")
+blas3/sme_kernel.jl:println(io, "  %va0$s = load <vscale x 2 x double>, ptr %pa0$s, align 8")
+blas3/sme_kernel.jl:println(io, "  %va1$s = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %prhi, ptr %pa1$s)")
+blas3/sme_kernel.jl:println(io, "  %va1$s = load <vscale x 2 x double>, ptr %pa1$s, align 8")
+blas3/sme_kernel.jl:println(io, "  %vb0$s = load <vscale x 2 x double>, ptr %pb0$s, align 8")
+blas3/sme_kernel.jl:println(io, "  %vb1$s = load <vscale x 2 x double>, ptr %pb1$s, align 8")
+blas3/sme_kernel.jl:println(io, "  br label %ipend\n")
+blas3/sme_kernel.jl:println(io, "  br label %kdis_e\n")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> splat (i1 true), ptr %$(tag)q$s$n, i32 $tile, i32 $sl)")
+blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1> %pg$jj, ptr %sp$jj, i32 0, i32 $jj)")
+blas3/sme_kernel.jl:println(io, "kdis_e:")
+blas3/sme_kernel.jl:println(io, "tile_e:")
+blas3/sme_kernel.jl:println(io, mopa(0, 0, 0, s))
+blas3/sme_kernel.jl:println(io, mopa(1, 0, 1, s))
+blas3/sme_kernel.jl:println(io, mopa(2, 1, 0, s))
+blas3/sme_kernel.jl:println(io, mopa(3, 1, 1, s))
 
 # --- 2026-09-25, the SME gemv IR generator. Same reason as the gemm generator above: these are
 #              `print`/`println` into an in-memory `IOBuffer` while the kernel text is built,

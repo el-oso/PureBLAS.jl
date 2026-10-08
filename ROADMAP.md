@@ -1938,6 +1938,42 @@ two sets of figures are not comparable row by row:
      irreducible, plus ~7% per depth step. Counting the C write, the grid sits 0.4 us off its true
      floor. **The remaining target at this cell is the B pack, not the driver and not the kernel.**
 
+1.0c **✅ RAGGED EDGES ARE PREDICATES, AND THE SCALAR B PACK IS GONE (2026-10-08).** The small cells
+     were not kernel-bound. Decomposed on the gate's own shape (`bench/probes/sme_small_decomp.jl`,
+     per call): at n=50 the tile grid was 0.89 us of a 4.47 us driver — the padded-C scratch copies
+     were 2.55 us, the scalar `_sme_pack_B_edge!` 0.87, and m=50 ran as 48+2 because MC rounded down
+     to a tile, so there were two macrokernel calls and two pads. At n=100 copies plus scalar pack
+     were 8.2 of 13.6 us; at n=1000 the scalar pack alone was 275 us. Three changes, all in
+     `sme_kernel.jl`: the ZA transpose packer loads under `whilelt` predicates, so a ragged k or n is
+     packed by the same kernel as a whole one and the scalar edge pack is deleted; the macrokernel
+     takes `mrem`/`nrem` and predicates the C slices and A loads of its edge tiles, so an edge tile
+     writes C directly and the scratch tile and both copies are deleted — which also frees the
+     in-place A route from its whole-tile condition; and MC rounds only on a real split, as KC
+     already did. Gate shape (`bench/probes/sme_gate_shape.jl`, fresh session, first probe, medians
+     of 64, per call, no frequency lock on this box so every figure is directional):
+
+         n        32     50     100    128    256    512    1000    1024
+         before  0.547  5.275  14.41  10.78  93.9   575    4438    4520   us
+         after   0.536  1.611   6.06  10.62  89.3   572    4093    4500
+
+     Against the cached references that is roughly 0.22 -> 0.71 at n=50, 0.36 -> 0.84 at n=100 and
+     0.86 -> 0.94 at n=1000; the cells want a `plots.jl` re-measure before any table is updated.
+     Validated against an independent scalar reference over 256 ragged/transposed/alpha-beta cases
+     (worst 1.5e-15), views with an untouched halo, bit-identical at 1/2/4/6 threads, 0 B at steady
+     state (`bench/probes/sme_validate.jl`).
+
+     ⚠ THE TRAP, so it is not re-walked: the kernel emits a whole-tile body and an edge body and
+     picks one per tile. When both ended in the same unrolled store epilogue, LLVM tail-merged the
+     two into one block of 32 `phi <vscale x 2 x i1>` — 32 predicates live across the k-loop
+     against 16 predicate registers — and EVERY tile, whole ones included, ran 5x slower. A single
+     body with one `select` per slice avoids the phis but keeps the 32 predicates live across the
+     k-loop and costs whole tiles 2.6% at kce=128 and 11% at kce=50
+     (`bench/probes/sme_macro_variants.jl`). The shipped edge body loads and stores its live columns
+     in a loop with a register slice index, so only `prlo`/`prhi` are live and there is no common
+     tail; whole tiles then measure identical to the pre-change kernel (8.79 vs 8.85 us on 8x8 at
+     kce=128). What remains at n=50/100 is the kernel's own tile occupancy — a 2-row remainder still
+     costs a full row of tiles — and the per-call floor; the B pack at tile-exact n is unchanged.
+
 1.1  **~~Integrate the gemv prototype~~ — ALREADY DONE, and this item was stale.** The SME gemv is
      live: `level2.jl:1968` asks `_sme_gemv_eligible` and calls `_sme_gemv!`, landed 2026-09-25 in
      #2. The item said "it is not wired in", which was true when written and had not been revisited.
