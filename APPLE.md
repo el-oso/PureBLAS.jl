@@ -28,21 +28,24 @@ the existing worker pool work there. It is not urgent for the M6 and it must not
 
 ## Step 0 — three blockers, and none of them is a kernel
 
-Nothing on Apple can be scored until these land. Do them before any kernel work.
+All three have landed; a threaded Apple cell is expressible and one exists. They are kept here
+because each records a trap that is invisible until it bites.
 
-- [ ] **`accelerate_mt` does not exist as an arm.** `_REF_MT` in `bench/plots.jl` is
-      `{"openblas_mt", "aocl_mt"}` only. On Apple a threaded gate is not merely unmeasured, it is
-      **unexpressible**. Add the arm.
-- [ ] **Accelerate ignores `BLAS.set_num_threads`.** It reads `VECLIB_MAXIMUM_THREADS` **once, at
-      first use**, so the variable must be set at file-load time before the library is touched — the
-      same shape as the existing single-thread pin at `bench/plots.jl:155-175`. Getting this wrong
-      does not error; it silently measures the wrong thread count.
+- [x] **`accelerate_mt` exists.** `_REF_MT_ARMS` in `bench/plots.jl` carries it, and a threaded Apple
+      gate is expressible.
+- [x] **Accelerate ignores `BLAS.set_num_threads`, and `bench/plots.jl` handles it.** It reads
+      `VECLIB_MAXIMUM_THREADS` **once, at first use**, so `_VECLIB_NT` is decided from the arm
+      selection and exported before any forward into the library. Getting this wrong does not error;
+      it silently measures the wrong thread count. The two Accelerate arms therefore cannot share a
+      process, and a run requesting both is refused with the mechanism named.
       ⚠ Related trap already paid for once: the Accelerate dylib needs
       `suffix_hint = "\x1a$NEWLAPACK$ILP64"`. Without the leading `0x1A`, LBT falls back to LP64 and
       `dgemm_64_` **returns zeros rather than raising**.
-- [ ] **Measure `openblas_mt` across every group.** `ROADMAP.md` Step 0 says this and it is still
-      true: the per-cell reference rule needs *both* OpenBLAS arms present, because a single op draws
-      on each depending on size. There is **no `mt_data_neon_*.txt` cache at all** today.
+- [x] **`openblas_mt` is measured across every group.** `bench/mt_data_neon_mac.home.txt` holds 937
+      cells with all three threaded arms — `accelerate_mt`, `openblas_mt`, `pb_mt` — so the per-cell
+      reference rule has both reference arms it needs.
+      ⚠ The cache header records `freq=0kHz base=0kHz boost=-1`: this platform reports no pin, so
+      every figure drawn from it is directional. See the caveats section below.
 
 ---
 
@@ -61,13 +64,31 @@ Follow `ROADMAP.md` phases 1→3 (real → complex → dual). Additions from the
 - [ ] **`_gemv!`'s first branch is `_sme_gemv_eligible`.** A threaded gemv-N must decline for the
       same reason gemm does. The MT campaign's Phase 2 threads gemv-N on AMD; that change must not
       capture SME-eligible calls here.
-- [ ] **SME covers Float64 gemm plus one gemv kernel and nothing else.** Extending it is pass-1 work.
+- [ ] **SME covers Float64 gemm, BOTH gemv arms and `ger`, plus four BLAS-1 kernels.** In
+      `src/blas3/sme_kernel.jl`: gemm, gemv-N, gemv-T (whose ZA-resident and multi-by-multi inner arms
+      split on `_SME_GEMVT_RESIDENT_MAX`), and `ger`. In `src/blas1/sme_l1.jl`: `dot`, `asum`, `axpy!`,
+      `scal!`, with `src/blas1/sme_l1_cf.jl` holding their `@cfunction` trampolines because a constant
+      `@cfunction` binds its callee at method-definition time. `symv` and `trmv` reach SME through
+      their own cuts in `src/blas2/level2.jl`. Float32 is NOT covered anywhere; extending it is
+      pass-1 work.
       SME is Float64-only (`FEAT_SME_F64F64`), but complex and dual decompose into *real* products,
       so they inherit SME iff those products reach an eligible call — routing, not kernels.
 
 ---
 
 ## Pass 2 — NEON-MT
+
+- [ ] ⛔ **THREADING `symv`, `trmv` OR `trsv` NEEDS THE gemv-T SCRATCH PREFIT IN THE SAME CHANGE.**
+      `_SME_GEMVT_SCR` (`src/blas3/sme_kernel.jl`) is a per-thread strip grown by `_ws_grow!` inside
+      `_sme_gemvt_cabi`. It is safe today only because **SME eligibility is decided at the threaded
+      entry and never inside a chunk, so every SME route declines the worker pool before a worker
+      exists** — `_gemv!` tests `_sme_gemvt_eligible` ahead of its thread seam, `_symv_split!` is
+      selected ahead of symv's, and `trmv`/`trsv` fork no task. Measured: symv at n=2428 with four
+      workers available dispatches no pool. Thread any of those three and the growth happens inside a
+      published job, where the driver spins rather than yields and so reaches no GC safepoint — a
+      swallowed worker exception or a silent hang, by interleaving. The fix is a driver-sized,
+      worker-indexed strip prefit before publishing, as `_trmmr_prefit!` does. A different owner does
+      not fix it: the growth is the hazard, not the ownership.
 
 - [ ] **The pool has no architecture guard anywhere.** No `isapple`/`aarch64`/`Sys.ARCH` in
       `src/blas3/gemm.jl`, `src/arena.jl` or `src/workspace.jl` — it is plain Julia tasks and should
@@ -155,3 +176,87 @@ expect that test to pick it up and require a reproducibility proof for it.
 - **Sync the fleet with git, never rsync** (`bench/fleet_sync.sh`). rsync copies the code but not its
   identity, and the cache header then lies about which commit produced the numbers.
 - **Fable reviews adversarially at the end of each phase**, before it is committed.
+
+- **There is no core pinning either, and `bench/probe.sh` is right to leave this host unpinned.**
+  macOS exposes no `sched_setaffinity` equivalent that binds a thread to a core, so `probe.sh`'s
+  `*) MASK="" ;;` default is the correct behavior here rather than a missing entry. Worker placement
+  across the three core tiers — 2 "Super" and 4 "Performance" cores sharing 20 MB of L2, 6
+  "Efficiency" cores on 8 MB — is a request, not a guarantee, so a threaded Apple cell must carry its
+  spread rather than a single ratio, and self-speedup is not a quantity this box can report honestly.
+
+- **`bench/fleet_sync.sh` does not cover this host** (`BOXES_ALL=(galen neuromancer)`), so the Apple
+  cache is carried by hand. The caches are untracked, so nothing here reaches the AMD fleet's agent
+  except through a committed file.
+
+- **An Apple instrument can be validated for DETECTION but never for linearity.**
+  `/usr/sbin/taskpolicy -b` moves work to the Efficiency cluster and gives a repeatable 5.4x
+  degradation (single-threaded `asum` on 8 MB: 204.0–204.2 GB/s normal, 36.8–38.4 background, the
+  nominal arm reproducing to 0.1%), which is enough to confirm an instrument notices a slower machine
+  — the half a broken probe fails while passing its one-sided test. But there is nothing between:
+  `-c utility` and `-t 0|1|2` all read 204.0–204.2 unchanged. Two levels, 1x and 5.4x. So no
+  "tracks an induced pin within two points" calibration is possible, and because the fault changes
+  **which core runs** rather than the clock, it validates a throughput instrument and nothing that
+  claims to read a frequency.
+
+---
+
+## How to measure on this box
+
+Each rule below cost a withdrawn number. They are here because the knowledge base they were first
+written into is not a git repository, so nothing in it reaches the AMD fleet's agent or survives a
+fresh checkout.
+
+- **A figure is a property of the HARNESS SHAPE as much as the kernel, and the gap is large.** Timing
+  one operand reused across samples against building a fresh one in Chairmarks' setup position — what
+  `sweep_heavy` does — gives, for the same gemv-T kernel on the same 4 MB operand: 550.1 against
+  297.0 GB/s on the SME arm, 117.7 against 108.9 on the NEON arm. A pool of 8 pre-generated operands
+  cycled round-robin reads 135.1, the SLOWEST of the three, because the pool itself does not fit in
+  cache — the careful-looking option is the coldest one. **Size any operand pool against the cache.**
+- ⛔ **A RATIO of two kernels is not shape-invariant and the error CHANGES SIGN.** SME against NEON,
+  ratio taken inside each shape: the probe shape overstates the faster kernel's lead by up to 2.59x
+  below 0.6x L2 and understates it by 0.75x above 0.8x, flipping near 0.7x L2. So no correction
+  factor exists, and **a probe-measured ratio is not a statement about a gate cell** until it is
+  re-measured in the shape the gate uses. State a band position in units of L2, not in MB.
+- **The throughput mode belongs to the ALLOCATION, not the process or the thread.** Eight fresh
+  operands in ONE process span 2.8-3.4x at 14 MB. Repeated timing of one operand gives a 1-3% spread
+  that reads as precision and is not. A shared file mapping across processes removes the spread
+  entirely (1.8% over 20 draws, zero degraded) but sits ~3% below the fresh fast mode, so it compares
+  kernels and must not be mixed with fresh-operand numbers in one table.
+- **Choose the draw count from the NOISIER arm, and print the raw draws before writing a conclusion.**
+  A five-draw comparison of two lda values read 1.04x and would have closed a live item; at fourteen
+  draws the distributions did not overlap and the answer was 1.16x. One tight arm against one noisy
+  arm reads as a null result rather than as an undersampled one.
+- **Measure ONE CONDITION PER PROCESS when conditions differ in allocation size or count.** Position
+  within a process moves a reading in EITHER direction — the same lda read 1.26x slower measured
+  fourth than first, and an in-process size ladder both depressed a 16 MB cell by 1.11x and INFLATED
+  24 and 32 MB cells by 1.13x and 1.08x. Measured one per process, this box is essentially noiseless
+  below capacity: four draws at 4, 8, 12 and 16 MB are identical to one decimal.
+- **Check the instrument reaches the mechanism.** Failures of this class produce a readable, plausible
+  number about something other than the question, and none of them errors: a replica passing
+  triangular flags as literals where the real path passes runtime Bools (overstated a component gain
+  threefold); `const UP = ARGS[2]=="1"`, which is still a compile-time constant and so does not defeat
+  that folding; asking `_l1_workers` anything without `set_num_threads` first, where it short-circuits
+  before it looks at bytes; a probe that cannot name which build produced it; and a predicate keyed on
+  `max(m, nrt, k)` tested only on shapes where `max` cannot move.
+
+## gemv-T: what is closed and what is open
+
+- ⛔ **The gate-binding cell, square n=128, is CLOSED as not winnable by restructuring this kernel.**
+  Seven mechanisms investigated, six falsified: the ZA fold (21% of the call at that size, but
+  stripping it leaves 1.81x of the 2.33x shortfall), the zero-mask width (bitwise identical, no
+  consistent gain), the zero itself (0 within noise), loop unrolling (1.002x, bitwise identical),
+  explicit `prfm` prefetch (1.002x there and 0.197x at m=1024 — five times slower), and cross-group ZA
+  serialization (evidence against, on a probe with an unexplained 36% penalty, so not a clean
+  refutation). The seventh, **double-buffered ZA tiles**, is confirmed and too small: block 2b in tiles
+  0-3 and block 2b+1 in the idle tiles 4-7 is bitwise identical and reads 1.11-1.15x warm and 1.03x
+  cold at that cell, 1.00 everywhere larger. It moves the cell 0.335 to about 0.344 against a need of
+  2-3x. Both arms TIE there (SME 828 ns against NEON 797), so lowering `_SME_GEMVT_MINM` is priced at
+  nothing.
+- **Leading-dimension aliasing is OPEN at 1.16x**, re-measured in the gate's own shape: lda=1024 spans
+  467.1-495.9 GB/s over 14 allocations and lda=1040 spans 511.0-585.3, not overlapping. The probe
+  shape claims 1.29-1.38x, which is the shape gap above. ⛔ Falsified: fewer concurrent streams (the
+  8-stream arm wins at every lda), packing (gemv reads A once, so a copy is three passes to buy one),
+  and 128-byte column alignment (1024 and 1040 are both `mod 16 == 0` and differ 1.20x). In-kernel
+  staggering of the 8 streams' row offsets is the only unfalsified mitigation and is unmeasured.
+- ⚠ The ragged-row window, the strided-register load and the ZA-internal drain are all SHIPPED and
+  measured; `sme_kernel.jl` carries their numbers. The remaining gemv-T lever is the lda one above.

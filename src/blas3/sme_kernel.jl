@@ -1540,7 +1540,13 @@ const _SME_GEMV_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 # ⛔ A NEUTRAL-OR-WORSE REWRITE OF THE DRAIN, measured as an in-process A/B against the other: folding
 # the drain's L lanes with a halving `llvm.vector.splice` tree (which lowers to `ext` and so CROSSES
 # the 128-bit segments `faddp` cannot) is correct to the same 2e-15 as `faddv` and measures
-# 0.76-0.90x of it. `faddv` in turn loses to the deferred arm, so the scratch round-trip stands.
+# 0.76-0.90x of it, so `faddv` stands as the lane fold wherever one is still needed.
+#
+# ⚠ THE "DEFERRED ARM" THE COMMENTS BELOW MEASURE NO LONGER EXISTS. It wrote one `_SME_L`-lane strip
+# per column to `_SME_GEMVT_SCR` and summed the lanes in the caller; the ZA-internal drain replaced
+# it, and `_SME_GEMVT_SCR` now holds only the ragged-row `x` window. Its measurements are kept
+# because they price a scratch round-trip, which is what any future arm that leaves streaming mode to
+# fold would pay again — not because the arm is a live alternative.
 
 # ══ gemv-T, ZA-internal drain ═══════════════════════════════════════════════════════════════════
 #
@@ -1718,13 +1724,13 @@ end
 # WINS, because it is plain IR: LLVM schedules its loads freely and keeps more of them in flight
 # against DRAM latency, where the asm loop's fixed sequence cannot. Measured in one process, same
 # buffers, medians of three 1-1.5 s windows (N = 4-18k one-call samples), this kernel fused against
-# the strided kernel's deferred arm:
+# the removed deferred arm of the strided kernel:
 #
 #     A MB      8    10    12    14    15    16    18    20    24.5   32 (2048^2)   134 (4096^2)
 #     ratio  0.83  0.84  0.89  0.91  1.06  1.03  1.18  1.17   1.10      1.13           1.04
 #
 # `_SME_GEMVT_RESIDENT_MAX` routes on that crossover. Only the fused epilogue exists here: in the
-# DRAM regime the deferred arm of this loop never beat it (0.90x at 16 MB, 0.96x at 32 MB wide,
+# DRAM regime the removed deferred arm of this loop never beat it (0.90x at 16 MB, 0.96x at 32 MB wide,
 # ties elsewhere), so there is nothing to defer.
 #
 # ⛔ Emitting all NC column loads before all NC `fmla`s gives the register allocator NC distinct z
@@ -1927,10 +1933,24 @@ end
 end
 
 
-# One scratch strip per thread, grow-only through `_ws_grow!`, so the deferred arm allocates only on a
-# thread's first call through it. `_sme_gemvt_cabi` claims it and drops it within the same call and
-# makes no public Level-3 call, so it cannot be live across a threaded join — the same argument the
-# trsv reciprocal caches carry in `test/perthread_lint_baseline.txt`.
+# One scratch strip per thread, grow-only through `_ws_grow!`, holding the zero-prefixed `x` window
+# `_sme_gemvt_cabi` hands the kernel when `m` is not a whole multiple of the row block. A thread
+# allocates it on its first ragged call and never again.
+#
+# IT IS NEVER LIVE INSIDE A PUBLISHED JOB, AND THE REASON IS THE SME ROUTING INVARIANT: SME
+# eligibility is decided at the threaded entry and never inside a chunk, so every SME route declines
+# the worker pool before a worker exists. That is what makes all three paths to the `_ws_grow!` below
+# safe for ONE reason rather than three — `_gemv!` tests `_sme_gemvt_eligible` ahead of its thread
+# seam, `_symv_split!` is selected ahead of symv's, and `trmv`/`trsv` fork no task at all, which
+# `test/level2_tests.jl` asserts and which the four `_TRMV_ACC*` / `_TRSV_*` entries in
+# `test/perthread_lint_baseline.txt` rest on. Measured: symv at n=2428 with four workers available
+# dispatches no pool.
+#
+# ⛔ THREADING `symv`, `trmv` OR `trsv` BREAKS THIS, AND SILENTLY. Growth inside a published job
+# allocates where the driver spins rather than yields, so it reaches no GC safepoint — a swallowed
+# worker exception or a silent hang, by interleaving. A chunk body that can reach this strip needs it
+# prefit by the driver and indexed by worker before publishing, the shape `_trmmr_prefit!` uses. A
+# different owner does not fix it; the growth is the hazard, not the ownership.
 const _SME_GEMVT_SCR = Base.OncePerThread{Vector{Float64}}(() -> Float64[])
 # ⚠ THE HORIZONTAL REDUCTION IS TWO THIRDS OF THE PER-COLUMN COST, AND IT IS WHY THERE ARE TWO ARMS.
 #
@@ -2161,6 +2181,14 @@ _SME_GEMVT_NC in _SME_GEMVT_NCS || throw(ArgumentError(
 # and the reason is structural rather than tunable: one ZA drain per column is irreducible, it costs
 # about 7.8 ns, and at 128 rows a column's own stream is only 4 KB. Narrowing the drain from four ZA
 # groups to one would remove three folds out of five ops and still land above the NEON time.
+# ⛔ HIDING THE DRAIN RATHER THAN NARROWING IT IS ALSO MEASURED AND ALSO LOSES. A pair-unrolled
+# variant accumulating even column blocks in ZA tiles 0-3 and odd blocks in the idle tiles 4-7, so a
+# block's windows carry no dependency on the previous block's vertical read, is bitwise identical and
+# reads 1.11-1.15x warm and 1.03x cold at this cell and 1.00 at every larger one. It confirms the
+# latency is real — about 74 cycles a group, hidden by 32 row windows and not by the 4 this cell has —
+# and prices recovering it at a tenth of what the cell needs. Five further mechanisms are measured
+# dead here: the ZA fold itself, the zero-mask width, the zero, loop unrolling, and explicit `prfm`
+# prefetch (1.002x here, 0.197x at m=1024).
 # Accelerate reaches about 457 GB/s here, which is matrix-unit throughput at a per-column cost this
 # kernel shape does not have. Moving this cell needs a different decomposition, not a better constant.
 #
