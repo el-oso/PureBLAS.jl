@@ -1530,8 +1530,8 @@ const _TRTRI_BASE = @load_preference("trtri_base", 16)::Int
 # only AFTER both of its recursive calls have returned, so the deeper uses are finished.
 # ESCAPE AUDIT (@scope arn): `tmp` does not leave the block. It is passed DOWN into `_trtri_rec!`
 # (legal — handles travel, tokens do not), which uses it only as a `view(tmp, …)` gemm destination and
-# then as a gemm source; `gemm!` gates on `_strided1(C)` (gemm.jl:2949), true for `PtrMatrix`, so the
-# borrowed C keeps the SIMD path. Neither `gemm!` nor `fill!` retains a reference. `V` is the caller's.
+# then as a gemm source; `_gemm_core_out!` routes on `_strided1(C)`, true for `PtrMatrix`, so the
+# borrowed C keeps the SIMD path. Neither the gemm nor `fill!` retains a reference. `V` is the caller's.
 function _trtri!(V, A, nb::Int, up::Bool, unit::Bool)
     @scope arn begin
         _trtri_rec!(V, A, nb, up, unit, borrow!(arn, eltype(V), cld(nb, 2), cld(nb, 2)))
@@ -1555,17 +1555,31 @@ function _trtri_rec!(V, A, nb::Int, up::Bool, unit::Bool, tmp)
     # sizing argument on `_trtri!`). Each level slices the sub-block it needs out of it.
     _trtri_rec!(V11, A11, h, up, unit, tmp)
     _trtri_rec!(V22, A22, m, up, unit, tmp)
+    # THE OFF-BLOCK PRODUCTS GO STRAIGHT TO `_gemm_core_out!`, NOT THROUGH `gemm!`.
+    #
+    # A trsmR pool chunk reaches this function — `_trsmr_run_chunk` → `_trsm_right!` →
+    # `_trsm_cmplx_small_R!` → `_trtri!` — so the public entry here would close a call cycle
+    # `gemm!` → pool → chunk → `_trtri_rec!` → `gemm!`. Inference walks that cycle, hits its
+    # recursion limit and widens the inner call to `Any`; `juliac --trim` then rejects the
+    # unresolved invoke. `_gemm_core_out!` never requests workers, so the cycle terminates.
+    #
+    # Same arithmetic, so the result is bit-identical (req#11). The one route `gemm!` can take that
+    # this call cannot is Strassen, and it is unreachable here: `_strassen_owns` needs
+    # `min(m, n, k) >= 256`, hence an entry `nb >= 512`, while every caller sizes its inverse buffer
+    # at `_L3_NB` or at a `k` bounded by the trsm cuts — 128 at the widest. Strassen is also
+    # restricted to `T <: BlasReal`, and the complex callers are the ones that run inside a chunk.
+    # The outlined form is the right one for two products in one frame, per `_gemm_core_out!`.
     if up
         A12 = view(A, 1:h, (h + 1):nb); V12 = view(V, 1:h, (h + 1):nb)
         t = view(tmp, 1:h, 1:m)
-        gemm!(t, A12, V22; alpha = true, beta = false)            # t = A12·V22   (h×m)
-        gemm!(V12, V11, t; alpha = -one(T), beta = false)         # V12 = -V11·t
+        _gemm_core_out!(t, A12, V22, one(T), zero(T), false, false, false, false)   # t = A12·V22
+        _gemm_core_out!(V12, V11, t, -one(T), zero(T), false, false, false, false)  # V12 = -V11·t
         fill!(view(V, (h + 1):nb, 1:h), zero(T))                  # strict-lower stays 0
     else
         A21 = view(A, (h + 1):nb, 1:h); V21 = view(V, (h + 1):nb, 1:h)
         t = view(tmp, 1:m, 1:h)
-        gemm!(t, A21, V11; alpha = true, beta = false)            # t = A21·V11   (m×h)
-        gemm!(V21, V22, t; alpha = -one(T), beta = false)         # V21 = -V22·t
+        _gemm_core_out!(t, A21, V11, one(T), zero(T), false, false, false, false)   # t = A21·V11
+        _gemm_core_out!(V21, V22, t, -one(T), zero(T), false, false, false, false)  # V21 = -V22·t
         fill!(view(V, 1:h, (h + 1):nb), zero(T))                  # strict-upper stays 0
     end
     return V
@@ -5198,9 +5212,11 @@ function trsm!(
     # THREADED SIDE-L: split B's columns. Placed here, below every staging branch above, because each
     # of those either returns or rewrites the operands — a split above them would hand workers a B the
     # serial path would not have solved. Below this point the operands are final.
-    # `BlasReal`, not `BlasFloat`: the pool exists only for the two real types, and the route
-    # predicates on the complex path read their own width rather than `nroute`, so a complex column
-    # split would not be reproducible even once a pool existed.
+    # `BlasReal`, not `BlasFloat`. The pool itself carries complex (`_gemm_poolvec`) and the complex
+    # gemm route predicates do read the undivided width, so neither is the obstacle any more: what a
+    # complex side-L split needs is the `_MT_KIND_TRSM` chunk seam and its lost-claim fallback — which
+    # re-solves the WHOLE of B through `_trsm!` — shown to agree bit-for-bit on the complex routes, the
+    # way `_trgemm_packed!`'s seam was shown for the real packed path.
     # THREADED SIDE-R: split B's rows. `potrf`'s lower factorization is the caller that needs this —
     # it solves `A21·L11⁻ᵀ` with A21 tall and narrow, and that solve does not thread without it.
     if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
@@ -7028,9 +7044,16 @@ end
     size(m, 1) < n && (m = Matrix{Float32}(undef, n, n); r[] = m)
     return m
 end
-# Only the two real types ever thread (`_gemm_workers` is gated on them), so every other element type
-# resolves to the per-thread owner and this method is never reached from a threaded call. It exists so
-# the call site stays ONE type-stable expression instead of a branch inference has to prove unreachable.
+# THIS FALLBACK IS A PER-THREAD OWNER AND MUST NEVER BE REACHED FROM A THREADED CALL. `Ad` is handed
+# to the workers as an operand and so is held across the join; guarantee 3 puts such a buffer in the
+# `OncePerTask` tier, which the two methods above satisfy and this one does not. What keeps it safe is
+# `_symm!`'s OWN admission guard below, which admits `Float64`/`Float32` only — not `_gemm_threaded!`,
+# whose bound now also admits complex. So admitting another element type to the symm split requires a
+# `OncePerTask` owner for it HERE, in the same edit, or a threaded complex symm shares one buffer
+# between tasks.
+#
+# It exists so the call site stays ONE type-stable expression instead of a branch inference has to
+# prove unreachable.
 @inline _symm_scr_mt(::Type{T}, n::Int) where {T} = _symm_scr(T, n)
 
 @inline function _symm_scr(::Type{Float64}, n::Int)
