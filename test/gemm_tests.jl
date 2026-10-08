@@ -439,13 +439,11 @@ end
     using PureBLAS, LinearAlgebra, Random
     using Base.Threads: nthreads
     const P = PureBLAS
-    # THE TYPE LIST IS READ FROM THE DRIVER'S SIGNATURE, NEVER WRITTEN HERE. `_gemm_threaded!` is
-    # declared `where {T <: BlasReal}` because three things in its body exist only for the real types:
-    # the pool registry, the shared-pack prefit, and the `nroute` discipline that keeps a column slice
-    # on the whole problem's route. Widening that bound to admit complex therefore widens THIS test in
-    # the same edit, and it fails until complex is genuinely reproducible — which is the point. A list
-    # of types spelled out here would have gone on passing while the driver silently grew a type it
-    # cannot split correctly.
+    # THE TYPE LIST IS READ FROM THE DRIVER'S SIGNATURE, NEVER WRITTEN HERE. `_gemm_threaded!`'s bound
+    # names exactly the types `_gemm_poolvec` holds a pool for, so widening that bound widens THIS
+    # test in the same edit, and it fails until the new type is genuinely reproducible — which is the
+    # point. A list of types spelled out here would have gone on passing while the driver silently
+    # grew a type it cannot split correctly.
     bounds = Any[]
     for mm in methods(P._gemm_threaded!)
         s = mm.sig

@@ -963,7 +963,7 @@ if StrictMode.proofs_loaded()
         # here → heuristic; the full-mode dogfood roots the same call under juliac's authoritative verifier.
         @assert_trim_compatible _gemm_cmplx_unpacked!(
             Val(1), Val(1), false, m, m, m,
-            one(ComplexF64), Az3, Bz3, zero(ComplexF64), Cz3
+            one(ComplexF64), Az3, Bz3, zero(ComplexF64), Cz3, -1
         )
     end
 end

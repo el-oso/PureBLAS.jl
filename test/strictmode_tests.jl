@@ -306,8 +306,10 @@ end
         # (authoritative). trim_tests.jl stays as the ccallable-rooted belt (strict verify isn't perfect yet).
         for TC in (ComplexF64, ComplexF32)
             Az = randn(TC, 8, 8); Bz = randn(TC, 8, 8); Cz = zeros(TC, 8, 8)
-            @test_trim_compatible P._gemm_cmplx_unpacked!(Val(1), Val(1), false, 8, 8, 8, one(TC), Az, Bz, zero(TC), Cz)
-            @test_trim_compatible P._gemm_cmplx_unpacked!(Val(1), Val(-1), true, 8, 8, 8, TC(1.3, 0.7), Az, Bz, TC(0.9, -0.4), Cz)
+            # The trailing `-1` is `nroute`: route from this call's own width. A serial caller passes
+            # -1; only a column-split caller passes the undivided width.
+            @test_trim_compatible P._gemm_cmplx_unpacked!(Val(1), Val(1), false, 8, 8, 8, one(TC), Az, Bz, zero(TC), Cz, -1)
+            @test_trim_compatible P._gemm_cmplx_unpacked!(Val(1), Val(-1), true, 8, 8, 8, TC(1.3, 0.7), Az, Bz, TC(0.9, -0.4), Cz, -1)
         end
         # packing + generic path allocate nothing
         A = randn(8, 5); Bm = randn(5, 6); Cg = zeros(8, 6)
