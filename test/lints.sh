@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run every CHEAP static check in one go — seconds, not the suite's half hour.
 #
-# WHY THIS EXISTS. All eleven checkers below already run inside `Pkg.test()`, and every one of them is
+# WHY THIS EXISTS. Every checker below also runs inside `Pkg.test()`, and each one is
 # also runnable on its own. But the only way anyone actually reached them was the full suite, so a
 # baseline or a generated table could sit stale for a whole session and surface at the end of a 35
 # minute run. That happened twice on 2026-09-17: `test/yield_lint_baseline.txt` carried the old
@@ -37,7 +37,7 @@ run() {                                   # run <name> <script...>
 }
 
 echo "cheap static checks:"
-for l in armstate estimator expint fastpath generated_meta perthread pin prefsync probe_refblas probe_regime req8 workspace yield; do
+for l in armstate estimator expint fastpath generated_meta liveness perthread pin prefsync probe_refblas probe_regime req8 workspace yield; do
     f="test/${l}_lint.jl"
     [[ -f $f ]] && run "$l" "$f"
 done
