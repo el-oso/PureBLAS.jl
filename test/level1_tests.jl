@@ -631,3 +631,61 @@ end
         @test P.get_num_threads() == 1
     end
 end
+
+# req#11 FOR THE COMPLEX REDUCTIONS. `dzasum` and `dznrm2` reinterpret the vector to 2n reals and run
+# the real blocked kernel, so they are split by the same fixed block grid the real ops are — and that
+# makes them subject to the same invariant, which the real item above cannot cover because it only
+# loops the real types. Without this item the complex reductions thread with nothing asserting that a
+# worker count cannot change a bit.
+#
+# THE LADDER IS IN COMPLEX ELEMENTS AND MUST BE, because the grid acts on the REINTERPRETED length. A
+# block boundary at real index `4B` is complex index `2B`, so every rung of the real ladder halves.
+# Writing the real rungs here would put all five of them in the interior of a block and the ragged
+# cases — the ones the invariant actually turns on — would never be exercised.
+@testitem "L1 complex reductions: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        bits(v::Real) = bitstring(v)
+        bitsame(a::Real, b::Real) = bits(a) == bits(b)
+        @testset "$T" for T in (ComplexF64, ComplexF32)
+            R = real(T)
+            B = P._red_block(R)                 # the grid is the REAL element's, not the complex one
+            W = P._vwidth(R)
+            @test B % (8 * W) == 0              # same 8-chain requirement as the real item
+            @test iseven(B)                     # or a block boundary could split a complex element
+            ns = (B ÷ 4,                        # 2n < B: below admission, must not thread, still right
+                  2B,                           # 2n = 4B: smallest threaded, exact multiple
+                  2B + 1,                       # 2n = 4B+2: ragged final block, one complex element
+                  2B + W ÷ 2,                   # 2n = 4B+W: ragged by one whole vector step
+                  nt * B + 1)                   # every worker busy, ragged
+            @testset "n=$n" for n in ns
+                x = randn(T, n)
+                P.set_num_threads(1)
+                r_asum = P.asum(x)
+                r_nrm2 = P.nrm2(x)
+                # A WITNESS THAT THE SPLIT RAN, at the one size where it must. Without it every
+                # assertion below passes on a library that declined to thread, which is how a silent
+                # gap reports green.
+                if n == 2B
+                    p = P._gemm_pool(R)
+                    P.set_num_threads(nt)
+                    g0 = @atomic p.gen
+                    P.asum(x)
+                    @test (@atomic p.gen) != g0
+                end
+                for nw in (2, nt)
+                    P.set_num_threads(nw)
+                    @test bitsame(P.asum(x), r_asum)
+                    @test bitsame(P.nrm2(x), r_nrm2)
+                end
+                P.set_num_threads(1)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
