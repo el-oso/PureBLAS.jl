@@ -89,6 +89,8 @@ declare void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1>, ptr, i32, i32)
 declare void @llvm.aarch64.sme.st1d.vert(<vscale x 2 x i1>, ptr, i32, i32)
 declare void @llvm.aarch64.sme.ld1d.horiz(<vscale x 2 x i1>, ptr, i32, i32)
 declare void @llvm.aarch64.sme.st1d.horiz(<vscale x 2 x i1>, ptr, i32, i32)
+declare <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64, i64)
+declare <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1>, ptr)
 """
 
 # ── Macrokernel ────────────────────────────────────────────────────────────────────────────────
@@ -100,6 +102,17 @@ declare void @llvm.aarch64.sme.st1d.horiz(<vscale x 2 x i1>, ptr, i32, i32)
 #
 # beta == 0 zeroes ZA; otherwise C is PRELOADED into ZA and the `fmopa`s accumulate on top, so
 # the epilogue is a plain store with no read-modify-write. Same instruction count either way.
+#
+# RAGGED EDGES ARE PREDICATES, NOT COPIES. The last row tile holds `mrem` live rows and the last
+# column tile `nrem` live columns (each 1..MR/NR; a whole tile when the block divides). A C slice
+# is one column of a tile over 8 rows, so a row remainder is a lane predicate on the slice and a
+# column remainder is an all-false predicate on the slices past it: a predicated `st1d` writes
+# only the live rows of a live column and nothing else, and a predicated `ld1d` zeroes the dead
+# lanes. The A loads of the last row tile carry the same row predicate, so an operand read IN
+# PLACE never touches a row past its block. The tile's dead rows and columns still accumulate
+# whatever the padded panel holds — zeros or stale values — and are never stored, so the panel
+# padding needs to be readable, not zero. B is read with whole-vector loads and must therefore
+# extend to a whole column tile; a packed panel does, and `_sme_inplace_b` requires it.
 function _sme_macro_ir(overwrite::Bool)
     slots = _sme_c_slots()
     L = _SME_L
@@ -111,7 +124,95 @@ function _sme_macro_ir(overwrite::Bool)
     # nothing: LLVM strength-reduces both loops to add chains either way, measured 0.994-1.018
     # against the constant-stride form at n=64..1024 with bit-identical output.
     args = "ptr %c, i64 %ldc, ptr %ap, ptr %bp, i64 %nip, i64 %njp, i64 %kce, " *
-        "i64 %aip, i64 %aks, i64 %bjp, i64 %bks"
+        "i64 %aip, i64 %aks, i64 %bjp, i64 %bks, i64 %mrem, i64 %nrem"
+    mopa(t, a, b, s) = "  call void @llvm.aarch64.sme.mopa.nxv2f64(i32 $t, <vscale x 2 x i1> splat (i1 true), " *
+        "<vscale x 2 x i1> splat (i1 true), <vscale x 2 x double> %va$a$s, <vscale x 2 x double> %vb$b$s)"
+    # Every C slice of a whole tile, unrolled under the constant all-true predicate.
+    whole = function (op, s)
+        tag = op == "ld1d" ? "l" : "s"
+        for (n, (tile, sl, col, row)) in enumerate(slots)
+            println(io, "  %$(tag)o$s$n = mul nsw i64 %ldc, $col")
+            println(io, "  %$(tag)p$s$n = getelementptr inbounds double, ptr %ci, i64 %$(tag)o$s$n")
+            println(io, "  %$(tag)q$s$n = getelementptr inbounds double, ptr %$(tag)p$s$n, i64 $row")
+            println(io, "  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> splat (i1 true), ptr %$(tag)q$s$n, i32 $tile, i32 $sl)")
+        end
+    end
+    # The live C slices of an edge tile: a loop over the live columns with a register slice index,
+    # rows under `%prlo`/`%prhi`. Columns below L live in tiles 0/2, the rest in tiles 1/3.
+    # Entered from `pre` by a plain branch; leaves to `next`.
+    live = function (op, t, pre, next)
+        print(io, """
+  %nlo$t = icmp slt i64 %cols, $L
+  %clo$t = select i1 %nlo$t, i64 %cols, i64 $L
+  br label %$(t)lo
+
+$(t)lo:
+  %j$(t)lo = phi i64 [ 0, %$pre ], [ %j$(t)lon, %$(t)lo ]
+  %o$(t)lo = mul nsw i64 %j$(t)lo, %ldc
+  %p$(t)lo = getelementptr inbounds double, ptr %ci, i64 %o$(t)lo
+  %q$(t)lo = getelementptr inbounds double, ptr %p$(t)lo, i64 $L
+  %s$(t)lo = trunc i64 %j$(t)lo to i32
+  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> %prlo, ptr %p$(t)lo, i32 0, i32 %s$(t)lo)
+  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> %prhi, ptr %q$(t)lo, i32 2, i32 %s$(t)lo)
+  %j$(t)lon = add nuw nsw i64 %j$(t)lo, 1
+  %d$(t)lo = icmp slt i64 %j$(t)lon, %clo$t
+  br i1 %d$(t)lo, label %$(t)lo, label %$(t)mid
+
+$(t)mid:
+  %any$(t)hi = icmp sgt i64 %cols, $L
+  br i1 %any$(t)hi, label %$(t)hi, label %$next
+
+$(t)hi:
+  %j$(t)hi = phi i64 [ $L, %$(t)mid ], [ %j$(t)hin, %$(t)hi ]
+  %o$(t)hi = mul nsw i64 %j$(t)hi, %ldc
+  %p$(t)hi = getelementptr inbounds double, ptr %ci, i64 %o$(t)hi
+  %q$(t)hi = getelementptr inbounds double, ptr %p$(t)hi, i64 $L
+  %r$(t)hi = sub nsw i64 %j$(t)hi, $L
+  %s$(t)hi = trunc i64 %r$(t)hi to i32
+  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> %prlo, ptr %p$(t)hi, i32 1, i32 %s$(t)hi)
+  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> %prhi, ptr %q$(t)hi, i32 3, i32 %s$(t)hi)
+  %j$(t)hin = add nuw nsw i64 %j$(t)hi, 1
+  %d$(t)hi = icmp slt i64 %j$(t)hin, %cols
+  br i1 %d$(t)hi, label %$(t)hi, label %$next
+
+""")
+    end
+    # Emits the k-loop of body `s`, continuing the block `from` (already open).
+    kloop = function (s, pred, from)
+        print(io, """
+  %kpos$s = icmp sgt i64 %kce, 0
+  br i1 %kpos$s, label %kloop_$s, label %tstore_$s
+
+kloop_$s:
+  %kk$s = phi i64 [ 0, %$from ], [ %kkn$s, %kloop_$s ]
+  %aoff$s = mul nsw i64 %kk$s, %aks
+  %boff$s = mul nsw i64 %kk$s, %bks
+  %pa0$s = getelementptr inbounds double, ptr %api, i64 %aoff$s
+  %pa1$s = getelementptr inbounds double, ptr %pa0$s, i64 $L
+  %pb0$s = getelementptr inbounds double, ptr %bpj, i64 %boff$s
+  %pb1$s = getelementptr inbounds double, ptr %pb0$s, i64 $L
+""")
+        if pred
+            println(io, "  %va0$s = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %prlo, ptr %pa0$s)")
+            println(io, "  %va1$s = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %prhi, ptr %pa1$s)")
+        else
+            println(io, "  %va0$s = load <vscale x 2 x double>, ptr %pa0$s, align 8")
+            println(io, "  %va1$s = load <vscale x 2 x double>, ptr %pa1$s, align 8")
+        end
+        println(io, "  %vb0$s = load <vscale x 2 x double>, ptr %pb0$s, align 8")
+        println(io, "  %vb1$s = load <vscale x 2 x double>, ptr %pb1$s, align 8")
+        println(io, mopa(0, 0, 0, s))
+        println(io, mopa(1, 0, 1, s))
+        println(io, mopa(2, 1, 0, s))
+        println(io, mopa(3, 1, 1, s))
+        print(io, """
+  %kkn$s = add nuw nsw i64 %kk$s, 1
+  %kdone$s = icmp eq i64 %kkn$s, %kce
+  br i1 %kdone$s, label %tstore_$s, label %kloop_$s
+
+tstore_$s:
+""")
+    end
     print(io, """
 define void @entry($args) {
   call void @macro($args)
@@ -129,6 +230,10 @@ entry:
 
 jploop:
   %jp = phi i64 [ 0, %entry ], [ %jpn, %jpend ]
+  %jpn = add nuw nsw i64 %jp, 1
+  %lastj = icmp eq i64 %jpn, %njp
+  %cols = select i1 %lastj, i64 %nrem, i64 $(_SME_NR)
+  %jrag = icmp ne i64 %cols, $(_SME_NR)
   %bo = mul nsw i64 %jp, %bjp
   %bpj = getelementptr inbounds double, ptr %bp, i64 %bo
   %co = mul nsw i64 %jp, %ldcnr
@@ -137,65 +242,50 @@ jploop:
 
 iploop:
   %ip = phi i64 [ 0, %jploop ], [ %ipn, %ipend ]
+  %ipn = add nuw nsw i64 %ip, 1
+  %lasti = icmp eq i64 %ipn, %nip
+  %rows = select i1 %lasti, i64 %mrem, i64 $(_SME_MR)
+  %irag = icmp ne i64 %rows, $(_SME_MR)
+  %edge = or i1 %irag, %jrag
   %ao = mul nsw i64 %ip, %aip
   %api = getelementptr inbounds double, ptr %ap, i64 %ao
   %cio = mul nsw i64 %ip, $(_SME_MR)
   %ci = getelementptr inbounds double, ptr %cj, i64 %cio
+  br i1 %edge, label %tile_e, label %tile_f
+
+tile_f:
 """)
+    # A WHOLE tile: the instruction stream of a kernel with no edge support at all.
     if overwrite
         println(io, "  call void @llvm.aarch64.sme.zero(i32 255)")
     else
-        for (n, (tile, sl, col, row)) in enumerate(slots)
-            println(io, "  %lo$n = mul nsw i64 %ldc, $col")
-            println(io, "  %lp$n = getelementptr inbounds double, ptr %ci, i64 %lo$n")
-            println(io, "  %lq$n = getelementptr inbounds double, ptr %lp$n, i64 $row")
-            println(io, "  call void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1> splat (i1 true), ptr %lq$n, i32 $tile, i32 $sl)")
-        end
+        whole("ld1d", "f")
     end
-    print(io, """
-  %kpos = icmp sgt i64 %kce, 0
-  br i1 %kpos, label %kloop, label %tstore
-
-kloop:
-  %kk = phi i64 [ 0, %iploop ], [ %kkn, %kloop ]
-  %aoff = mul nsw i64 %kk, %aks
-  %boff = mul nsw i64 %kk, %bks
-  %pa0 = getelementptr inbounds double, ptr %api, i64 %aoff
-  %pa1 = getelementptr inbounds double, ptr %pa0, i64 $L
-  %pb0 = getelementptr inbounds double, ptr %bpj, i64 %boff
-  %pb1 = getelementptr inbounds double, ptr %pb0, i64 $L
-  %va0 = load <vscale x 2 x double>, ptr %pa0, align 8
-  %va1 = load <vscale x 2 x double>, ptr %pa1, align 8
-  %vb0 = load <vscale x 2 x double>, ptr %pb0, align 8
-  %vb1 = load <vscale x 2 x double>, ptr %pb1, align 8
-  call void @llvm.aarch64.sme.mopa.nxv2f64(i32 0, <vscale x 2 x i1> splat (i1 true), <vscale x 2 x i1> splat (i1 true), <vscale x 2 x double> %va0, <vscale x 2 x double> %vb0)
-  call void @llvm.aarch64.sme.mopa.nxv2f64(i32 1, <vscale x 2 x i1> splat (i1 true), <vscale x 2 x i1> splat (i1 true), <vscale x 2 x double> %va0, <vscale x 2 x double> %vb1)
-  call void @llvm.aarch64.sme.mopa.nxv2f64(i32 2, <vscale x 2 x i1> splat (i1 true), <vscale x 2 x i1> splat (i1 true), <vscale x 2 x double> %va1, <vscale x 2 x double> %vb0)
-  call void @llvm.aarch64.sme.mopa.nxv2f64(i32 3, <vscale x 2 x i1> splat (i1 true), <vscale x 2 x i1> splat (i1 true), <vscale x 2 x double> %va1, <vscale x 2 x double> %vb1)
-  %kkn = add nuw nsw i64 %kk, 1
-  %kdone = icmp eq i64 %kkn, %kce
-  br i1 %kdone, label %tstore, label %kloop
-
-tstore:
-""")
-    for (n, (tile, sl, col, row)) in enumerate(slots)
-        println(io, "  %so$n = mul nsw i64 %ldc, $col")
-        println(io, "  %sp$n = getelementptr inbounds double, ptr %ci, i64 %so$n")
-        println(io, "  %sq$n = getelementptr inbounds double, ptr %sp$n, i64 $row")
-        println(io, "  call void @llvm.aarch64.sme.st1d.vert(<vscale x 2 x i1> splat (i1 true), ptr %sq$n, i32 $tile, i32 $sl)")
+    kloop("f", false, "tile_f")
+    whole("st1d", "f")
+    println(io, "  br label %ipend\n")
+    # An EDGE tile. Only `%prlo`/`%prhi` are live across its k-loop; the live-column loops keep
+    # the predicate count at two, so nothing spills, and give the two bodies no common tail for
+    # the optimizer to merge into one block of predicate phis — which is what a shared epilogue
+    # with one predicate per slice does, and it costs 5x on EVERY tile.
+    println(io, "tile_e:")
+    println(io, "  %prlo = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 0, i64 %rows)")
+    println(io, "  %prhi = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 $L, i64 %rows)")
+    println(io, "  call void @llvm.aarch64.sme.zero(i32 255)")
+    if overwrite
+        println(io, "  br label %kdis_e\n")
+    else
+        live("ld1d", "pl", "tile_e", "kdis_e")
     end
+    println(io, "kdis_e:")
+    kloop("e", true, "kdis_e")
+    live("st1d", "st", "tstore_e", "ipend")
     print(io, """
-  br label %ipend
-
 ipend:
-  %ipn = add nuw nsw i64 %ip, 1
-  %ipdone = icmp eq i64 %ipn, %nip
-  br i1 %ipdone, label %jpend, label %iploop
+  br i1 %lasti, label %jpend, label %iploop
 
 jpend:
-  %jpn = add nuw nsw i64 %jp, 1
-  %jpdone = icmp eq i64 %jpn, %njp
-  br i1 %jpdone, label %done, label %jploop
+  br i1 %lastj, label %done, label %jploop
 
 done:
   call void @llvm.aarch64.sme.za.disable()
@@ -211,25 +301,27 @@ const _SME_MACRO_OVER = _sme_macro_ir(true)
 
 # `aip`/`bjp` step one panel-row / panel-column block; `aks`/`bks` step one depth position. A PACKED
 # panel and an operand read IN PLACE differ only in these four numbers — see `_sme_panel_strides`.
+# `mrem`/`nrem` are the live rows/columns of the LAST row/column tile, 1..MR and 1..NR.
 @inline function _sme_macro!(
         C::Ptr{Float64}, ldc::Int, Ap::Ptr{Float64}, Bp::Ptr{Float64},
-        nip::Int, njp::Int, kce::Int, aip::Int, aks::Int, bjp::Int, bks::Int, overwrite::Bool
+        nip::Int, njp::Int, kce::Int, aip::Int, aks::Int, bjp::Int, bks::Int,
+        mrem::Int, nrem::Int, overwrite::Bool
     )
     T = Tuple{
         Ptr{Float64}, Int64, Ptr{Float64}, Ptr{Float64}, Int64, Int64, Int64,
-        Int64, Int64, Int64, Int64,
+        Int64, Int64, Int64, Int64, Int64, Int64,
     }
     if overwrite
         Base.llvmcall(
             (_SME_MACRO_OVER, "entry"), Cvoid, T,
             C, Int64(ldc), Ap, Bp, Int64(nip), Int64(njp), Int64(kce),
-            Int64(aip), Int64(aks), Int64(bjp), Int64(bks)
+            Int64(aip), Int64(aks), Int64(bjp), Int64(bks), Int64(mrem), Int64(nrem)
         )
     else
         Base.llvmcall(
             (_SME_MACRO_ACC, "entry"), Cvoid, T,
             C, Int64(ldc), Ap, Bp, Int64(nip), Int64(njp), Int64(kce),
-            Int64(aip), Int64(aks), Int64(bjp), Int64(bks)
+            Int64(aip), Int64(aks), Int64(bjp), Int64(bks), Int64(mrem), Int64(nrem)
         )
     end
     return nothing
@@ -248,21 +340,28 @@ end
 #
 # Pointers are pre-offset by the caller: `b` at B[pc, jc], `bp` at the panel base.
 #   src(cb, pb, jj) = b  + (pb*L + (cb*L + jj)*ldb)
-#   dst(cb, pb, i)  = bp + ((cb>>1)*kce*NR + (pb*L + i)*NR + (cb&1)*L)
+#   dst(cb, pb, i)  = bp + ((cb>>1)*kpad*NR + (pb*L + i)*NR + (cb&1)*L)
+#
+# The panel is `kpad` deep and `ncb*L` wide, both whole LxL blocks; the operand underneath is only
+# `kce` deep and `nce` wide. The ragged remainder is handled by the LOADS: a depth block past
+# `kce` loads under a `whilelt` lane predicate and a column past `nce` under an all-false one, so
+# no load touches memory outside the operand and the dead lanes land in ZA as zeros. The stores
+# then write whole horizontal slices as usual, so the panel's padding is zero-filled.
 function _sme_packb_ir()
     L = _SME_L
     io = IOBuffer()
     print(io, _SME_DECLS)
+    args = "ptr %bp, ptr %b, i64 %ldb, i64 %kpad, i64 %kce, i64 %nce, i64 %ncb"
     print(io, """
-define void @entry(ptr %bp, ptr %b, i64 %ldb, i64 %kce, i64 %ncb) {
-  call void @packb(ptr %bp, ptr %b, i64 %ldb, i64 %kce, i64 %ncb)
+define void @entry($args) {
+  call void @packb($args)
   ret void
 }
 
-define internal void @packb(ptr %bp, ptr %b, i64 %ldb, i64 %kce, i64 %ncb) #0 {
+define internal void @packb($args) #0 {
 entry:
   call void @llvm.aarch64.sme.za.enable()
-  %kb = sdiv i64 %kce, $L
+  %kb = sdiv i64 %kpad, $L
   %anycb = icmp sgt i64 %ncb, 0
   %anykb = icmp sgt i64 %kb, 0
   %go = and i1 %anycb, %anykb
@@ -272,7 +371,7 @@ cbloop:
   %cb = phi i64 [ 0, %entry ], [ %cbnext, %cbend ]
   %jp = lshr i64 %cb, 1
   %jblk = and i64 %cb, 1
-  %jpoff = mul nsw i64 %jp, %kce
+  %jpoff = mul nsw i64 %jp, %kpad
   %jpoffn = mul nsw i64 %jpoff, $(_SME_NR)
   %jbo = mul nsw i64 %jblk, $L
   %dstbase = add nsw i64 %jpoffn, %jbo
@@ -282,13 +381,17 @@ cbloop:
 pbloop:
   %pb = phi i64 [ 0, %cbloop ], [ %pbnext, %pbloop ]
   %p0 = mul nsw i64 %pb, $L
+  %pk = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 %p0, i64 %kce)
 """)
     for jj in 0:(L - 1)
         println(io, "  %c$jj = add nsw i64 %colbase, $jj")
+        println(io, "  %ck$jj = icmp slt i64 %c$jj, %nce")
+        println(io, "  %pg$jj = select i1 %ck$jj, <vscale x 2 x i1> %pk, <vscale x 2 x i1> zeroinitializer")
         println(io, "  %cs$jj = mul nsw i64 %c$jj, %ldb")
         println(io, "  %so$jj = add nsw i64 %p0, %cs$jj")
-        println(io, "  %sp$jj = getelementptr inbounds double, ptr %b, i64 %so$jj")
-        println(io, "  call void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1> splat (i1 true), ptr %sp$jj, i32 0, i32 $jj)")
+        # Not `inbounds`: a dead column's address lies outside the operand and is never dereferenced.
+        println(io, "  %sp$jj = getelementptr double, ptr %b, i64 %so$jj")
+        println(io, "  call void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1> %pg$jj, ptr %sp$jj, i32 0, i32 $jj)")
     end
     for i in 0:(L - 1)
         println(io, "  %r$i = add nsw i64 %p0, $i")
@@ -318,11 +421,15 @@ end
 
 const _SME_PACKB = _sme_packb_ir()
 
-@inline function _sme_packb!(bp::Ptr{Float64}, b::Ptr{Float64}, ldb::Int, kce::Int, ncb::Int)
+# `kpad` is the panel's depth (a whole number of L), `kce`/`nce` the operand's live depth and
+# width, `ncb` the number of L-wide column blocks the panel holds.
+@inline function _sme_packb!(
+        bp::Ptr{Float64}, b::Ptr{Float64}, ldb::Int, kpad::Int, kce::Int, nce::Int, ncb::Int
+    )
     Base.llvmcall(
         (_SME_PACKB, "entry"), Cvoid,
-        Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Int64, Int64},
-        bp, b, Int64(ldb), Int64(kce), Int64(ncb)
+        Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Int64, Int64, Int64, Int64},
+        bp, b, Int64(ldb), Int64(kpad), Int64(kce), Int64(nce), Int64(ncb)
     )
     return nothing
 end
@@ -375,31 +482,6 @@ function _sme_pack_A!(
     return nothing
 end
 
-# Scalar B pack with zero fill, for blocks whose edges the ZA transpose cannot read: it works in
-# whole LxL blocks and would run off the end of B on a ragged column or depth remainder.
-function _sme_pack_B_edge!(
-        Bp::Ptr{Float64}, B::Ptr{Float64}, ldb::Int,
-        pc::Int, jc::Int, kce::Int, nce::Int, kpad::Int
-    )
-    NR = _SME_NR
-    npn = cld(nce, NR)
-    let pb = Bp
-        @inbounds for jp in 0:(npn - 1)
-            base = jp * kpad * NR
-            j0 = jp * NR
-            for p in 0:(kpad - 1)
-                d = pb + (base + p * NR) * 8
-                for j in 0:(NR - 1)
-                    v = (p < kce && (j0 + j) < nce) ?
-                        unsafe_load(B + ((pc + p) + (jc + j0 + j) * ldb) * 8) : 0.0
-                    unsafe_store!(d + j * 8, v)
-                end
-            end
-        end
-    end
-    return nothing
-end
-
 # ── Reading A in place instead of packing it ────────────────────────────────────────────────────
 # A packed A panel holds `Ap[ip*kpad*MR + p*MR + i] = A[ic + ip*MR + i, pc + p]`, so for op(A) = A
 # the pack is a PURE STRIDED COPY: the kernel can read A itself by taking `aks = lda` for its depth
@@ -415,16 +497,16 @@ end
 # lines at MR=16, so no bytes are wasted — but the next step is `lda` away, which puts consecutive
 # steps on few L1 sets when `lda` is unlucky.
 #
-# Three preconditions, all structural:
+# Two preconditions, both structural:
 #   - op(A) = A. When A is transposed its MR-run is strided, not contiguous, and a copy is the only
 #     way to give the kernel what it loads.
 #   - alpha == 1. Scaling happens inside the contiguous packer; with no copy there is nowhere for it
 #     to ride. Routing it onto B instead would add a pass over the B panel, which is the cost this
 #     is removing.
-#   - The block is a whole number of tiles in m. An in-place read has no zero-filled remainder, so a
-#     padded ROW would read past the operand. Depth needs no such condition: the kernel's depth
-#     COUNT (`kce`) and a panel's depth STRIDE (`kpad`) are separate arguments, so a ragged k runs
-#     exactly `kce` steps and the padding is simply never reached.
+# Neither dimension of the block needs to be whole: the kernel's depth COUNT (`kce`) and a panel's
+# depth STRIDE (`kpad`) are separate arguments, so a ragged k runs exactly `kce` steps, and the A
+# loads of the last row tile carry a lane predicate (`mrem`), so a ragged m never reads a row past
+# the block.
 #
 # THE CUT IS SIZED FOR THE WORST `lda`, because the caller's is not ours to choose. Square Float64
 # through `gemm!`, A a view of a power-of-two-wide parent so the stride always aliases, packed
@@ -466,7 +548,6 @@ end
 
 @inline function _sme_inplace_a(mce::Int, kce::Int, alpha::Float64, tA::Bool)
     (!tA && alpha == 1.0 && !(@inbounds _EXPFLAG[_EXP17])) || return false
-    mce % _SME_MR == 0 || return false
     return mce * kce <= _sme_inplace_cap()
 end
 
@@ -527,10 +608,15 @@ const _SME_PANEL_BUDGET = @load_preference("sme_panel_bytes", 64 * 1024 * 1024):
     end
     # Row block: the A panel (MC x KC) is the operand re-read per column panel, so hold it to a
     # share of L2 the way the SIMD path holds its own A block.
+    # The same rule as KC: round only a block that is actually a split. A single block takes the
+    # true m — the kernel predicates its last row tile — where rounding it would carve m = 50 into
+    # 48 + 2 and run the two rows as a second block with its own pack and its own macrokernel call.
     mb = max(_SME_MR, ((_L2_BYTES * 3) ÷ 10) ÷ (KC * sizeof(Float64)))
     MC = min(m, mb)
-    MC -= MC % _SME_MR
-    MC = max(MC, _SME_MR)
+    if MC < m
+        MC -= MC % _SME_MR
+        MC = max(MC, _SME_MR)
+    end
     return MC, NC, KC
 end
 
@@ -538,14 +624,13 @@ end
 # C = beta*C + alpha*op(A)*op(B), column-major, Float64, on the SME path. alpha rides in the A
 # pack; beta is applied by scaling C once up front, after which every depth block accumulates.
 #
-# Ragged edges: the packed panels are zero-filled to whole MRxNR tiles, so the macrokernel always
-# runs full tiles. A tile that would write outside C is computed into a contiguous scratch tile
-# and the live part copied back — the extra cost falls only on the edges.
+# Ragged edges: the packed panels are padded to whole MRxNR tiles, so the macrokernel always runs
+# whole tiles, and it predicates the C slices of its last row and column tile (`mrem`, `nrem`) so
+# a tile that overhangs C writes only the live part — no scratch tile and no copy.
 function _sme_gemm!(
         C::Ptr{Float64}, ldc::Int, A::Ptr{Float64}, lda::Int, B::Ptr{Float64}, ldb::Int,
         m::Int, n::Int, k::Int, alpha::Float64, beta::Float64, tA::Bool, tB::Bool,
-        Ap::Ptr{Float64}, Bp::Ptr{Float64}, Cs::Ptr{Float64},
-        MC::Int, NC::Int, KC::Int
+        Ap::Ptr{Float64}, Bp::Ptr{Float64}, MC::Int, NC::Int, KC::Int
     )
     MR = _SME_MR
     NR = _SME_NR
@@ -588,9 +673,8 @@ function _sme_gemm!(
             #   op(A)=A2 -- A is k x m, so that run is strided and needs a transpose
             #   op(B)=B  -- B is k x n, so the run is strided and needs a transpose
             #   op(B)=B2 -- B is n x k, so the run is contiguous
-            # So N,T needs no transpose at all and T,N needs two. The ZA transpose works in whole
-            # LxL blocks and would read past the operand on a ragged edge, hence the scalar
-            # fallback there.
+            # So N,T needs no transpose at all and T,N needs two. The ZA transpose predicates its
+            # loads, so a ragged depth or width is packed by the same kernel as a whole one.
             local pb::Ptr{Float64}, bjp::Int, bks::Int
             if _sme_inplace_b(nce, kce, bscale, tB)
                 # B itself IS the panel — the op(B)=B2 row of the table above is the contiguous case,
@@ -601,17 +685,16 @@ function _sme_gemm!(
             else
                 if tB
                     _sme_pack_A!(Bp, B, ldb, jc, pc, nce, kce, kpad, bscale)
-                elseif kce == kpad && nce == npad
-                    _sme_packb!(Bp, B + (pc + jc * ldb) * 8, ldb, kpad, npad ÷ _SME_L)
-                    bscale == 1.0 || _sme_scale_panel!(Bp, npad * kpad, bscale)
                 else
-                    _sme_pack_B_edge!(Bp, B, ldb, pc, jc, kce, nce, kpad)
+                    _sme_packb!(Bp, B + (pc + jc * ldb) * 8, ldb, kpad, kce, nce, npad ÷ _SME_L)
                     bscale == 1.0 || _sme_scale_panel!(Bp, npad * kpad, bscale)
                 end
                 pb = Bp
                 bjp = kpad * NR
                 bks = NR
             end
+            njp = npad ÷ NR
+            nrem = nce - (njp - 1) * NR
             ic = 0
             while ic < m
                 mce = min(MC, m - ic)
@@ -625,18 +708,17 @@ function _sme_gemm!(
                 else
                     if !tA
                         _sme_pack_A!(Ap, A, lda, ic, pc, mce, kce, kpad, alpha)
-                    elseif kce == kpad && mce == mpad
-                        _sme_packb!(Ap, A + (pc + ic * lda) * 8, lda, kpad, mpad ÷ _SME_L)
                     else
-                        _sme_pack_B_edge!(Ap, A, lda, pc, ic, kce, mce, kpad)
+                        _sme_packb!(Ap, A + (pc + ic * lda) * 8, lda, kpad, kce, mce, mpad ÷ _SME_L)
                     end
                     pa = Ap
                     aip = kpad * MR
                     aks = MR
                 end
-                _sme_macro_edges!(
-                    C, ldc, pa, pb, Cs, ic, jc, mce, nce, mpad, npad, kce, kpad,
-                    aip, aks, bjp, bks, overwrite_first && pc == 0
+                nip = mpad ÷ MR
+                _sme_macro!(
+                    C + (ic + jc * ldc) * 8, ldc, pa, pb, nip, njp, kce, aip, aks, bjp, bks,
+                    mce - (nip - 1) * MR, nrem, overwrite_first && pc == 0
                 )
                 ic += MC
             end
@@ -647,107 +729,18 @@ function _sme_gemm!(
     return nothing
 end
 
-# Runs the macrokernel over a packed block. Whole tiles that fit inside C go straight in; a tile
-# that would overhang goes through a contiguous MRxNR scratch tile and is copied back live-part
-# only.
-#
-# `Ap`/`Bp` may be a packed panel or the operand itself; `aip`/`aks`/`bjp`/`bks` say which. An
-# operand read in place has no zero-filled remainder, so the caller only ever hands one to a block
-# whose own dimension is a whole number of tiles — every path below that runs PADDED tiles
-# (`mpad`>`mce`, `npad`>`nce`) is therefore reached only with packed panels on the padded side.
-function _sme_macro_edges!(
-        C::Ptr{Float64}, ldc::Int, Ap::Ptr{Float64}, Bp::Ptr{Float64},
-        Cs::Ptr{Float64}, ic::Int, jc::Int, mce::Int, nce::Int,
-        mpad::Int, npad::Int, kce::Int, kpad::Int, aip::Int, aks::Int, bjp::Int, bks::Int, over::Bool
-    )
-    MR = _SME_MR
-    NR = _SME_NR
-    nip = mpad ÷ MR
-    njp = npad ÷ NR
-    full_i = (mce % MR == 0)
-    full_j = (nce % NR == 0)
-    let pa = Ap, pb = Bp, pcs = Cs
-        if full_i && full_j
-            _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip, njp, kce,
-                        aip, aks, bjp, bks, over)
-            return nothing
-        end
-        # PAD THE BLOCK, NOT THE TILE, when it fits. The per-tile path below pays a macrokernel
-        # prologue for every edge tile, and that prologue is most of what an edge tile costs:
-        # measured at n=100, 0.26 us per tile of which 0.037 is the copy. Rounding the block up to
-        # whole tiles makes it ONE call. Measured against the per-tile path, whole-gemm times:
-        # n=50 6.64 -> ~2.4 us, n=100 14.7 -> ~7.5, n=132 26.4 -> ~16.8.
-        if mpad * npad <= _sme_cpad_cap()
-            for j in 0:(npad - 1), i in 0:(mpad - 1)
-                v = (!over && i < mce && j < nce) ?
-                    unsafe_load(C + ((ic + i) + (jc + j) * ldc) * 8) : 0.0
-                unsafe_store!(pcs + (i + j * mpad) * 8, v)
-            end
-            _sme_macro!(pcs, mpad, pa, pb, nip, njp, kce, aip, aks, bjp, bks, false)
-            for j in 0:(nce - 1), i in 0:(mce - 1)
-                unsafe_store!(C + ((ic + i) + (jc + j) * ldc) * 8,
-                              unsafe_load(pcs + (i + j * mpad) * 8))
-            end
-            return nothing
-        end
-        # Interior tiles in one call, then the ragged last row/column tile by tile.
-        nip_full = mce ÷ MR
-        njp_full = nce ÷ NR
-        if nip_full > 0 && njp_full > 0
-            _sme_macro!(C + (ic + jc * ldc) * 8, ldc, pa, pb, nip_full, njp_full, kce,
-                        aip, aks, bjp, bks, over)
-        end
-        for jp in 0:(njp - 1), ip in 0:(nip - 1)
-            (ip < nip_full && jp < njp_full) && continue
-            rows = min(MR, mce - ip * MR)
-            cols = min(NR, nce - jp * NR)
-            (rows <= 0 || cols <= 0) && continue
-            api = pa + ip * aip * 8
-            bpj = pb + jp * bjp * 8
-            # Scratch tile is contiguous with leading dimension MR; seed it with the live C so
-            # the accumulate is exact, and zero the dead part.
-            for j in 0:(NR - 1), i in 0:(MR - 1)
-                v = (!over && i < rows && j < cols) ?
-                    unsafe_load(C + ((ic + ip * MR + i) + (jc + jp * NR + j) * ldc) * 8) : 0.0
-                unsafe_store!(pcs + (i + j * MR) * 8, v)
-            end
-            _sme_macro!(pcs, MR, api, bpj, 1, 1, kce, aip, aks, bjp, bks, false)
-            for j in 0:(cols - 1), i in 0:(rows - 1)
-                unsafe_store!(
-                    C + ((ic + ip * MR + i) + (jc + jp * NR + j) * ldc) * 8,
-                    unsafe_load(pcs + (i + j * MR) * 8)
-                )
-            end
-        end
-    end
-    return nothing
-end
-
-# Scratch sizes for a given problem, so callers can size workspace without replaying the loop.
-# How large a PADDED C BLOCK the edge path may materialise, in elements. A ragged block costs one
-# macrokernel call per edge tile today, and that call's prologue dominates its work: measured at
-# n=100, 13 edge tiles at 0.26 us each of which only 0.037 is the scratch copy. Rounding the whole
-# block up to whole tiles turns those 13 calls into ONE, at the price of a copy in and out.
-#
-# Bounded by L1 because the padded block is written, read by the kernel, and read back immediately:
-# beyond L1 the copy stops being cheap and the per-tile path is the better of the two. At 128 KiB
-# that covers a square block to n = 128, which is exactly the range where the whole matrix is one
-# ragged block and the per-call overhead is the entire cost.
-@inline _sme_cpad_cap() = max(_SME_MR * _SME_NR, _L1_BYTES ÷ sizeof(Float64))
-
+# Packed-panel sizes for a given problem, so callers can size workspace without replaying the loop.
 @inline function _sme_scratch_sizes(m::Int, n::Int, k::Int)
     MC, NC, KC = _sme_blocks(m, n, k)
     kpad = cld(min(KC, k), _SME_L) * _SME_L
     apad = cld(min(MC, m), _SME_MR) * _SME_MR
     bpad = cld(min(NC, n), _SME_NR) * _SME_NR
-    csz = max(_SME_MR * _SME_NR, min(apad * bpad, _sme_cpad_cap()))
-    return (apad * kpad, bpad * kpad, csz, MC, NC, KC)
+    return (apad * kpad, bpad * kpad, MC, NC, KC)
 end
 
 # ── Entry point from `_gemm_core!` ─────────────────────────────────────────────────────────────
 # Float64, op(A)=A, op(B)=B, unit row stride on all three. Scratch comes from the shared Level-3
-# workspace: the MRxNR edge tile is carved off the tail of the A slot so no new workspace field is
-# needed (that struct's constructor is a long positional list and adding to it has shipped a bug).
+# workspace.
 #
 # Below `_SME_MIN` the problem is too small for the packed panels to pay for themselves and the
 # existing SIMD routes are better. It is a MEASURED crossover, not a residency formula: it depends on
@@ -790,10 +783,10 @@ const _SME_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
 function _sme_entry_cabi(
         C::Ptr{Float64}, ldc::Int, A::Ptr{Float64}, lda::Int, B::Ptr{Float64}, ldb::Int,
         m::Int, n::Int, k::Int, alpha::Float64, beta::Float64, tA::Int, tB::Int,
-        Ap::Ptr{Float64}, Bp::Ptr{Float64}, Cs::Ptr{Float64}, MC::Int, NC::Int, KC::Int
+        Ap::Ptr{Float64}, Bp::Ptr{Float64}, MC::Int, NC::Int, KC::Int
     )
     _sme_gemm!(C, ldc, A, lda, B, ldb, m, n, k, alpha, beta, tA != 0, tB != 0,
-               Ap, Bp, Cs, MC, NC, KC)
+               Ap, Bp, MC, NC, KC)
     return nothing
 end
 
@@ -808,9 +801,9 @@ end
 # So both kernels answer a known question before their pointers are published. The data is
 # ASYMMETRIC and row/column distinguishable -- `i + 1000j` -- because a transposed or row-permuted
 # geometry is invisible on symmetric input, which is exactly the bug class this is here to catch.
-# Shapes are chosen to reach the edge paths: a ragged gemm exercises the edge macrokernel and the
-# scalar B pack, and a gemv row count that is a sum of several ladder blocks plus a scrap exercises
-# the block halving and the overlapping tail.
+# Shapes are chosen to reach the edge paths: a ragged gemm exercises the predicated edge tiles and
+# the predicated ZA transpose, and a gemv row count that is a sum of several ladder blocks plus a
+# scrap exercises the block halving and the overlapping tail.
 #
 # A MISMATCH THROWS. It means the hardware model in this file is wrong for this machine, which is a
 # bug to report rather than a condition to degrade around; falling back silently would leave a wrong
@@ -985,9 +978,9 @@ end
 # before its remainder panel is amortized.
 # ONE FLOOR, NOT TWO. A ragged operand used to need a much higher floor than a tile-exact one,
 # because its edge tiles each cost a separate macrokernel call — measured at 0.26 us apiece, of
-# which only 0.037 was the scratch copy, the rest a prologue paid for ~0.05 us of work. Padding the
-# whole block to whole tiles turns those calls into one (see `_sme_cpad_cap`), so the reason for the
-# second, higher floor is gone with it.
+# which only 0.037 was the scratch copy, the rest a prologue paid for ~0.05 us of work. The kernel
+# predicates its edge tiles (`mrem`/`nrem` in `_sme_macro!`), so a ragged block is one call, and the
+# reason for the second, higher floor is gone with it.
 #
 # Measured on an M6 at the sizes the old ragged floor rejected, forced SME against the path taken
 # today: n=40 0.81x (loses), n=50 1.25x, n=72 1.92x, n=88 2.52x. The wins begin at 50 and n=40 is
@@ -2741,23 +2734,22 @@ end
 @noinline function _gemm_sme!(C, A, B, alpha::Float64, beta::Float64, m::Int, n::Int, k::Int,
                              tA::Bool, tB::Bool)
     Threads.atomic_add!(_SME_CALLS, 1)
-    asz, bsz, csz, MC, NC, KC = _sme_scratch_sizes(m, n, k)
+    asz, bsz, MC, NC, KC = _sme_scratch_sizes(m, n, k)
     # The pack buffers are per-TASK (`_gemm_scratch` -> `_gpackws`), not per-thread: cooperative
     # A-packing meets the other workers at a barrier while the packed B panel is live. Going
     # through `_gemm_scratch` keeps both growths at the one growth point, so a single barrier
-    # covers them. The C scratch is carved off the tail of the A buffer.
-    Ap, Bp = _gemm_scratch(Float64, asz + csz, bsz)
+    # covers them.
+    Ap, Bp = _gemm_scratch(Float64, asz, bsz)
     ldc = stride(C, 2); lda = stride(A, 2); ldb = stride(B, 2)
     GC.@preserve C A B Ap Bp begin
-        pap = pointer(Ap)
         ccall(
             _SME_ENTRY[], Cvoid,
             (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
              Int, Int, Int, Float64, Float64, Int, Int,
-             Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int),
+             Ptr{Float64}, Ptr{Float64}, Int, Int, Int),
             pointer(C), ldc, pointer(A), lda, pointer(B), ldb,
             m, n, k, alpha, beta, tA ? 1 : 0, tB ? 1 : 0,
-            pap, pointer(Bp), pap + asz * sizeof(Float64), MC, NC, KC
+            pointer(Ap), pointer(Bp), MC, NC, KC
         )
     end
     return C
@@ -2833,7 +2825,7 @@ elseif _SME_STATIC
     _sme_entry_cf() = @cfunction(_sme_entry_cabi, Cvoid,
         (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
          Int, Int, Int, Float64, Float64, Int, Int,
-         Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
+         Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
     _sme_gemv_cf() = @cfunction(_sme_gemv_cabi, Cvoid,
         (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64, Int))
     _sme_gemvt_cf() = @cfunction(_sme_gemvt_cabi, Cvoid,
@@ -2849,7 +2841,7 @@ else
         return @cfunction($f, Cvoid,
             (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
              Int, Int, Int, Float64, Float64, Int, Int,
-             Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
+             Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
     end
     function _sme_gemv_cf()
         g = Base.inferencebarrier(_sme_gemv_cabi)
