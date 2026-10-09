@@ -573,49 +573,42 @@ const _GEMM_SPLIT_S = 2
 # rounded down to a multiple of 16 and capped at 128.
 @inline _at_l3_nb(hw) = clamp(_round_dn(isqrt(hw.l2 ÷ 32), 16), 16, 128)
 
-# A STRASSEN LEAF MUST BE WIDER THAN THE GEMM BLOCKING WIDTH, which is what this floor expresses:
-# level 1 halves the problem, so admitting `n` commits to leaves of `n ÷ 2`, and a leaf at or below
-# `_L3_NB` is one block wide with nothing to amortize the recursion's 18 extra adds over. Hence
-# `2 * _at_l3_nb(hw) + 1` — the smallest `n` whose leaf clears the blocking width.
+# THE FLOOR IS µARCH-SPLIT AT ITS OWN BOUNDARY CELL, so it stays a flat literal. All three boxes,
+# frequency-locked and verified under load, 4 rounds per arm with arm order rotated, fresh operands per
+# sample, through the public entry. `+` = Strassen FASTER serially; the threaded column is how much
+# faster CLASSICAL is at six threads:
 #
-# The deeper levels already carry this criterion: `_strassen_depth`'s `(s >> 1) >= _fh_strassen_base()`
-# requires a leaf of at least `_STRASSEN_BASE` before it will recurse again. Its `d == 0 ||` clause
-# exempts level 1 from that check, so level 1 is the one place the leaf width is not tested, and the
-# floor is what has to test it.
+#     n     Zen3     Zen4     Zen5  |  Zen3 6t  Zen4 6t  Zen5 6t
+#     256   -2.7%    -1.5%    +1.6% |   2.42x    2.55x    1.91x     <- leaf 128 == _L3_NB
+#     300   -8.3%    +0.5%    +4.1% |   2.13x    2.33x    1.63x     <- non-power-of-two
+#     384   -0.3%    +3.7%   +13.0% |   1.71x    1.86x    1.37x
+#     448   +2.2%    +6.2%   +15.4% |   1.61x    1.70x    1.22x
+#     512   +0.1%    +6.1%    +7.6% |   1.55x    1.57x    1.34x
 #
-# MEASURED, both frequency-locked gate boxes, 4 rounds per arm with arm order rotated, fresh operands
-# per sample, through the public entry — Strassen on against Strassen off, serial and at six threads
-# (`+` = Strassen faster serially; the threaded column is how much faster CLASSICAL is):
+# CLASSICAL WINS THREADED AT EVERY SIZE ON EVERY BOX, 1.22x to 2.55x. Serially the boxes disagree, and
+# they disagree AT n=256: Zen3 and Zen4 lose 1.5-2.7% to Strassen there while Zen5 gains 1.6%. So
+# excluding n=256 is free on two boxes and costs the third — a serial-against-threaded trade on one
+# constant, not a defect to fix, and the same shape holds at every larger size in the band.
 #
-#     n     Zen3 serial  Zen4 serial    Zen3 6t    Zen4 6t
-#     256      -2.7%        -1.5%        2.42x      2.55x     <- leaf 128 == _L3_NB
-#     300      -8.3%        +0.5%        2.13x      2.33x
-#     384      -0.3%        +3.7%        1.71x      1.86x
-#     448      +2.2%        +6.2%        1.61x      1.70x
-#     512      +0.1%        +6.1%        1.55x      1.57x
+# ⛔ A LEAF-WIDTH DERIVATION WAS TRIED AND FAILS req#8(b). `2 * _at_l3_nb(hw) + 1` reads well — level 1
+# halves the problem, so n=256 commits to leaves of exactly `_L3_NB`, one block wide with nothing to
+# amortize the recursion's 18 extra adds over, and `_strassen_depth`'s `d == 0 ||` clause is the one
+# place the leaf width goes untested. It reproduces Zen3 and Zen4 and CONTRADICTS Zen5, so it does not
+# reproduce the fleet's measured optima and cannot be trusted to extrapolate. The datapath does not
+# rescue it either: Zen5 is the native-512 box, and cheaper FMAs make Strassen's flops-for-adds trade
+# LESS attractive, which predicts the opposite of the sign measured.
 #
-# n=256 is the only size where both boxes agree that Strassen loses, and it is the size the criterion
-# above excludes. From 300 up the serial signs OPPOSE across the two boxes while classical still wins
-# threaded, so those sizes are a genuine serial-vs-threaded trade on one constant and are left alone.
-#
-# REPRODUCED, which is what this knob's history demands of anything that moves it — an earlier +2.3%
-# here was run-to-run variation that reversed on a second run of the same box. n=256 is four runs
-# across the two boxes, every one negative, and the serial draws do not overlap in any of them (Zen3
-# -2.7% then -2.5%, Zen4 -1.5% then -1.6%; a representative pair is strassen 0.6469-0.6517 ms against
-# classical 0.6300-0.6331). n=300's -8.2%/-8.3% likewise reproduces with no overlap, and it is the
-# NON-POWER-OF-TWO size: the po2-only ladder reads -2.7/-0.3/+2.2/+0.1 and looks like a wash.
-# ⚠ Zen5 IS NOT COVERED. Its clock reads pinned in sysfs and runs at 4830 MHz under load, so no arm
-# from that box is admissible until it is relocked. The one coherent Zen5 figure on record claims
-# +1.55% FOR Strassen at this very cell, against a table that reads 1.0625 and 1.0565 at n=1024 and
-# n=2048 where both floors give the same depth and the true answer is 1.0000 — so that 1.55% sits
-# inside the dispersion of the instrument that produced it, which is an argument and not a measurement.
-#
-# ⛔ DO NOT RAISE THIS TO 512. `docs/src/knobs.md` records that value as gate-rejected, and the table
-# above is why it should stay rejected: it would cost Zen4 6.1-6.2% serially at 448 and 512.
+# ⛔ DO NOT RAISE THIS TO 512 either. `docs/src/knobs.md` records that value as gate-rejected, and the
+# table is why it should stay so: Zen4 pays 6.1-6.2% serially at 448 and 512, Zen5 7.6-15.4%.
 # ⚠ `_strassen_depth` is keyed on `min(m, n, k)` and the table is square, so a skewed shape whose
 # min-dim clears the floor on a long axis is not covered by it.
-# PDM: Derive — leaf width against `_at_l3_nb`, the deeper levels' own criterion applied to level 1.
-@inline _at_strassen_min(hw) = 2 * _at_l3_nb(hw) + 1
+# ⚠ The threaded column is why this is worth revisiting rather than closing: 1.22-2.55x on every box at
+# every size in the band is a large, unanimous threaded loss, and it is paid to keep a serial win that
+# only two of three boxes see at the boundary. Which side wins is a GATE-POLICY decision — one constant
+# serves both gates and req#11 forbids keying it on the thread count — so it is the user's, not a
+# derivation waiting to be found.
+# PDM: Literal — µarch-split at the boundary cell; three-box table above. | req8-ok: fleet-measured, derivation falsified
+@inline _at_strassen_min(hw) = 256
 # FALSIFIED PREDICATE, now a fleet-evidenced literal — same story as `_at_strassen_min` directly above.
 # Was `_datapath_bytes(hw) >= 64 ? 1792 : 448`. FLAT on zen3/zen4; 1792 measured on Zen5
 # (2 locked runs: 1.0011/1.0813/1.0703 at n=256/512/1024) — and Zen5 is a 32 B datapath, so the

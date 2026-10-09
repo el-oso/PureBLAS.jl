@@ -207,21 +207,20 @@
 @test P._datapath_bytes(zen4) == 32
 @test P._datapath_bytes(zen5) == 64      # Granite Ridge / Turin: genuinely native
 @test P._datapath_bytes(zen5m) == 32     # Strix / Krackan: FP256, lands with zen4
-# `trmm_rpack` is one value everywhere. `strassen_min` is DERIVED from the gemm blocking width: a
-# Strassen leaf is `n ÷ 2`, so the floor is the smallest `n` whose leaf clears `_at_l3_nb`, which is
-# the criterion the deeper levels already apply through `_STRASSEN_BASE`.
+# Both are ONE value everywhere, and `strassen_min` stays that way on purpose: a leaf-width derivation
+# (`2 * _at_l3_nb + 1`, excluding n=256 because its leaf is exactly one blocking width) reproduces Zen3
+# and Zen4 and CONTRADICTS Zen5, which gains 1.6% from Strassen at that cell. A formula that misses a
+# fleet box is not trusted to extrapolate — see the three-box table at `_at_strassen_min`.
 for d in (zen3, zen4, zen5, zen5m, tigerlake)
-    @test P._at_strassen_min(d) == 2 * P._at_l3_nb(d) + 1
+    @test P._at_strassen_min(d) == 256
     @test P._at_trmm_rpack(d) == 1792
 end
-# Every fleet descriptor has 512 KB or more of L2, so the blocking width caps at 128 and the floor is
-# 257 — a SMALL-L2 descriptor must move it, or the derivation is a literal wearing a formula.
+# `_at_l3_nb` IS derived, and the small-L2 descriptor is what proves it is a formula rather than a
+# literal: every fleet box caps at 128, so only an off-fleet L2 can move it.
 for d in (zen3, zen4, zen5, zen5m, tigerlake)
     @test P._at_l3_nb(d) == 128
-    @test P._at_strassen_min(d) == 257
 end
-@test P._at_l3_nb((; zen3..., l2 = 128 * 1024)) == 64       # 64 KB tile: leaf must clear 64
-@test P._at_strassen_min((; zen3..., l2 = 128 * 1024)) == 129
+@test P._at_l3_nb((; zen3..., l2 = 128 * 1024)) == 64
 # Live machine agrees with the formula applied to its own detected _HW, and `_L3_NB` resolves through
 # the same function so the two cannot drift.
 @test P._STRASSEN_MIN == P._at_strassen_min(P._HW)
