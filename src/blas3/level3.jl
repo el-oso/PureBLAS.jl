@@ -1514,7 +1514,7 @@ function trmm!(
     # TINY real trmm: go straight to the base kernel, skipping the `_trmm!`→`_trmm_left!/_trmm_right!`
     # wrapper chain (ROADMAP: adds ~16% on a ~50 ns 8×8 op — trmm@8 0.84 via chain vs 0.999 direct). The
     # dispatch below MIRRORS the k≤_TRMM_BASE branches of `_trmm_left!`/`_trmm_right!` exactly.
-    if eltype(B) <: BlasReal && transA != 'C' && k <= (sl ? _TRMM_BASE_R : _TRMM_BASE)
+    if eltype(B) <: BlasReal && transA != 'C' && k <= _TRMM_BASE_R
         up_ = uplo == 'U'; tr_ = transA != 'N'; unit_ = diag == 'U'
         if sl
             k <= _fh_trmm_ddirect() ? _trmm_dense_L!(up_, tr_, unit_, A, B) : _trmm_small!(true, up_, tr_, unit_, A, B)
