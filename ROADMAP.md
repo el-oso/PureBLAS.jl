@@ -1818,6 +1818,30 @@ sparse Cholesky.
   rebuild (that is the refusal above, and cross-run references are what made Zen5's cache
   unusable in the first place).
 
+- **The dual groups have no threaded reference, so DL* cannot be gated with threads on.**
+  OpenBLAS and AOCL implement no dual-number arithmetic, so there is no vendor arm to compare
+  against at any thread count. `DL1`'s reference is the arm `generic` — LinearAlgebra's own fallback
+  over `Vector{Dual}`, a different Julia *implementation* rather than a different BLAS — and it is
+  single-threaded. A `pb_mt` arm divided by `generic` is therefore threaded ÷ serial: the ratio rises
+  with the thread count whatever PureBLAS does, which is the same flattering-the-numerator error that
+  a throttled reference produces. `bench/fleet_refresh.sh` keeps the dual groups out of a threaded
+  group list for this reason, and `_gemm_dual3!` calling `_gemm_core_out!` means the dual gemm plane
+  products do not thread anyway.
+
+  What a defensible dual threaded number needs, roughly by value:
+  1. **A derived reference from the real threaded vendor arms.** A dual `gemm` over `Dual{T,N}` does
+     the work of `1 + N` real `gemm`s on the value and partial planes, so `(1 + N) ×` the cached
+     `max(openblas_mt, aocl_mt)` time for the same shape is a reference with no new measurement at
+     all — it prices what a dual product *should* cost on that silicon. Needs the multiplier argued
+     per op (`trmm`/`trsm`/`syrk` have their own plane counts), and it is a roofline, so it belongs in
+     its own view rather than beside a measured arm.
+  2. **Self-speedup as the reported figure for DL\*.** `pb_mt ÷ pb` within one run is honest and
+     already measurable. It scores scaling, not competitiveness, so it cannot carry the gate — state
+     that wherever it is published rather than letting a reader read it as one.
+  3. **A threaded `generic` arm.** Thread LinearAlgebra's generic fallback in the harness so the
+     reference matches the arm's thread count. This means authoring a reference implementation whose
+     parallel efficiency then decides PureBLAS's score, which is a conflict the other two avoid.
+
 ### Wishlist
 
 - **Pure-Julia reimplementation of BLASFEO kernel ideas.** BLASFEO (github.com/giaf/blasfeo, BSD-2)
