@@ -52,3 +52,7 @@ bench/probes/*.bak
 # local build output and scratch logs
 bench/tools/build/
 scratchpad/
+
+# Pre-sweep cache snapshots kept so bench/ledger/ledger.sh can record a genuine before/after.
+# Each is a full ~24 MB cache copy; the LEDGER ITSELF (bench/ledger/cells.tsv) is small and tracked.
+bench/ledger/snapshots/
