@@ -48,12 +48,28 @@ const _OPENBLAS = B.get_config().loaded_libs[1].libname
 
 const OP = ARGS[1]
 const N = parse(Int, ARGS[2])
+# A THIRD ARGUMENT SWITCHES TO SELF-SPEEDUP and measures NO reference at all: the two arms are the
+# SAME PB closure on the SAME operands at 1 thread and at `NT`, so the comparison needs no vendor
+# library and no LBT forwarding. That is what makes K-process replication of a THREADED verdict
+# affordable — and why it carries no authorisation cost, unlike the gate mode below.
+#
+# WHY IT HAS TO BE ACROSS PROCESSES. Inter-round spread within one process cannot certify a cell: a
+# round reuses one page-colouring draw for both arms and only a new process re-rolls it. Measured here
+# at axpy n=1e6, 10 in-process rounds read 1.0153 [1.0000, 1.0214] where 10 fresh processes read
+# 0.9868 with 9 of 10 below 1.0 — the OPPOSITE SIGN, not merely a wider interval. So a tight
+# `spread_mt` in `bench/ledger/cells.tsv` disqualifies nothing and confirms nothing; this does.
+#
+#   julia --project=bench -t 7 bench/cellrep.jl trmm 32 6 >> log      # one process, one line
+#   bench/ledger/replicate.sh trmm 32 6 10                            # ten processes, with the verdict
+const NT = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 0
 _l1rep(s) = clamp(8_000_000 ÷ s, 30, 20000)          # plots.jl's _L1REP — the regime must match
 _l2rep(s) = clamp(400_000_000 ÷ (s * s), 30, 20000)  # plots.jl's _L2REP — O(s²) work
+_l3rep(s) = clamp(20_000_000 ÷ (s * s * s), 1, 512)  # plots.jl's _reps_cubic — O(s³) work
 # WHICH formula an op gets is part of the regime, not a detail: `_l1rep` on an O(s²) op asks for
 # 7812 reps of a 1024x1024 gemv per sample, ~1000x plots.jl's budget, and the cell would then be
 # timed deep in a steady state the gate never enters.
 const _L2OPS = ("gemvN", "gemvT", "trmv")
+const _L3OPS = ("trmmL", "trmmR", "syrk")
 
 # op => (setup, pb work, reference work). Reference goes through LinearAlgebra.BLAS, which LBT points
 # at whichever library is forwarded below.
@@ -244,10 +260,48 @@ const OPS = Dict(
             end; s
         ),
     ),
+    # ── L3, SELF-SPEEDUP ONLY ──────────────────────────────────────────────────────────────────────
+    # The reference closure is deliberately the PB one: these entries exist for the `NT` mode, where
+    # both arms are PB and the third slot is never called. Pointing it at a vendor would make a gate
+    # run on these ops silently measure PB against itself, so it errors instead.
+    #
+    # The gate shapes are plots.jl's: `sq(s) = (randn(s,s), randn(s), randn(s))` for syrk, and for
+    # trmm a triangular A with a square B, destructive in B so each rep restores it — without that,
+    # repeated in-place B := A*B diverges and the timing measures denormals, which is the same trap
+    # `trmv` above documents.
+    "trmmL" => (
+        () -> (tril(randn(N, N)) + N * I, randn(N, N), zeros(N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                copyto!(c[3], c[2]); P.trmm!(c[1], c[3]; side = 'L', uplo = 'L', alpha = 1.0)
+            end; c[3][1]
+        ),
+        (c, m) -> error("cellrep: trmmL is self-speedup only (pass a thread count); it has no reference arm"),
+    ),
+    "trmmR" => (
+        () -> (tril(randn(N, N)) + N * I, randn(N, N), zeros(N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                copyto!(c[3], c[2]); P.trmm!(c[1], c[3]; side = 'R', uplo = 'L', alpha = 1.0)
+            end; c[3][1]
+        ),
+        (c, m) -> error("cellrep: trmmR is self-speedup only (pass a thread count); it has no reference arm"),
+    ),
+    "syrk" => (
+        () -> (randn(N, N), zeros(N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.syrk!(c[2], c[1]; uplo = 'U', alpha = 1.0, beta = 0.0)
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: syrk is self-speedup only (pass a thread count); it has no reference arm"),
+    ),
 )
 haskey(OPS, OP) || error("cellrep: unknown op $OP (have: $(join(sort(collect(keys(OPS))), ", ")))")
+(OP in _L3OPS && NT <= 1) &&
+    error("cellrep: $OP is self-speedup only — pass a thread count, e.g. `cellrep.jl $OP $N 6`")
 mk, pbw, refw = OPS[OP]
-reps = (OP in _L2OPS ? _l2rep : _l1rep)(N)
+reps = (OP in _L3OPS ? _l3rep : OP in _L2OPS ? _l2rep : _l1rep)(N)
 
 "Median-of-samples time for one arm, Chairmarks, fresh input per sample (plots.jl's `evals=1` regime)."
 function armtime(work)
@@ -263,12 +317,30 @@ end
 # 2.9 ms single-threaded — a 4x phantom "win" that would poison every large-n screen).
 ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"
 using AOCL_jll
-out = Dict{String, Float64}()
-for (nm, lib) in ("openblas" => nothing, "aocl" => AOCL_jll.aocl_blas_ilp64)
-    isnothing(lib) ? B.lbt_forward(_OPENBLAS; clear = true) :
-        B.lbt_forward(lib; clear = true)      # clear=true, as plots.jl:66 does — clear=false leaves routing ambiguous
-    out[nm] = armtime(refw)
+if NT > 1
+    # SELF-SPEEDUP: no reference arm is measured and no library is forwarded, so this path costs no
+    # authorisation. Both arms are the same closure on the same operands; only `set_num_threads`
+    # differs, and it is set OUTSIDE the timed window because it takes a lock and may allocate the
+    # pools on first use. The pools are warmed once here so neither arm pays for them.
+    P.set_num_threads(NT); P.set_num_threads(1)
+    t1 = armtime(pbw)
+    P.set_num_threads(NT)
+    # WITNESS IN THE OUTPUT, not just in a comment: `set_num_threads` CLAMPS to
+    # `min(Threads.nthreads(), _MT_NW_MASK)`, so a process launched without enough `-t` silently
+    # measures fewer workers than asked. Printing what the pool ACCEPTED, read back after the call,
+    # means a line from such a process is identifiable afterwards instead of averaging in unnoticed.
+    ntgot = P._MT_NTHREADS[]
+    tn = armtime(pbw)
+    P.set_num_threads(1)
+    @printf("%s\t%d\t%d\t%d\t%.6g\t%.6g\t%.6g\n", OP, N, NT, ntgot, t1 / tn, t1, tn)
+else
+    out = Dict{String, Float64}()
+    for (nm, lib) in ("openblas" => nothing, "aocl" => AOCL_jll.aocl_blas_ilp64)
+        isnothing(lib) ? B.lbt_forward(_OPENBLAS; clear = true) :
+            B.lbt_forward(lib; clear = true)  # clear=true, as plots.jl:66 does — clear=false leaves routing ambiguous
+        out[nm] = armtime(refw)
+    end
+    tpb = armtime(pbw)                        # PB is a direct Julia call; LBT state is irrelevant to it
+    ratio = minimum(values(out)) / tpb        # the FASTER reference sets the gate
+    @printf("%s\t%d\t%.6g\t%.6g\t%.6g\t%.6g\n", OP, N, ratio, tpb, out["openblas"], out["aocl"])
 end
-tpb = armtime(pbw)                            # PB is a direct Julia call; LBT state is irrelevant to it
-ratio = minimum(values(out)) / tpb            # the FASTER reference sets the gate
-@printf("%s\t%d\t%.6g\t%.6g\t%.6g\t%.6g\n", OP, N, ratio, tpb, out["openblas"], out["aocl"])
