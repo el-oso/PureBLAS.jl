@@ -187,8 +187,16 @@ if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | gre
         echo "    the per-box masks are in bench/plots.jl's _ARM_PB_MT comment. ==="
         exit 2
     fi
+    # THE CHECK MUST LOAD WHAT THE SWEEP LOADS, on the cores the sweep uses. `_MT_NT` is assigned
+    # nowhere, so `${_MT_NT:-6}` certified six threads however wide the pool actually was: a run at
+    # `SWEEP_EXTRA="mt=12"` draws twice the package power it was cleared for, and the power limit these
+    # checks exist to catch stays invisible. And sampling every core on the box rather than the sweep's
+    # own mask lets a co-tenant on another CCD fail a run that never touches it — galen's documented
+    # recipe pins the sweep to CCD1 while something else holds CCD0.
+    _MT_NT="$_pool"
+    export MTCORES="$CORE"
     echo "=== PRE-LOCK (all cores) ==="
-    _premt=$(NT="${_MT_NT:-6}" bash bench/fleet_freqlock.sh verify-mt 2>&1)
+    _premt=$(NT="$_MT_NT" bash bench/fleet_freqlock.sh verify-mt 2>&1)
     printf '%s\n' "$_premt" | tail -3
     if ! printf '%s' "$_premt" | grep -q '✅'; then
         echo "=== ABORT: the pin does not hold with every core loaded, so a THREADED sweep here"
@@ -261,9 +269,14 @@ for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP}; do
     # written instead of discarding the whole sweep.
     #
     # Runs BEFORE the cooldown below, so the heat this check puts into the package is what the cooldown
-    # then removes. After it, every group would start hotter than the references were measured in.
+    # then removes — which is why the cooldown is UNCONDITIONAL on a threaded run. It is otherwise
+    # skipped before the first group on the grounds that `PRE-LOCK` has just idled the box, and this
+    # check breaks that premise: it drives ~20 s of sustained all-core vector FP (an 8 s settle plus
+    # six 2 s samples under a 6-thread 1024-cube gemm), so the first group would start on a package
+    # that was fully loaded a moment earlier. That is the anchor-mismatch failure this cooldown exists
+    # to prevent, and its repair is the full-arms re-sweep this project caches references to avoid.
     if [ "${_MT_RUN:-0}" = 1 ]; then
-        _gmt=$(NT="${_MT_NT:-6}" bash bench/fleet_freqlock.sh verify-mt 2>&1)
+        _gmt=$(NT="$_MT_NT" bash bench/fleet_freqlock.sh verify-mt 2>&1)
         if ! printf '%s' "$_gmt" | grep -q '✅'; then
             echo "=== ABORT before group $g: the pin no longer holds with every core loaded."
             printf '%s\n' "$_gmt" | tail -2
@@ -271,6 +284,7 @@ for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP}; do
             FAILED="$FAILED $g(all-core)"
             break
         fi
+        _PB_COOL=1
     fi
     # LET THE BOX COOL BETWEEN GROUPS, or the anchors will not match the cached references.
     #
@@ -288,7 +302,7 @@ for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP}; do
     # A few minutes per group is far cheaper than that, and cheaper still than a discarded sweep.
     #
     # Skipped before the first group: `PRE-LOCK` has already just idled the box.
-    if [ -n "${_PB_NOTFIRST:-}" ]; then
+    if [ -n "${_PB_NOTFIRST:-}" ] || [ -n "${_PB_COOL:-}" ]; then
         echo "    (idle ${GROUP_GAP:-300}s so the box returns to the references' thermal state)"
         sleep "${GROUP_GAP:-300}"
     fi
@@ -322,13 +336,17 @@ echo "=== POST-LOCK ==="; bash bench/fleet_freqlock.sh verify 2>&1 | tail -2
 # damaged is unknown; it says the sweep is not publishable until the box is re-checked.
 if [ "${_MT_RUN:-0}" = 1 ]; then
     echo "=== POST-LOCK (all cores) ==="
-    _postmt=$(NT="${_MT_NT:-6}" bash bench/fleet_freqlock.sh verify-mt 2>&1)
+    _postmt=$(NT="$_MT_NT" bash bench/fleet_freqlock.sh verify-mt 2>&1)
     printf '%s\n' "$_postmt" | tail -3
-    printf '%s' "$_postmt" | grep -q '✅' || {
+    # KEPT OUT OF `FAILED`, which names GROUPS. The block below prints "these groups did NOT land" and
+    # "their cells still carry the PREVIOUS commit", and offers a per-group re-run command — all three
+    # are false here and the third is not even a group name. The groups DID land; what is in doubt is
+    # whether the box was still locked while they did.
+    printf '%s' "$_postmt" | grep -q '✅' || POSTMT_BAD=1
+    [ -z "${POSTMT_BAD:-}" ] || {
         echo "=== WARNING: the pin held at the START of this sweep and does NOT hold now. Every"
         echo "    threaded arm written above is suspect — the box may have been measuring its power"
         echo "    limit for part of the run. Do NOT publish; re-check the box and re-sweep. ==="
-        FAILED="$FAILED post-lock-all-cores"
     }
 fi
 if [ -n "$FAILED" ]; then
@@ -338,4 +356,5 @@ if [ -n "$FAILED" ]; then
     echo "    Then confirm with: bench/cache_staleness.sh"
     exit 1
 fi
+[ -z "${POSTMT_BAD:-}" ] || { echo "=== REFRESH COMPLETE but NOT PUBLISHABLE — the all-core pin failed at the end ==="; exit 1; }
 echo "=== REFRESH DONE ==="

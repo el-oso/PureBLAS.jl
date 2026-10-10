@@ -331,11 +331,26 @@ JL
     # reads exactly like the wintermute power limit this subcommand exists to catch. An idle core is
     # not a throttled core. Frequency is per PHYSICAL core on these parts, so one CPU per core is both
     # necessary and sufficient to sample.
+    # MTCORES RESTRICTS THIS TO ONE SWEEP'S OWN MASK. Loading and sampling every core on the box makes
+    # the verdict depend on cores the caller never uses: galen's documented recipe runs the sweep on
+    # CCD1 while a co-tenant holds CCD0, so a whole-box check reports that co-tenant's clock as a
+    # failure. Accepts the same comma/range spelling as BENCH_CORE; unset means the whole box, which is
+    # right for a bare `verify-mt` asking "can this machine hold its pin".
+    _cand=""
+    if [ -n "${MTCORES:-}" ]; then
+        for _p in $(printf '%s' "$MTCORES" | tr ',' ' '); do
+            case "$_p" in
+                *-*) for _c in $(seq "${_p%-*}" "${_p#*-}"); do _cand="$_cand $_c"; done ;;
+                *)   _cand="$_cand $_p" ;;
+            esac
+        done
+    else
+        for _d in /sys/devices/system/cpu/cpu[0-9]*; do _cand="$_cand ${_d##*/cpu}"; done
+    fi
     _cores=""; _seen=" "
-    for _d in /sys/devices/system/cpu/cpu[0-9]*; do
-        [ -d "$_d/cpufreq" ] || continue
-        _n=${_d##*/cpu}
-        _id=$(cat "$_d/topology/core_id" 2>/dev/null || echo "$_n")
+    for _n in $_cand; do
+        [ -d "/sys/devices/system/cpu/cpu$_n/cpufreq" ] || continue
+        _id=$(cat "/sys/devices/system/cpu/cpu$_n/topology/core_id" 2>/dev/null || echo "$_n")
         case "$_seen" in *" $_id "*) continue ;; esac
         _seen="$_seen$_id "; _cores="${_cores:+$_cores,}$_n"
     done
