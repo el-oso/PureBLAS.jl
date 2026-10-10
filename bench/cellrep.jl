@@ -70,6 +70,11 @@ _l3rep(s) = clamp(20_000_000 ÷ (s * s * s), 1, 512)  # plots.jl's _reps_cubic �
 # timed deep in a steady state the gate never enters.
 const _L2OPS = ("gemvN", "gemvT", "trmv")
 const _L3OPS = ("trmmL", "trmmR", "syrk")
+# plots.jl's `tri(s)`, character for character. Conditioned so repeated in-place `B := A*B` is stable,
+# which is what lets the gate omit a per-rep restore; see the note at the L3 registry entries.
+_tri(s) = (A = randn(s, s) ./ (2s); for i in 1:s
+        A[i, i] = 1 + abs(A[i, i])
+    end; A)
 
 # op => (setup, pb work, reference work). Reference goes through LinearAlgebra.BLAS, which LBT points
 # at whichever library is forwarded below.
@@ -265,25 +270,29 @@ const OPS = Dict(
     # both arms are PB and the third slot is never called. Pointing it at a vendor would make a gate
     # run on these ops silently measure PB against itself, so it errors instead.
     #
-    # The gate shapes are plots.jl's: `sq(s) = (randn(s,s), randn(s), randn(s))` for syrk, and for
-    # trmm a triangular A with a square B, destructive in B so each rep restores it — without that,
-    # repeated in-place B := A*B diverges and the timing measures denormals, which is the same trap
-    # `trmv` above documents.
+    # THE OPERANDS AND FLAGS ARE plots.jl's, COPIED NOT APPROXIMATED. Its `tri(s)` is
+    # `randn(s,s) ./ (2s)` with `A[i,i] = 1 + abs(A[i,i])`, and the conditioning is the point: with a
+    # unit-ish diagonal and O(1/s) off-diagonals, repeated in-place `B := A*B` neither blows up nor
+    # decays, so the gate needs NO per-rep restore and its timing is of the kernel rather than of
+    # denormals. A first version here used `tril(randn) + N*I`, whose diagonal is ~N, which forces a
+    # `copyto!` to stay finite — and that restore is extra traffic the gate never pays. It read 0.998
+    # where the cached cell reads 0.876, i.e. it measured a different problem. `uplo` is 'U' and the
+    # sides are 'L'/'R' as the gate sets them; syrk is `trans='N'`, `uplo='U'`, C zeroed.
     "trmmL" => (
-        () -> (tril(randn(N, N)) + N * I, randn(N, N), zeros(N, N)),
+        () -> (_tri(N), randn(N, N)),
         (c, m) -> (
             for _ in 1:m
-                copyto!(c[3], c[2]); P.trmm!(c[1], c[3]; side = 'L', uplo = 'L', alpha = 1.0)
-            end; c[3][1]
+                P.trmm!(c[2], c[1]; side = 'L', uplo = 'U')
+            end; c[2][1]
         ),
         (c, m) -> error("cellrep: trmmL is self-speedup only (pass a thread count); it has no reference arm"),
     ),
     "trmmR" => (
-        () -> (tril(randn(N, N)) + N * I, randn(N, N), zeros(N, N)),
+        () -> (_tri(N), randn(N, N)),
         (c, m) -> (
             for _ in 1:m
-                copyto!(c[3], c[2]); P.trmm!(c[1], c[3]; side = 'R', uplo = 'L', alpha = 1.0)
-            end; c[3][1]
+                P.trmm!(c[2], c[1]; side = 'R', uplo = 'U')
+            end; c[2][1]
         ),
         (c, m) -> error("cellrep: trmmR is self-speedup only (pass a thread count); it has no reference arm"),
     ),
@@ -291,7 +300,7 @@ const OPS = Dict(
         () -> (randn(N, N), zeros(N, N)),
         (c, m) -> (
             for _ in 1:m
-                P.syrk!(c[2], c[1]; uplo = 'U', alpha = 1.0, beta = 0.0)
+                P.syrk!(c[2], c[1]; uplo = 'U', trans = 'N')
             end; c[2][1]
         ),
         (c, m) -> error("cellrep: syrk is self-speedup only (pass a thread count); it has no reference arm"),
