@@ -45,16 +45,28 @@ for box in "${boxes[@]}"; do
     if ! ssh -o ConnectTimeout=8 -o BatchMode=yes "$box" true 2>/dev/null; then
         echo "  UNREACHABLE — skipped" >&2; continue
     fi
+    # DETACH, NEVER CHECK OUT `master`. Checking out `master` and hard-resetting it to `$ref` leaves
+    # the box's `master` pointing at whatever was synced — a feature commit, or one that has since
+    # been reverted — so `git branch`, `git worktree list` and the shell prompt all name it `master`
+    # while it is nothing of the kind. That is the same provenance lie this script exists to prevent,
+    # one level up: rsync made the cache's `commit=` stamp false, and hijacking the branch label makes
+    # the BOX's own report of itself false. Measured consequence: galen sat on a reverted commit for
+    # hours under the label `master`, and `git worktree list` showed `15bd758c [master]`.
+    # Detached HEAD is the honest state for a box that tracks whatever it was last told to.
     ssh "$box" "cd $REMOTE_DIR && \
         git fetch -q origin && \
-        git checkout -q master 2>/dev/null || true; \
+        git checkout -q --detach $ref && \
         git reset --hard -q $ref && \
         echo \"  HEAD  \$(git rev-parse --short HEAD)  \$(git log -1 --format=%s | cut -c1-60)\" && \
         echo \"  dirty \$(git status --porcelain | grep -vc '^??' || true) tracked file(s)\" && \
-        echo \"  caches kept: \$(ls bench/plots_data_*.txt 2>/dev/null | wc -l)\""
-    # Parity check: identical source content, not just an identical commit id. Cheap, and it is the
-    # check that caught a locale sort-order false alarm when this was verified by hand.
-    lm=$(find src -name '*.jl' -exec md5sum {} \; | LC_ALL=C sort | md5sum | cut -d' ' -f1)
-    rm_=$(ssh "$box" "cd $REMOTE_DIR && find src -name '*.jl' -exec md5sum {} \; | LC_ALL=C sort | md5sum | cut -d' ' -f1")
-    if [[ "$lm" == "$rm_" ]]; then echo "  src parity OK"; else echo "  SRC PARITY MISMATCH ($lm vs $rm_)" >&2; fi
+        echo \"  caches kept: \$(ls bench/*_data_*.txt 2>/dev/null | wc -l)\""
+    # PARITY AGAINST THE REF, NOT AGAINST THE WORKING TREE. Comparing an md5 walk of the local `src/`
+    # answers "does the box match what is on my disk", which is the wrong question twice over: with
+    # uncommitted edits it can never pass, and when syncing a box to a DIFFERENT ref on purpose it
+    # reports a mismatch for a sync that did exactly what was asked. Git already has the exact answer
+    # — the tree object id of `src/` — so compare that: identical ids mean byte-identical content, no
+    # file walk, no locale ordering to get wrong.
+    lt=$(git rev-parse "$ref:src")
+    rt=$(ssh "$box" "cd $REMOTE_DIR && git rev-parse HEAD:src")
+    if [[ "$lt" == "$rt" ]]; then echo "  src parity OK (tree $lt)"; else echo "  SRC PARITY MISMATCH ($lt vs $rt)" >&2; fi
 done
