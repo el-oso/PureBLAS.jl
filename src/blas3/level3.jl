@@ -1072,7 +1072,7 @@ end
 # row split exactly where this branch owns the call.
 function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, wi::Int = 0)
     k = size(A, 1)
-    if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
+    if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE_R
         return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
             _trmm_small!(false, up, tr, unit, A, B)
     elseif _strided1(B) && eltype(B) === Float64 && !cj && k > _fh_trmm_rpack() &&
@@ -1120,17 +1120,22 @@ end
 # Halving recursion (diagonal blocks of the flat loop + the complex/AD path).
 function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
-    if k <= _TRMM_BASE
-        if eltype(B) <: BlasReal && !cj
-            return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
-                _trmm_small!(false, up, tr, unit, A, B)
-        elseif eltype(B) <: BlasComplex
-            # (the old "side-R packed regresses" note was a routing-bug artifact: the 0.24 was the scalar
-            # column-axpy base @_trmm_right!, not a packed kernel — packed_R didn't exist yet.)
-            return !_strided1(B) ? _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B) :
-                (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
-                _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B)
-        end
+    # ONE BASE PER ELEMENT TYPE. The real base is `_TRMM_BASE_R`, which is two SME tiles where the
+    # coprocessor exists and `_L3_NB` where it does not; complex and the generic fallback keep
+    # `_TRMM_BASE`. The last branch must exclude real-non-conjugate explicitly: it is the catch-all
+    # for the types the first two do not claim, and letting it take real as well would make a
+    # `transA = 'C'` real call — `cj` true, so the first branch declines it — reach no branch at all
+    # between `_TRMM_BASE_R` and `_TRMM_BASE` and recurse on an unchanged `k`.
+    if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE_R
+        return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
+            _trmm_small!(false, up, tr, unit, A, B)
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE
+        # (the old "side-R packed regresses" note was a routing-bug artifact: the 0.24 was the scalar
+        # column-axpy base @_trmm_right!, not a packed kernel — packed_R didn't exist yet.)
+        return !_strided1(B) ? _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B) :
+            (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
+            _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B)
+    elseif k <= _TRMM_BASE && !(eltype(B) <: BlasReal && !cj)
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
     end
     h = _trsplit(k)
