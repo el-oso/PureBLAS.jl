@@ -104,7 +104,10 @@ case "$MODE" in
 esac
 
 echo "=== pinning sweep to core $CORE ($(hostname)), mode=$MODE ==="
-[ "$MODE" = full ] && echo "=== FULL ARMS: passing '$ARMSARG' — every named arm measured per cell in one machine state ==="
+# PRINT THE ARM STRING UNCONDITIONALLY. `mode=pb` names a DEFAULT, not what this run measures: a
+# SWEEP_ARMS override can put vendor arms in a `pb`-mode run, and a reader who takes the mode word as
+# "references untouched" draws the opposite conclusion from the truth. The arm string is the fact.
+echo "=== ARMS: '$ARMSARG' — every named arm measured per cell in one machine state ==="
 # PRE-LOCK MUST PASS, not merely be readable. The per-group check below compares each reading against
 # the OPENING one, so it catches a lock that lets go mid-sweep but not a box that was never locked: an
 # unlocked box reads a stable boost clock and drifts 0%. neuromancer opened a sweep at 4774 MHz against
