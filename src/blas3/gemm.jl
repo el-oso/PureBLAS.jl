@@ -3738,6 +3738,70 @@ const _GEMM_MT_WORK_CANDIDATES = ntuple(i -> (_GEMM_MT_WORK_SHIPPED >> 2) << (i 
 const _GEMM_MT_WORK_PREF = @load_preference("gemm_mt_work", nothing)
 const _GEMM_MT_WORK = something(_GEMM_MT_WORK_PREF, _GEMM_MT_WORK_SHIPPED)::Int   # req8-ok: shipped default until tune!() moves it
 
+# ── THE JOIN COST IS A FUNCTION OF THE WORKER COUNT, NOT A CONSTANT ─────────────────────────────────
+# `_MT_JOIN_NS_MEASURED` is the round trip at SIX workers, and the round trip grows with the worker
+# count. Measured on galen (Zen3, locked 3701 MHz) by calling `_gemm_threaded!` with an explicit `nw`
+# so admission is bypassed and compute driven to ~zero; round trip = threaded minus serial at the same
+# size, two sizes per count:
+#
+#     nw     2        3        4        6
+#     n=8    367 ns   382      457      681
+#     n=16   283 ns   226      299      590
+#
+# So it roughly DOUBLES from two workers to six, and 616 sits at the six-worker end. ⚠ The fine shape
+# between is NOT resolved — n=16 reads 226 at nw=3 against 283 at nw=2, non-monotonic, so only the
+# nw=2-vs-nw=6 gap (2.1x) is clearly outside the ~±60 ns dispersion. A straight line through those two
+# ends is therefore the honest model: two points, two parameters, no claim about the middle.
+#
+# WHY A CONSTANT IS WRONG RATHER THAN MERELY IMPRECISE. Charging the six-worker price against a
+# two-worker decision prices a property of the machine's core count into a threshold that req#8 says
+# must be derived, and it biases the decision in one direction: a call is refused the workers it could
+# amortise. gemm n=100 is 2e6 flops; priced at six workers it admits 2, priced per worker it admits 3,
+# and the pool is not inefficient on what it gets — 2 admitted workers there deliver 1.70x, 85% of
+# linear. The small-n threaded gap against a vendor using six is an ADMISSION decision, not a scaling
+# failure.
+# PDM: Measured — the MARGINAL cost of one more worker in the fork-join. It is an uncore latency, so
+# nothing detected predicts it; the slope above is the measurement. The FIXED part is DERIVED from it
+# and `_MT_JOIN_NS_MEASURED` so the two cannot drift apart: a model that reads 616 ns at six workers
+# is the recorded number, by construction. | tune: via gemm_mt_work, which scales both parts together
+const _MT_JOIN_NS_PER_WORKER = 78   # req8-ok: fleet-measured slope, (681-367)/4 and (590-283)/4 ≈ 78
+const _MT_JOIN_NS_FIXED = _MT_JOIN_NS_MEASURED - 6 * _MT_JOIN_NS_PER_WORKER   # 148 ns, so J(6) == 616
+# Both parts in FLOPS, by the same conversion `_GEMM_MT_WORK_SHIPPED` uses, and scaled by the same
+# Preference so a calibrated box moves the whole model rather than half of it.
+_mt_join_scale(ns::Int) =
+    ((ns * _MT_JOIN_CLOCK_MHZ_MEASURED ÷ 1000) * _MT_AMORTISE * _mt_flops_per_cycle(Float64)) *
+    _GEMM_MT_WORK ÷ _GEMM_MT_WORK_SHIPPED
+const _MT_JOIN_F0 = max(1, _mt_join_scale(_MT_JOIN_NS_FIXED))
+const _MT_JOIN_FW = max(1, _mt_join_scale(_MT_JOIN_NS_PER_WORKER))
+# The two-worker floor: a call that cannot amortise two workers cannot amortise more, so this is the
+# one compare the small-call path pays. It REPLACES `_GEMM_MT_WORK` as the rejection threshold and is
+# roughly half of it, which is the whole correction.
+const _MT_WORK_MIN = 2 * _MT_JOIN_F0 + 4 * _MT_JOIN_FW
+
+"""
+    _mt_workers_for(flops, nt, cap) -> Int
+
+Largest worker count whose own join cost this much work amortises, capped by `nt` and by `cap` (the
+caller's granularity limit — whole `_NR`-wide column blocks, or whole panels). `1` means serial.
+
+Admit `w` when `flops >= w * (F0 + FW * w)`, i.e. when each of the `w` workers brings at least
+`_MT_AMORTISE` times its own marginal share of the join. Solving the quadratic gives
+
+    w = (sqrt(F0^2 + 4 * FW * flops) - F0) / (2 * FW)
+
+One `isqrt` and three multiplies, and only calls that already cleared `_MT_WORK_MIN` reach it — the
+entry predicate for a gemm that takes tens of nanoseconds stays a compare, which is why the floor is
+checked by the caller before this is called.
+"""
+@inline function _mt_workers_for(flops::Int, nt::Int, cap::Int)
+    # A call that pays for every available thread needs no solve. This is also what keeps the product
+    # below the Int64 range: without it, `4 * FW * flops` overflows somewhere above n≈40000, and an
+    # overflowed `isqrt` argument would return a worker count rather than refusing.
+    flops >= nt * (_MT_JOIN_F0 + _MT_JOIN_FW * nt) && return max(1, min(nt, cap))
+    w = (isqrt(_MT_JOIN_F0 * _MT_JOIN_F0 + 4 * _MT_JOIN_FW * flops) - _MT_JOIN_F0) ÷ (2 * _MT_JOIN_FW)
+    return max(1, min(nt, w, cap))
+end
+
 """
     _gemm_workers(m, n, k) -> Int
 
@@ -3887,13 +3951,13 @@ end
 @inline function _gemm_workers(m::Int, n::Int, k::Int)
     nt = _MT_NTHREADS[]
     nt > 1 || return 1
-    # Early-out BEFORE any division. This predicate sits on the entry of every gemm, including the ones
-    # that take tens of nanoseconds, and an integer divide is ~20-40 cycles — so the small-call path
-    # must reach a decision with multiplies and compares only. (On a single-threaded process the line
-    # above already ends it, which is why the gate never sees this at all.)
+    # Early-out BEFORE any division or root. This predicate sits on the entry of every gemm, including
+    # the ones that take tens of nanoseconds, so the small-call path must reach a decision with
+    # multiplies and compares only. (On a single-threaded process the line above already ends it,
+    # which is why the gate never sees this at all.)
     flops = 2 * m * n * k
-    (flops < _GEMM_MT_WORK || n < _NR) && return 1
-    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
+    (flops < _MT_WORK_MIN || n < _NR) && return 1
+    return _mt_workers_for(flops, nt, cld(n, _NR))
 end
 
 # The job is a set of ISBITS fields on a pre-existing mutable struct, not a closure and not a tuple of
@@ -4106,8 +4170,8 @@ the cap would trade a rare idle worker for narrower chunks everywhere.
     nt = _MT_NTHREADS[]
     nt > 1 || return 1
     flops = n * (n + 1) * k
-    (flops < _GEMM_MT_WORK || n < _NR) && return 1
-    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
+    (flops < _MT_WORK_MIN || n < _NR) && return 1
+    return _mt_workers_for(flops, nt, cld(n, _NR))
 end
 
 """
