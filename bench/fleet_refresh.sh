@@ -122,7 +122,13 @@ fi
 # limit. wintermute passed it at a 2813 MHz pin while six cores oscillated 2332-2804 MHz on a 60 W
 # supply, and every threaded sweep since ran under that ✅ — 1208 of its cached arms are stamped below
 # the pin, and 413 cells compare two power states rather than two libraries.
-if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | grep -q 'pb_mt'; then
+#
+# ANY threaded arm makes this a threaded sweep, not `pb_mt` alone: `arms=openblas_mt,aocl_mt` loads
+# every core just as hard, so matching `_mt` is what keeps the all-core checks on. This mirrors
+# `_ANY_MT` in `bench/plots.jl`, whose comment records that keying on `pb_mt` alone sent a
+# reference-only threaded run down the single-threaded path.
+if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | grep -q '_mt'; then
+    _MT_RUN=1
     # THE JULIA THREAD COUNT MUST EXCEED THE PHYSICAL CORE COUNT, and this refuses rather than
     # measuring a handicapped pool. `bench/plots.jl`'s `_pin_threads!` pins one thread per physical
     # core and leaves anything beyond that floating, because the runtime needs a slot it can schedule
@@ -244,6 +250,25 @@ for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP}; do
         FAILED="$FAILED $g(lock)"
         break
     fi
+    # AND THE ALL-CORE CHECK BETWEEN GROUPS, for a threaded sweep, because the check above cannot see
+    # the other direction. A dropped pin makes the cores run FASTER than the setpoint, which one core
+    # under load reveals; a package power limit makes them run SLOWER only when every core is busy, and
+    # one core never reproduces it. Both end a sweep's validity, so both are checked per group, and a
+    # failure stops the run here rather than at the end — which bounds the loss to the groups already
+    # written instead of discarding the whole sweep.
+    #
+    # Runs BEFORE the cooldown below, so the heat this check puts into the package is what the cooldown
+    # then removes. After it, every group would start hotter than the references were measured in.
+    if [ "${_MT_RUN:-0}" = 1 ]; then
+        _gmt=$(NT="${_MT_NT:-6}" bash bench/fleet_freqlock.sh verify-mt 2>&1)
+        if ! printf '%s' "$_gmt" | grep -q '✅'; then
+            echo "=== ABORT before group $g: the pin no longer holds with every core loaded."
+            printf '%s\n' "$_gmt" | tail -2
+            echo "    Groups already written are kept; this one and the rest are not measured."
+            FAILED="$FAILED $g(all-core)"
+            break
+        fi
+    fi
     # LET THE BOX COOL BETWEEN GROUPS, or the anchors will not match the cached references.
     #
     # An `arms=pb` group runs ~3x faster than the full-arms group that produced the cached OpenBLAS
@@ -285,6 +310,24 @@ for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP}; do
     [ $ok -eq 1 ] || FAILED="$FAILED $g"
 done
 echo "=== POST-LOCK ==="; bash bench/fleet_freqlock.sh verify 2>&1 | tail -2
+# A THREADED SWEEP NEEDS THE ALL-CORE CHECK AT BOTH ENDS. `verify` loads one core, so it cannot see a
+# package power limit, and a sweep that drifted into one for its last hours closes with a ✅ that
+# certifies nothing. The in-cell `mtanchor` field does not cover this either: it scales the pin by the
+# all-core anchor's slowdown against the FIRST threaded window's reference, so a box throttled for the
+# whole run throttles the reference too and the ratio reads 1.0 — `bench/plots.jl` states that
+# limitation at `_mt_effective_khz`. A ❌ here does not delete the cache, because which cells it
+# damaged is unknown; it says the sweep is not publishable until the box is re-checked.
+if [ "${_MT_RUN:-0}" = 1 ]; then
+    echo "=== POST-LOCK (all cores) ==="
+    _postmt=$(NT="${_MT_NT:-6}" bash bench/fleet_freqlock.sh verify-mt 2>&1)
+    printf '%s\n' "$_postmt" | tail -3
+    printf '%s' "$_postmt" | grep -q '✅' || {
+        echo "=== WARNING: the pin held at the START of this sweep and does NOT hold now. Every"
+        echo "    threaded arm written above is suspect — the box may have been measuring its power"
+        echo "    limit for part of the run. Do NOT publish; re-check the box and re-sweep. ==="
+        FAILED="$FAILED post-lock-all-cores"
+    }
+fi
 if [ -n "$FAILED" ]; then
     echo "=== REFRESH INCOMPLETE — these groups did NOT land:$FAILED"
     echo "    Their cells still carry the PREVIOUS commit. Re-run them before publishing:"
