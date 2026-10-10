@@ -4890,8 +4890,8 @@ end
     nt = _MT_NTHREADS[]
     nt > 1 || return 1
     flops = k * k * n
-    (flops < _MT_WORK_MIN || n < _NR) && return 1
-    return _mt_workers_for(flops, nt, cld(n, _NR))
+    (flops < _GEMM_MT_WORK || n < _NR) && return 1
+    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
 end
 
 # One worker's column band. Called from `_gemm_run_chunk` (gemm.jl) on the pool's `_MT_KIND_TRSM` job,
