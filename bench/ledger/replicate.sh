@@ -62,10 +62,17 @@ awk -F'\t' -v K="$K" '
     printf "  %d of %d below 1.0\n", below, c
     # A verdict only where the sign is nearly unanimous AND the median is clear of 1.0. Anything else
     # is reported as not adjudicable rather than rounded into a pass or a fail.
+    # THE SIGN AND THE MAGNITUDE ARE SEPARATE CLAIMS, and a wide across-process spread kills the
+    # second without touching the first. Measured here: galen axpy@300000 reads median 2.43 with 9 of
+    # 10 processes above 1.0 — the sign is beyond doubt — while min 0.85 and max 3.81 put the spread at
+    # 4.49, so "threading helps" is established and "threading gives 2.43x" is not. Reporting only the
+    # median invites the second reading, so a spread past 1.5 says so in the verdict line.
+    spr = (r[1] > 0 ? r[c] / r[1] : 0)
+    mag = (spr > 1.5) ? sprintf(" ⚠ SIGN only — spread %.2f across processes, so the magnitude is NOT established", spr) : ""
     if (med < 0.98 && below >= c - 1)
-      printf "  VERDICT: threading LOSES here — %d/%d processes agree and the median is %.4f\n", below, c, med
+      printf "  VERDICT: threading LOSES here — %d/%d processes agree, median %.4f%s\n", below, c, med, mag
     else if (med > 1.02 && below <= 1)
-      printf "  VERDICT: threading WINS here — %d/%d processes agree and the median is %.4f\n", c - below, c, med
+      printf "  VERDICT: threading WINS here — %d/%d processes agree, median %.4f%s\n", c - below, c, med, mag
     else
       printf "  VERDICT: NOT ADJUDICABLE — median %.4f with %d/%d below 1.0; the across-process draw dominates the effect\n", med, below, c
   }' "$log"
