@@ -15,38 +15,36 @@
 #
 # PROVENANCE IS PER ARM, NEVER FROM THE HEADER. `commit` and `anchor` come from the `pb_mt` arm's own
 # record, because a targeted `op=`/`group=` merge rewrites the header while the file's other cells keep
-# the commit they were measured at — `plots.jl` writes a per-arm commit for exactly this reason and its
-# comment calls a header stamp "the same per-row provenance hazard `coverage_ops.jl` documents". A
+# the commit they were measured at — `plots.jl` writes a per-arm commit for exactly this reason. A
 # galen cache measured across two runs holds 1008 arms at one commit and 110 at another under a single
 # header; stamping the header against all of them is a false record of 1008 cells.
 #
 # `arm_time` keeps the full `%Y-%m-%dT%H:%M` the writer stores, and the dedup key uses it. Truncating
 # to a date makes a second sweep on the same day match every existing row, so `record` adds nothing
-# and reports success — which is this script's primary workflow failing on its commonest case. A
-# sweep also SPANS stamps: 12 groups with a 300 s gap runs for hours and crosses midnight, so one
-# sweep's cells carry many times and several commits. `diff` therefore keys on COMMIT, not on time,
-# and prints how many cells each side holds so partial coverage cannot read as full coverage.
+# and reports success. A sweep also SPANS stamps: 12 groups with a 300 s gap runs for hours and
+# crosses midnight, so one sweep's cells carry many times and several commits. `diff` therefore keys
+# on COMMIT, and counts DISTINCT CELLS so partial coverage cannot read as full coverage.
+#
+# EVERY RATIO IS FORMED ELEMENT-WISE OVER THE PAIRED QUANTILE VECTORS, then reduced by median. That is
+# the reduction `plots.jl` uses for both `selfsp` and `gate` (`_series`, via `_ratio`), and `_qvec`'s
+# comment insists the pairing "is preserved, nothing is approximated". Dividing two separately reduced
+# scalars is NOT the same number: measured on galen's 951 cells, 22 differ by more than 3%, the worst
+# being `L1/swap@300000` at 1.5973 element-wise against 1.2141 scalar — 31.6% — and **135 cells land on
+# opposite sides of 1.0**, which is the "does this thread at all" question. A ratio formed any other way
+# will not match the published plot for the same cell.
 #
 # ⚠ WHAT `spread_*` CANNOT DO: it is INTER-ROUND, so it is WITHIN ONE PROCESS, and a tight arm here is
 # NOT an adjudicable cell. Every round of a cell reuses one page-colouring draw for both arms — only a
 # new process re-rolls it — and `bench/cellrep.jl`'s header records the measured consequence at
 # axpy n=1e6: 10 in-process rounds read 1.0153 [1.0000, 1.0214] where 10 FRESH PROCESSES read 0.9868
-# with 9 of 10 below 1.0. Not merely wider: the OPPOSITE SIGN. So these columns separate "this arm
-# swung between rounds" from "it did not", which catches a bimodal arm but cannot certify a tight one;
-# a cell tight in both arms can still be a different number in the next process. Classifying a cell as
-# adjudicable needs K independent processes, which no cache holds and this script therefore cannot
-# compute — use it to DISQUALIFY a cell, never to confirm one.
+# with 9 of 10 below 1.0. Not merely wider: the OPPOSITE SIGN. So use it to DISQUALIFY a cell, never to
+# confirm one. It is EMPTY, not 1.0000, unless at least TWO rounds yielded a usable figure — a spread
+# of 1 by construction must not read as a measured tight arm.
 #
 # ESTIMATOR: a per-round figure is the MEDIAN of that round's 48 stored quantiles, and an arm's figure
 # is the median over rounds — the true median, averaging the two middle values when the count is even,
 # because the lower median equals the MINIMUM at the 2 rounds `_rounds_light` uses and `min` is the one
-# estimator this project forbids outright. `spread_*` is the inter-round max/min and is EMPTY, not
-# 1.0000, when an arm has a single round: a spread of 1 by construction must not read as a measured
-# tight arm. The `gate` column divides the two arms' quantile vectors ELEMENT-WISE and takes the median
-# of the ratios, which is the reduction `plots.jl` uses (`_qvec`'s comment: the pairing "is preserved,
-# nothing is approximated"); dividing two separately reduced scalars disagrees with it on a bimodal
-# arm. It is EMPTY when the cache holds no threaded vendor arm, so an `arms=pb,pb_mt` run cannot be
-# mistaken for a scored one.
+# estimator this project forbids outright.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 LEDGER=bench/ledger/cells.tsv
@@ -59,16 +57,25 @@ _extract() {   # <cache> <box>
       if (n % 2 == 1) return a[int((n - 1) / 2)]
       return (a[n / 2 - 1] + a[n / 2]) / 2
     }
+    # Median of the ELEMENT-WISE ratio of two arms quantile vectors. Returns "" when they cannot be
+    # paired, which is honest rather than a number formed a different way.
+    function pairmed(A, B, la, lb,   j, c) {
+      if (la != lb || la == 0) return ""
+      c = 0
+      for (j = 1; j <= la; j++) if (B[j] > 0) R[c++] = A[j] / B[j]
+      if (c == 0) return ""
+      return med(R, c)
+    }
     BEGIN { Q = 48; OFS = "\t" }
     NR == 1 { next }                            # the header carries no per-cell truth; see the note above
     {
-      delete md; delete sp; delete tm; delete cm; delete an; delete nrd; delete vec
+      delete md; delete sp; delete tm; delete cm; delete an; delete vlen
       for (i = 4; i <= NF; i++) {
         k = split($i, a, "|"); if (k < 9) continue
         arm = a[1]
         # THE CSV IS ALWAYS THE LAST FIELD. `plots.jl` states the extension rule outright -- "append
-        # before the csv, never after it" -- and `load_cache` indexes from both ends. A hardcoded 9
-        # would silently skip EVERY arm the day a tenth field lands, and report 0 new rows, exit 0.
+        # before the csv, never after it" -- so a hardcoded index would silently skip EVERY arm the
+        # day a tenth field lands, and report 0 new rows with exit 0.
         m = split(a[k], q, ","); if (m < Q || m % Q != 0) continue
         nr = m / Q; n = 0; lo = 1e30; hi = 0
         for (r = 0; r < nr; r++) {
@@ -80,25 +87,32 @@ _extract() {   # <cache> <box>
         }
         if (n == 0) continue
         md[arm] = med(mv, n); delete mv
-        nrd[arm] = nr
-        sp[arm] = (nr >= 2 && lo > 0) ? hi / lo : ""
+        # KEYED ON THE VALID-ROUND COUNT `n`, NOT the stored `nr`: with nr >= 2 but only one round
+        # yielding a usable figure, lo == hi and the column would read a perfect 1.0000.
+        sp[arm] = (n >= 2 && lo > 0) ? hi / lo : ""
         tm[arm] = a[2]; cm[arm] = a[3]; an[arm] = a[4]
-        for (j = 1; j <= m; j++) vec[arm, j] = q[j] + 0
         vlen[arm] = m
+        for (j = 1; j <= m; j++) VEC[arm, j] = q[j] + 0
       }
       if (!("pb" in md) || !("pb_mt" in md)) next
-      selfsp = md["pb"] / md["pb_mt"]
-      # The gate ratio, formed element-wise against the threaded vendor arms and reduced by median --
-      # the same pairing `plots.jl` preserves. Taken over the arm whose median ratio is SMALLEST,
-      # which is `min over refs`, the rule `_series` applies.
+      delete P; delete T
+      for (j = 1; j <= vlen["pb"]; j++)    P[j] = VEC["pb", j]
+      for (j = 1; j <= vlen["pb_mt"]; j++) T[j] = VEC["pb_mt", j]
+      selfsp = pairmed(P, T, vlen["pb"], vlen["pb_mt"])
+      if (selfsp == "") selfsp = md["pb"] / md["pb_mt"]     # unequal round counts: scalar, flagged by `~`
+      # The gate ratio: min over the THREADED vendor arms of the element-wise median ref/pb_mt. The arm
+      # list mirrors _REF_MT_ALL in plots.jl rather than hardcoding two names -- omitting
+      # accelerate_mt makes every row of an Apple cache read as unscored, which the empty gate column
+      # is defined to mean "no threaded vendor arm present".
+      # (NO APOSTROPHES anywhere in this awk program: it is single-quoted and one would end the string.
+      # bench/check_arm_clocks.sh carries the same warning; this file earned it the same way.)
       gate = ""
       for (ref in md) {
-        if (ref != "openblas_mt" && ref != "aocl_mt") continue
-        if (vlen[ref] != vlen["pb_mt"]) continue        # different round counts cannot be paired
-        nn = 0
-        for (j = 1; j <= vlen[ref]; j++) if (vec["pb_mt", j] > 0) rr[nn++] = vec[ref, j] / vec["pb_mt", j]
-        if (nn == 0) continue
-        g = med(rr, nn); delete rr
+        if (ref != "openblas_mt" && ref != "aocl_mt" && ref != "accelerate_mt") continue
+        delete Rv
+        for (j = 1; j <= vlen[ref]; j++) Rv[j] = VEC[ref, j]
+        g = pairmed(Rv, T, vlen[ref], vlen["pb_mt"])
+        if (g == "") continue
         if (gate == "" || g < gate) gate = g
       }
       printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.6g\t%.6g\t%.4f\t%s\t%s\t%s\n",
@@ -107,6 +121,7 @@ _extract() {   # <cache> <box>
         (gate == "" ? "" : sprintf("%.4f", gate)),
         (sp["pb"] == "" ? "" : sprintf("%.4f", sp["pb"])),
         (sp["pb_mt"] == "" ? "" : sprintf("%.4f", sp["pb_mt"]))
+      delete VEC
     }' "$1"
 }
 
@@ -121,7 +136,7 @@ case "${1:-}" in
     fi
     tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
     _extract "$cache" "$box" > "$tmp"
-    [ -s "$tmp" ] && : || { echo "extracted NOTHING from $cache — refusing to report success" >&2; exit 3; }
+    [ -s "$tmp" ] || { echo "extracted NOTHING from $cache — refusing to report success" >&2; exit 3; }
     added=$(awk -F'\t' 'NR==FNR{seen[$1"|"$2"|"$3"|"$4"|"$5]=1; next}
                         !($1"|"$2"|"$3"|"$4"|"$5 in seen){print; c++} END{print c+0 > "/dev/stderr"}' \
               "$LEDGER" "$tmp" 2>&1 >>"$LEDGER" | tail -1)
@@ -129,47 +144,58 @@ case "${1:-}" in
     ;;
   stamps)
     box="${2:-}"
-    awk -F'\t' -v BOX="$box" 'NR>1 && (BOX=="" || $1==BOX) {c[$1"\t"$6]++; lo[$1"\t"$6]=(lo[$1"\t"$6]==""||$5<lo[$1"\t"$6])?$5:lo[$1"\t"$6]; hi[$1"\t"$6]=($5>hi[$1"\t"$6])?$5:hi[$1"\t"$6]}
-      END{printf "%-12s %-10s %6s  %s\n","box","commit","cells","arm times"; for(k in c){split(k,p,"\t"); printf "%-12s %-10s %6d  %s .. %s\n", p[1], p[2], c[k], lo[k], hi[k]}}' "$LEDGER" | sort
+    awk -F'\t' -v BOX="$box" 'NR>1 && (BOX=="" || $1==BOX) {c[$1"\t"$6]++
+        lo[$1"\t"$6]=(lo[$1"\t"$6]==""||$5<lo[$1"\t"$6])?$5:lo[$1"\t"$6]
+        hi[$1"\t"$6]=($5>hi[$1"\t"$6])?$5:hi[$1"\t"$6]}
+      END{printf "%-12s %-10s %6s  %s\n","box","commit","cells","arm times"
+          for(k in c){split(k,p,"\t"); printf "%-12s %-10s %6d  %s .. %s\n", p[1], p[2], c[k], lo[k], hi[k]}}' "$LEDGER" | sort
     ;;
   diff)
     box="${2:?usage: ledger.sh diff <box> <earlier-commit> <later-commit>}"; c0="${3:?}"; c1="${4:?}"
     awk -F'\t' -v BOX="$box" -v C0="$c0" -v C1="$c1" '
       NR == 1 { next }
       $1 != BOX { next }
-      { key = $2 "/" $3 "@" $4
-        if ($6 == C0) { n0++; a[key] = $10; as[key] = $9; aa[key] = $7 + 0 }
-        if ($6 == C1) { n1++; b[key] = $10; bs[key] = $9; ba[key] = $7 + 0 } }
+      {
+        key = $2 "/" $3 "@" $4
+        # COUNT DISTINCT CELLS, not rows. A retried group writes the same cell twice at one commit
+        # (fleet_refresh retries up to six times, and a per-group re-run is the documented repair), and
+        # counting rows would overstate coverage -- the opposite of what the subset warning is for.
+        if ($6 == C0) { if (!(key in a)) n0++; else dup0++; a[key] = $10; as[key] = $9; aa[key] = $7 + 0 }
+        if ($6 == C1) { if (!(key in b)) n1++; else dup1++; b[key] = $10; bs[key] = $9; ba[key] = $7 + 0 }
+      }
       END {
         if (n0 == 0 || n1 == 0) {
-          printf "no cells for %s (%d rows) or %s (%d rows) on %s — run `stamps` to see what is recorded\n", C0, n0+0, C1, n1+0, BOX
+          printf "no cells for %s (%d) or %s (%d) on %s — run `stamps` to see what is recorded\n", C0, n0+0, C1, n1+0, BOX
           exit 1
         }
         printf "%-22s %8s %8s %8s   %9s %9s\n", "cell", "selfsp0", "selfsp1", "d.self", "thr_ms0", "thr_ms1"
-        for (k in b) if (k in a) {
+        for (k in b) {
+          if (!(k in a)) continue
           both++
-          cs = (a[k] > 0 ? b[k] / a[k] : 0)                      # self-speedup change
-          ct = (as[k] > 0 ? bs[k] / as[k] : 0)                   # THREADED TIME change
+          cs = (a[k] > 0 ? b[k] / a[k] : 0)
+          ct = (as[k] > 0 ? bs[k] / as[k] : 0)
           # TWO COMMITS ARE TWO RUNS, so the absolute times carry the machine state they were measured
-          # under and the stored anchor is what reports it. Beyond 3% the times are not comparable and
-          # the column is withheld rather than printed with a caveat nobody reads; `selfsp` is a
-          # within-run ratio and stays valid either way. `check_arm_anchors.sh` uses the same 3%.
+          # under and the stored anchor reports it. Beyond 3% they are not comparable and the column is
+          # withheld; `selfsp` is a within-run ratio and stays valid either way.
           ok = (aa[k] > 0 && ba[k] > 0 && aa[k] / ba[k] < 1.03 && ba[k] / aa[k] < 1.03)
-          ok || noanch++
-          # Report a cell when EITHER moved. `selfsp` is a ratio of the two arms, so it cancels any
-          # change that slows both equally -- which is exactly the shape of a shared-kernel
-          # regression. The absolute threaded time is what catches that, so both are tested.
+          if (!ok) noanch++
+          note = ""
+          if (!ok) { note = sprintf("anchor %.0f%% — times not comparable", (aa[k] / ba[k] - 1) * 100) }
+          else if (ct > 1.03) { note = sprintf("SLOWER %.1f%%", (ct - 1) * 100) }
+          else if (ct < 0.97) { note = "faster" }
+          # Report when EITHER moved: `selfsp` is a ratio of the two arms, so it cancels a change that
+          # slows both equally -- the shape of a shared-kernel regression -- and the absolute threaded
+          # time is what catches that.
           if (cs < 0.97 || cs > 1.03 || (ok && (ct < 0.97 || ct > 1.03))) {
             moved++
-            printf "%-22s %8.3f %8.3f %7.1f%%   %9.4g %9.4g  %s\n", k, a[k], b[k], (cs - 1) * 100,
-              as[k], bs[k],
-              (!ok ? "anchor " sprintf("%.0f%%", (aa[k] / ba[k] - 1) * 100) " — times not comparable" :
-               ct > 1.03 ? "SLOWER " sprintf("%.1f%%", (ct - 1) * 100) : ct < 0.97 ? "faster" : "")
+            printf "%-22s %8.3f %8.3f %7.1f%%   %9.4g %9.4g  %s\n", k, a[k], b[k], (cs - 1) * 100, as[k], bs[k], note
           }
         }
-        printf "\n%s: %d cells   %s: %d cells   in BOTH: %d   moved >3%%: %d\n", C0, n0, C1, n1, both+0, moved+0
+        printf "\n%s: %d cell(s)   %s: %d cell(s)   in BOTH: %d   moved >3%%: %d\n", C0, n0, C1, n1, both+0, moved+0
+        if (dup0 + dup1 > 0)
+          printf "⚠ %d duplicate row(s) collapsed (same cell, same commit, different arm time) — only the last was used.\n", dup0+dup1
         if (noanch > 0)
-          printf "⚠ %d of %d shared cells have anchors more than 3%% apart — for those, only `selfsp` is read; the absolute times describe two different machine states.\n", noanch, both+0
+          printf "⚠ %d of %d shared cells have anchors more than 3%% apart — for those only `selfsp` is read.\n", noanch, both+0
         if (both < n0 || both < n1)
           printf "⚠ %d and %d cells are in only one side — a sweep spans several commits, so this is a SUBSET; check `stamps`.\n", n0-both, n1-both
       }' "$LEDGER"

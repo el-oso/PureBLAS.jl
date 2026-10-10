@@ -53,9 +53,15 @@ for box in "${boxes[@]}"; do
     # the BOX's own report of itself false. Measured consequence: galen sat on a reverted commit for
     # hours under the label `master`, and `git worktree list` showed `15bd758c [master]`.
     # Detached HEAD is the honest state for a box that tracks whatever it was last told to.
+    # DETACH AT CURRENT HEAD, THEN RESET. `checkout --detach <ref>` REFUSES when a tracked file is
+    # locally modified and differs between the two trees, and under `set -euo pipefail` that refusal
+    # kills this script outright: the `echo`s in the `&&` chain never print, the parity check never
+    # runs, and in `all` mode the remaining boxes are never synced. A dirty box is an EXPECTED state —
+    # the line below reports the count — so the reset has to keep its force. Detaching at HEAD moves
+    # no files and cannot refuse; `reset --hard $ref` then does the work it always did.
     ssh "$box" "cd $REMOTE_DIR && \
         git fetch -q origin && \
-        git checkout -q --detach $ref && \
+        git checkout -q --detach && \
         git reset --hard -q $ref && \
         echo \"  HEAD  \$(git rev-parse --short HEAD)  \$(git log -1 --format=%s | cut -c1-60)\" && \
         echo \"  dirty \$(git status --porcelain | grep -vc '^??' || true) tracked file(s)\" && \

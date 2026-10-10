@@ -29,10 +29,16 @@ for box in "${BOXES[@]}"; do
     if ! ssh -n -o ConnectTimeout=8 -o BatchMode=yes "$box" true 2>/dev/null; then
         printf "%-13s UNREACHABLE\n" "$box"; continue
     fi
-    read -r rh dirty subj < <(ssh -n "$box" "cd $REMOTE_DIR && printf '%s %s %s\n' \
+    # A REMOTE THAT PRINTS NOTHING MUST NOT KILL THE RUN. If `cd` fails, the directory is not a git
+    # repo, or git errors, the chain emits nothing; `read` then returns 1 and `set -e` exits the
+    # script — before this box has even been named, and without reaching the boxes after it. That is
+    # strictly worse than the UNREACHABLE case handled above, which at least says which box.
+    if ! read -r rh dirty subj < <(ssh -n "$box" "cd $REMOTE_DIR && printf '%s %s %s\n' \
         \"\$(git rev-parse HEAD)\" \
         \"\$(git status --porcelain | grep -vc '^??' || true)\" \
-        \"\$(git log -1 --format=%s | tr ' ' '_' | cut -c1-52)\"")
+        \"\$(git log -1 --format=%s | tr ' ' '_' | cut -c1-52)\""); then
+        printf "%-13s NO REPO or git error at %s\n\n" "$box" "$REMOTE_DIR"; continue
+    fi
     printf "%-13s %s  %s\n" "$box" "${rh:0:8}" "$(printf '%s' "$subj" | tr '_' ' ')"
     # Relation to local HEAD. Both shas must exist HERE for this to mean anything; a box on a commit
     # this checkout has never fetched is itself a finding.
