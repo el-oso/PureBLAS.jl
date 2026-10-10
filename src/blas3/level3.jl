@@ -66,6 +66,32 @@ const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
 const _TRMM_RPACK = @load_preference("trmm_rpack", _at_trmm_rpack(_HW))::Int
 @inline _fh_trmm_rpack() = (f = _FKR_trmm_rpack[]; f >= 0 ? f : _TRMM_RPACK)
 
+# Side-R above `_TRMM_RPACK` has two routes, and only one of them can reach the matrix coprocessor:
+# `_trmm_packedR!` drives `_microkernel!`, which is NEON, while the flat panel loop issues
+# `_gemm_core!` calls that `_sme_eligible` can route to the SME kernel. So the packed route is
+# declined exactly where those panel gemms are eligible. Measured on an M6, Float64, side R, serial,
+# packed against flat, in GFLOP/s:
+#
+#     m,k        2048,2048  4096,4096  2100,2100 L,T  4096,2048  512,2048 L,N
+#     packed          62.9       63.9           63.4       63.1      62.0
+#     flat           236.9      284.1          247.0      233.9     253.4
+#
+# The packed column is the NEON FP64 roofline on this machine, which is what a path that never
+# reaches the coprocessor must read.
+#
+# THIS DOES NOT GIVE UP THE REPRODUCIBILITY THE PACKED ROUTE CARRIES. `trmm!`'s threaded side-R
+# split is admitted only above `_TRMM_RPACK`, where the packed kernel owns the call and a row band
+# therefore takes the serial call's route; the same predicate gates that split, so a BANDED flat
+# loop — whose `_gemm_core!` switch reads the band's own row count and would return a band-dependent
+# result — is never reachable. An SME-owned call declines the pool for its own reasons besides (see
+# `_sme_owns`).
+#
+# Off SME `_SME_F64` is false, so this is identically false and no other box's route moves.
+# PDM: Derived — the panel gemm's own eligibility, `_sme_tile_ok` on B's row count against the panel
+# width, rather than a size threshold: the flat loop pays exactly when its gemms reach the kernel. | tune: n/a, follows _sme_tile_ok
+@inline _trmmr_sme_owns(::Type{T}, k::Int, m::Int) where {T} =
+    _SME_F64 && T === Float64 && _sme_tile_ok(m, min(_trmm_rpanel(), k))
+
 # trmm side-L real: k above this uses the single-pass K-trimmed PACKED routine; at or below it, the
 # recursion over `gemm!`. Its own constant as of task #134 — it used to read `_GEMM_UNPACK_MAX`, which is
 # gemm's UNPACKED-vs-BLOCKED crossover (2·(nvreg−4)·W = 448 on the AVX-512 boxes, 96 on AVX2). That is a
@@ -1049,7 +1075,8 @@ function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, wi::Int = 
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
         return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
             _trmm_small!(false, up, tr, unit, A, B)
-    elseif _strided1(B) && eltype(B) === Float64 && !cj && k > _fh_trmm_rpack()
+    elseif _strided1(B) && eltype(B) === Float64 && !cj && k > _fh_trmm_rpack() &&
+            !_trmmr_sme_owns(Float64, k, size(B, 1))
         return _trmm_packedR!(up, tr, unit, A, B, Float64, wi)
     elseif eltype(B) <: BlasReal && !cj
         # FLAT panel loop: each _TRMM_RPANEL-column panel of B gets ONE fat off-diagonal gemm on a
@@ -1454,7 +1481,8 @@ function trmm!(
     # are the same, and its `k²·m` overstates trmm's flops by 2x, which only makes it more conservative
     # about admitting a call — moot above this size floor, where the work dwarfs the join either way.
     if !sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
-            _strided1(A) && _strided1(B) && size(B, 2) == k && k > _fh_trmm_rpack()
+            _strided1(A) && _strided1(B) && size(B, 2) == k && k > _fh_trmm_rpack() &&
+            !_trmmr_sme_owns(Float64, k, size(B, 1))
         nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
         if nwr > 1
             rA = _root(A); rB = _root(B)
