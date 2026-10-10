@@ -2735,10 +2735,26 @@ const _GT_TRANSPOSE = (_GT_W == 8)
 # warm-micro MIS-TUNE — full-L1 nets +1.5–5.8pt on Zen4 (n=32 0.918→0.976, n≥512 +1.5–3.6pt), Zen5 INSENSITIVE
 # (safe). Non-AVX-512: keep the 128 literal — Zen3/AVX2 optimum (measured; a bigger base REGRESSES it, n=256
 # 0.996→0.85). req#8 Preferences-override "trsm_fused_base" still applies for calibration.
-# PDM: Derived — formula over detected consts on AVX-512: full-L1 residency of the KC×NR P-stripe, `_L1_BYTES ÷ (_GT_NR * sizeof)`; the non-AVX-512 arm keeps a measured 128 (a bigger base regresses Zen3 n=256)
+# WHERE A MATRIX COPROCESSOR EXISTS THE CEILING IS THE SPLIT'S OWN ELIGIBILITY, NOT A CACHE FIT. The
+# recursion's alternative to fusing a block is to halve it and hand the off-diagonal to `_gemm_sub!`,
+# whose `k ÷ 2` square operand must clear `_sme_tile_ok`'s `min >= 2 * _SME_MR` floor. So a block
+# under `4 * _SME_MR` cannot produce an eligible gemm by splitting and is worth fusing, and one at or
+# above it is worth splitting. Measured on an M6, Float64, side L, upper, no-trans, through `trsm!`,
+# against the shipped 128 (us/call):
+#
+#     n          50     100     128     256     512    1024
+#     base 128  5.46   27.85   54.07   244.0  1135.6   6143
+#     base 112  5.41   28.80   41.84   192.0   903.9   4939
+#     base  96  5.40   24.50   41.68   192.5   903.9   4983
+#     base  64  5.41   24.52   41.80   191.6   906.9   4914
+#
+# 64 and 96 are one measurement apart and both beat 112 and 128; 64 is the one the floor derives. The
+# n=50 column is flat because 50 is under the floor either way and stays fused.
+# PDM: Derived — formula over detected consts on AVX-512: full-L1 residency of the KC×NR P-stripe, `_L1_BYTES ÷ (_GT_NR * sizeof)`; on SME the smallest block whose halving yields an `_sme_tile_ok`-eligible off-diagonal gemm, `4 * _SME_MR`; the remaining arm keeps a measured 128 (a bigger base regresses Zen3 n=256)
 const _TRSM_FUSED_BASE = @load_preference(
     "trsm_fused_base",
-    _GT_TRANSPOSE ? max(_GT_MR, _L1_BYTES ÷ (_GT_NR * sizeof(Float64))) : 128
+    _GT_TRANSPOSE ? max(_GT_MR, _L1_BYTES ÷ (_GT_NR * sizeof(Float64))) :
+        _SME_F64 ? 4 * _SME_MR : 128
 )::Int
 # Lower crossover for the fused leaf: below this k the pack-U + ftrsm-buffer setup isn't amortized, so the
 # scalar dense base wins on the sub-µs tiny solve. DERIVE, keyed on the SIMD width because the setup is
