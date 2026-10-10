@@ -87,10 +87,22 @@ const _TRMM_RPACK = @load_preference("trmm_rpack", _at_trmm_rpack(_HW))::Int
 # `_sme_owns`).
 #
 # Off SME `_SME_F64` is false, so this is identically false and no other box's route moves.
-# PDM: Derived — the panel gemm's own eligibility, `_sme_tile_ok` on B's row count against the panel
-# width, rather than a size threshold: the flat loop pays exactly when its gemms reach the kernel. | tune: n/a, follows _sme_tile_ok
-@inline _trmmr_sme_owns(::Type{T}, k::Int, m::Int) where {T} =
-    _SME_F64 && T === Float64 && _sme_tile_ok(m, min(_trmm_rpanel(), k))
+# ASK `_sme_eligible` ITSELF rather than restate part of it. The flat loop's panel gemm is
+# `_gemm_core!(Bpan, view(B, :, …), Ablk, …)`, so its three operands are B, B and A, and its m and n
+# are B's row count and the panel width. Every condition that gemm will apply has to be applied here
+# too, because what this predicate buys is given up unconditionally: a `true` costs the packed route
+# AND the thread pool, so a `true` that gemm then declines leaves the flat loop running serially on
+# the SIMD unit above `_TRMM_RPACK`, which is the one place the packed route exists to own.
+# `_SME_F64` alone misses two reachable states. `_SME_ENTRY[]` is `C_NULL` on a machine that
+# advertises the feature and fails `_sme_selftest` (see `_sme_init!`), where `_SME_F64` stays true
+# because it is a compile-time constant. And `_strided1(A)` is false for a triangular operand with a
+# non-unit row stride, which `_trmm_packedR!` handles because only B reaches a kernel by pointer —
+# measured on an M6 at m=512, k=2048 through `view(X, 1:2:2k, 1:k)`: 35.2 ms with the packed route
+# against 36.9 ms without it, both at the SIMD rate.
+# PDM: Derived — the panel gemm's own eligibility, asked of `_sme_eligible` with that gemm's operands
+# and shape, rather than a size threshold: the flat loop pays exactly when its gemms reach the kernel. | tune: n/a, follows _sme_eligible
+@inline _trmmr_sme_owns(::Type{T}, k::Int, m::Int, A, B) where {T} =
+    _sme_eligible(T, m, min(_trmm_rpanel(), k), k, false, false, false, false, B, B, A)
 
 # trmm side-L real: k above this uses the single-pass K-trimmed PACKED routine; at or below it, the
 # recursion over `gemm!`. Its own constant as of task #134 — it used to read `_GEMM_UNPACK_MAX`, which is
@@ -1076,7 +1088,7 @@ function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, wi::Int = 
         return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
             _trmm_small!(false, up, tr, unit, A, B)
     elseif _strided1(B) && eltype(B) === Float64 && !cj && k > _fh_trmm_rpack() &&
-            !_trmmr_sme_owns(Float64, k, size(B, 1))
+            !_trmmr_sme_owns(Float64, k, size(B, 1), A, B)
         return _trmm_packedR!(up, tr, unit, A, B, Float64, wi)
     elseif eltype(B) <: BlasReal && !cj
         # FLAT panel loop: each _TRMM_RPANEL-column panel of B gets ONE fat off-diagonal gemm on a
@@ -1482,7 +1494,7 @@ function trmm!(
     # about admitting a call — moot above this size floor, where the work dwarfs the join either way.
     if !sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
             _strided1(A) && _strided1(B) && size(B, 2) == k && k > _fh_trmm_rpack() &&
-            !_trmmr_sme_owns(Float64, k, size(B, 1))
+            !_trmmr_sme_owns(Float64, k, size(B, 1), A, B)
         nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
         if nwr > 1
             rA = _root(A); rB = _root(B)
