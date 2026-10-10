@@ -27,6 +27,16 @@
 # sweep's cells carry many times and several commits. `diff` therefore keys on COMMIT, not on time,
 # and prints how many cells each side holds so partial coverage cannot read as full coverage.
 #
+# ⚠ WHAT `spread_*` CANNOT DO: it is INTER-ROUND, so it is WITHIN ONE PROCESS, and a tight arm here is
+# NOT an adjudicable cell. Every round of a cell reuses one page-colouring draw for both arms — only a
+# new process re-rolls it — and `bench/cellrep.jl`'s header records the measured consequence at
+# axpy n=1e6: 10 in-process rounds read 1.0153 [1.0000, 1.0214] where 10 FRESH PROCESSES read 0.9868
+# with 9 of 10 below 1.0. Not merely wider: the OPPOSITE SIGN. So these columns separate "this arm
+# swung between rounds" from "it did not", which catches a bimodal arm but cannot certify a tight one;
+# a cell tight in both arms can still be a different number in the next process. Classifying a cell as
+# adjudicable needs K independent processes, which no cache holds and this script therefore cannot
+# compute — use it to DISQUALIFY a cell, never to confirm one.
+#
 # ESTIMATOR: a per-round figure is the MEDIAN of that round's 48 stored quantiles, and an arm's figure
 # is the median over rounds — the true median, averaging the two middle values when the count is even,
 # because the lower median equals the MINIMUM at the 2 rounds `_rounds_light` uses and `min` is the one
