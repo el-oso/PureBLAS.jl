@@ -34,6 +34,28 @@ bash bench/fleet_freqlock.sh verify-mt 2>&1 | tail -1 | grep -q '✅' || {
     echo "REFUSING: the all-core clock check does not pass — a threaded ratio here is not adjudicable." >&2
     exit 2; }
 
+# AND THE BOX MUST BE QUIET, which `plots.jl` checks and this did not. Measured consequence: a
+# PureBLAS precompile — minutes of multi-core work, orphaned at PPID 1 after a `src/` change
+# invalidated the pkgimage — was running at 300% CPU during a gemvN run here, and the ten processes
+# came back with an across-process spread of 557 and a median of 0.0100. The tool correctly refused a
+# verdict, but it should not have spent the box time at all.
+#
+# SAMPLED, NOT A LIFETIME AVERAGE. `ps` reports CPU over a process's whole life, which both
+# over-reports a finished burst and under-reports a fresh one; `top -bn2` discards its first sample and
+# measures the interval, which is what `plots.jl`'s own guard does by reading /proc over a window.
+# ANCHOR ON THE PROCESS-TABLE HEADER, not on a line number: `NR` is global across both of top's
+# iterations, so a count-based skip lets the second iteration's summary lines ("%Cpu(s): … id",
+# "MiB Mem : … used") through as if they were process rows — which they parse as, with a plausible
+# number in the %CPU column. The first version here reported "used," and "28321.7" as busy processes.
+_busy=$(top -bn2 -d 2 -o %CPU 2>/dev/null \
+        | awk '/^top -/ { it++; rows = 0 } /^ *PID +USER/ { if (it == 2) rows = 1; next } rows && it == 2 { print $9, $12 }' \
+        | awk '$1 + 0 >= 25 { printf "%6.1f%%  %s\n", $1, $2; n++ } END { exit !n }') && {
+    echo "REFUSING: the box is not quiet — a contended run produces a spread, not a ratio." >&2
+    printf '%s\n' "$_busy" | sed 's/^/    /' >&2
+    echo "  Wait for it, or pass FORCE_BUSY=1 if you accept the measurement is a screen only." >&2
+    [ -n "${FORCE_BUSY:-}" ] || exit 2
+    echo "  FORCE_BUSY set — continuing, and the numbers below are NOT adjudicable." >&2; }
+
 log=$(mktemp); trap 'rm -f "$log"' EXIT
 echo "=== $op n=$n, $nt threads, $K independent processes ==="
 for i in $(seq 1 "$K"); do
