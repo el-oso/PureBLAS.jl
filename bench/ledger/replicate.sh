@@ -28,21 +28,22 @@ jt=$((nt + 1))
 pre=""
 [ -n "${BENCH_CORE:-}" ] && pre="taskset -c ${BENCH_CORE}"
 
-# THE CLOCK, BEFORE ANYTHING. An unlocked box makes every ratio here a draw against drift, and the
-# all-core form is the one that matters because the threaded arm loads every core.
-bash bench/fleet_freqlock.sh verify-mt 2>&1 | tail -1 | grep -q '✅' || {
-    echo "REFUSING: the all-core clock check does not pass — a threaded ratio here is not adjudicable." >&2
-    exit 2; }
+# PRE-WARM FIRST, OR THE GUARD BELOW CATCHES THIS SCRIPT'S OWN COMPILER. `--project=bench` keeps its
+# own pkgimage, so the first julia launched here can spend a minute at 100% precompiling PureBLAS —
+# and the contention check then correctly refuses, naming a process this script started. Observed
+# twice: two orphaned precompiles at 99.9% on a box measured idle seconds earlier.
+# `fleet_refresh.sh` carries the same step for the same reason, before its first timed group.
+# Free when the cache is warm (a second or two of load).
+julia --project=bench -e 'using PureBLAS, LinearAlgebra' >/dev/null 2>&1 || {
+    echo "REFUSING: the bench environment will not load — fix that before measuring." >&2; exit 2; }
 
-# AND THE BOX MUST BE QUIET, which `plots.jl` checks and this did not. Measured consequence: a
-# PureBLAS precompile — minutes of multi-core work, orphaned at PPID 1 after a `src/` change
-# invalidated the pkgimage — was running at 300% CPU during a gemvN run here, and the ten processes
-# came back with an across-process spread of 557 and a median of 0.0100. The tool correctly refused a
-# verdict, but it should not have spent the box time at all.
+# THEN THE BOX, and only then the clock. The all-core clock check deliberately loads every core for
+# ~20 s, so it has to come AFTER the quiet check or it fails it itself.
 #
-# SAMPLED, NOT A LIFETIME AVERAGE. `ps` reports CPU over a process's whole life, which both
-# over-reports a finished burst and under-reports a fresh one; `top -bn2` discards its first sample and
-# measures the interval, which is what `plots.jl`'s own guard does by reading /proc over a window.
+# SAMPLED, NOT A LIFETIME AVERAGE. `ps` averages over a process's whole life, which over-reports a
+# finished burst and under-reports a fresh one; `top -bn2` discards its first sample and measures the
+# interval, which is what the guard inside `plots.jl` does by reading /proc over a window.
+#
 # ANCHOR ON THE PROCESS-TABLE HEADER, not on a line number: `NR` is global across both of top's
 # iterations, so a count-based skip lets the second iteration's summary lines ("%Cpu(s): … id",
 # "MiB Mem : … used") through as if they were process rows — which they parse as, with a plausible
@@ -55,6 +56,10 @@ _busy=$(top -bn2 -d 2 -o %CPU 2>/dev/null \
     echo "  Wait for it, or pass FORCE_BUSY=1 if you accept the measurement is a screen only." >&2
     [ -n "${FORCE_BUSY:-}" ] || exit 2
     echo "  FORCE_BUSY set — continuing, and the numbers below are NOT adjudicable." >&2; }
+
+bash bench/fleet_freqlock.sh verify-mt 2>&1 | tail -1 | grep -q '✅' || {
+    echo "REFUSING: the all-core clock check does not pass — a threaded ratio here is not adjudicable." >&2
+    exit 2; }
 
 log=$(mktemp); trap 'rm -f "$log"' EXIT
 echo "=== $op n=$n, $nt threads, $K independent processes ==="
