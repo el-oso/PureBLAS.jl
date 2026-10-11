@@ -355,6 +355,23 @@ JL
         _seen="$_seen$_id "; _cores="${_cores:+$_cores,}$_n"
     done
     [ -n "$_cores" ] || _cores=0
+    # PRECOMPILE SYNCHRONOUSLY, OR THIS CHECK LEAKS A 100%-CPU ORPHAN EVERY TIME IT RUNS. The load
+    # below is backgrounded and killed after the sampling window. A cold load spends that window
+    # precompiling, and a precompile WORKER writes a temp pkgimage that only its parent installs — so
+    # killing the parent throws the work away, leaves the worker orphaned at PPID 1 grinding one core
+    # flat, and guarantees the next invocation precompiles again. It never converges on its own:
+    # verified by running `verify-mt` twice in a row and watching a second orphan appear.
+    #
+    # The damage is to whatever runs next. `bench/ledger/replicate.sh` screens the box for contention
+    # BEFORE calling this, so the orphan appears after the screen has passed and lands squarely on the
+    # measurements: gemvN n=192 on wintermute read median 0.1009 and 0.0554 across two 20-process
+    # batches, against 12/12 clean between 1.80 and 2.38 with no `verify-mt` in the loop.
+    # `plots.jl`'s own guard refuses and retries, so a sweep pays retries rather than recording this.
+    #
+    # Free when warm, and the cold cost is paid here where it blocks instead of where it contends. The
+    # main project is a separate environment from `bench`, so a caller that pre-warms `bench` — both
+    # `fleet_refresh.sh` and `replicate.sh` do — does not cover this.
+    julia --project="$_root" -e 'using Pkg; Pkg.precompile()' >/dev/null 2>&1 || true
     taskset -c "$_cores" julia -t "$_nt" --project="$_root" "$_ld" "$_nt" 30 >/dev/null 2>&1 &
     _jp=$!
     sleep 8                                    # past load+compile, into the sustained window
