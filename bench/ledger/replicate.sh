@@ -48,9 +48,17 @@ julia --project=bench -e 'using PureBLAS, LinearAlgebra' >/dev/null 2>&1 || {
 # iterations, so a count-based skip lets the second iteration's summary lines ("%Cpu(s): … id",
 # "MiB Mem : … used") through as if they were process rows — which they parse as, with a plausible
 # number in the %CPU column. The first version here reported "used," and "28321.7" as busy processes.
-_busy=$(top -bn2 -d 2 -o %CPU 2>/dev/null \
+#
+# THE AGENT HARNESS IS BASELINE, NOT CONTENTION. `claude` runs at 20-40% of one core whenever a
+# measurement is driven from a session, which is every measurement in the ledger, so counting it as
+# contention refuses a box that is in exactly the state the cached arms were taken in. It is excluded
+# by name and only up to one core's worth: a harness past 150% is a runaway and still refuses.
+_sample_busy() { top -bn2 -d 2 -o %CPU 2>/dev/null \
         | awk '/^top -/ { it++; rows = 0 } /^ *PID +USER/ { if (it == 2) rows = 1; next } rows && it == 2 { print $9, $12 }' \
-        | awk '$1 + 0 >= 25 { printf "%6.1f%%  %s\n", $1, $2; n++ } END { exit !n }') && {
+        | awk '$2 == "claude" && $1 + 0 < 150 { next }
+               $1 + 0 >= 25 { printf "%6.1f%%  %s\n", $1, $2; n++ } END { exit !n }'; }
+
+_busy=$(_sample_busy) && {
     echo "REFUSING: the box is not quiet — a contended run produces a spread, not a ratio." >&2
     printf '%s\n' "$_busy" | sed 's/^/    /' >&2
     echo "  Wait for it, or pass FORCE_BUSY=1 if you accept the measurement is a screen only." >&2
@@ -67,6 +75,17 @@ for i in $(seq 1 "$K"); do
     $pre julia -t "$jt" --project=bench bench/cellrep.jl "$op" "$n" "$nt" 2>/dev/null >> "$log" || {
         echo "  process $i FAILED — not counted" >&2; }
 done
+
+# AND AGAIN AFTERWARDS, because the check above is START-ONLY and contention that arrives mid-run is
+# invisible to it. Measured here: a 300%-CPU process appeared between the check and the runs, and two
+# of ten gemvN n=256 processes read 0.010 and 0.037 against a serial arm steady to 0.3% — a 98x
+# blowup. The reduction correctly refused to adjudicate the wide spread, but named no cause, so the
+# bimodality read as a property of the kernel. Twenty processes on a verified-quiet box then came back
+# 20/20 between 2.21 and 2.70. A spread this tool cannot explain sends the reader hunting a mechanism
+# that is not there, so it says when the box moved under it.
+_busy=$(_sample_busy) && {
+    echo "  ⚠ THE BOX WENT BUSY DURING THE RUN — the numbers below are NOT adjudicable, re-run them:" >&2
+    printf '%s\n' "$_busy" | sed 's/^/      /' >&2; }
 
 # ONE-BASED, AND `c` INITIALISED. An uninitialised awk variable used as a SUBSCRIPT is the empty
 # string, not 0 — so `r[c] = ...` on the first record creates `r[""]` while `c++` then makes the next
