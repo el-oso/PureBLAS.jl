@@ -371,7 +371,13 @@ JL
     # Free when warm, and the cold cost is paid here where it blocks instead of where it contends. The
     # main project is a separate environment from `bench`, so a caller that pre-warms `bench` — both
     # `fleet_refresh.sh` and `replicate.sh` do — does not cover this.
-    julia --project="$_root" -e 'using Pkg; Pkg.precompile()' >/dev/null 2>&1 || true
+    # BOUNDED, AND LOUD WHEN IT DOES NOT FINISH. Swallowing the result hides the one case that still
+    # behaves like the old bug: if the environment will not precompile, the load below spends its
+    # window compiling and orphans a worker exactly as before, while this check still prints a verdict.
+    if ! timeout 1800 julia --project="$_root" -e 'using Pkg; Pkg.precompile()' >/dev/null 2>&1; then
+        echo "⚠ the main project did not precompile inside 30 min — the load below may compile during"
+        echo "  its own sampling window, which both weakens this verdict and can leave an orphan."
+    fi
     taskset -c "$_cores" julia -t "$_nt" --project="$_root" "$_ld" "$_nt" 30 >/dev/null 2>&1 &
     _jp=$!
     sleep 8                                    # past load+compile, into the sustained window
@@ -386,7 +392,16 @@ JL
         sleep 2
     done
     echo "loaded+sampled cores: $_cores"
-    kill "$_jp" 2>/dev/null || true; wait "$_jp" 2>/dev/null || true
+    # SIGTERM, THEN SIGKILL — a bare `kill` followed by `wait` can block without limit. Julia services
+    # a termination signal from its scheduler, and a process whose threads are inside a non-yielding
+    # kernel need not reach it; `wait` then holds this check open for as long as the load chooses to
+    # live. Observed once on galen: `verify-mt` sat for 53 minutes with its load as a live child, so
+    # the caller's whole measurement run stalled behind a check that normally takes 22 seconds.
+    # SIGKILL cannot be ignored, so this returns in at most five seconds more than the window.
+    kill "$_jp" 2>/dev/null || true
+    for _k in 1 2 3 4 5; do kill -0 "$_jp" 2>/dev/null || break; sleep 1; done
+    kill -9 "$_jp" 2>/dev/null || true
+    wait "$_jp" 2>/dev/null || true
     echo "pin=${_hi} MHz   under ${_nt}-thread gemm: min=${_min} MHz  max=${_max} MHz"
     # Same 12% band as `verify`, applied to the WORST core — and a spread test, because an oscillating
     # clock can average inside the band while never holding it.
