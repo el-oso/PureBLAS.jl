@@ -21,6 +21,37 @@
 # PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 20 : 48`
 const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ? 20 : 48)::Int
 
+# THE THREADED BAND LIMIT, WHICH IS A DIFFERENT QUESTION FROM THE SERIAL ONE ABOVE. `_GBMV_CONV_MAX`
+# answers "which arm is faster on one core"; this answers "is the convolution arm still worth taking
+# when a row split is available", and the two have different answers because only convolution can be
+# split. A row split makes it 2.8-3.7x faster and makes the per-column axpy 0.31-0.35x, i.e. 3x
+# SLOWER, so declining the pool whenever the SERIAL cut prefers axpy left gbmvN unthreaded on AVX2 at
+# the gate's band of 33 while the vendor threads its own — a threaded gate of 0.37, PureBLAS on one
+# core against six.
+#
+# PHYSICAL CRITERION: the convolution arm re-reads A about `band / W` times (it tiles the output into
+# W-row blocks and sweeps every column reaching each block), so its serial penalty tracks `band / W`
+# and nothing else. Threading has to recover that penalty. Measured on galen (Zen3, W=4, n=2048,
+# freq-locked, both arms in one process on shared operands, `Measure.ab` rotating them), conv relative
+# to axpy and the penalty it implies:
+#
+#     band    band/W   conv/axpy   penalty      band    band/W   conv/axpy   penalty
+#       13      3.2      0.9914     1.01x         65     16.2      0.6350     1.57x
+#       21      5.2      1.1992     0.83x         81     20.2      0.6242     1.60x
+#       33      8.2      0.8594     1.16x         97     24.2      0.5913     1.69x
+#       49     12.2      0.7588     1.32x
+#
+# (band 13 is at or under the serial cut, so both arms resolve to convolution there and the 0.9914 is
+# a null control.) The penalty PLATEAUS near 1.7x by `band/W` ≈ 20 and never approaches the 2.8x a
+# split recovers, so threading-with-convolution beats serial-with-axpy at every band measured. At
+# band 21 convolution is outright faster serially too, which says the serial cut is slightly
+# conservative — left alone, because moving it is a separate question with a separate measurement.
+#
+# The bound is the measured range and not an extrapolation of it: `band/W <= 24` is exactly as far as
+# the table goes. The gate's band of 33 sits at 8.2, comfortably inside on every box.
+# PDM: Derived — formula over `_vwidth`, physical criterion is the arm's `band/W` A-re-read factor; validated across band/W = 3.2..24.2 on AVX2, penalty 1.01-1.69x against a 2.8x threading gain. | tune: candidate
+const _GBMV_MT_BAND_MAX = @load_preference("gbmv_mt_band_max", 24 * _vwidth(Float64))::Int
+
 # gbmv-N "convolution" kernel: tile the OUTPUT y into W-row blocks kept in ONE register (no y-window
 # re-stream, unlike per-column which re-reads the overlapping window ~band times). For each column
 # touching the block, FMA a contiguous masked AB-segment scaled by x[j]. Best for narrow/medium band
@@ -144,7 +175,20 @@ end
 @inline function _gbmv_n_simd!(
         m::Int, n::Int, kl::Int, ku::Int, α::T, AB, x, y, ib0::Int, ib1::Int
     ) where {T <: BlasReal}
-    (kl + ku + 1) <= _GBMV_CONV_MAX && return _gbmv_conv!(m, n, kl, ku, α, AB, x, y, ib0, ib1)
+    # A ROW-BAND CALL TAKES THE CONVOLUTION ARM WHATEVER THE BAND. Only this arm can be threaded: a
+    # row split makes it 2.8-3.7x faster and makes the per-column axpy below 3x SLOWER, so the pool is
+    # only ever asked for when the convolution arm is what will run. `ib0 > 0 || ib1 < m` is exactly
+    # the "this is a worker's band" test — the serial entry passes `0, m`.
+    #
+    # ⚠ THIS IS SAFE ONLY BECAUSE THE TWO ARMS ARE BITWISE IDENTICAL, which is measured, not assumed:
+    # both walk columns in ascending `j`, so every `y[i]` sees its terms in the same order and the
+    # rounding cannot differ. 1260 comparisons over both parities of each dimension, square and
+    # rectangular, bands from 5 to 49, asymmetric `kl != ku`, and alphas that are not powers of two —
+    # all identical under `reinterpret`. `test/level2_tests.jl` gates it, because req#11 now rests on
+    # it: the lost-claim path runs the unsplit entry and therefore the OTHER arm from the winner's
+    # workers, and that is only permissible while the two agree bit for bit.
+    ((kl + ku + 1) <= _GBMV_CONV_MAX || ib0 > 0 || ib1 < m) &&
+        return _gbmv_conv!(m, n, kl, ku, α, AB, x, y, ib0, ib1)
     GC.@preserve AB x y begin
         Ap = pointer(AB); xp = _ptr(x); yp = _ptr(y); ldb = stride(AB, 2); sz = sizeof(T)
         @inbounds for j in 1:n

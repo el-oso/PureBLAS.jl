@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 171 of them.
+Every `@load_preference` key in `src/` — 172 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 171 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 79 Derived · 22 Measured · 52 Literal · 18 Exempt.
-**Default form** (mechanical): 68 formula · 22 delegates · 8 sibling · 63 literal · 5 flag · 5 other.
+**Tier:** 80 Derived · 22 Measured · 52 Literal · 18 Exempt.
+**Default form** (mechanical): 69 formula · 22 delegates · 8 sibling · 63 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -75,6 +75,7 @@ Every `@load_preference` key in `src/` — 171 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `gbmv_conv_max` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 20 : 48` | — |
+| `gbmv_mt_band_max` | formula | Derived | formula over `_vwidth`, physical criterion is the arm's `band/W` A-re-read factor; validated across band/W = 3.2..24.2 on AVX2, penalty 1.01-1.69x against a 2.8x threading gain. | candidate |
 
 ## BLAS-2 packed
 

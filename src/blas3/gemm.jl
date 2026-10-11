@@ -5081,8 +5081,14 @@ end
             _symv_blocked!(up, C.m, alpha, C, A.ptr, B.ptr, _symv_nblk(C.m, T))
         elseif kind == _MT_KIND_GBMVN
             # A loser does the whole output. Its band IS `[0, m)`, which is what the unsplit kernel
-            # already runs, and the arm choice reads `kl + ku + 1` only — so there is nothing to route
-            # and nothing that can differ from the winner's bands.
+            # already runs, so there is nothing to route.
+            #
+            # ⚠ IT DOES, HOWEVER, TAKE A DIFFERENT ARM FROM THE WINNER'S WORKERS once the band exceeds
+            # `_GBMV_CONV_MAX`: `[0, m)` is not a row band, so this runs the per-column axpy where they
+            # run convolution. That is permissible because the two arms are BITWISE IDENTICAL — both
+            # accumulate each `y[i]` over columns in ascending `j` — which is measured over 1260 shapes
+            # and gated by a test rather than argued. It is a speed difference for the loser only, and
+            # req#11 asks for identical bits, not an identical instruction stream.
             #
             # THE BANDED STORE IS REBUILT AT ITS OWN HEIGHT, exactly as `_gbmvn_run_chunk` does. `C.m`
             # is the OUTPUT ROW COUNT, so handing `C` over unchanged describes a store `m` tall where
@@ -5493,28 +5499,41 @@ calls that have almost no work in them.
 Capped by whole output row blocks of `_vwidth(T)`, because `_gbmv_conv!` accumulates one W-row block
 at a time and a band shorter than one block would be all masked tail.
 
-ONLY THE CONVOLUTION ARM IS THREADED, and the admission turns on the SAME predicate the kernel uses
-to pick its arm. `_gbmv_n_simd!` sends `kl + ku + 1 <= _GBMV_CONV_MAX` to the row-blocked convolution
-and everything wider to a per-column axpy, and a row band does very different things to the two:
+ONLY THE CONVOLUTION ARM IS THREADED, and a row-band call takes it whatever the band — so admission
+turns on `_GBMV_MT_BAND_MAX`, NOT on the serial cut `_GBMV_CONV_MAX`. The two answer different
+questions: the serial cut is where the per-column axpy overtakes convolution on one core, while this
+asks whether convolution is still worth taking when a split is available. Keying admission on the
+serial cut declined the pool on AVX2 at the gate's band of 33, leaving the op single-threaded against
+a vendor that threads its own. A row band does very different things to the two arms:
 
 | band arm | threaded speedup over its own serial path |
 |---|---|
 | convolution (AVX-512, cut 48) | 2.82x / 2.82x / 2.96x / 3.01x / 3.72x at n = 1000…4096 |
 | per-column axpy (AVX2, cut 20) | **0.31x / 0.33x / 0.33x / 0.34x / 0.35x** at the same sizes |
 
-Same code, same shapes, same band of 33 — the two boxes differ only in which arm the cut selects, so
-threading is worth 3x on one and costs 3x on the other. The axpy arm's column loop runs over all `n`
-in every worker and keeps the small slice of each column that falls inside its row band, so each
-worker pays the whole sweep's column overhead for a fraction of the writes; why that is worth 3x
-rather than the ~1.5x that accounting predicts is not established, and the loss is reason enough to
-withdraw the claim without it.
+The axpy arm's column loop runs over all `n` in every worker and keeps the small slice of each column
+that falls inside its row band, so each worker pays the whole sweep's column overhead for a fraction
+of the writes; why that is worth 3x rather than the ~1.5x that accounting predicts is not established.
 
-So this reads the arm, not the op: an admission rule derived from measuring one arm does not transfer
-to the other, and this op is the demonstration.
+So a split call never takes that arm. The resolution is not to decline the pool but to take the arm
+that splits: `_gbmv_n_simd!` routes any row-band call to convolution regardless of the band, which is
+permissible ONLY because the two arms are bitwise identical — both walk columns in ascending `j`, so
+every `y[i]` sees its terms in the same order. That is measured over 1260 shapes and gated by a test,
+because req#11 now rests on it: the lost-claim path runs the unsplit entry and therefore the other
+arm from the winner's workers.
+
+The band bound is then about COST rather than correctness, and `_GBMV_MT_BAND_MAX` carries the
+measured penalty curve it comes from.
 """
 @inline function _gbmvn_workers(m::Int, n::Int, kl::Int, ku::Int, ::Type{T}) where {T}
     _MT_NTHREADS[] > 1 || return 1
-    (kl + ku + 1) <= _GBMV_CONV_MAX || return 1
+    # THE THREADED CUT, NOT THE SERIAL ONE. This used to read `_GBMV_CONV_MAX`, the band at which the
+    # per-column axpy overtakes the convolution arm ON ONE CORE — which is the wrong question here,
+    # because only convolution can be split and a split call takes it whatever the band. Keying
+    # admission on the serial cut therefore declined the pool on AVX2 at the gate's band of 33 and left
+    # the op single-threaded against a vendor that threads its own. See `_GBMV_MT_BAND_MAX` for the
+    # penalty curve this bound comes from.
+    (kl + ku + 1) <= _GBMV_MT_BAND_MAX || return 1
     nw = _l1_workers(n * (kl + ku + 1) * sizeof(T), m, T)
     nw > 1 || return 1
     return max(1, min(nw, m ÷ _vwidth(T)))
