@@ -1790,6 +1790,17 @@ sparse Cholesky.
 
 ### Tooling backlog
 
+- **33.7 GB of orphaned precompile temp files to delete across the fleet (found 2026-10-11).**
+  `fleet_freqlock.sh verify-mt` backgrounded a load and killed it mid-precompile, and a precompile
+  worker writes a temp pkgimage that only its parent installs — so every call discarded ~300 MB and
+  left the file behind. Fixed in `5f4bcb6e`/`b09d1637`; the accumulated files are still on disk:
+
+        wintermute  77 files  14 G       galen  64 files  12 G       neuromancer  40 files  7.7 G
+
+  against 9-10 installed `.ji` each. They are `~/.julia/compiled/v1.13/PureBLAS/jl_*` and are inert
+  garbage, but a delete must skip any file a live precompile is writing — filter on mtime, and not
+  while a box is precompiling. Needs the user's go-ahead; it is a three-box delete outside the repo.
+
 - **Re-evaluate the gating strategy — a full sweep is too slow to run casually (raised 2026-09-03).**
   MEASURED on the 2026-09-03 fleet refresh: Zen5, full rebuild (every arm interleaved). The rate
   DECAYS through the sweep as it reaches larger `n` and the LAPACK ops, so quote an interval rate, never
