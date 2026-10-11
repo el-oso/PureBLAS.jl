@@ -105,8 +105,13 @@ const OPS = Dict(
     # BANDWIDTH IS FIXED AT 16, so the work is O(s) and not O(s^2) — but the reps still come from
     # `_l2rep`, because that is the budget `plots.jl` gives this op as a member of its L2 group and the
     # regime has to match the gate rather than the asymptotics.
+    # `GBMV_K` overrides the half-bandwidth, defaulting to the 16 `plots.jl` sweeps (band 33). It
+    # exists because the band is what selects the arm and the arm is what decides whether the pool is
+    # used at all, so a cell at another band is a different routing question rather than a different
+    # size. Changing it changes the REGIME, so a number taken under an override is not comparable to a
+    # gate cell and must say which band it used.
     "gbmvN" => (
-        () -> (k = 16; (randn(2k + 1, N), randn(N), randn(N), k)),
+        () -> (k = parse(Int, get(ENV, "GBMV_K", "16")); (randn(2k + 1, N), randn(N), randn(N), k)),
         (c, m) -> (
             for _ in 1:m
                 P.gbmv!(c[3], c[1], c[2], N, c[4], c[4]; trans = 'N', alpha = 1.0, beta = 0.0)
