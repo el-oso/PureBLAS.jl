@@ -546,9 +546,42 @@ const _SME_INPLACE_MAX =
     return ov > 0 ? ov : _SME_INPLACE_MAX
 end
 
-@inline function _sme_inplace_a(mce::Int, kce::Int, alpha::Float64, tA::Bool)
+# The macrokernel re-reads the A block once per column panel, so `njp` is the multiplier on an
+# in-place walk's cost: `njp` strided passes over the block against one strided pass plus `njp`
+# contiguous ones. There is no closed form over the block's size and its page geometry that places
+# the crossover — with A held at 64x2048 so neither moves, in place reads 2.36x at njp=4, 1.85x at
+# njp=16 and 0.94x at njp=64, and holding njp while varying the columns per page from 1 to 32 moves
+# the MAGNITUDE (1.52x to 2.40x) without moving the crossover.
+#
+# WHERE THE CUT SITS AND WHY NOT HIGHER. A shape loses as soon as the cut admits its own panel count:
+# square gemm reads 1.078 at a cut of 32 (njp = 32 there) and 1.079 at a cut of 64 at n = 1024
+# (njp = 64), both gate cells. Everything the rank-k ops have to gain is already in by 16 — syrk at
+# n = 512 reads 0.883 at a cut of 16 and 0.880 to 0.883 at 24, 32 and 64, inside their own SE. So 16
+# is the largest value that is both saturating and safe. (bench/probes/sme_inplace_njp.jl for the
+# end-to-end table, sme_inplace_njp_sweep.jl for the cut value, sme_inplace_njp_l3sz.jl for the gemm
+# gate; each declares the regime its figures belong to.)
+# PDM: Measured — the column-panel re-read count at which packing A starts to pay; no formula over block size and page geometry places the crossover, and the value is bounded above by the gate cells that lose when the cut admits their own panel count. | tune: _EXPINT[10]
+# req8-ok: a measured crossover bounded above by the two gate cells that lose when the cut reaches their own panel count -- the tables above are the whole justification, and there is no hardware ratio to derive it from.
+const _SME_INPLACE_NJP = @load_preference("sme_inplace_njp", 16)::Int
+
+@inline function _sme_inplace_njp()
+    ov = @inbounds _EXPINT[10]          # sweep override; 0 = the shipped cut, negative = residency only
+    return ov == 0 ? _SME_INPLACE_NJP : ov
+end
+
+# TWO ADMISSIONS, ANSWERING DIFFERENT QUESTIONS. The residency cut keeps the strided re-reads CHEAP by
+# holding the block in L1; this one keeps them FEW. At a small column-panel count the pack cannot
+# amortize whatever the block's size, so a block far above the residency cut still wants to be read
+# in place.
+@inline function _sme_inplace_a(mce::Int, kce::Int, njp::Int, alpha::Float64, tA::Bool)
     (!tA && alpha == 1.0 && !(@inbounds _EXPFLAG[_EXP17])) || return false
-    return mce * kce <= _sme_inplace_cap()
+    mce * kce <= _sme_inplace_cap() && return true
+    njp <= _sme_inplace_njp() || return false
+    # Witness: the widest panel count this branch has admitted, so a sweep can tell a shape that
+    # declined the branch from one the knob never reached. Diagnostic only -- a racing update
+    # under-reports and changes nothing the kernel reads.
+    @inbounds _EXPINT[11] = max(_EXPINT[11], njp)
+    return true
 end
 
 # The same trick on the other operand, and the transpose condition is the MIRROR of A's: the kernel
@@ -700,7 +733,7 @@ function _sme_gemm!(
                 mce = min(MC, m - ic)
                 mpad = cld(mce, MR) * MR
                 local pa::Ptr{Float64}, aip::Int, aks::Int
-                if _sme_inplace_a(mce, kce, alpha, tA)
+                if _sme_inplace_a(mce, kce, njp, alpha, tA)
                     # A itself IS the panel: the kernel walks it at `lda` and no copy happens.
                     pa = A + (ic + pc * lda) * 8
                     aip = MR

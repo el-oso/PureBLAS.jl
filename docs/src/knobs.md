@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 171 of them.
+Every `@load_preference` key in `src/` — 172 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 171 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 79 Derived · 22 Measured · 52 Literal · 18 Exempt.
-**Default form** (mechanical): 68 formula · 22 delegates · 9 sibling · 62 literal · 5 flag · 5 other.
+**Tier:** 79 Derived · 23 Measured · 52 Literal · 18 Exempt.
+**Default form** (mechanical): 68 formula · 22 delegates · 9 sibling · 63 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -263,6 +263,7 @@ Every `@load_preference` key in `src/` — 171 of them.
 | `sme_ger_groups` | literal | Measured | each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | candidate, (1,2,4,8) |
 | `sme_ger_minm` | literal | Derived | formula over detected consts: the kernel's own row granularity, `4 * _SME_L`, below and outside of which it has nothing to run. | — |
 | `sme_inplace_max` | formula | Derived | A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a couple of L1-fuls, and the coefficient is set one step inside where that was measured to flip under a worst-case stride, because a caller with extra cache traffic tips the edge. | n/a, follows _L1_BYTES |
+| `sme_inplace_njp` | literal | Measured | the column-panel re-read count at which packing A starts to pay; no formula over block size and page geometry places the crossover, and the value is bounded above by the gate cells that lose when the cut admits their own panel count. | _EXPINT[10] |
 | `sme_min` | literal | Measured | tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | sweep |
 | `sme_min_exact` | literal | Measured | the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | sweep |
 | `sme_panel_bytes` | literal | Measured | a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | sweep |
