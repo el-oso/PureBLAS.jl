@@ -292,13 +292,13 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Tuning constants that are NOT knobs
 
-59 `const _X = <literal>` values in `src/` with no `@load_preference`.
+60 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 32 Literal · 23 Exempt · 2 Unaudited.
+**Tier:** 2 Measured · 32 Literal · 23 Exempt · 3 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -412,6 +412,7 @@ on these, not on knobs.
 | `_MT_KIND_AXPY` | 6 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_COPY` | 11 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_DOT` | 7 | Exempt | job-kind tag, not hardware tuning. |
+| `_MT_KIND_ELEM` | 19 | Unaudited | — |
 | `_MT_KIND_GBMVN` | 18 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_GEMM` | 0 | Exempt | job-kind TAGS, not hardware tuning. They name which body a chunk runs; nothing about |
 | `_MT_KIND_GEMVN` | 15 | Exempt | job-kind tag, not hardware tuning. |

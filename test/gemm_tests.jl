@@ -221,6 +221,30 @@ end
         for t in 1:nt
             @test outs[t] ≈ want rtol = 1e-12
         end
+        # AND WITH alpha AND beta BOTH NON-TRIVIAL, because the combine passes take a DIFFERENT arm
+        # there. 300 is Strassen-claimed (min(m,n,k) >= `_STRASSEN_MIN`), so a loser here runs the
+        # combines' lost-claim fallback — and with alpha = 1, beta = 0 above, three of the four
+        # C-assembly passes take their beta-free arm and the `beta * C` form is never exercised on the
+        # losing path at all. A non-power-of-two alpha for the same reason it appears in the
+        # bit-identity item: scaling by +-2^j is exact and would hide a misplaced alpha.
+        @test P._strassen_owns(Float64, 300, 300, 300, false, A, B)
+        C0 = randn(300, 300)
+        want2 = copy(C0)
+        P.set_num_threads(1)
+        P.gemm!(want2, A, B; alpha = 3.7, beta = -1.25)
+        P.set_num_threads(nt)
+        outs2 = [copy(C0) for _ in 1:nt]
+        Threads.@threads :static for t in 1:nt
+            o = copy(C0)
+            for _ in 1:8
+                copyto!(o, C0)
+                P.gemm!(o, A, B; alpha = 3.7, beta = -1.25)
+            end
+            copyto!(outs2[t], o)
+        end
+        for t in 1:nt
+            @test outs2[t] ≈ want2 rtol = 1e-12
+        end
         P.set_num_threads(1)
     end
 end
@@ -364,6 +388,12 @@ end
         end
         @test !P._strassen_owns(Float64, n, n, kthin, false, Athin, Bthin)
         @test P._gemm_workers(n, n, kthin) > 1
+        # AND THAT THE COMBINES THEMSELVES SPLIT, which is a second witness and not a duplicate of the
+        # one above. The recursion's leaves threading says nothing about its combine passes: those are
+        # published as their own jobs and decline below an amortisation floor, so a floor that moved
+        # would leave them serial and every assertion below would still pass — the invariant holds
+        # trivially when nothing is split. The half-block is what a level-1 combine covers.
+        @test P._elem_workers(n ÷ 2, n ÷ 2, nthreads(), Float64) > 1
         bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
         S = randn(n, n); Bs = randn(n, n)
         for α in (1.0, -1.0, 2.5), β in (0.0, 0.5)

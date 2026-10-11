@@ -3204,6 +3204,81 @@ end
 # seven private scratch pools, and the resulting working set saturates memory bandwidth at 2.3x with
 # no improvement from four workers to seven. Here only one leaf is live at a time and the workers
 # share its packed A panel.
+# ── STRASSEN COMBINE PASSES ────────────────────────────────────────────────────────────────────────
+# ONE BROADCAST FOR THREE CALLERS, and that is what makes req#11 hold here BY CONSTRUCTION rather than
+# by argument: the serial recursion, a worker's chunk body and the lost-claim fallback all reach this
+# same function, so "identical bits at every thread count" is a property of there being one
+# implementation, not a property to be established by comparing two.
+#
+# Every combine in `_strassen_rec!` is an instance of `C = α·(A ± B ± L) + β·C`:
+#   the eight operand sums and `U`   α = 1, β = 0, no L
+#   `C11`                           α, β, no L
+#   `C12` / `C21` / `C22`           α, β, with L
+# In-place forms (`TA = TA - A11`, `TB = B22 - TB`) arrive as `C === A` or `C === B`, which is safe
+# because every element is read and written at the same index.
+#
+# ⚠ β IS NOT MULTIPLIED IN WHEN IT IS ZERO, and that is CORRECTNESS, not a speed shortcut. The
+# pre-combine targets are `undef` scratch on first touch and `0.0 * Inf` is NaN, so a uniform
+# `α·(…) + β·C` would poison `TA`/`TB` on the first node of a fresh task. The serial code this
+# replaces avoided it by not mentioning `C` at all in its β = 0 forms; this keeps that.
+#
+# The `isone(α)` arm exists for the same reason in reverse: it keeps the eight operand sums emitting
+# exactly `A ± B`, so routing them through here changes none of their arithmetic. Multiplying by 1.0
+# would in fact be exact for every IEEE value, but emitting the multiply at all would make the serial
+# recursion pay two extra flops per element on a bandwidth-bound pass for no reason.
+#
+# The branches are on SCALARS and sit outside the loops, so none of this costs anything per element.
+@inline function _elem_comb!(C, A, B, L, α::T, β::T, sB::T, sL::T, hasL::Bool) where {T}
+    if hasL
+        if iszero(β)
+            @. C = α * ((A + sB * B) + sL * L)
+        else
+            @. C = α * ((A + sB * B) + sL * L) + β * C
+        end
+    elseif isone(α) && iszero(β)
+        @. C = A + sB * B
+    elseif iszero(β)
+        @. C = α * (A + sB * B)
+    else
+        @. C = α * (A + sB * B) + β * C
+    end
+    return nothing
+end
+
+# Workers for ONE combine pass. Elementwise and bandwidth-bound, so the floor is the one BLAS-1 uses:
+# a slice whose operands fit in the private L1 is a slice smaller than the cost of waking a core for
+# it. Three blocks are touched (two read, one written), which is what `3 *` counts; the four-operand
+# C-assembly touches four, so this floor is the conservative direction.
+#
+# `nw` is the LEAF's worker count and is passed through rather than recomputed, because the column
+# geometry matching the leaf's is the point — see `_elem_run_chunk`. Capped by whole `_NR` column
+# groups so a chunk is never a partial vector.
+@inline function _elem_workers(m::Int, n::Int, nw::Int, ::Type{T}) where {T}
+    nw > 1 || return 1
+    (3 * m * n * sizeof(T) < _L1_MT_MIN) && return 1
+    return max(1, min(nw, cld(n, _NR)))
+end
+
+# One combine pass, threaded or not. `sB`/`sL` are SIGNS as booleans (true meaning minus) rather than
+# values, so they ride in the pool's existing `up`/`sym2` flags; `hasL` rides in `unit`. When `L` is
+# absent the caller passes `A` in its place — the broadcast that mentions `L` is not the one that runs,
+# so nothing dereferences a placeholder.
+@inline function _comb!(C, A, B, L, α::T, β::T, sB::Bool, sL::Bool, hasL::Bool, nw::Int) where {T}
+    ew = _elem_workers(size(C, 1), size(C, 2), nw, T)
+    if ew > 1
+        rC = _root(C); rA = _root(A); rB = _root(B); rL = _root(L)
+        Lp = _pm(L)
+        lup = hasL ? LuPanel{T}(Lp.ptr, Lp.ld, Lp.m, Lp.n, Ptr{Int}(0), 0, 0, -1) : _lupanel_none(T)
+        GC.@preserve rC rA rB rL _gemm_threaded!(
+            _pm(C), _pm(A), _pm(B), α, β, false, false, false, false, ew,
+            _MT_KIND_ELEM, sB, sL, hasL, lup
+        )
+        return nothing
+    end
+    _elem_comb!(C, A, B, L, α, β, sB ? -one(T) : one(T), sL ? -one(T) : one(T), hasL)
+    return nothing
+end
+
 @inline function _strassen_leaf!(C, A, Bm, alpha::T, beta::T, nw::Int) where {T}
     m = size(C, 1); n = size(C, 2); k = size(A, 2)
     if nw > 1 && _strided1(A) && _strided1(Bm) && _strided1(C) && _gemm_workers(m, n, k) > 1
@@ -3227,21 +3302,34 @@ function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T, nw:
     C11 = @view C[1:mh, 1:nh]; C12 = @view C[1:mh, (nh + 1):n]; C21 = @view C[(mh + 1):m, 1:nh]; C22 = @view C[(mh + 1):m, (nh + 1):n]
     TA, TB, P1, P2, P3, P4, P5, P6, P7, U = _strassen_lvl_scratch(T, level, mh, nh, kh)
     o = one(T); z = zero(T); dm = depth - 1; lv = level + 1
-    @. TA = A21 + A22; @. TB = B12 - B11; _strassen_rec!(P5, TA, TB, dm, lv, o, z, nw)   # S1,T1 → P5
-    @. TA = TA - A11;  @. TB = B22 - TB;  _strassen_rec!(P6, TA, TB, dm, lv, o, z, nw)   # S2,T2 → P6
-    @. TB = TB - B21;                     _strassen_rec!(P4, A22, TB, dm, lv, o, z, nw)  # T4 → P4
-    @. TA = A12 - TA;                     _strassen_rec!(P3, TA, B22, dm, lv, o, z, nw)  # S4 → P3
-    @. TA = A11 - A21; @. TB = B22 - B12; _strassen_rec!(P7, TA, TB, dm, lv, o, z, nw)   # S3,T3 → P7
+    # EVERY COMBINE GOES THROUGH `_comb!`, which splits the pass across the pool when the block is
+    # worth it and otherwise runs the identical broadcast inline. The `iszero(beta)` fork that used to
+    # wrap the four C-assembly lines is gone: `_elem_comb!` makes that choice itself, for the same
+    # reason the fork existed — β = 0 must not read an `undef` target.
+    #
+    # Argument order is the arithmetic order. `(A ± B) ± L` is evaluated left to right exactly as the
+    # broadcasts it replaces were, and a negative sign is applied as a multiply by -1, which is an
+    # exact IEEE negation — so `(U + P7) + (-1)·P4` is bit-for-bit `(U + P7) - P4`.
+    _comb!(TA, A21, A22, A21, o, z, false, false, false, nw)         # S1
+    _comb!(TB, B12, B11, B12, o, z, true, false, false, nw)          # T1
+    _strassen_rec!(P5, TA, TB, dm, lv, o, z, nw)                     # S1,T1 → P5
+    _comb!(TA, TA, A11, TA, o, z, true, false, false, nw)            # S2  (in place: C === A)
+    _comb!(TB, B22, TB, B22, o, z, true, false, false, nw)           # T2  (in place: C === B)
+    _strassen_rec!(P6, TA, TB, dm, lv, o, z, nw)                     # S2,T2 → P6
+    _comb!(TB, TB, B21, TB, o, z, true, false, false, nw)            # T4
+    _strassen_rec!(P4, A22, TB, dm, lv, o, z, nw)                    # T4 → P4
+    _comb!(TA, A12, TA, A12, o, z, true, false, false, nw)           # S4
+    _strassen_rec!(P3, TA, B22, dm, lv, o, z, nw)                    # S4 → P3
+    _comb!(TA, A11, A21, A11, o, z, true, false, false, nw)          # S3
+    _comb!(TB, B22, B12, B22, o, z, true, false, false, nw)          # T3
+    _strassen_rec!(P7, TA, TB, dm, lv, o, z, nw)                     # S3,T3 → P7
     _strassen_rec!(P1, A11, B11, dm, lv, o, z, nw)
     _strassen_rec!(P2, A12, B21, dm, lv, o, z, nw)
-    @. U = P1 + P6                                                                   # U1
-    if iszero(beta)
-        @. C11 = alpha * (P1 + P2); @. C12 = alpha * (U + P5 + P3)
-        @. C21 = alpha * (U + P7 - P4); @. C22 = alpha * (U + P7 + P5)
-    else
-        @. C11 = alpha * (P1 + P2) + beta * C11; @. C12 = alpha * (U + P5 + P3) + beta * C12
-        @. C21 = alpha * (U + P7 - P4) + beta * C21; @. C22 = alpha * (U + P7 + P5) + beta * C22
-    end
+    _comb!(U, P1, P6, P1, o, z, false, false, false, nw)             # U1
+    _comb!(C11, P1, P2, P1, alpha, beta, false, false, false, nw)
+    _comb!(C12, U, P5, P3, alpha, beta, false, false, true, nw)
+    _comb!(C21, U, P7, P4, alpha, beta, false, true, true, nw)
+    _comb!(C22, U, P7, P5, alpha, beta, false, false, true, nw)
     return C
 end
 # Entry: pick adaptive depth, pad m,n,k up to a multiple of 2^depth (odd-n) if needed, recurse.
@@ -4071,6 +4159,18 @@ const _MT_KIND_SYMV = 17
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_GBMVN = 18
+# Strassen's combine passes: `C = α·(A ± B ± L) + β·C` over a block, elementwise. The one job kind in
+# this list that carries a FOURTH operand, and it needs no new field for it — `lap`/`lald` are already
+# on the pool for the getrf look-ahead panel, and a kind reinterpreting an existing slot is the same
+# thing `gbmvN` does when it carries `kl`/`ku` in the A slot's own dimensions.
+#
+# The two signs and the presence of `L` ride in `up`, `sym2` and `unit` respectively, which that kind
+# does not otherwise use. `α` and `β` are the pool's own.
+# An enum discriminant, host-invariant by construction: nothing about the machine can make 19 a better
+# tag than 20, so there is no residency or latency criterion to derive it from and no candidate set to
+# measure. Same category as `_STEIN_SEED0`.
+# req8-ok: enum discriminant, host-invariant by construction — see the two lines above
+const _MT_KIND_ELEM = 19
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
@@ -4284,6 +4384,7 @@ end
     p.kind == _MT_KIND_GEMVT && return _gemvt_run_chunk(p, nw, i)
     p.kind == _MT_KIND_SYMV && return _symv_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GBMVN && return _gbmvn_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_ELEM && return _elem_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4681,6 +4782,32 @@ end
 # `x .*= a` over this worker's element range. Elementwise, so no accumulation crosses the partition —
 # but `_scal_simd!` does carry an L1-residency branch, so `p.m` is handed over as the route width for the
 # same reason axpy does it: compute on the slice, route from the whole.
+# A worker's slice of one Strassen combine pass: the SAME columns the leaf chunk of the same index
+# owned, which is deliberate. The combine reads the `P` blocks six cores have just written, and the
+# in-situ cost of these passes measures about twice their cost in isolation (0.657 ms against 0.323 at
+# n=512); the leading hypothesis is dirty remote lines, so giving assembly chunk `i` the columns leaf
+# chunk `i` wrote is the arrangement that would avoid the traffic. UNVERIFIED as the cause — the
+# geometry costs nothing either way, so it is chosen as the one that cannot be worse.
+#
+# `_gemm_chunk` groups on `_NR`, so a column band is whole vector-width multiples and every chunk
+# broadcasts over a contiguous block. Nothing here grows a buffer: every slot was fit by
+# `_strassen_lvl_scratch` before the level's first leaf ran, so a chunk body cannot allocate inside a
+# published job.
+@noinline function _elem_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    sz = sizeof(T)
+    Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sz, p.m, len, p.ldc)
+    Ac = PtrMatrix{T}(p.Ap + j0 * p.lda * sz, p.m, len, p.lda)
+    Bc = PtrMatrix{T}(p.Bp + j0 * p.ldb * sz, p.m, len, p.ldb)
+    # `L` is only read when `unit` says it is present; when it is not, the broadcast that mentions it
+    # is not the one that runs, so `Ac` stands in rather than building a handle on a null pointer.
+    Lc = p.unit ? PtrMatrix{T}(p.lap + j0 * p.lald * sz, p.m, len, p.lald) : Ac
+    _elem_comb!(Cc, Ac, Bc, Lc, p.alpha, p.beta,
+        p.up ? -one(T) : one(T), p.sym2 ? -one(T) : one(T), p.unit)
+    return nothing
+end
+
 @noinline function _scal_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
     i0, len = _l1_chunk(p.m, nw, i, T)
     len > 0 || return nothing
@@ -5019,6 +5146,14 @@ end
         # with 24 concurrent callers it is the common case, not the rare one.
         if kind == _MT_KIND_SYRK
             _syrk_serial_fallback!(C, A, B, alpha, tA, up, sym2)
+        elseif kind == _MT_KIND_ELEM
+            # A loser does the WHOLE block through the same `_elem_comb!` the winner's workers call,
+            # so it is the one arm in this dispatch where the two paths are the identical broadcast
+            # rather than two implementations that have to be shown to agree. `L` stands in as `A`
+            # when absent, exactly as the chunk body does.
+            _elem_comb!(C, A, B,
+                unit ? PtrMatrix{T}(lup.ptr, C.m, C.n, lup.ld) : A,
+                alpha, beta, up ? -one(T) : one(T), sym2 ? -one(T) : one(T), unit)
         elseif kind == _MT_KIND_LUAHEAD
             # Both halves, serially, in this order. They write disjoint memory so the order cannot
             # change the bits; doing the panel first matches the worker numbering, which is what a
