@@ -54,7 +54,15 @@ for box in "${BOXES[@]}"; do
     # nothing, because `reset --hard` can point a local label anywhere.
     br=$(git branch -r --contains "$rh" 2>/dev/null | sed 's/^[ *]*//' | grep -v HEAD | paste -sd, - || true)
     printf "              %s\n" "$rel"
-    if [[ -z "$br" ]]; then
+    # ⚠ AN UNKNOWN COMMIT IS NOT AN ORPHANED ONE, and conflating them accuses a healthy box. The test
+    # above is `--contains`, which FAILS on an object this checkout does not have rather than
+    # returning nothing; `|| true` swallows the failure, so `br` is empty and the orphan branch below
+    # fires. That is reachable whenever a box sits on a commit pushed from another machine, because
+    # `git fetch` here is itself best-effort and fails silently offline. Gate on the `cat-file`
+    # result: when the object is absent the honest verdict is "cannot tell", which `rel` already says.
+    if [[ "$rel" == UNKNOWN* ]]; then
+        printf "              (cannot test for an orphan: this checkout does not have that commit)\n"
+    elif [[ -z "$br" ]]; then
         printf "              ⛔ ORPHANED — on NO remote branch. Reverted or force-pushed over;\n"
         printf "                 anything measured here is unreproducible. Re-sync before use.\n"
     else

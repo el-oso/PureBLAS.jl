@@ -2163,8 +2163,10 @@ function _scale_pack_cmplx!(PR::Vector{T}, PI::Vector{T}, len::Int, sr::T, si::T
     return
 end
 
-# Complex split-pack buffers live in the per-type L3Workspace `cg` field (see src/workspace.jl);
-# `_gemm_scratch_cmplx(T, lenA, lenB)` grows and returns them.
+# Complex split-pack buffers come from `_cgws`, a per-TASK owner (see src/workspace.jl);
+# `_gemm_scratch_cmplx(T, lenA, lenB)` grows and returns them. Per-task because they are produced once
+# per call and read for the whole macrokernel, so they are live across a join once the pool accepts a
+# complex type.
 
 # Complex blocked driver, specialized on conj signs SA,SB (resolved once at the boundary below).
 function _gemm_cmplx_impl!(
@@ -5178,7 +5180,8 @@ end
         #
         # ⚠ A COMPLEX CHUNK THEREFORE GROWS ITS OWN PACK SCRATCH INSIDE THE PUBLISHED JOB.
         # `_gemm_scratch_cmplx` grows four buffers and `_gemm_3m_scratch` nine, both from owners the
-        # driver cannot reach — `_l3ws` is `OncePerThread` and `_m3ws` is `OncePerTask` — so there is no
+        # driver cannot reach — `_cgws` and `_m3ws` are both `OncePerTask`, so the driver cannot touch
+        # a worker task's copy at all — so there is no
         # prefit to write without first moving them to a worker-indexed process-wide pool, the shape
         # `_gpack_shared`/`_trmmr_prefit!` use. That is a real exposure and it is stated rather than
         # implied: the rule elsewhere in this driver is that a chunk body which grows a buffer

@@ -15,24 +15,23 @@
 # WHERE THE CONVERSION ACTUALLY ENDED. Stage 1 (2026-09-04) took the 37 fixed-size small roles and
 # left 143 fields, and this note used to stop there, saying "conversion continues staged, riskiest
 # last" — which reads as work in progress. It is not: **173 of the original 180 fields are now
-# arena-borrowed and `L3Workspace` is down to SEVEN.**
+# arena-borrowed and `L3Workspace` holds exactly ONE field, `s2`.**
 #
-# Those seven are not leftovers, they are a decision, recorded in workspace.jl: they are the gemm and
-# syr2k PACK BUFFERS (`gpackA`, `gpackB`, `cg`, `s2`, `str`, `strbt` — `m3` left for `_m3ws`, see the
-# threading note in workspace.jl). They stay because they are
-# touched on EVERY `gemm!` call — the one frequency at which a bump-allocate could cost more than a
-# const-dispatched field load — because they are genuinely shared allocator state rather than
-# per-routine scratch, and because `str` is a pool whose disjointness is slot-index arithmetic across
-# seven recursive Winograd children, which this file's scope model cannot express.
+# `s2` is not a leftover, it is a decision recorded in workspace.jl: it is the `syr2k` fused
+# two-product pack. It stays a struct field because it is touched on every such call — the one
+# frequency at which a bump-allocate could cost more than a const-dispatched field load — and because
+# it is shared allocator state rather than per-routine scratch. Converting it has NOT been decided and
+# would need its own gate run.
 #
-# Converting the SIX that remain has NOT been decided and would need its own gate run.
-#
-# The seventh, `m3`, was NOT a deliberate hold — it was a live hazard and is now fixed. `_trmm_dual!`
-# and `_trsm_dual!` claim it and then call the PUBLIC `trmm!`/`trsm!` on the planes; public `trmm!`
-# threads and its join yields, and there is no arena scope on that path, so the depth guard could not
-# help. A per-thread buffer held across that join is the shape that measured `getrf!` wrong 20/96. It
-# is now `_m3ws`, a per-task owner split OUT of `L3Workspace` so the pack buffers keep their cheap
-# per-thread lookup. See the threading note in workspace.jl.
+# EVERY OTHER PACK BUFFER LEFT FOR A PER-TASK OWNER, AND NOT FOR TIDINESS — each is held across a
+# threaded join, which a per-thread buffer cannot survive. `gpackA`/`gpackB` → `_gpackws` (cooperative
+# A-packing meets the other workers at a barrier while the packed B panel is live), `str`/`strbt` →
+# `_strws` (the Winograd recursion hands each leaf to the threaded path while holding its level
+# slots), `cg` → `_cgws` (the complex split-pack is read for a whole macrokernel), `m3` → `_m3ws`
+# (`_trmm_dual!`/`_trsm_dual!` claim it and then call the PUBLIC `trmm!`/`trsm!` on the planes, whose
+# join yields, with no arena scope on that path for the depth guard to help). A per-thread buffer held
+# across a join is the shape that measured `getrf!` wrong 20 times in 96. See the threading note in
+# workspace.jl for each.
 #
 # THE TWO HAZARDS, AND EXACTLY HOW FAR THE EXPANSION-TIME CHECKS GO.
 #   * A borrow ESCAPING its scope would read memory the next borrow overwrites. `@scope` rejects the

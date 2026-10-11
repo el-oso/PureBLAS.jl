@@ -49,6 +49,11 @@ const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ 
 # defaults, which is what a reader needs to know before trusting a mirror test: the band in which the
 # side-R mirror can disagree with its callee is `_TRMM_BASE_R < k <= _TRMM_BASE`, so off SME that band
 # is provably empty and such a test passes vacuously there. It cannot be made to fail by pinning.
+# ⚠ A PIN SET OFF SME IS DISCARDED, AND `test/prefsync_lint.jl` IS WHAT REPORTS IT. Silently dropping
+# a preference is the kind of silent-continue this project rules out, but the report does not belong
+# here: a load-time `@warn` is a side effect in a module that must stay trim-safe, and `test/yield_lint.jl`
+# flags logging on principle because it can yield. The lint already reads both `LocalPreferences.toml`
+# files for exactly this class of mistake, so the SME-only knobs are listed there instead.
 # PDM: Literal — recursion-overhead floor, flat 32-48, the same floor `_POTRF_BASE` carries; SME-only, the x86 side measured and regressing. | tune: candidate
 const _TRMM_BASE_R = _SME_F64 ? min(@load_preference("trmm_base_r", 32)::Int, _L3_NB) : _L3_NB
 # PDM: Literal — trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 64..1024 within noise on Zen3+Zen4+Zen5 except two non-replicating cells <=2.5% (2026-08-21)

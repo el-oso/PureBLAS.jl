@@ -403,6 +403,28 @@ JL
     kill -9 "$_jp" 2>/dev/null || true
     wait "$_jp" 2>/dev/null || true
     echo "pin=${_hi} MHz   under ${_nt}-thread gemm: min=${_min} MHz  max=${_max} MHz"
+    # A CHECK THAT SAMPLED NOTHING MUST NOT PASS. `_min` starts at 99999 and the sampling loop skips
+    # any core whose `scaling_cur_freq` will not read, so with zero readings the band test below is
+    # `99999 >= 88% of the pin` (true) and the spread is `0 * 100 / 99999` = 0 (true) — a confident ✅
+    # from a measurement that never happened. Everything downstream gates on that ✅: this script is
+    # called before every replication and before, between and after every sweep group.
+    if [ "$_max" -eq 0 ]; then
+        echo "❌ NO CORE CLOCK WAS READ — this check measured nothing and cannot certify anything."
+        echo "   Sampled set was '${_cores}'. Either cpufreq is unreadable here, or MTCORES named"
+        echo "   CPUs that do not exist (an unparsable spelling drops every candidate)."
+        exit 2
+    fi
+    # AND THE LOAD MUST BE AS WIDE AS THE VERDICT CLAIMS. `_nt` comes from NT and the sampled set from
+    # MTCORES, and nothing tied them together: `MTCORES=0,1 NT=6` put six threads on two CPUs, sampled
+    # two cores, and printed "6 cores HOLD" — fewer loaded cores draw less package power, so the check
+    # passed exactly the box it exists to fail. `fleet_refresh.sh` guards this upstream; this did not.
+    _ncore=$(printf '%s' "$_cores" | tr ',' '\n' | grep -c .)
+    if [ "$_nt" -gt "$_ncore" ]; then
+        echo "❌ ASKED TO CERTIFY ${_nt} THREADS ON ${_ncore} CORE(S) — refusing. ${_nt} threads over"
+        echo "   '${_cores}' draws less package power than ${_nt} cores would, so a ✅ here would"
+        echo "   certify a state the sweep never runs in. Widen MTCORES or lower NT."
+        exit 2
+    fi
     # Same 12% band as `verify`, applied to the WORST core — and a spread test, because an oscillating
     # clock can average inside the band while never holding it.
     if [ "$_min" -ge $(( _hi * 88 / 100 )) ] && [ "$(( _max * 100 / _min ))" -le 108 ]; then

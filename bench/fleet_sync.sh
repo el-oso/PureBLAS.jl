@@ -59,9 +59,17 @@ for box in "${boxes[@]}"; do
     # runs, and in `all` mode the remaining boxes are never synced. A dirty box is an EXPECTED state —
     # the line below reports the count — so the reset has to keep its force. Detaching at HEAD moves
     # no files and cannot refuse; `reset --hard $ref` then does the work it always did.
+    # ⚠ THE DETACH MUST NOT GATE THE RESET. It was in the `&&` chain, which made the sync silently
+    # conditional on a step that can fail for reasons the reset does not care about — a stale
+    # `index.lock` from a concurrent git, an interrupted rebase or cherry-pick. When it failed the
+    # chain short-circuited: none of the lines below printed, the box kept its OLD HEAD, and under
+    # `set -euo pipefail` the run died before the parity check and before the remaining boxes in `all`
+    # mode. That is the same class this comment block claims to have fixed. `reset --hard $ref` is
+    # what actually moves the box and it works from any state, so it runs unconditionally; the detach
+    # only keeps the local branch label off the ref, and failing to do so is not worth losing a sync.
     ssh "$box" "cd $REMOTE_DIR && \
-        git fetch -q origin && \
-        git checkout -q --detach && \
+        { git fetch -q origin || true; } && \
+        { git checkout -q --detach 2>/dev/null || true; } && \
         git reset --hard -q $ref && \
         echo \"  HEAD  \$(git rev-parse --short HEAD)  \$(git log -1 --format=%s | cut -c1-60)\" && \
         echo \"  dirty \$(git status --porcelain | grep -vc '^??' || true) tracked file(s)\" && \

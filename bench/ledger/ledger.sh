@@ -98,8 +98,13 @@ _extract() {   # <cache> <box>
       delete P; delete T
       for (j = 1; j <= vlen["pb"]; j++)    P[j] = VEC["pb", j]
       for (j = 1; j <= vlen["pb_mt"]; j++) T[j] = VEC["pb_mt", j]
+      # UNEQUAL ROUND COUNTS force the scalar form, and the scalar form is the untrustworthy one: the
+      # header above records that it disagrees with the element-wise reduction by up to 31.6% and puts
+      # 135 of 951 cells on the OPPOSITE SIDE of 1.0. A reader has to be able to tell which rows those
+      # are, so the value carries a trailing `~` rather than looking like every other number.
       selfsp = pairmed(P, T, vlen["pb"], vlen["pb_mt"])
-      if (selfsp == "") selfsp = md["pb"] / md["pb_mt"]     # unequal round counts: scalar, flagged by `~`
+      selfsp_mark = ""
+      if (selfsp == "") { selfsp = md["pb"] / md["pb_mt"]; selfsp_mark = "~" }
       # The gate ratio: min over the THREADED vendor arms of the element-wise median ref/pb_mt. The arm
       # list mirrors _REF_MT_ALL in plots.jl rather than hardcoding two names -- omitting
       # accelerate_mt makes every row of an Apple cache read as unscored, which the empty gate column
@@ -115,9 +120,9 @@ _extract() {   # <cache> <box>
         if (g == "") continue
         if (gate == "" || g < gate) gate = g
       }
-      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.6g\t%.6g\t%.4f\t%s\t%s\t%s\n",
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.6g\t%.6g\t%s\t%s\t%s\t%s\n",
         BOX, $1, $2, $3, tm["pb_mt"], cm["pb_mt"], an["pb_mt"],
-        md["pb"] * 1000, md["pb_mt"] * 1000, selfsp,
+        md["pb"] * 1000, md["pb_mt"] * 1000, sprintf("%.4f%s", selfsp, selfsp_mark),
         (gate == "" ? "" : sprintf("%.4f", gate)),
         (sp["pb"] == "" ? "" : sprintf("%.4f", sp["pb"])),
         (sp["pb_mt"] == "" ? "" : sprintf("%.4f", sp["pb_mt"]))

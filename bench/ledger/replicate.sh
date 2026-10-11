@@ -7,7 +7,7 @@
 # where 10 FRESH PROCESSES read 0.9868 with 9 of 10 below 1.0 — the opposite sign, not a wider
 # interval. So a tight in-process spread disqualifies nothing and confirms nothing. This does.
 #
-#   BENCH_CORE=0,2,4,6,8,10,1 bench/ledger/replicate.sh trmm 32 6 10
+#   BENCH_CORE=0,2,4,6,8,10,1 bench/ledger/replicate.sh trmmL 32 6 10
 #
 # ARMS ARE BOTH PUREBLAS — the same closure on the same operands at 1 thread and at `nt` — so no
 # vendor library is forwarded, nothing is measured against a reference, and this needs no
@@ -65,14 +65,21 @@ _busy=$(_sample_busy) && {
     [ -n "${FORCE_BUSY:-}" ] || exit 2
     echo "  FORCE_BUSY set — continuing, and the numbers below are NOT adjudicable." >&2; }
 
-bash bench/fleet_freqlock.sh verify-mt 2>&1 | tail -1 | grep -q '✅' || {
+# PASS THE WIDTH AND THE MASK, or this clears the wrong machine state. `verify-mt` defaults `NT` to 6
+# and samples every core on the box, so without these a `replicate.sh gemvN 256 12` is cleared at half
+# the package power it will draw, and a run pinned to one CCD is adjudicated against a co-tenant on the
+# other. `fleet_refresh.sh` passes both for exactly these two reasons; this did not.
+NT="$nt" MTCORES="${BENCH_CORE:-}" bash bench/fleet_freqlock.sh verify-mt 2>&1 | tail -1 | grep -q '✅' || {
     echo "REFUSING: the all-core clock check does not pass — a threaded ratio here is not adjudicable." >&2
     exit 2; }
 
 log=$(mktemp); trap 'rm -f "$log"' EXIT
 echo "=== $op n=$n, $nt threads, $K independent processes ==="
 for i in $(seq 1 "$K"); do
-    $pre julia -t "$jt" --project=bench bench/cellrep.jl "$op" "$n" "$nt" 2>/dev/null >> "$log" || {
+    # `$i` is the ROTATION INDEX, not a label: `cellrep.jl` times the threaded arm first on the even
+    # ones. A fixed order biases all K processes the same way and a common bias is what a cross-process
+    # median cannot remove, which matters because the verdict below turns on 0.98 / 1.02.
+    $pre julia -t "$jt" --project=bench bench/cellrep.jl "$op" "$n" "$nt" "$i" 2>/dev/null >> "$log" || {
         echo "  process $i FAILED — not counted" >&2; }
 done
 
@@ -95,10 +102,17 @@ _busy=$(_sample_busy) && {
 awk -F'\t' -v K="$K" '
   BEGIN { c = 0 }
   { nt_asked = $3; nt_got = $4; r[++c] = $5 + 0
-    if (nt_got != nt_asked) clamp++ }
+    if (nt_got != nt_asked) clamp++
+    if ($8 == "UNPINNED" || $8 == "") unpinned++ }
   END {
     if (c == 0) { print "  no usable lines — every process failed"; exit 1 }
     if (clamp > 0) printf "  ⚠ %d of %d process(es) had the pool CLAMP below the requested width — discard and re-run with more -t\n", clamp, c
+    # A RATIO FROM AN UNPINNED PROCESS IS NOT THE REGIME OF THE CELL IT REPLICATES. The gate pins one
+    # thread per physical core before measuring; unpinned, two threads can share a core while another
+    # idles, and the measured figure for that difference is 2.14x unpinned against 1.07x pinned at one
+    # cell. So it is a wrong NUMBER, not a noisier one, and more processes cannot average it away.
+    # (No apostrophes in here: this awk program is single-quoted in the shell.)
+    if (unpinned > 0) printf "  ⚠ %d of %d process(es) ran UNPINNED — not the regime the cell was measured in; the magnitude below does not transfer\n", unpinned, c
     for (i = 2; i <= c; i++) { t = r[i]; j = i - 1
       while (j >= 1 && r[j] > t) { r[j + 1] = r[j]; j-- }; r[j + 1] = t }
     med = (c % 2 == 1) ? r[int((c + 1) / 2)] : (r[c / 2] + r[c / 2 + 1]) / 2

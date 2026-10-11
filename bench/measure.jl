@@ -229,4 +229,87 @@ function abshow(res; label = "")
     return nothing
 end
 
+
+# ── THREAD PINNING ────────────────────────────────────────────────────────────────────────────────
+# A THREADED RATIO IS ONLY COMPARABLE TO ONE MEASURED UNDER THE SAME PINNING. `bench/plots.jl` runs
+# `_ANY_MT && _pin_threads!()` before it measures anything, which binds one Julia thread per PHYSICAL
+# core; without it the runtime's threads float and two can share a core while another sits idle. The
+# repo's own figure for that difference is 2.14x unpinned against 1.07x pinned at the same cell — so a
+# harness that does not pin is not measuring the regime the published cells were measured in, whatever
+# else it gets right. `taskset -c` is NOT a substitute: it restricts the CPU SET the process may use
+# and says nothing about which thread lands where inside it.
+#
+# ⚠ DUPLICATED FROM `bench/plots.jl` ON PURPOSE, AND IT MUST STAY IDENTICAL. `plots.jl` generates every
+# published number and does not include this module, so sharing the implementation would mean editing
+# the gate generator; the copy is the cheaper risk. If the two ever disagree, the ratios they produce
+# are not comparable and the drift will not announce itself — `ROADMAP.md`'s tooling backlog carries
+# the de-duplication item.
+const PINNED_AT = Ref("")
+
+"""One CPU per physical core, from the set this process is actually allowed to run on."""
+function core_cpus()
+    allowed = Int[]
+    m = try
+        match(r"Cpus_allowed_list:\s*(\S+)", read("/proc/self/status", String))
+    catch
+        nothing
+    end
+    isnothing(m) && return allowed
+    for part in split(m.captures[1], ',')
+        if occursin('-', part)
+            a, b = split(part, '-')
+            append!(allowed, parse(Int, a):parse(Int, b))
+        else
+            push!(allowed, parse(Int, part))
+        end
+    end
+    seen = Set{Int}()
+    out = Int[]
+    for c in allowed
+        f = "/sys/devices/system/cpu/cpu$(c)/topology/core_id"
+        id = isfile(f) ? something(tryparse(Int, strip(read(f, String))), c) : c
+        id in seen && continue
+        push!(seen, id)
+        push!(out, c)
+    end
+    return out
+end
+
+"""Every CPU sharing `cpu`'s physical core, so a pinned thread may use either SMT sibling."""
+function core_siblings(cpu::Int)
+    f = "/sys/devices/system/cpu/cpu$(cpu)/topology/thread_siblings_list"
+    isfile(f) || return (cpu,)
+    out = Int[]
+    for part in split(strip(read(f, String)), ',')
+        ends = split(part, '-')
+        for c in parse(Int, ends[1]):parse(Int, ends[end])
+            push!(out, c)
+        end
+    end
+    return isempty(out) ? (cpu,) : out
+end
+
+"""
+    pin_threads!() -> String
+
+Bind one Julia thread per physical core and return what was pinned (empty when pinning is not
+possible: non-Linux, single-threaded, or no readable topology). Call it BEFORE any threaded timing.
+"""
+function pin_threads!()
+    (Sys.islinux() && Threads.nthreads() > 1) || return ""
+    cpus = core_cpus()
+    isempty(cpus) && return ""
+    Threads.@threads :static for i in 1:Threads.nthreads()
+        if i <= length(cpus)
+            mask = zeros(UInt64, 16)
+            for c in core_siblings(cpus[i])
+                mask[c ÷ 64 + 1] |= UInt64(1) << (c % 64)
+            end
+            ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(mask), mask)
+        end
+    end
+    PINNED_AT[] = join(cpus, ",")
+    return PINNED_AT[]
+end
+
 end # module
