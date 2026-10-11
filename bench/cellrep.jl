@@ -68,7 +68,7 @@ _l3rep(s) = clamp(20_000_000 ÷ (s * s * s), 1, 512)  # plots.jl's _reps_cubic �
 # WHICH formula an op gets is part of the regime, not a detail: `_l1rep` on an O(s²) op asks for
 # 7812 reps of a 1024x1024 gemv per sample, ~1000x plots.jl's budget, and the cell would then be
 # timed deep in a steady state the gate never enters.
-const _L2OPS = ("gemvN", "gemvT", "trmv")
+const _L2OPS = ("gemvN", "gemvT", "trmv", "gbmvN")
 const _L3OPS = ("trmmL", "trmmR", "syrk")
 # plots.jl's `tri(s)`, character for character. Conditioned so repeated in-place `B := A*B` is stable,
 # which is what lets the gate omit a per-rep restore; see the note at the L3 registry entries.
@@ -89,6 +89,22 @@ const OPS = Dict(
         (c, m) -> (
             for _ in 1:m
                 B.gemv!('N', 1.0, c[1], c[2], 0.0, c[3])
+            end; c[3][1]
+        ),
+    ),
+    # BANDWIDTH IS FIXED AT 16, so the work is O(s) and not O(s^2) — but the reps still come from
+    # `_l2rep`, because that is the budget `plots.jl` gives this op as a member of its L2 group and the
+    # regime has to match the gate rather than the asymptotics.
+    "gbmvN" => (
+        () -> (k = 16; (randn(2k + 1, N), randn(N), randn(N), k)),
+        (c, m) -> (
+            for _ in 1:m
+                P.gbmv!(c[3], c[1], c[2], N, c[4], c[4]; trans = 'N', alpha = 1.0, beta = 0.0)
+            end; c[3][1]
+        ),
+        (c, m) -> (
+            for _ in 1:m
+                B.gbmv!('N', N, c[4], c[4], 1.0, c[1], c[2], 0.0, c[3])
             end; c[3][1]
         ),
     ),
