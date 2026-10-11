@@ -1790,6 +1790,23 @@ sparse Cholesky.
 
 ### Tooling backlog
 
+- **The in-window clock sampler is bounded at ~1%, and that is below the gate's resolution (measured
+  2026-10-11).** `Measure._khz` reads `/proc/self/stat` field 39 — the calling thread's core — and it
+  samples BEFORE and AFTER each window, never during it. So the figure recorded for a threaded cell is
+  the driver's core between windows, and a package limit that binds only while six cores are loaded
+  would not appear in it. That is the gap; here is its size, pin against achieved-under-load:
+
+        wintermute  pin 3501  loaded min 3468   0.94% under
+        galen       pin 3701  loaded min 3659   1.13% under
+
+  Under 1.2% on both locked boxes, against a gate adjudicated at two significant digits — so sampling
+  around the window rather than during it cannot move a verdict, and `verify-mt` (run before every
+  measurement, and before and after every sweep group) is what bounds it. **Not worth a format
+  change**: adding a during-window field would alter what every cached arm's anchor means, or add a
+  field the ledger and `plots.jl` must both parse, to correct an error smaller than the rounding.
+  Revisit only if a box appears whose loaded clock sits further than ~2% below its pin while still
+  passing `verify-mt`.
+
 - **33.7 GB of orphaned precompile temp files to delete across the fleet (found 2026-10-11).**
   `fleet_freqlock.sh verify-mt` backgrounded a load and killed it mid-precompile, and a precompile
   worker writes a temp pkgimage that only its parent installs — so every call discarded ~300 MB and
