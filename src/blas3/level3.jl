@@ -40,8 +40,17 @@ const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ 
 # justification is not merely unproven off Apple, it is false there, and specifically at sizes that are
 # not powers of two — 64, 128 and 256 all read favourably on that box and only n=100 exposes it.
 # Hence `_L3_NB` off SME, which keeps every non-SME box bit-for-bit on the path it has today.
+# THE PREFERENCE IS SME-ONLY, because the sentence above it is unconditional. Reading it before the
+# `_SME_F64` test made the pin reach further than its own justification: a `trmm_base_r` set on an x86
+# box took `min(pin, _L3_NB)` and changed x86 trmmR routing, contradicting "keeps every non-SME box
+# bit-for-bit on the path it has today" directly above. Off SME this is `_L3_NB` whatever is pinned.
+#
+# That also makes `_TRMM_BASE_R == _TRMM_BASE` off SME an INVARIANT rather than a coincidence of two
+# defaults, which is what a reader needs to know before trusting a mirror test: the band in which the
+# side-R mirror can disagree with its callee is `_TRMM_BASE_R < k <= _TRMM_BASE`, so off SME that band
+# is provably empty and such a test passes vacuously there. It cannot be made to fail by pinning.
 # PDM: Literal — recursion-overhead floor, flat 32-48, the same floor `_POTRF_BASE` carries; SME-only, the x86 side measured and regressing. | tune: candidate
-const _TRMM_BASE_R = min(@load_preference("trmm_base_r", _SME_F64 ? 32 : _L3_NB)::Int, _L3_NB)
+const _TRMM_BASE_R = _SME_F64 ? min(@load_preference("trmm_base_r", 32)::Int, _L3_NB) : _L3_NB
 # PDM: Literal — trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 64..1024 within noise on Zen3+Zen4+Zen5 except two non-replicating cells <=2.5% (2026-08-21)
 const _TRMM_RPANEL = @load_preference("trmm_rpanel", 512)::Int
 @inline _trmm_rpanel() = (f = _FKR_trmm_rpanel[]; f >= 0 ? f : _TRMM_RPANEL)
