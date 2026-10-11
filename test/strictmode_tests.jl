@@ -9,8 +9,10 @@
 # dropped), so a leftover `static = false` reads as an unchanged test while its meaning has flipped.
 # Two properties, two tools, and they are not interchangeable:
 #   * leaf kernels must be alloc-free on EVERY path       → `@test_noalloc` (the proof)
-#   * drivers holding grow-once scratch are alloc-free in  → `@test (@allocated f(...)) == 0`, after
-#     STEADY STATE, not on the first call                    a warm-up, as gemm_tests.jl does
+#   * drivers holding grow-once scratch are alloc-free in  → `@test alloc(f, ...) == 0`, after a
+#     STEADY STATE, not on the first call                    warm-up, as gemm_tests.jl does — the
+# measurement goes through a compiled barrier, never at testitem scope, where the window charges the
+# caller's own dispatch as well as the kernel's.
 # Most drivers cannot use the proof: they statically reach allocation sites an all-paths proof counts
 # even where the branch is runtime-dead. `gemm!` is the exception since `5f4a2eae` — every L3 pool it
 # reaches is GROW-ONLY and grows through one `@noinline` function, so the barrier exemption states
@@ -95,6 +97,15 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
+        # `@allocated` reads the kernel only from inside a compiled barrier. At testitem scope the
+        # operands are module globals, so the measured call is a dynamic dispatch and the window also
+        # charges the caller's method lookup and the boxing of the return value: a clean read there
+        # cannot separate "the driver allocates nothing" from "inference happened to be clean at this
+        # one call site". Same form as `gemm_tests.jl` and the eigen item below. A varargs barrier can
+        # itself allocate through the splat, so a non-zero read has to be re-checked against a
+        # fixed-arity barrier before it is charged to the driver.
+        alloc(f, args...) = @allocated f(args...)
+        steady(f, args...) = (f(args...); alloc(f, args...))
         tri(s) = (
             M = tril(randn(s, s)); for i in 1:s
                 M[i, i] += s
@@ -128,8 +139,8 @@ end
         BL = randn(32, 256); BR = randn(256, 32)
         P._trsm_base_invL!(false, false, false, Atri, BL)
         P._trsm_base_invR!(false, false, false, Atri, BR)
-        @test (@allocated P._trsm_base_invL!(false, false, false, Atri, BL)) == 0
-        @test (@allocated P._trsm_base_invR!(false, false, false, Atri, BR)) == 0
+        @test alloc(P._trsm_base_invL!, false, false, false, Atri, BL) == 0
+        @test alloc(P._trsm_base_invR!, false, false, false, Atri, BR) == 0
         # Fused gemmtrsm leaf (side-L upper, the wide-B gate shape f64) — typestable + alloc-free steady
         # state. Covers the transpose pack (shufflevector kernels) + the const-owned ftrsm buffer.
         Aup = (
@@ -140,7 +151,7 @@ end
         BF = randn(128, 256)
         P._trsm_fused_L!(false, Aup, BF)                                  # warm the ftrsm buffer
         @assert_typestable P._trsm_fused_L!(false, Aup, randn(128, 256))
-        @test (@allocated P._trsm_fused_L!(false, Aup, BF)) == 0
+        @test alloc(P._trsm_fused_L!, false, Aup, BF) == 0
         # Whole-k packed sweep (shared-panel restructure; default-off toggle) — same typestable + alloc-free
         # contract. Covers _pack_U_micro! + the packed slab/tail kernels reading the ftrsm buffer. AVX-512-f64
         # ONLY: `_trsm_fused_full_L!` is dispatched (trsm.jl:_trsm_left!) solely under `_GT_TRANSPOSE` and has
@@ -155,19 +166,17 @@ end
             BFF = randn(512, 256)
             P._trsm_fused_full_L!(false, Auf, BFF)                           # warm the ftrsm buffer
             @assert_typestable P._trsm_fused_full_L!(false, Auf, randn(512, 256))
-            @test (@allocated P._trsm_fused_full_L!(false, Auf, BFF)) == 0
+            @test alloc(P._trsm_fused_full_L!, false, Auf, BFF) == 0
         end
         As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
         # n=512 now takes the recursive route into gemm rather than the packed kernel, so it reaches
         # the SME path and its function pointer -- hence the barrier here too, same as below.
-        steady0(f, args...) = (f(args...); @allocated f(args...))
-        @test steady0(P._syrk_blocked!, false, false, false, 0.8, As, Cs, 512) == 0
+        @test steady(P._syrk_blocked!, false, false, false, 0.8, As, Cs, 512) == 0
         As32 = randn(32, 32); Cs32 = zeros(32, 32)   # small-n unified single-pack path (AVX2)
         # Measured through a function barrier, per req#10: at top level the operands are `Any`-typed
         # and the first compile of each such call site caches a method instance, which reports as
         # allocation a caller passing concrete types never pays. `_symm!` reaches gemm, whose SME
         # route is behind a function pointer (one dynamic dispatch), so it is the one that shows it.
-        steady(f, args...) = (f(args...); @allocated f(args...))
         @test steady(P._syrk_blocked!, false, false, false, 0.8, As32, Cs32, 32) == 0
         @test steady(P._syr2k_packed!, false, false, 0.8, 0.3, As, Bs, Cs, 512) == 0
         @test steady(P._symm!, true, false, false, 0.8, 0.3, As, Bs, Cs) == 0
@@ -193,26 +202,41 @@ end
         # is covered ccallable-rooted in trim_tests.jl; here the type/alloc contract on the hot driver.
         Awz = randn(ComplexF64, 48, 40); Bwz = randn(ComplexF64, 48, 40)
         Cwz = zeros(ComplexF64, 48, 48)
+        MZ48 = Matrix{ComplexF64}
         @assert_typestable P._ctri_unpacked!(true, true, 1.0, Awz, zeros(ComplexF64, 48, 48), 40)
-        P._ctri_unpacked!(true, true, 1.0, Awz, Cwz, 40)
-        @test (@allocated P._ctri_unpacked!(true, true, 1.0, Awz, Cwz, 40)) == 0
-        P._ctri_unpacked!(false, false, 1.2 + 0.3im, Awz, Cwz, 40)
-        @test (@allocated P._ctri_unpacked!(false, false, 1.2 + 0.3im, Awz, Cwz, 40)) == 0
         @assert_typestable P.herk!(zeros(ComplexF64, 48, 48), Awz; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)
         # rank-2k (two products through the shared _ctri_core!)
         @assert_typestable P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40)
-        P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, Cwz, 40)
-        @test (@allocated P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, Cwz, 40)) == 0
-        P._ctri2_unpacked!(false, false, 1.2 + 0.3im, Awz, Bwz, Cwz, 40)
-        @test (@allocated P._ctri2_unpacked!(false, false, 1.2 + 0.3im, Awz, Bwz, Cwz, 40)) == 0
         # ztrsmR-C direct base (`_trsm_cmplx_dRC!`, the zpotrf-lower recursion path) — typestable + alloc-free.
         Atr = randn(ComplexF64, 48, 48) ./ 96; for d in 1:48
             Atr[d, d] = 1 + abs(Atr[d, d])
         end
         Btr = randn(ComplexF64, 64, 48)
         @assert_typestable P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48))
-        P._trsm_cmplx_dRC!(true, false, 48, Atr, Btr)
-        @test (@allocated P._trsm_cmplx_dRC!(true, false, 48, Atr, Btr)) == 0
+        # THE COMPLEX RANK-K AND ztrsmR DRIVERS TAKE THE PROOF, NOT THE MEASUREMENT. They reach no pool
+        # whose growth an all-paths scan must count, so AllocCheck proves them outright and no barrier
+        # registration is needed — which makes the runtime form strictly weaker here and the wrong
+        # instrument. The real drivers above cannot be proved: the trsm inverse bases reach 103 static
+        # allocation sites, `_trsm_fused_L!` 18, and `_pbtrf_blocked!`/`_pbtrf_blocked_U!` 155 and 161,
+        # so those keep the warmed runtime check. Which tier a driver belongs in is a fact about that
+        # driver, not about this file, and it has to be checked per driver.
+        #
+        # SIGNATURES, NOT THE MARK-ONCE REGISTRY. `test_registered()` is the driver that re-proves what
+        # `src/` declared, and it cannot see anything here: the registry is populated at declaration
+        # time and that cross-package `Dict` insert does not survive a cached pkgimage load, so this
+        # test process reads ZERO entries however many declarations `src/` carries. `test_signatures`
+        # enumerates directly and is unaffected — the same reason the eigen item below uses it.
+        # `alpha`'s type selects the kernel arm, so both arms are listed rather than assumed to share.
+        test_signatures(
+            [
+                (P._ctri_unpacked!, (Bool, Bool, Float64, MZ48, MZ48, Int)),
+                (P._ctri_unpacked!, (Bool, Bool, ComplexF64, MZ48, MZ48, Int)),
+                (P._ctri2_unpacked!, (Bool, Bool, Float64, MZ48, MZ48, MZ48, Int)),
+                (P._ctri2_unpacked!, (Bool, Bool, ComplexF64, MZ48, MZ48, MZ48, Int)),
+                (P._trsm_cmplx_dRC!, (Bool, Bool, Int, MZ48, MZ48)),
+            ];
+            guarantees = (:noalloc,)
+        )
         @test true
     end
 end
@@ -325,6 +349,8 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
+        # Barrier-measured, per the L3 trsm/syrk/symm item above.
+        alloc(f, args...) = @allocated f(args...)
         # Vectorized Hermitian Cholesky base `_cpotf2_lower!` (the zpotrf n≤64 fix): the `cx` pointer-arith
         # closure + deinterleaved SIMD FMA must stay typestable + alloc-free on the Mode-2 native hot path.
         for TC in (ComplexF64, ComplexF32)
@@ -361,7 +387,7 @@ end
             # (bench/probes/zqr_alloc_check.jl) — so the guarantee holds, it is just not statically
             # provable.
             qw = copy(Q); P.qr_unblocked!(qw, tau)
-            @test (@allocated P.qr_unblocked!(qw, tau)) == 0
+            @test alloc(P.qr_unblocked!, qw, tau) == 0
         end
         @test true
     end
@@ -467,6 +493,8 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
+        # Barrier-measured, per the L3 trsm/syrk/symm item above.
+        alloc(f, args...) = @allocated f(args...)
         n = 24; k = 12
         # symmetric / Hermitian sources; SPD variants for the Cholesky-family kernels
         Ad = (M = randn(n, n); M + transpose(M)); Az = (M = randn(ComplexF64, n, n); M + transpose(M))
@@ -623,10 +651,10 @@ end
         # `_gemm_strassen!` pad pool — see the L3 item above for the full reasoning.
         P._pbtrf_blocked!(wideband(Float64, 64), n, 64)          # size the owned scratch for nb(64)
         Wpb = wideband(Float64, 64)
-        @test (@allocated P._pbtrf_blocked!(Wpb, n, 64)) == 0
+        @test alloc(P._pbtrf_blocked!, Wpb, n, 64) == 0
         P._pbtrf_blocked_U!(wideU(Float64, 64), n, 64)
         WpbU = wideU(Float64, 64)
-        @test (@allocated P._pbtrf_blocked_U!(WpbU, n, 64)) == 0
+        @test alloc(P._pbtrf_blocked_U!, WpbU, n, 64) == 0
         pack(M) = [M[i, j] for j in 1:n for i in j:n]              # lower column-packed
         APsd = pack(Sd); P.pptrf!(APsd; uplo = 'L')
         @test_trim_compatible P.pptrf!(pack(Sd); uplo = 'L')
