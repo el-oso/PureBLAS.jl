@@ -40,18 +40,21 @@ Where the remaining gap lives, by op family:
 
 | family | shape of the gap |
 |---|---|
-| BLAS-3 `gemm`-fed | strong from n≈128 up; the loss is concentrated at n ≤ 100 |
-| `trmm` / `trmmR` | low across the whole ladder (0.10-0.30), the largest open gap |
+| BLAS-3 `gemm`-fed | strong from n≈512 up; the loss is concentrated at n ≤ 256 |
+| `syrk` / `syr2k` | the largest open gap: `syrk` is 0.15 at n = 50 and 0.57 on the median |
+| `trmm` / `trmmR` | side R reaches the coprocessor from n≈100 up (median 0.44); side L is 0.20-0.46 |
 | BLAS-2 | closed at mid and large n; `gemvT`, `trmv` dip where their routing cuts sit |
 | BLAS-1 | parity with OpenBLAS; Accelerate leads at the largest sizes, where DRAM binds |
 
 `gemm` against Accelerate across the ladder:
 
-| n | 32 | 50 | 100 | 128 | 256 | 512 | 1000 | 1024+ |
-|---|---|---|---|---|---|---|---|---|
-| ratio | 0.86 | **0.23** | 0.36 | 0.90 | 0.82 | 0.95 | 0.86 | **passes** |
+| n | 8 | 32 | 50 | 100 | 128 | 256 | 512 | 1000 | 2048+ |
+|---|---|---|---|---|---|---|---|---|---|
+| ratio | 2.32 | 0.87 | 0.88 | 0.83 | 0.90 | **0.82** | 0.95 | 0.93 | **passes** |
 
-n = 50 is the binding cell and is what the `gemm` gate figure reports.
+n = 256 is the binding cell and is what the `gemm` gate figure reports. n = 1024 reads 1.79, but
+Accelerate's own per-round spread in that one cell is 1.27x, so it is not a usable number — the cell
+either side of it reads 0.93 and 1.07.
 
 ## What reaches SME, and when
 
@@ -63,9 +66,14 @@ while `(33,33)` and `(40,40)` are false; n = 33 and n = 40 measure 0.66x and 0.9
 they stay on.
 
 The routines that reach the unit through `gemm` do so by declining their own private packed paths:
-`syrk` and `syr2k` both hand off from n = 96, and `trmm` side-R keeps its packed kernel only above
-k = 1792, where that kernel — not a size — is what makes a threaded call bit-reproducible against a
-serial one.
+`syrk` and `syr2k` both hand off from n = 96, and `trmm` side-R declines its packed kernel wherever
+the panel gemms it would replace are themselves eligible — the predicate asks `_sme_eligible` with
+those gemms' own operands and shape rather than restating part of it. Above k = 1792 that packed
+kernel is also what makes a threaded call bit-reproducible against a serial one, because the flat
+panel loop keys its kernel choice on the band's own row count; so the same predicate declines the
+thread pool, and a banded flat loop is never reachable. The side-R recursion bottoms out two SME
+tiles down rather than at `_L3_NB`, and `trmm!`'s tiny fast path carries the same base so the two
+cannot disagree about which calls it may answer directly.
 
 `gemv` reaches SME in both forms, with floors that are not the same quantity: the untransposed form
 asks for `m·n` work (half of L1 in elements), the transposed form asks for **m alone** (256 rows),
@@ -135,36 +143,36 @@ FAIL can still have a winning median — true for `axpy`, `asum`, `scal`, `symv`
 | L1 | `dot` | 1.10 (1.00) | **1.19** (1.02) | 1.000 | **PASS** |
 | L1 | `axpy` | **1.17** (1.00) | **1.22** (0.98) | 0.979 | FAIL |
 | L1 | `nrm2` | **8.29** (7.00) | **1.92** (1.67) | 1.672 | **PASS** |
-| L1 | `asum` | 1.10 (1.00) | **1.03** (0.87) | 0.866 | FAIL |
+| L1 | `asum` | **1.10** (1.00) | **1.03** (0.87) | 0.866 | FAIL |
 | L1 | `scal` | 1.00 (0.99) | 0.98 (0.83) | 0.834 | FAIL |
 | L1 | `iamax` | 0.99 (0.50) | **1.85** (1.00) | 0.503 | FAIL |
-| L2 | `gemvN` | **7.47** (1.92) | 0.86 (0.48) | 0.480 | FAIL |
-| L2 | `gemvT` | **2.14** (1.76) | 0.74 (0.34) | 0.338 | FAIL |
-| L2 | `ger` | **2.54** (0.99) | 0.95 (0.64) | 0.638 | FAIL |
-| L2 | `symv` | 1.16 (0.74) | **1.72** (0.94) | 0.740 | FAIL |
-| L2 | `trmv` | **2.00** (1.73) | 0.72 (0.23) | 0.228 | FAIL |
+| L2 | `gemvN` | **7.24** (1.85) | 0.92 (0.48) | 0.480 | FAIL |
+| L2 | `gemvT` | **2.03** (1.67) | 0.94 (0.34) | 0.335 | FAIL |
+| L2 | `ger` | **2.54** (0.99) | 0.95 (0.63) | 0.633 | FAIL |
+| L2 | `symv` | **1.16** (0.74) | **1.72** (0.94) | 0.740 | FAIL |
+| L2 | `trmv` | **2.51** (1.78) | 0.89 (0.45) | 0.449 | FAIL |
 | L2 | `trsv` | **1.63** (1.37) | 0.93 (0.68) | 0.680 | FAIL |
-| L2 | `trsvLN` | 1.43 (1.30) | 0.85 (0.69) | 0.692 | FAIL |
+| L2 | `trsvLN` | **1.43** (1.30) | 0.85 (0.69) | 0.692 | FAIL |
 | L2 | `trsvLT` | **2.13** (1.32) | **1.04** (0.79) | 0.794 | FAIL |
 | L2 | `spmv` | **1.57** (1.04) | **1.05** (0.68) | 0.676 | FAIL |
 | L2 | `gbmvN` | 0.84 (0.80) | 0.80 (0.69) | 0.689 | FAIL |
 | L2 | `sbmv` | **3.05** (3.01) | 0.78 (0.69) | 0.689 | FAIL |
-| L3 | `gemm` | **6.76** (0.98) | 0.92 (0.23) | 0.228 | FAIL |
-| L3 | `symm` | **4.65** (0.93) | 0.76 (0.25) | 0.251 | FAIL |
-| L3 | `syrk` | **4.12** (0.83) | 0.57 (0.15) | 0.149 | FAIL |
-| L3 | `syr2k` | **4.95** (1.05) | 0.70 (0.27) | 0.275 | FAIL |
-| L3 | `trmm` | 1.07 (0.55) | 0.23 (0.12) | 0.124 | FAIL |
-| L3 | `trmmR` | 1.00 (0.45) | 0.22 (0.10) | 0.096 | FAIL |
-| L3 | `trsm` | **1.87** (1.02) | 0.52 (0.27) | 0.268 | FAIL |
-| L3 | `trsmR` | **1.82** (1.27) | 0.57 (0.32) | 0.316 | FAIL |
+| L3 | `gemm` | **6.93** (2.32) | 0.94 (0.82) | 0.825 | FAIL |
+| L3 | `symm` | **4.55** (1.15) | 0.76 (0.39) | 0.390 | FAIL |
+| L3 | `syrk` | **4.01** (0.84) | 0.57 (0.15) | 0.153 | FAIL |
+| L3 | `syr2k` | **4.95** (1.31) | 0.70 (0.34) | 0.341 | FAIL |
+| L3 | `trmm` | **1.63** (0.64) | 0.32 (0.20) | 0.202 | FAIL |
+| L3 | `trmmR` | **2.74** (0.58) | 0.44 (0.17) | 0.174 | FAIL |
+| L3 | `trsm` | **2.31** (1.09) | 0.55 (0.36) | 0.356 | FAIL |
+| L3 | `trsmR` | **1.82** (1.27) | 0.57 (0.32) | 0.315 | FAIL |
 | LP | `potrf` | **1.88** (1.42) | 0.59 (0.34) | 0.344 | FAIL |
 | LP | `getrf` | **2.12** (1.08) | **1.42** (0.69) | 0.692 | FAIL |
-| LP | `geqrf` | 1.25 (1.14) | 0.94 (0.28) | 0.280 | FAIL |
+| LP | `geqrf` | **1.25** (1.14) | 0.94 (0.28) | 0.280 | FAIL |
 | LP | `gesvd` | **1.76** (1.00) | **1.22** (0.78) | 0.782 | FAIL |
 
-198 of 279 measured cells sit below the gate. The worst are `trmmR` and `trmm` at n = 100-128 and
-`syrk` at n = 32-100; `trmmR`'s binding cell carries a round-to-round spread as large as its own
-value, so it is not yet a number worth tuning against.
+184 of 281 measured cells sit below the gate. The worst are `syrk` at n = 32-100, `trmmR` at
+n = 100 and `trmm` at n = 50-100. Both binding cells are now stable enough to tune against: the
+per-round spread is 1.03x for `syrk` at n = 50 and 1.03x for `trmmR` at n = 100.
 
 Full machine-readable tables: [`gen_table.md`](assets/apple/gen_table.md) (vs OpenBLAS),
 [`gen_table_accelerate.md`](assets/apple/gen_table_accelerate.md) (vs Accelerate).
