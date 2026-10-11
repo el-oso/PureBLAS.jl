@@ -652,6 +652,10 @@ end
 # `_strws` joined on the same grounds: the Winograd recursion now hands each leaf to the threaded
 # classical path, so it holds its level slots across a yield and its pool left the per-THREAD owner
 # too. Its only allocation is a new task first touching the pair.
+# `_cgws` joined for the same reason, one step ahead of the code that needs it: the complex split-pack
+# is produced once per call and read for the whole macrokernel, so it is live across the join the
+# moment the pool accepts a complex type, and its owner moved off per-THREAD before that bound widens
+# rather than after. Its only allocation is a new task's first touch of the four buffers.
 #
 # The registration is session-wide and keyed on function identity, so this item UNREGISTERS afterwards:
 # left in place it would exempt those functions from every other `@test_noalloc` in the same worker.
@@ -664,7 +668,7 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
-        for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._m3ws, P._gpackws, P._strws)
+        for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._m3ws, P._gpackws, P._strws, P._cgws)
             StrictMode.register_alloc_barrier!(f)
         end
         try
@@ -692,7 +696,7 @@ end
             end
             @test threw
         finally
-            for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._m3ws, P._gpackws, P._strws)
+            for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._m3ws, P._gpackws, P._strws, P._cgws)
                 delete!(StrictMode._ALLOC_BARRIERS, f)         # internal: no public unregister exists
             end
             StrictMode.clear_cache!()                          # the registration cached verdicts
