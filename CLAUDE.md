@@ -372,9 +372,11 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
   insensitive to window tails. Report numbers WITH their estimator and sample count (`Measure.report` →
   "0.946 (median of 8 rounds)"); a bare figure hides which statistic produced it.
   **Throwaway probes go in `bench/probes/`, never a /tmp scratch dir** — contents are gitignored but the
-  directory IS scanned by `test/estimator_lint.jl`, which fails the suite on an unapproved reduction
-  (escape hatch `# estimator-ok: <reason>` for deliberate non-gate uses like `cpuvalidate.jl`'s
-  cliff-finding). Why this is a rule and not advice: on 2026-08-03/04 the shipped kernels obeyed the
+  directory IS scanned by `test/estimator_lint.jl`, which fails the suite on an unapproved reduction.
+  **There is no escape hatch, by design** — that file's header records that the two it used to have
+  were each talked around with a plausible reason, so a probe wanting a different statistic has to
+  express the spread with quantiles instead (`q1`/`q3`, or listing the samples). Why this is a rule
+  and not advice: on 2026-08-03/04 the shipped kernels obeyed the
   median rule while the PROBES used `minimum(@elapsed …)`, which ranked an `iamax` unroll NB=2 *above*
   NB=4 at n=1e6 where the gate's median ranked it 15% *worse*. A day went into explaining that
   contradiction with tail hypotheses and a kernel port; the estimator swap was the whole of it. Sample

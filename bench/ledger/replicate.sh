@@ -24,7 +24,12 @@ op="${1:?usage: replicate.sh <op> <n> <threads> [K=10]}"; n="${2:?}"; nt="${3:?}
 # The Julia thread count must EXCEED the pool width: `plots.jl`'s `_pin_threads!` pins one thread per
 # physical core and the runtime needs an unpinned slot, so `-t nt` leaves the join waiting on a pinned
 # thread that cannot move. `cellrep.jl` prints what the pool actually accepted, which is the check.
-jt=$((nt + 1))
+#
+# `REP_JT` overrides it with a full `-t` SPEC rather than a count, which is what it takes to place the
+# driver: on Julia 1.12+ a bare `-t N` leaves the main thread in the `:interactive` pool, where
+# `_pin_threads!` — which walks the DEFAULT pool — never reaches it, and the driver runs a chunk from
+# an unpinned thread. `REP_JT=6,0` puts the driver in the default pool so it is pinned like a worker.
+jt="${REP_JT:-$((nt + 1))}"
 pre=""
 [ -n "${BENCH_CORE:-}" ] && pre="taskset -c ${BENCH_CORE}"
 

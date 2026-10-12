@@ -61,16 +61,31 @@ esac
 # Both were repaired by a FULL-ARMS sweep, which is the documented exception to "never re-measure a
 # reference": the rule protects reference arms from pointless churn, not from a state mismatch that has
 # already invalidated them. Verify with `bench/check_arm_anchors.sh` after either mode.
-# THE MULTI-THREADED ARM. `pb_mt` needs julia started with threads and a CPU mask wide enough to hold
-# the runtime threads as well as the workers, so it comes in through JL_FLAGS + BENCH_CORE. The mask is
-# one CPU per physical core PLUS one spare, and CPU numbering differs per box — `bench/plots.jl`'s
-# `_ARM_PB_MT` comment carries the mask and the measurement behind the spare slot.
+# THE MULTI-THREADED ARM. `pb_mt` needs julia started with threads and a CPU mask holding one CPU per
+# physical core, so it comes in through JL_FLAGS + BENCH_CORE. CPU numbering differs per box, and
+# `bench/plots.jl`'s `_ARM_PB_MT` comment carries each box's mask.
 #
-# ⚠ `-t` IS THE JULIA THREAD COUNT AND IT IS NOT THE POOL SIZE. It must EXCEED the physical core
-# count, because `plots.jl` pins one thread per core and the runtime needs an unpinned slot; the pool
-# size goes in separately as `mt=`. The guard below refuses `-t <= ncores`. On a 6-core box:
+# ⚠ `-t` IS A THREAD-POOL SPEC AND IT IS NOT THE POOL SIZE. A threaded sweep requires
+# `-t <ncores>,0`: as many DEFAULT threads as the mask holds physical cores, and an EMPTY interactive
+# pool. Two separate reasons, and the guard below refuses a spec that misses either.
 #
-#   BENCH_CORE=0,2,4,6,8,10,1 JL_FLAGS="-t 7" SWEEP_EXTRA="mt=6" SWEEP_ARMS="arms=pb,pb_mt" \
+# The pool's driver is the CALLING thread and it runs one of the chunks itself, so it has to be pinned
+# like a worker. `_pin_threads!` pins the DEFAULT pool, so a main thread sitting in `:interactive` —
+# which is where Julia 1.12+ puts it under a bare `-t N` — is never reached, and one of the chunks
+# then runs on a thread free to migrate onto a core that already holds a worker.
+#
+# A thread BEYOND the core count does the same damage from the other side: `_pin_threads!` leaves it
+# floating, the scheduler may place a chunk on it, and that chunk shares a core with a pinned one.
+# Chunk count equals pool width, so the clean geometry is one chunk per thread per core.
+#
+# Measured on wintermute, syrk, `pb_mt` over `pb`, six INDEPENDENT processes per arm, reported as the
+# median self-speedup with the across-process spread in parentheses. `-t 6,0` reads 4.27 (1.03) at
+# n=512, 4.93 (1.01) at n=1024 and 5.05 (1.02) at n=2048. `-t 7,0` reads 2.70 (1.68), 2.94 (1.70) and
+# 3.14 (1.61) on the same cells, and a bare `-t 7` reads 4.91 (1.57) at n=1024. Both of the rejected
+# shapes are BIMODAL, and their MAXIMUM equals `-t 6,0`'s median — they sometimes land the good
+# placement and sometimes do not, which is why the spread and not the median is the thing to read.
+#
+#   BENCH_CORE=0,2,4,6,8,10 JL_FLAGS="-t 6,0" SWEEP_EXTRA="mt=6" SWEEP_ARMS="arms=pb,pb_mt" \
 #       SWEEP_GROUPS="L1 L2 L3 LP CL1 CL2 CL3 CLP" bench/fleet_refresh.sh
 #
 # The dual groups have no `pb_mt` arm — their reference is LinearAlgebra's generic fallback, which is
@@ -132,14 +147,9 @@ fi
 # reference-only threaded run down the single-threaded path.
 if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | grep -q '_mt'; then
     _MT_RUN=1
-    # THE JULIA THREAD COUNT MUST EXCEED THE PHYSICAL CORE COUNT, and this refuses rather than
-    # measuring a handicapped pool. `bench/plots.jl`'s `_pin_threads!` pins one thread per physical
-    # core and leaves anything beyond that floating, because the runtime needs a slot it can schedule
-    # on; with `-t <ncores>` there is nothing left over and the pool's join waits on a pinned thread
-    # that cannot move. The pool size is a SEPARATE number — pass it as `mt=<ncores>` through
-    # SWEEP_EXTRA. Measured on wintermute (6 cores), gemm n=1000, pb_mt over pb: `-t 6` gave 0.36x,
-    # `-t 7` gave 1.38x under the old one-hyperthread pin, and 3.61x once the pin was corrected to
-    # cover the whole core. The 2026-10-03 sweep ran `-t 6` and its entire pb_mt arm was unusable.
+    # THE THREAD SPEC MUST BE `-t <ncores>,0` — one default thread per physical core in the mask and
+    # an empty interactive pool — and this refuses rather than measuring a bimodal pool. The header
+    # note carries the mechanism and the fleet numbers behind both refusals.
     # DISTINCT PHYSICAL CORES INSIDE THE SWEEP'S MASK, which is the number `_pin_threads!` will pin:
     # it reads `Cpus_allowed_list` and takes one CPU per `topology/core_id`, so the mask bounds it, not
     # the box. Counting the whole box instead refuses galen's documented recipe — 12 cores, swept at
@@ -168,13 +178,28 @@ if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | gre
     else
         _ncore=$(lscpu -p=Socket,Core 2>/dev/null | grep -v '^#' | sort -u | grep -c . || echo 0)
     fi
-    _jlnt=$(printf '%s' "${JL_FLAGS:-}" | sed -n 's/.*-t[ =]*\([0-9]\+\).*/\1/p')
-    if [ -n "$_jlnt" ] && [ "$_ncore" -gt 0 ] && [ "$_jlnt" -le "$_ncore" ]; then
-        echo "=== ABORT: JL_FLAGS has -t $_jlnt against a mask holding $_ncore physical core(s)."
-        echo "    A threaded sweep needs at least -t $((_ncore + 1)) so one thread stays unpinned for"
-        echo "    the runtime; set the POOL size separately with SWEEP_EXTRA=\"mt=$_ncore\"."
-        echo "    Mask: BENCH_CORE=$CORE. See the note above. ==="
-        exit 2
+    # The spec is read WHOLE (`[0-9,]`) so the interactive half is visible: taking the first integer
+    # alone cannot tell `-t 6,0` from `-t 6`, and those are the two arms of the measurement above.
+    _jlspec=$(printf '%s' "${JL_FLAGS:-}" | sed -n 's/.*-t[ =]*\([0-9,]\+\).*/\1/p')
+    _jlnt=${_jlspec%%,*}
+    if [ -n "$_jlspec" ] && [ "$_ncore" -gt 0 ]; then
+        case "$_jlspec" in
+            *,0) : ;;
+            *)
+                echo "=== ABORT: JL_FLAGS has -t $_jlspec, which leaves the main thread in the"
+                echo "    :interactive pool where _pin_threads! never reaches it. The pool's driver"
+                echo "    runs a chunk itself, so an unpinned driver shares a core with a worker and"
+                echo "    the arm goes bimodal. Use JL_FLAGS=\"-t $_ncore,0\". See the note above. ==="
+                exit 2 ;;
+        esac
+        if [ "$_jlnt" -ne "$_ncore" ]; then
+            echo "=== ABORT: JL_FLAGS has $_jlnt default thread(s) against a mask holding $_ncore"
+            echo "    physical core(s). A thread past the core count is left floating and the"
+            echo "    scheduler can put a chunk on it, sharing a core with a pinned one."
+            echo "    Use JL_FLAGS=\"-t $_ncore,0\" with SWEEP_EXTRA=\"mt=$_ncore\"."
+            echo "    Mask: BENCH_CORE=$CORE. See the note above. ==="
+            exit 2
+        fi
     fi
     # AND THE MASK MUST BE WIDE ENOUGH FOR THE POOL. The default `CORE` is a SINGLE core (the serial
     # bench core), so a threaded sweep launched without BENCH_CORE pins one thread and the other five
