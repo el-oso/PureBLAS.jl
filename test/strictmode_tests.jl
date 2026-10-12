@@ -9,14 +9,17 @@
 # dropped), so a leftover `static = false` reads as an unchanged test while its meaning has flipped.
 # Two properties, two tools, and they are not interchangeable:
 #   * leaf kernels must be alloc-free on EVERY path       → `@test_noalloc` (the proof)
-#   * drivers holding grow-once scratch are alloc-free in  → `@test alloc(f, ...) == 0`, after a
-#     STEADY STATE, not on the first call                    warm-up, as gemm_tests.jl does — the
-# measurement goes through a compiled barrier, never at testitem scope, where the window charges the
-# caller's own dispatch as well as the kernel's.
-# Most drivers cannot use the proof: they statically reach allocation sites an all-paths proof counts
-# even where the branch is runtime-dead. `gemm!` is the exception since `5f4a2eae` — every L3 pool it
-# reaches is GROW-ONLY and grows through one `@noinline` function, so the barrier exemption states
-# something true. That proof is the `gemm!` item at the end of this file; it registers the barriers,
+#   * drivers holding grow-once scratch are alloc-free in  → `@test_noalloc` under the pool-growth
+#     STEADY STATE, not on the first call                    barriers, which scope the exemption to
+#     exactly "a workspace reached a new high-water mark"
+# A DRIVER TAKES THE PROOF UNLESS IT STATICALLY REACHES THE SCHEDULER. Every L3 pool is grow-only and
+# grows through a `@noinline` function, so registering those functions makes the exemption state
+# something true and the per-site proof holds. What is left over is not PureBLAS scratch: the drivers
+# that still fail reach Julia's own task and lock machinery — `enable_finalizers`, `init_perthread`,
+# `SpinLock`, `notify`, `taskheap` — through a thread pool or a blocked reduction, and there is no
+# honest grow-only barrier to register for the scheduler. Those, and only those, keep a warmed runtime
+# reading inside a compiled barrier (never at testitem scope, where the window charges the caller's own
+# dispatch as well as the kernel's): `_syrk_blocked!`, `_symm!` and complex `qr_unblocked!`. That proof is the `gemm!` item at the end of this file; it registers the barriers,
 # proves, then unregisters, because the registration is session-wide and would otherwise weaken every
 # other `@test_noalloc` in the same worker.
 
@@ -97,147 +100,174 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
-        # `@allocated` reads the kernel only from inside a compiled barrier. At testitem scope the
-        # operands are module globals, so the measured call is a dynamic dispatch and the window also
-        # charges the caller's method lookup and the boxing of the return value: a clean read there
-        # cannot separate "the driver allocates nothing" from "inference happened to be clean at this
-        # one call site". Same form as `gemm_tests.jl` and the eigen item below. A varargs barrier can
-        # itself allocate through the splat, so a non-zero read has to be re-checked against a
-        # fixed-arity barrier before it is charged to the driver.
-        alloc(f, args...) = @allocated f(args...)
-        steady(f, args...) = (f(args...); alloc(f, args...))
-        tri(s) = (
-            M = tril(randn(s, s)); for i in 1:s
-                M[i, i] += s
-            end; M
-        )
-        # ROOT-CAUSE guard, on the CONSUMER (not the accessor — passing `Float64` as a value infers over
-        # DataType, where T is unresolvable, a test artifact). Here T = eltype(B) is a concrete compile-
-        # time parameter, so :full-mode JET report_opt sees the real specialization: the invL/invR base
-        # holds the trtri+gemm scratch, and a non-concrete scratch return (view of an abstract
-        # IdDict{DataType,Matrix} value) shows up as internal runtime dispatch / boxing here. This is the
-        # check that was missing when the per-leaf boxing shipped — it passes only with concrete returns.
-        Atri = tri(32)
-        @assert_typestable P._trsm_base_invL!(false, false, false, Atri, randn(32, 256))
-        @assert_typestable P._trsm_base_invR!(false, false, false, Atri, randn(256, 32))
-        # Driver steady-state is allocation-free. Cached scratch allocates once on first touch, so what
-        # is asserted is the empirical WARMED path — and from StrictMode 0.4 that has to be spelled with
-        # runtime `@allocated`, not `@test_noalloc`. 0.4 dropped the `static = false` runtime form, so
-        # `@test_noalloc` is now ONLY AllocCheck's static all-paths proof, and every driver below can
-        # statically reach `gemm!` → `_gemm_strassen!`, whose pad/level pool is a lazily sized
-        # `Vector{Matrix}` (workspace.jl `_str_fit!`). That branch is runtime-dead at these shapes but an
-        # all-paths proof must still count it, so no warm-up can make the static form green. Same reason
-        # gemm_tests.jl guards its drivers this way; the file header above says so.
-        # StrictMode macros reject kwargs, so we assert on the POSITIONAL
-        # internal drivers — which is exactly where the scratch/views live: the invL/invR bases hold
-        # the trtri+gemm scratch (the boxing site), the packed syrk/syr2k/symm hold the pack buffers.
-        # WARM the trsm_tmp scratch first: @assert_typestable above is JET-static (never executes), and
-        # trsm_tmp is trsm-specific (unlike the syrk pack buffers, pre-grown by the earlier GEMM items in
-        # this worker). Without this the noalloc target IS the first-touch grow → scheduling-flaky fail.
-        # Operands are hoisted OUT of the measured expression: `@allocated` counts its whole argument
-        # list, where the macro form bound each argument before measuring.
-        BL = randn(32, 256); BR = randn(256, 32)
-        P._trsm_base_invL!(false, false, false, Atri, BL)
-        P._trsm_base_invR!(false, false, false, Atri, BR)
-        @test alloc(P._trsm_base_invL!, false, false, false, Atri, BL) == 0
-        @test alloc(P._trsm_base_invR!, false, false, false, Atri, BR) == 0
-        # Fused gemmtrsm leaf (side-L upper, the wide-B gate shape f64) — typestable + alloc-free steady
-        # state. Covers the transpose pack (shufflevector kernels) + the const-owned ftrsm buffer.
-        Aup = (
-            M = triu(randn(128, 128)); for i in 1:128
-                M[i, i] += 128.0
-            end; M
-        )
-        BF = randn(128, 256)
-        P._trsm_fused_L!(false, Aup, BF)                                  # warm the ftrsm buffer
-        @assert_typestable P._trsm_fused_L!(false, Aup, randn(128, 256))
-        @test alloc(P._trsm_fused_L!, false, Aup, BF) == 0
-        # Whole-k packed sweep (shared-panel restructure; default-off toggle) — same typestable + alloc-free
-        # contract. Covers _pack_U_micro! + the packed slab/tail kernels reading the ftrsm buffer. AVX-512-f64
-        # ONLY: `_trsm_fused_full_L!` is dispatched (trsm.jl:_trsm_left!) solely under `_GT_TRANSPOSE` and has
-        # no non-transpose fallback (its slab kernels require W==MR==8), so a DIRECT call on AVX2 throws by
-        # design — gate the dogfood on the same predicate the dispatcher uses.
-        if PureBLAS._GT_TRANSPOSE
-            Auf = (
-                M = triu(randn(512, 512)); for i in 1:512
-                    M[i, i] += 512.0
+        # THE PROOF, NOT A MEASUREMENT, WHEREVER IT HOLDS. `@test_noalloc` is AllocCheck's static
+        # all-paths proof; a warmed runtime reading is strictly weaker and cannot see a path this shape
+        # does not take. Most drivers here are provable once the pool-growth functions are registered as
+        # barriers, which scopes the exemption to exactly "a workspace reached a new high-water mark" —
+        # `workspace.jl` states that contract and names the growth points.
+        #
+        # `_arena_coalesce!` IS IN THE SET AND HAS TO BE. The arena's fold is the one allocation a scope
+        # can make, and while it was inlined into `_arena_exit!` it was not registrable, so every driver
+        # that borrows from the arena fell through to the per-site proof — which then reported the pool
+        # growth the other barriers already covered, 103 sites for `_trsm_base_invL!` and every one of
+        # them a high-water mark. The registration is process-global, so it is torn down in `finally`
+        # and the verdict cache cleared, exactly as the `gemm!` item at the end of this file does.
+        _POOLS = (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._arena_coalesce!,
+            P._m3ws, P._gpackws, P._strws)
+        for f in _POOLS
+            StrictMode.register_alloc_barrier!(f)
+        end
+        try
+            # `@allocated` reads the kernel only from inside a compiled barrier. At testitem scope the
+            # operands are module globals, so the measured call is a dynamic dispatch and the window also
+            # charges the caller's method lookup and the boxing of the return value: a clean read there
+            # cannot separate "the driver allocates nothing" from "inference happened to be clean at this
+            # one call site". Same form as `gemm_tests.jl` and the eigen item below. A varargs barrier can
+            # itself allocate through the splat, so a non-zero read has to be re-checked against a
+            # fixed-arity barrier before it is charged to the driver.
+            alloc(f, args...) = @allocated f(args...)
+            steady(f, args...) = (f(args...); alloc(f, args...))
+            tri(s) = (
+                M = tril(randn(s, s)); for i in 1:s
+                    M[i, i] += s
                 end; M
             )
-            BFF = randn(512, 256)
-            P._trsm_fused_full_L!(false, Auf, BFF)                           # warm the ftrsm buffer
-            @assert_typestable P._trsm_fused_full_L!(false, Auf, randn(512, 256))
-            @test alloc(P._trsm_fused_full_L!, false, Auf, BFF) == 0
+            # ROOT-CAUSE guard, on the CONSUMER (not the accessor — passing `Float64` as a value infers over
+            # DataType, where T is unresolvable, a test artifact). Here T = eltype(B) is a concrete compile-
+            # time parameter, so :full-mode JET report_opt sees the real specialization: the invL/invR base
+            # holds the trtri+gemm scratch, and a non-concrete scratch return (view of an abstract
+            # IdDict{DataType,Matrix} value) shows up as internal runtime dispatch / boxing here. This is the
+            # check that was missing when the per-leaf boxing shipped — it passes only with concrete returns.
+            Atri = tri(32)
+            @assert_typestable P._trsm_base_invL!(false, false, false, Atri, randn(32, 256))
+            @assert_typestable P._trsm_base_invR!(false, false, false, Atri, randn(256, 32))
+            # Driver steady-state is allocation-free. Cached scratch allocates once on first touch, so what
+            # is asserted is the empirical WARMED path — and from StrictMode 0.4 that has to be spelled with
+            # `@test_noalloc` is ONLY AllocCheck's static all-paths proof since StrictModeTest 0.4, which
+            # dropped the `static = false` runtime form. The drivers below reach `gemm!` →
+            # `_gemm_strassen!`, whose pad/level pool is a lazily sized `Vector{Matrix}` (workspace.jl
+            # `_str_fit!`), plus the arena and the pack pools — all grow-only, all behind the registered
+            # barriers above, so the proof holds on them. The warm-up calls that remain are for the few
+            # assertions still taking a runtime reading, not for the proofs, which never execute.
+            # StrictMode macros reject kwargs, so we assert on the POSITIONAL
+            # internal drivers — which is exactly where the scratch/views live: the invL/invR bases hold
+            # the trtri+gemm scratch (the boxing site), the packed syrk/syr2k/symm hold the pack buffers.
+            # WARM the trsm_tmp scratch first: @assert_typestable above is JET-static (never executes), and
+            # trsm_tmp is trsm-specific (unlike the syrk pack buffers, pre-grown by the earlier GEMM items in
+            # this worker). Without this the noalloc target IS the first-touch grow → scheduling-flaky fail.
+            # Operands are hoisted OUT of the measured expression: `@allocated` counts its whole argument
+            # list, where the macro form bound each argument before measuring.
+            BL = randn(32, 256); BR = randn(256, 32)
+            P._trsm_base_invL!(false, false, false, Atri, BL)
+            P._trsm_base_invR!(false, false, false, Atri, BR)
+            @test_noalloc P._trsm_base_invL!(false, false, false, Atri, BL)
+            @test_noalloc P._trsm_base_invR!(false, false, false, Atri, BR)
+            # Fused gemmtrsm leaf (side-L upper, the wide-B gate shape f64) — typestable + alloc-free steady
+            # state. Covers the transpose pack (shufflevector kernels) + the const-owned ftrsm buffer.
+            Aup = (
+                M = triu(randn(128, 128)); for i in 1:128
+                    M[i, i] += 128.0
+                end; M
+            )
+            BF = randn(128, 256)
+            P._trsm_fused_L!(false, Aup, BF)                                  # warm the ftrsm buffer
+            @assert_typestable P._trsm_fused_L!(false, Aup, randn(128, 256))
+            @test_noalloc P._trsm_fused_L!(false, Aup, BF)
+            # Whole-k packed sweep (shared-panel restructure; default-off toggle) — same typestable + alloc-free
+            # contract. Covers _pack_U_micro! + the packed slab/tail kernels reading the ftrsm buffer. AVX-512-f64
+            # ONLY: `_trsm_fused_full_L!` is dispatched (trsm.jl:_trsm_left!) solely under `_GT_TRANSPOSE` and has
+            # no non-transpose fallback (its slab kernels require W==MR==8), so a DIRECT call on AVX2 throws by
+            # design — gate the dogfood on the same predicate the dispatcher uses.
+            if PureBLAS._GT_TRANSPOSE
+                Auf = (
+                    M = triu(randn(512, 512)); for i in 1:512
+                        M[i, i] += 512.0
+                    end; M
+                )
+                BFF = randn(512, 256)
+                P._trsm_fused_full_L!(false, Auf, BFF)                           # warm the ftrsm buffer
+                @assert_typestable P._trsm_fused_full_L!(false, Auf, randn(512, 256))
+                @test_noalloc P._trsm_fused_full_L!(false, Auf, BFF)
+            end
+            As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
+            # n=512 now takes the recursive route into gemm rather than the packed kernel, so it reaches
+            # the SME path and its function pointer -- hence the barrier here too, same as below.
+            @test steady(P._syrk_blocked!, false, false, false, 0.8, As, Cs, 512) == 0
+            As32 = randn(32, 32); Cs32 = zeros(32, 32)   # small-n unified single-pack path (AVX2)
+            # Measured through a function barrier, per req#10: at top level the operands are `Any`-typed
+            # and the first compile of each such call site caches a method instance, which reports as
+            # allocation a caller passing concrete types never pays. `_symm!` reaches gemm, whose SME
+            # route is behind a function pointer (one dynamic dispatch), so it is the one that shows it.
+            @test steady(P._syrk_blocked!, false, false, false, 0.8, As32, Cs32, 32) == 0
+            @test_noalloc P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512)
+            @test steady(P._symm!, true, false, false, 0.8, 0.3, As, Bs, Cs) == 0
+            # PUBLIC ENTRY POINTS — assertable directly now that StrictMode ≥0.3.4 supports kwarg calls
+            # (issue el-oso/StrictMode.jl#4). This closes the mandate: StrictMode on every entry point, not
+            # just the positional internal drivers. :full-mode JET sees the whole kwarg→dispatch→kernel tree.
+            @assert_typestable P.trsm!(copy(Bs), tri(512); side = 'L', uplo = 'L', diag = 'N', alpha = 1.0)
+            @assert_typestable P.syrk!(zeros(512, 512), As; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
+            @assert_typestable P.syr2k!(zeros(512, 512), As, Bs; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
+            @assert_typestable P.symm!(zeros(512, 512), As, Bs; side = 'L', uplo = 'L', alpha = 0.8, beta = 0.3)
+            # OWNED-SCRATCH (GKH) guard — @assert_owned (StrictMode ≥0.3.5) fails on a runtime AbstractDict
+            # lookup reached on the hot path. This is the check that WAS MISSING when the complex `_symm_scr`
+            # scratch accessor shipped with const-dispatched owned Refs only for Float64/Float32: ComplexF64/F32
+            # fell through to the generic `get(::IdDict, T, …)` (~130 ns/call, ~26% of a tiny-n op). That's
+            # type-stable + alloc-free (warm hit) + trim-safe, so it passed all three OTHER asserts — only a
+            # benchmark caught it. Now every eltype has an owned Ref, and this guard goes red if that regresses.
+            Az = randn(ComplexF64, 64, 64); Hz = Az + Az'; Bz = randn(ComplexF64, 64, 64)
+            @assert_owned P.hemm!(zeros(ComplexF64, 64, 64), Hz, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im)
+            @assert_owned P.symm!(zeros(ComplexF64, 64, 64), Az, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im)
+            # UNPACKED-TRI complex rank-k (small-n trans='N', `_ctri_unpacked!` → `_uker_cmplx!` TRI-store): the
+            # path that fixed the zsyrk/zherk n≈24–48 valley. Direct-read A, no pack, masks the diagonal tile —
+            # must stay typestable + alloc-free (the tri sweep resolves sb/a1/ar/nr to concrete Vals). trim-side
+            # is covered ccallable-rooted in trim_tests.jl; here the type/alloc contract on the hot driver.
+            Awz = randn(ComplexF64, 48, 40); Bwz = randn(ComplexF64, 48, 40)
+            Cwz = zeros(ComplexF64, 48, 48)
+            MZ48 = Matrix{ComplexF64}
+            @assert_typestable P._ctri_unpacked!(true, true, 1.0, Awz, zeros(ComplexF64, 48, 48), 40)
+            @assert_typestable P.herk!(zeros(ComplexF64, 48, 48), Awz; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)
+            # rank-2k (two products through the shared _ctri_core!)
+            @assert_typestable P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40)
+            # ztrsmR-C direct base (`_trsm_cmplx_dRC!`, the zpotrf-lower recursion path) — typestable + alloc-free.
+            Atr = randn(ComplexF64, 48, 48) ./ 96; for d in 1:48
+                Atr[d, d] = 1 + abs(Atr[d, d])
+            end
+            Btr = randn(ComplexF64, 64, 48)
+            @assert_typestable P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48))
+            # The complex rank-k and ztrsmR drivers reach no pool at all, so they prove with or without
+            # the registration. `alpha`'s type selects the kernel arm, so both arms are asserted rather
+            # than assumed to share one.
+            #
+            # NOT `test_registered()`, THOUGH IT IS THE DRIVER BUILT FOR THIS. It re-proves whatever `src/`
+            # declared, and it can see nothing here: the mark-once registry is populated at declaration
+            # time and that cross-package `Dict` insert does not survive a cached pkgimage load, so this
+            # test process reads ZERO registered signatures however many declarations `src/` carries.
+            # `@test_noalloc` and `test_signatures` enumerate directly and are unaffected.
+            @test_noalloc P._ctri_unpacked!(true, true, 1.0, Awz, Cwz, 40)
+            @test_noalloc P._ctri_unpacked!(false, false, 1.2 + 0.3im, Awz, Cwz, 40)
+            @test_noalloc P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, Cwz, 40)
+            @test_noalloc P._ctri2_unpacked!(false, false, 1.2 + 0.3im, Awz, Bwz, Cwz, 40)
+            @test_noalloc P._trsm_cmplx_dRC!(true, false, 48, Atr, Btr)
+            @test true
+            # POSITIVE CONTROL. `@test_noalloc` records nothing when it holds, so an item whose macros
+            # had gone inert would look identical to one whose proofs all passed. With the exemption
+            # off the pool growth counts again and the SAME proof must fail.
+            _threw = false
+            set_ignore_barrier!(false)
+            try
+                @test_noalloc P._trsm_base_invL!(false, false, false, Atri, BL)
+            catch
+                _threw = true
+            finally
+                set_ignore_barrier!(true)
+            end
+            @test _threw
+        finally
+            for f in _POOLS
+                delete!(StrictMode._ALLOC_BARRIERS, f)   # internal: no public unregister exists
+            end
+            StrictMode.clear_cache!()
         end
-        As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
-        # n=512 now takes the recursive route into gemm rather than the packed kernel, so it reaches
-        # the SME path and its function pointer -- hence the barrier here too, same as below.
-        @test steady(P._syrk_blocked!, false, false, false, 0.8, As, Cs, 512) == 0
-        As32 = randn(32, 32); Cs32 = zeros(32, 32)   # small-n unified single-pack path (AVX2)
-        # Measured through a function barrier, per req#10: at top level the operands are `Any`-typed
-        # and the first compile of each such call site caches a method instance, which reports as
-        # allocation a caller passing concrete types never pays. `_symm!` reaches gemm, whose SME
-        # route is behind a function pointer (one dynamic dispatch), so it is the one that shows it.
-        @test steady(P._syrk_blocked!, false, false, false, 0.8, As32, Cs32, 32) == 0
-        @test steady(P._syr2k_packed!, false, false, 0.8, 0.3, As, Bs, Cs, 512) == 0
-        @test steady(P._symm!, true, false, false, 0.8, 0.3, As, Bs, Cs) == 0
-        # PUBLIC ENTRY POINTS — assertable directly now that StrictMode ≥0.3.4 supports kwarg calls
-        # (issue el-oso/StrictMode.jl#4). This closes the mandate: StrictMode on every entry point, not
-        # just the positional internal drivers. :full-mode JET sees the whole kwarg→dispatch→kernel tree.
-        @assert_typestable P.trsm!(copy(Bs), tri(512); side = 'L', uplo = 'L', diag = 'N', alpha = 1.0)
-        @assert_typestable P.syrk!(zeros(512, 512), As; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
-        @assert_typestable P.syr2k!(zeros(512, 512), As, Bs; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
-        @assert_typestable P.symm!(zeros(512, 512), As, Bs; side = 'L', uplo = 'L', alpha = 0.8, beta = 0.3)
-        # OWNED-SCRATCH (GKH) guard — @assert_owned (StrictMode ≥0.3.5) fails on a runtime AbstractDict
-        # lookup reached on the hot path. This is the check that WAS MISSING when the complex `_symm_scr`
-        # scratch accessor shipped with const-dispatched owned Refs only for Float64/Float32: ComplexF64/F32
-        # fell through to the generic `get(::IdDict, T, …)` (~130 ns/call, ~26% of a tiny-n op). That's
-        # type-stable + alloc-free (warm hit) + trim-safe, so it passed all three OTHER asserts — only a
-        # benchmark caught it. Now every eltype has an owned Ref, and this guard goes red if that regresses.
-        Az = randn(ComplexF64, 64, 64); Hz = Az + Az'; Bz = randn(ComplexF64, 64, 64)
-        @assert_owned P.hemm!(zeros(ComplexF64, 64, 64), Hz, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im)
-        @assert_owned P.symm!(zeros(ComplexF64, 64, 64), Az, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im)
-        # UNPACKED-TRI complex rank-k (small-n trans='N', `_ctri_unpacked!` → `_uker_cmplx!` TRI-store): the
-        # path that fixed the zsyrk/zherk n≈24–48 valley. Direct-read A, no pack, masks the diagonal tile —
-        # must stay typestable + alloc-free (the tri sweep resolves sb/a1/ar/nr to concrete Vals). trim-side
-        # is covered ccallable-rooted in trim_tests.jl; here the type/alloc contract on the hot driver.
-        Awz = randn(ComplexF64, 48, 40); Bwz = randn(ComplexF64, 48, 40)
-        Cwz = zeros(ComplexF64, 48, 48)
-        MZ48 = Matrix{ComplexF64}
-        @assert_typestable P._ctri_unpacked!(true, true, 1.0, Awz, zeros(ComplexF64, 48, 48), 40)
-        @assert_typestable P.herk!(zeros(ComplexF64, 48, 48), Awz; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)
-        # rank-2k (two products through the shared _ctri_core!)
-        @assert_typestable P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40)
-        # ztrsmR-C direct base (`_trsm_cmplx_dRC!`, the zpotrf-lower recursion path) — typestable + alloc-free.
-        Atr = randn(ComplexF64, 48, 48) ./ 96; for d in 1:48
-            Atr[d, d] = 1 + abs(Atr[d, d])
-        end
-        Btr = randn(ComplexF64, 64, 48)
-        @assert_typestable P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48))
-        # THE COMPLEX RANK-K AND ztrsmR DRIVERS TAKE THE PROOF, NOT THE MEASUREMENT. They reach no pool
-        # whose growth an all-paths scan must count, so AllocCheck proves them outright and no barrier
-        # registration is needed — which makes the runtime form strictly weaker here and the wrong
-        # instrument. The real drivers above cannot be proved: the trsm inverse bases reach 103 static
-        # allocation sites, `_trsm_fused_L!` 18, and `_pbtrf_blocked!`/`_pbtrf_blocked_U!` 155 and 161,
-        # so those keep the warmed runtime check. Which tier a driver belongs in is a fact about that
-        # driver, not about this file, and it has to be checked per driver.
-        #
-        # SIGNATURES, NOT THE MARK-ONCE REGISTRY. `test_registered()` is the driver that re-proves what
-        # `src/` declared, and it cannot see anything here: the registry is populated at declaration
-        # time and that cross-package `Dict` insert does not survive a cached pkgimage load, so this
-        # test process reads ZERO entries however many declarations `src/` carries. `test_signatures`
-        # enumerates directly and is unaffected — the same reason the eigen item below uses it.
-        # `alpha`'s type selects the kernel arm, so both arms are listed rather than assumed to share.
-        test_signatures(
-            [
-                (P._ctri_unpacked!, (Bool, Bool, Float64, MZ48, MZ48, Int)),
-                (P._ctri_unpacked!, (Bool, Bool, ComplexF64, MZ48, MZ48, Int)),
-                (P._ctri2_unpacked!, (Bool, Bool, Float64, MZ48, MZ48, MZ48, Int)),
-                (P._ctri2_unpacked!, (Bool, Bool, ComplexF64, MZ48, MZ48, MZ48, Int)),
-                (P._trsm_cmplx_dRC!, (Bool, Bool, Int, MZ48, MZ48)),
-            ];
-            guarantees = (:noalloc,)
-        )
-        @test true
     end
 end
 
@@ -649,12 +679,38 @@ end
         # legitimately sizes the owned buffers, and StrictMode 0.4 dropped the `static = false` runtime
         # form, leaving `@test_noalloc` as a static all-paths proof that must count the (runtime-dead)
         # `_gemm_strassen!` pad pool — see the L3 item above for the full reasoning.
-        P._pbtrf_blocked!(wideband(Float64, 64), n, 64)          # size the owned scratch for nb(64)
+        # BOTH TAKE THE STATIC PROOF under the same pool-growth barriers the L3 item registers — the
+        # owned W and S reach new high-water marks through `_ws_grow!`/`_ws_slot!` and the arena folds
+        # through `_arena_coalesce!`, and nothing else on this path allocates. Registration is
+        # process-global, so it is scoped to these two assertions and torn down immediately.
         Wpb = wideband(Float64, 64)
-        @test alloc(P._pbtrf_blocked!, Wpb, n, 64) == 0
-        P._pbtrf_blocked_U!(wideU(Float64, 64), n, 64)
         WpbU = wideU(Float64, 64)
-        @test alloc(P._pbtrf_blocked_U!, WpbU, n, 64) == 0
+        let pools = (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._arena_coalesce!,
+                P._m3ws, P._gpackws, P._strws)
+            for f in pools
+                StrictMode.register_alloc_barrier!(f)
+            end
+            try
+                @test_noalloc P._pbtrf_blocked!(Wpb, n, 64)
+                @test_noalloc P._pbtrf_blocked_U!(WpbU, n, 64)
+                # POSITIVE CONTROL: with the exemption off the pool growth counts and this must fail.
+                threw_pb = false
+                set_ignore_barrier!(false)
+                try
+                    @test_noalloc P._pbtrf_blocked!(Wpb, n, 64)
+                catch
+                    threw_pb = true
+                finally
+                    set_ignore_barrier!(true)
+                end
+                @test threw_pb
+            finally
+                for f in pools
+                    delete!(StrictMode._ALLOC_BARRIERS, f)
+                end
+                StrictMode.clear_cache!()
+            end
+        end
         pack(M) = [M[i, j] for j in 1:n for i in j:n]              # lower column-packed
         APsd = pack(Sd); P.pptrf!(APsd; uplo = 'L')
         @test_trim_compatible P.pptrf!(pack(Sd); uplo = 'L')
