@@ -79,7 +79,7 @@ _l3rep(s) = clamp(20_000_000 ÷ (s * s * s), 1, 512)  # plots.jl's _reps_cubic �
 # 7812 reps of a 1024x1024 gemv per sample, ~1000x plots.jl's budget, and the cell would then be
 # timed deep in a steady state the gate never enters.
 const _L2OPS = ("gemvN", "gemvT", "trmv", "gbmvN")
-const _L3OPS = ("trmmL", "trmmR", "syrk", "ztrsmR")
+const _L3OPS = ("trmmL", "trmmR", "syrk", "ztrsmR", "ztrsmL")
 # plots.jl's `tri(s)`, character for character. Conditioned so repeated in-place `B := A*B` is stable,
 # which is what lets the gate omit a per-rep restore; see the note at the L3 registry entries.
 _tri(s) = (A = randn(s, s) ./ (2s); for i in 1:s
@@ -321,6 +321,17 @@ const OPS = Dict(
             end; c[2][1]
         ),
         (c, m) -> error("cellrep: trmmL is self-speedup only (pass a thread count); it has no reference arm"),
+    ),
+    # `ztrsmL` is `plots.jl`'s CL3 `ztrsm` cell — side 'L', the plain name in the ledger, spelled with
+    # the side here for the same reason trmm is (each side needs its own operands).
+    "ztrsmL" => (
+        () -> (_ctri(N), randn(ComplexF64, N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.trsm!(c[2], c[1]; side = 'L', uplo = 'U')
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: ztrsmL is self-speedup only (pass a thread count); it has no reference arm"),
     ),
     # `ztrsmR` is `plots.jl`'s CL3 side-R solve: side 'R', uplo 'U', no trans, non-unit, alpha=1. Its
     # operands are conditioned like the real ones so repeated in-place solves stay stable.

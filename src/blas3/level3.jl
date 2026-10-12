@@ -5296,7 +5296,15 @@ function trsm!(
             return B
         end
     end
-    if sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 1) == k
+    # Complex is admitted for the same reason side R is, and the route token is what carries it.
+    # `_trsm_left!` takes `nrt` from `nroute < 0 ? size(B, 2) : nroute`; `_trsm_run_chunk` passes the
+    # undivided `p.n` and a serial call passes `-1` with the whole of B, so a band and the unsplit call
+    # resolve the SAME `nrt` — which matters here because the complex base DOES key on it
+    # (`recbase = nrt <= _fh_ctrsm_ncut() ? _fh_ctrsm_rec_l() : _TRMM_BASE`). Everything else below is
+    # invariant under a column split: `_ZGT_BASE` keys on `k`, and `_cgt_ok` reads element types and
+    # strides only. The chunk is `where {T}` and calls `_trsm_left!`/`_scal_all!`, both generic.
+    if sl && !iszero(alpha) && eltype(B) <: Union{BlasReal, BlasComplex} &&
+            _strided1(A) && _strided1(B) && size(B, 1) == k
         nw = _trsm_workers(k, size(B, 2))
         if nw > 1
             rA = _root(A); rB = _root(B)
