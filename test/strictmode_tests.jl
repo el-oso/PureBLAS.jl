@@ -112,8 +112,10 @@ end
         # growth the other barriers already covered, 103 sites for `_trsm_base_invL!` and every one of
         # them a high-water mark. The registration is process-global, so it is torn down in `finally`
         # and the verdict cache cleared, exactly as the `gemm!` item at the end of this file does.
+        # `_symm_scr_mt` is a `OncePerTask` accessor, and `Base.OncePerTask` is deliberately NOT
+        # auto-recognized as a barrier, so it is registered explicitly the way `_m3ws` is.
         _POOLS = (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._arena_coalesce!,
-            P._m3ws, P._gpackws, P._strws)
+            P._m3ws, P._gpackws, P._strws, P._symm_scr_mt)
         for f in _POOLS
             StrictMode.register_alloc_barrier!(f)
         end
@@ -200,7 +202,7 @@ end
             # route is behind a function pointer (one dynamic dispatch), so it is the one that shows it.
             @test steady(P._syrk_blocked!, false, false, false, 0.8, As32, Cs32, 32) == 0
             @test_noalloc P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512)
-            @test steady(P._symm!, true, false, false, 0.8, 0.3, As, Bs, Cs) == 0
+            @test_noalloc P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)
             # PUBLIC ENTRY POINTS — assertable directly now that StrictMode ≥0.3.4 supports kwarg calls
             # (issue el-oso/StrictMode.jl#4). This closes the mandate: StrictMode on every entry point, not
             # just the positional internal drivers. :full-mode JET sees the whole kwarg→dispatch→kernel tree.
