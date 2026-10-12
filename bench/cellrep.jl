@@ -79,7 +79,7 @@ _l3rep(s) = clamp(20_000_000 ÷ (s * s * s), 1, 512)  # plots.jl's _reps_cubic �
 # 7812 reps of a 1024x1024 gemv per sample, ~1000x plots.jl's budget, and the cell would then be
 # timed deep in a steady state the gate never enters.
 const _L2OPS = ("gemvN", "gemvT", "trmv", "gbmvN")
-const _L3OPS = ("trmmL", "trmmR", "syrk", "ztrsmR", "ztrsmL")
+const _L3OPS = ("trmmL", "trmmR", "syrk", "ztrsmR", "ztrsmL", "trsmL", "trsmRg")
 # plots.jl's `tri(s)`, character for character. Conditioned so repeated in-place `B := A*B` is stable,
 # which is what lets the gate omit a per-rep restore; see the note at the L3 registry entries.
 _tri(s) = (A = randn(s, s) ./ (2s); for i in 1:s
@@ -321,6 +321,28 @@ const OPS = Dict(
             end; c[2][1]
         ),
         (c, m) -> error("cellrep: trmmL is self-speedup only (pass a thread count); it has no reference arm"),
+    ),
+    # The two REAL trsm cells, each at `plots.jl`'s own form. ⚠ THEY DIFFER IN MORE THAN SIDE: the
+    # ledger's `trsm` is side 'L'/uplo 'U'/transA 'N', while `trsmR` is side 'R'/uplo 'L'/transA 'T' —
+    # the potrf/getrf panel-solve shape. Copying side-L's uplo and trans across would measure a
+    # different routing question under the same name.
+    "trsmL" => (
+        () -> (_tri(N), randn(N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.trsm!(c[2], c[1]; side = 'L', uplo = 'U')
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: trsmL is self-speedup only (pass a thread count); use plots.jl for the gate"),
+    ),
+    "trsmRg" => (
+        () -> (_tri(N), randn(N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.trsm!(c[2], c[1]; side = 'R', uplo = 'L', transA = 'T')
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: trsmRg is self-speedup only (pass a thread count); use plots.jl for the gate"),
     ),
     # `ztrsmL` is `plots.jl`'s CL3 `ztrsm` cell — side 'L', the plain name in the ledger, spelled with
     # the side here for the same reason trmm is (each side needs its own operands).
