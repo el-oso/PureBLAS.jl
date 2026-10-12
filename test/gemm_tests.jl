@@ -605,10 +605,12 @@ end
     # diverging: (m=41, n=1024) and (m=48, n=512) at uplo 'U' with transA 'N' and 'T', and at uplo 'L'
     # with transA 'N' — six of the twelve side-R combinations. `Float64` side R has been admitted to
     # the pool throughout, so this is not fallout from a complex admission. The mechanism is NOT
-    # diagnosed; what is established is that it needs a band whose row count is not a multiple of the
-    # side-R granule, which a square power-of-two ladder never produces. Listed exactly rather than
-    # predicated on a rule, so that fixing any one of them turns its `@test_broken` into a failure and
-    # forces this list to be revisited.
+    # diagnosed, and the obvious guess is WRONG: it is not simply a remainder band. The side-R granule
+    # is `_MR * _vwidth(Float64)` = 16 here; m=41 does leave a 9-row remainder, but **m=48 is an exact
+    # multiple of 16 and diverges anyway**, so divisibility by the granule does not exempt a shape.
+    # What the two failing shapes share is that B is WIDE AND SHORT (m much smaller than n), not that
+    # m is awkward. Listed exactly rather than predicated on a rule, both because no rule is known and
+    # so that fixing any one of them turns its `@test_broken` into a failure and forces a revisit.
     broken_r = Set([(41, 1024, 'U', 'N'), (41, 1024, 'U', 'T'), (41, 1024, 'L', 'N'),
                     (48, 512, 'U', 'N'), (48, 512, 'U', 'T'), (48, 512, 'L', 'N')])
     tri(T, s) = (A = randn(T, s, s) ./ (2s); for i in 1:s
