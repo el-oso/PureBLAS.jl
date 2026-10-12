@@ -7499,6 +7499,28 @@ const _CHEMM_PACK_CUT = @load_preference("chemm_pack_cut", _vwidth(Float64) == 4
 # per box; do that before treating 32 as meaningful.
 # PDM: Derived — same packed kernel as chemm, differing only by conjugation. | tune: n/a, follows chemm
 const _CSYMM_PACK_CUT = @load_preference("csymm_pack_cut", _CHEMM_PACK_CUT)::Int
+# `_symm!`'s column split is a THREADED ENTRY, and an SME-owned product must decline the pool there:
+# `_gemm_threaded!` reaches `_gemm_core_body!` once per chunk, so by the time the body asks
+# `_sme_eligible` the split has already happened and the chunks queue behind one coprocessor instead
+# of dividing the work. `_sme_owns` carries the measurement; `gemm!` applies the same term at its own
+# threaded entry (gemm.jl, beside `!_strassen_owns`).
+#
+# THE MATERIALIZED OPERAND IS NOT AVAILABLE YET, AND DOES NOT NEED TO BE. Threading is decided before
+# the buffer is chosen, because a threaded call must materialize into the per-task twin. The predicate
+# reads that operand slot only through `_strided1`, and the panel `_symm_materialize!` fills is a
+# contiguous n×n view either way — measured identical on `_symm_scr`, on `_symm_scr_mt` and on `B` at
+# every size and both element types. `B` stands in the slot because the admission already requires
+# `_strided1(B)`; naming the scratch instead would size the serial buffer on every call, including the
+# threaded ones that never use it.
+#
+# Off SME `_SME_F64` is false, so this is identically false and no other box's route moves — the whole
+# term const-folds away there.
+# PDM: Derived — the materialized product's own SME ownership, asked of `_sme_owns` with that product's
+# shape, rather than a size threshold: the split is declined exactly when the coprocessor would claim
+# the call. | tune: n/a, follows _sme_owns
+@inline _symm_sme_owns(::Type{T}, m::Int, nc::Int, n::Int, C, B) where {T} =
+    _sme_owns(T, m, nc, n, false, false, false, false, C, B, B)
+
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
     # Complex side-L in the 3M window → fuse the reflection into the 3M A-split (no materialize, no n²
@@ -7541,7 +7563,8 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     # `eltype(B) === T` because `_gemm_threaded!` takes three `PtrMatrix{T}`; `Ad` is built at `T`, but a
     # mixed-type B would be a MethodError where `_gemm_core!` promotes. (`gemm!` guards the same way.)
     nw = (T === Float64 || T === Float32) && eltype(B) === T &&
-        _strided1(B) && _strided1(C) ?
+        _strided1(B) && _strided1(C) &&
+        !_symm_sme_owns(T, size(C, 1), size(C, 2), n, C, B) ?
         _gemm_workers(size(C, 1), size(C, 2), n) : 1
     Ad = view(nw > 1 ? _symm_scr_mt(T, n) : _symm_scr(T, n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)
