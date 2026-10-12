@@ -5276,15 +5276,20 @@ function trsm!(
     # way `_trgemm_packed!`'s seam was shown for the real packed path.
     # THREADED SIDE-R: split B's rows. `potrf`'s lower factorization is the caller that needs this —
     # it solves `A21·L11⁻ᵀ` with A21 tall and narrow, and that solve does not thread without it.
-    # COMPLEX IS ADMITTED HERE AND NOWHERE ELSE IN L3 YET, because side R is the one split whose route
-    # is invariant by construction rather than by a threshold. `_trsm_right!` takes `mrt` from
-    # `nroute < 0 ? size(B, 1) : nroute`, the chunk passes the undivided `p.m`, and a serial call passes
-    # `-1` with the whole of B — so a band and the unsplit call resolve the SAME `mrt` and the complex
-    # bases below key on `k`, which a row split does not touch. The chunk is type-generic, holds no
-    # buffer across the join, and `_trmmr_prefit!` already has a non-real no-op method. Side L is NOT
-    # admitted: its split divides `nrhs`, which the complex base's narrow/wide decision reads.
-    if !sl && !iszero(alpha) && eltype(B) <: Union{BlasReal, BlasComplex} &&
-            _strided1(A) && _strided1(B) && size(B, 2) == k
+    # `BlasReal`, NOT complex, and the reason is measured rather than assumed. Admitting complex here
+    # breaks req#11 in three independent places, each because something below reads the band's own ROW
+    # count where `mrt` only substitutes the column count:
+    #   * `_CGEMM_3M`'s window is `min(m, nrt, k) >= _fh_cgemm_3m_kmin()` with `m = size(C, 1)`, so a
+    #     band narrower than kmin=16 declines Karatsuba while the unsplit solve takes it. The real
+    #     split survives only because every real predicate is a `max`.
+    #   * `_trsm_cmplx_small_R!` routes on `size(B, 1) >= _ZGT_W`, not `mrt`, and the last band can be
+    #     a single row.
+    #   * `_trsm_cmplx_dRN!`/`_dRC!` pick their axpy arm and scalar-tail length from the band's rows,
+    #     which is `potrf`'s own `side='R', uplo='L', transA='C'` shape.
+    # Measured on Zen4, ComplexF64, uplo 'U', transA 'N': B 41x1024 at alpha=3.7-1.25i and B 48x512 at
+    # alpha=1 both diverge bitwise at every worker count 2..6. Square power-of-two B does NOT — every
+    # band is then a multiple of the 8-row granule — which is why a square-only check passes it.
+    if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
         nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
         if nwr > 1
             rA = _root(A); rB = _root(B)
@@ -5296,15 +5301,16 @@ function trsm!(
             return B
         end
     end
-    # Complex is admitted for the same reason side R is, and the route token is what carries it.
-    # `_trsm_left!` takes `nrt` from `nroute < 0 ? size(B, 2) : nroute`; `_trsm_run_chunk` passes the
-    # undivided `p.n` and a serial call passes `-1` with the whole of B, so a band and the unsplit call
-    # resolve the SAME `nrt` — which matters here because the complex base DOES key on it
-    # (`recbase = nrt <= _fh_ctrsm_ncut() ? _fh_ctrsm_rec_l() : _TRMM_BASE`). Everything else below is
-    # invariant under a column split: `_ZGT_BASE` keys on `k`, and `_cgt_ok` reads element types and
-    # strides only. The chunk is `where {T}` and calls `_trsm_left!`/`_scal_all!`, both generic.
-    if sl && !iszero(alpha) && eltype(B) <: Union{BlasReal, BlasComplex} &&
-            _strided1(A) && _strided1(B) && size(B, 1) == k
+    # `BlasReal` here too, and side L fails for a narrower reason than side R: its complex routes ARE
+    # covered by `nrt`, but `_scal_all!` is not. It applies α flat when B is contiguous and per column
+    # otherwise, and `_scal_pair_simd!`'s vector body uses an fma while its scalar tail uses the
+    # two-rounding form — so where a band's flat run ends mid-vector and the unsplit one does not, the
+    # last few elements take different arithmetic. Real α is immune (one rounding either way), which is
+    # why the real split never saw it. For `ComplexF64` the band offsets happen to land on the vector
+    # width and it is safe by coincidence; `ComplexF32` has twice the lanes and does not.
+    # Measured on Zen4: `ComplexF32`, m=n=k=1001, α=3.7-1.25i diverges bitwise at worker counts 2, 4, 5
+    # and 6, while the same shape at α=1 and every `ComplexF64` shape tried are bit-identical.
+    if sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 1) == k
         nw = _trsm_workers(k, size(B, 2))
         if nw > 1
             rA = _root(A); rB = _root(B)

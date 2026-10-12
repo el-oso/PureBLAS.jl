@@ -574,3 +574,75 @@ end
         P.set_num_threads(1)
     end
 end
+
+# trsm had NO thread-invariance item, which is how a complex admission that violated requirement 11 in
+# four places passed its own certification: that certification used square power-of-two B, where every
+# band is a multiple of the row granule and no band ends mid-vector. This item exists so a future
+# widening of either `trsm!` admission is caught rather than measured.
+#
+# IT IS A REGRESSION GUARD, AND FOR COMPLEX IT IS CURRENTLY VACUOUS BY CONSTRUCTION — both admissions
+# are `BlasReal`, so the complex cases below cannot thread and verify trivially. That is stated rather
+# than hidden: the real cases carry the liveness witness, and the complex cases fire the moment anyone
+# admits complex. The three mechanisms they are aimed at, each measured on Zen4 before the revert:
+#   * `_CGEMM_3M`'s window reads `min(m, nrt, k)` with `m` the band's ROW count, so a band narrower
+#     than kmin declines Karatsuba while the unsplit solve takes it. B 48x512 at alpha=1 diverged.
+#   * `_trsm_cmplx_small_R!` routes on `size(B, 1)`, not `mrt`; the last band can be one row.
+#   * `_scal_all!` applies a complex alpha flat or per column, and its vector body uses an fma where
+#     its scalar tail uses the two-rounding form. ComplexF32 m=n=k=1001 at alpha=3.7-1.25i diverged.
+# Hence the shapes: NON-square and non-power-of-two B, an odd dimension, and an alpha that is not a
+# power of two. A square po2 ladder reproduces none of it.
+@testitem "trsm: bit-identical at every thread count" tags = [:checks] begin
+    using Random, LinearAlgebra
+    import PureBLAS as P
+    # BYTE-WISE, not `reinterpret(UInt64, …)`: a `Float32` is four bytes, so a fixed-width reinterpret
+    # throws on half the element types this item covers. Bytes also distinguish -0.0 and NaN payloads,
+    # which is the point of comparing patterns rather than values.
+    bitsame(X, Y) = size(X) == size(Y) &&
+        reinterpret(UInt8, vec(collect(X))) == reinterpret(UInt8, vec(collect(Y)))
+    nt = Threads.nthreads()
+    # KNOWN-FAILING, and it PREDATES the complex work: real `Float64` side R at narrow B already
+    # returns different bits at different worker counts. Measured on Zen4, alpha=1, nw=2..6 all
+    # diverging: (m=41, n=1024) and (m=48, n=512) at uplo 'U' with transA 'N' and 'T', and at uplo 'L'
+    # with transA 'N' — six of the twelve side-R combinations. `Float64` side R has been admitted to
+    # the pool throughout, so this is not fallout from a complex admission. The mechanism is NOT
+    # diagnosed; what is established is that it needs a band whose row count is not a multiple of the
+    # side-R granule, which a square power-of-two ladder never produces. Listed exactly rather than
+    # predicated on a rule, so that fixing any one of them turns its `@test_broken` into a failure and
+    # forces this list to be revisited.
+    broken_r = Set([(41, 1024, 'U', 'N'), (41, 1024, 'U', 'T'), (41, 1024, 'L', 'N'),
+                    (48, 512, 'U', 'N'), (48, 512, 'U', 'T'), (48, 512, 'L', 'N')])
+    tri(T, s) = (A = randn(T, s, s) ./ (2s); for i in 1:s
+            A[i, i] = one(T) + abs(A[i, i])
+        end; A)
+
+    # LIVENESS, on the real path that does thread: without this the whole item can pass with no worker
+    # ever started, which is the failure mode CLAUDE.md flags for every threading gate here.
+    P.set_num_threads(nt)
+    @test P._trsm_workers(1024, 1024) > 1 || P._trsm_workers_r(1024, 1024, Float64) > 1
+    P.set_num_threads(1)
+
+    for T in (Float64, Float32, ComplexF64, ComplexF32)
+        for (side, m, n) in (('L', 1001, 257), ('L', 512, 41), ('R', 41, 1024), ('R', 48, 512))
+            k = side == 'L' ? m : n
+            for uplo in ('U', 'L'), tA in ('N', 'T', 'C'), al in (one(T), T(3.7) - T(1.25) * im)
+                T <: Real && !isreal(al) && continue          # a complex alpha is not a real alpha
+                Random.seed!(97 + m + n + Int(side) + Int(uplo) + Int(tA))
+                A = tri(T, k); B0 = randn(T, m, n)
+                r = copy(B0)
+                P.set_num_threads(1)
+                P.trsm!(r, A; side, uplo, transA = tA, alpha = al)
+                # `Float64` ONLY, and that is measured rather than assumed: the same shapes pass for
+                # `Float32`, whose side-R band granule is twice as wide, so its bands land differently.
+                # Complex cannot thread at all under the present admissions, so it is unconditional.
+                isbroken = T === Float64 && side == 'R' && (m, n, uplo, tA) in broken_r
+                for nw in 2:nt
+                    P.set_num_threads(nw)
+                    g = copy(B0)
+                    P.trsm!(g, A; side, uplo, transA = tA, alpha = al)
+                    isbroken ? (@test_broken bitsame(g, r)) : (@test bitsame(g, r))
+                end
+                P.set_num_threads(1)
+            end
+        end
+    end
+end
