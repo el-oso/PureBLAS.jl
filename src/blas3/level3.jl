@@ -5276,7 +5276,15 @@ function trsm!(
     # way `_trgemm_packed!`'s seam was shown for the real packed path.
     # THREADED SIDE-R: split B's rows. `potrf`'s lower factorization is the caller that needs this —
     # it solves `A21·L11⁻ᵀ` with A21 tall and narrow, and that solve does not thread without it.
-    if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
+    # COMPLEX IS ADMITTED HERE AND NOWHERE ELSE IN L3 YET, because side R is the one split whose route
+    # is invariant by construction rather than by a threshold. `_trsm_right!` takes `mrt` from
+    # `nroute < 0 ? size(B, 1) : nroute`, the chunk passes the undivided `p.m`, and a serial call passes
+    # `-1` with the whole of B — so a band and the unsplit call resolve the SAME `mrt` and the complex
+    # bases below key on `k`, which a row split does not touch. The chunk is type-generic, holds no
+    # buffer across the join, and `_trmmr_prefit!` already has a non-real no-op method. Side L is NOT
+    # admitted: its split divides `nrhs`, which the complex base's narrow/wide decision reads.
+    if !sl && !iszero(alpha) && eltype(B) <: Union{BlasReal, BlasComplex} &&
+            _strided1(A) && _strided1(B) && size(B, 2) == k
         nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
         if nwr > 1
             rA = _root(A); rB = _root(B)
