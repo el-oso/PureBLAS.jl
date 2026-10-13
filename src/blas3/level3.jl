@@ -80,6 +80,44 @@ const _TRMM_RKC = @load_preference("trmm_rkc", _KC)::Int
 const _TRMM_RPACK = @load_preference("trmm_rpack", _at_trmm_rpack(_HW))::Int
 @inline _fh_trmm_rpack() = (f = _FKR_trmm_rpack[]; f >= 0 ? f : _TRMM_RPACK)
 
+# Side-R above `_TRMM_RPACK` has two routes, and only one of them can reach the matrix coprocessor:
+# `_trmm_packedR!` drives `_microkernel!`, which is NEON, while the flat panel loop issues
+# `_gemm_core!` calls that `_sme_eligible` can route to the SME kernel. So the packed route is
+# declined exactly where those panel gemms are eligible. Measured on an M6, Float64, side R, serial,
+# packed against flat, in GFLOP/s:
+#
+#     m,k        2048,2048  4096,4096  2100,2100 L,T  4096,2048  512,2048 L,N
+#     packed          62.9       63.9           63.4       63.1      62.0
+#     flat           236.9      284.1          247.0      233.9     253.4
+#
+# The packed column is the NEON FP64 roofline on this machine, which is what a path that never
+# reaches the coprocessor must read.
+#
+# THIS DOES NOT GIVE UP THE REPRODUCIBILITY THE PACKED ROUTE CARRIES. `trmm!`'s threaded side-R
+# split is admitted only above `_TRMM_RPACK`, where the packed kernel owns the call and a row band
+# therefore takes the serial call's route; the same predicate gates that split, so a BANDED flat
+# loop — whose `_gemm_core!` switch reads the band's own row count and would return a band-dependent
+# result — is never reachable. An SME-owned call declines the pool for its own reasons besides (see
+# `_sme_owns`).
+#
+# Off SME `_SME_F64` is false, so this is identically false and no other box's route moves.
+# ASK `_sme_eligible` ITSELF rather than restate part of it. The flat loop's panel gemm is
+# `_gemm_core!(Bpan, view(B, :, …), Ablk, …)`, so its three operands are B, B and A, and its m and n
+# are B's row count and the panel width. Every condition that gemm will apply has to be applied here
+# too, because what this predicate buys is given up unconditionally: a `true` costs the packed route
+# AND the thread pool, so a `true` that gemm then declines leaves the flat loop running serially on
+# the SIMD unit above `_TRMM_RPACK`, which is the one place the packed route exists to own.
+# `_SME_F64` alone misses two reachable states. `_SME_ENTRY[]` is `C_NULL` on a machine that
+# advertises the feature and fails `_sme_selftest` (see `_sme_init!`), where `_SME_F64` stays true
+# because it is a compile-time constant. And `_strided1(A)` is false for a triangular operand with a
+# non-unit row stride, which `_trmm_packedR!` handles because only B reaches a kernel by pointer —
+# measured on an M6 at m=512, k=2048 through `view(X, 1:2:2k, 1:k)`: 35.2 ms with the packed route
+# against 36.9 ms without it, both at the SIMD rate.
+# PDM: Derived — the panel gemm's own eligibility, asked of `_sme_eligible` with that gemm's operands
+# and shape, rather than a size threshold: the flat loop pays exactly when its gemms reach the kernel. | tune: n/a, follows _sme_eligible
+@inline _trmmr_sme_owns(::Type{T}, k::Int, m::Int, A, B) where {T} =
+    _sme_eligible(T, m, min(_trmm_rpanel(), k), k, false, false, false, false, B, B, A)
+
 # trmm side-L real: k above this uses the single-pass K-trimmed PACKED routine; at or below it, the
 # recursion over `gemm!`. Its own constant as of task #134 — it used to read `_GEMM_UNPACK_MAX`, which is
 # gemm's UNPACKED-vs-BLOCKED crossover (2·(nvreg−4)·W = 448 on the AVX-512 boxes, 96 on AVX2). That is a
@@ -1060,10 +1098,11 @@ end
 # row split exactly where this branch owns the call.
 function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, wi::Int = 0)
     k = size(A, 1)
-    if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE
+    if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE_R
         return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
             _trmm_small!(false, up, tr, unit, A, B)
-    elseif _strided1(B) && eltype(B) === Float64 && !cj && k > _fh_trmm_rpack()
+    elseif _strided1(B) && eltype(B) === Float64 && !cj && k > _fh_trmm_rpack() &&
+            !_trmmr_sme_owns(Float64, k, size(B, 1), A, B)
         return _trmm_packedR!(up, tr, unit, A, B, Float64, wi)
     elseif eltype(B) <: BlasReal && !cj
         # FLAT panel loop: each _TRMM_RPANEL-column panel of B gets ONE fat off-diagonal gemm on a
@@ -1107,17 +1146,22 @@ end
 # Halving recursion (diagonal blocks of the flat loop + the complex/AD path).
 function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     k = size(A, 1)
-    if k <= _TRMM_BASE
-        if eltype(B) <: BlasReal && !cj
-            return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
-                _trmm_small!(false, up, tr, unit, A, B)
-        elseif eltype(B) <: BlasComplex
-            # (the old "side-R packed regresses" note was a routing-bug artifact: the 0.24 was the scalar
-            # column-axpy base @_trmm_right!, not a packed kernel — packed_R didn't exist yet.)
-            return !_strided1(B) ? _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B) :
-                (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
-                _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B)
-        end
+    # ONE BASE PER ELEMENT TYPE. The real base is `_TRMM_BASE_R`, which is two SME tiles where the
+    # coprocessor exists and `_L3_NB` where it does not; complex and the generic fallback keep
+    # `_TRMM_BASE`. The last branch must exclude real-non-conjugate explicitly: it is the catch-all
+    # for the types the first two do not claim, and letting it take real as well would make a
+    # `transA = 'C'` real call — `cj` true, so the first branch declines it — reach no branch at all
+    # between `_TRMM_BASE_R` and `_TRMM_BASE` and recurse on an unchanged `k`.
+    if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE_R
+        return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
+            _trmm_small!(false, up, tr, unit, A, B)
+    elseif eltype(B) <: BlasComplex && k <= _TRMM_BASE
+        # (the old "side-R packed regresses" note was a routing-bug artifact: the 0.24 was the scalar
+        # column-axpy base @_trmm_right!, not a packed kernel — packed_R didn't exist yet.)
+        return !_strided1(B) ? _trmm_cmplx_base_R!(up, tr, cj, unit, k, A, B) :
+            (_CTRMM_PACK && k >= _fh_ctrmm_pack_min()) ? _trmm_cmplx_packed_R!(up, tr, cj, unit, k, A, B) :
+            _trmm_cmplx_small_R!(up, tr, cj, unit, k, A, B)
+    elseif k <= _TRMM_BASE && !(eltype(B) <: BlasReal && !cj)
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
     end
     h = _trsplit(k)
@@ -1468,7 +1512,8 @@ function trmm!(
     # are the same, and its `k²·m` overstates trmm's flops by 2x, which only makes it more conservative
     # about admitting a call — moot above this size floor, where the work dwarfs the join either way.
     if !sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
-            _strided1(A) && _strided1(B) && size(B, 2) == k && k > _fh_trmm_rpack()
+            _strided1(A) && _strided1(B) && size(B, 2) == k && k > _fh_trmm_rpack() &&
+            !_trmmr_sme_owns(Float64, k, size(B, 1), A, B)
         nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
         if nwr > 1
             rA = _root(A); rB = _root(B)
@@ -1483,7 +1528,7 @@ function trmm!(
     # TINY real trmm: go straight to the base kernel, skipping the `_trmm!`→`_trmm_left!/_trmm_right!`
     # wrapper chain (ROADMAP: adds ~16% on a ~50 ns 8×8 op — trmm@8 0.84 via chain vs 0.999 direct). The
     # dispatch below MIRRORS the k≤_TRMM_BASE branches of `_trmm_left!`/`_trmm_right!` exactly.
-    if eltype(B) <: BlasReal && transA != 'C' && k <= (sl ? _TRMM_BASE_R : _TRMM_BASE)
+    if eltype(B) <: BlasReal && transA != 'C' && k <= _TRMM_BASE_R
         up_ = uplo == 'U'; tr_ = transA != 'N'; unit_ = diag == 'U'
         if sl
             k <= _fh_trmm_ddirect() ? _trmm_dense_L!(up_, tr_, unit_, A, B) : _trmm_small!(true, up_, tr_, unit_, A, B)
@@ -2716,10 +2761,26 @@ const _GT_TRANSPOSE = (_GT_W == 8)
 # warm-micro MIS-TUNE — full-L1 nets +1.5–5.8pt on Zen4 (n=32 0.918→0.976, n≥512 +1.5–3.6pt), Zen5 INSENSITIVE
 # (safe). Non-AVX-512: keep the 128 literal — Zen3/AVX2 optimum (measured; a bigger base REGRESSES it, n=256
 # 0.996→0.85). req#8 Preferences-override "trsm_fused_base" still applies for calibration.
-# PDM: Derived — formula over detected consts on AVX-512: full-L1 residency of the KC×NR P-stripe, `_L1_BYTES ÷ (_GT_NR * sizeof)`; the non-AVX-512 arm keeps a measured 128 (a bigger base regresses Zen3 n=256)
+# WHERE A MATRIX COPROCESSOR EXISTS THE CEILING IS THE SPLIT'S OWN ELIGIBILITY, NOT A CACHE FIT. The
+# recursion's alternative to fusing a block is to halve it and hand the off-diagonal to `_gemm_sub!`,
+# whose `k ÷ 2` square operand must clear `_sme_tile_ok`'s `min >= 2 * _SME_MR` floor. So a block
+# under `4 * _SME_MR` cannot produce an eligible gemm by splitting and is worth fusing, and one at or
+# above it is worth splitting. Measured on an M6, Float64, side L, upper, no-trans, through `trsm!`,
+# against the shipped 128 (us/call):
+#
+#     n          50     100     128     256     512    1024
+#     base 128  5.46   27.85   54.07   244.0  1135.6   6143
+#     base 112  5.41   28.80   41.84   192.0   903.9   4939
+#     base  96  5.40   24.50   41.68   192.5   903.9   4983
+#     base  64  5.41   24.52   41.80   191.6   906.9   4914
+#
+# 64 and 96 are one measurement apart and both beat 112 and 128; 64 is the one the floor derives. The
+# n=50 column is flat because 50 is under the floor either way and stays fused.
+# PDM: Derived — formula over detected consts on AVX-512: full-L1 residency of the KC×NR P-stripe, `_L1_BYTES ÷ (_GT_NR * sizeof)`; on SME the smallest block whose halving yields an `_sme_tile_ok`-eligible off-diagonal gemm, `4 * _SME_MR`; the remaining arm keeps a measured 128 (a bigger base regresses Zen3 n=256)
 const _TRSM_FUSED_BASE = @load_preference(
     "trsm_fused_base",
-    _GT_TRANSPOSE ? max(_GT_MR, _L1_BYTES ÷ (_GT_NR * sizeof(Float64))) : 128
+    _GT_TRANSPOSE ? max(_GT_MR, _L1_BYTES ÷ (_GT_NR * sizeof(Float64))) :
+        _SME_F64 ? 4 * _SME_MR : 128
 )::Int
 # Lower crossover for the fused leaf: below this k the pack-U + ftrsm-buffer setup isn't amortized, so the
 # scalar dense base wins on the sub-µs tiny solve. DERIVE, keyed on the SIMD width because the setup is
@@ -7474,6 +7535,28 @@ const _CHEMM_PACK_CUT = @load_preference("chemm_pack_cut", _vwidth(Float64) == 4
 # per box; do that before treating 32 as meaningful.
 # PDM: Derived — same packed kernel as chemm, differing only by conjugation. | tune: n/a, follows chemm
 const _CSYMM_PACK_CUT = @load_preference("csymm_pack_cut", _CHEMM_PACK_CUT)::Int
+# `_symm!`'s column split is a THREADED ENTRY, and an SME-owned product must decline the pool there:
+# `_gemm_threaded!` reaches `_gemm_core_body!` once per chunk, so by the time the body asks
+# `_sme_eligible` the split has already happened and the chunks queue behind one coprocessor instead
+# of dividing the work. `_sme_owns` carries the measurement; `gemm!` applies the same term at its own
+# threaded entry (gemm.jl, beside `!_strassen_owns`).
+#
+# THE MATERIALIZED OPERAND IS NOT AVAILABLE YET, AND DOES NOT NEED TO BE. Threading is decided before
+# the buffer is chosen, because a threaded call must materialize into the per-task twin. The predicate
+# reads that operand slot only through `_strided1`, and the panel `_symm_materialize!` fills is a
+# contiguous n×n view either way — measured identical on `_symm_scr`, on `_symm_scr_mt` and on `B` at
+# every size and both element types. `B` stands in the slot because the admission already requires
+# `_strided1(B)`; naming the scratch instead would size the serial buffer on every call, including the
+# threaded ones that never use it.
+#
+# Off SME `_SME_F64` is false, so this is identically false and no other box's route moves — the whole
+# term const-folds away there.
+# PDM: Derived — the materialized product's own SME ownership, asked of `_sme_owns` with that product's
+# shape, rather than a size threshold: the split is declined exactly when the coprocessor would claim
+# the call. | tune: n/a, follows _sme_owns
+@inline _symm_sme_owns(::Type{T}, m::Int, nc::Int, n::Int, C, B) where {T} =
+    _sme_owns(T, m, nc, n, false, false, false, false, C, B, B)
+
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
     # Complex side-L in the 3M window → fuse the reflection into the 3M A-split (no materialize, no n²
@@ -7516,7 +7599,8 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     # `eltype(B) === T` because `_gemm_threaded!` takes three `PtrMatrix{T}`; `Ad` is built at `T`, but a
     # mixed-type B would be a MethodError where `_gemm_core!` promotes. (`gemm!` guards the same way.)
     nw = (T === Float64 || T === Float32) && eltype(B) === T &&
-        _strided1(B) && _strided1(C) ?
+        _strided1(B) && _strided1(C) &&
+        !_symm_sme_owns(T, size(C, 1), size(C, 2), n, C, B) ?
         _gemm_workers(size(C, 1), size(C, 2), n) : 1
     Ad = view(nw > 1 ? _symm_scr_mt(T, n) : _symm_scr(T, n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)

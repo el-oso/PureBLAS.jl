@@ -103,12 +103,34 @@ jobs:
   trim-so:
     name: Julia 1.13 - juliac --trim .so build (authoritative)
     runs-on: ubuntu-latest
+    # STATE THE AOT CODEGEN TARGET rather than inheriting the driver's default. JuliaC reads
+    # JULIA_CPU_TARGET (src/compiling.jl) and falls back to its own default when nothing sets it:
+    # from 0.3.11 that default is `Sys.sysimage_target()`, Julia's four-group multiversioned list, so
+    # the compile stage runs four codegen passes and the hosted runner kills the step partway through.
+    # `juliac/toolenv` holds no tracked Manifest, so the driver version floats with the registry and a
+    # release can change that default with no change in this repo — naming the target here is what
+    # makes the gate independent of it.
+    #
+    # ONE TARGET IS WHAT THIS GATE NEEDS: it proves the trim verifier passes and that the .so links
+    # for a C host, and neither depends on the ISA level. `generic` runs on any runner, so the ctest.c
+    # step below can execute what this step built. juliac/build.jl deliberately leaves the target to
+    # the driver — a distributable Linux .so wants the multiversioned default — so the single target
+    # is this job's choice, not the build script's.
+    env:
+      JULIA_CPU_TARGET: generic
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.13'
       - uses: julia-actions/cache@v2
+        # THE DEPOT CACHE KEY MUST CARRY THE CPU TARGET. Precompiled images are stored per target, and
+        # this job sets JULIA_CPU_TARGET while the action's default key covers only workflow, job and
+        # OS — so a depot saved under a different target restores here and `using JuliaC` fails with
+        # `Precompiled image ... not available with flags CacheFlags(...)`, before any compiling starts.
+        # Naming the target in the prefix keeps one cache namespace per target.
+        with:
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu=${{ env.JULIA_CPU_TARGET }}
       - uses: julia-actions/julia-buildpkg@v1
       - name: Build libpureblas.so (juliac --trim=safe --compile-ccallable)
         run: julia --project=. juliac/build.jl
