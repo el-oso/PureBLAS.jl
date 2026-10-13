@@ -8,7 +8,12 @@ const OUTDIR = joinpath(@__DIR__, "build")
 mkpath(OUTDIR)
 
 # ── juliac driver: the JuliaC.jl package ───────────────────────────────────────────────────────────
-# The driver is the registered package JuliaC.jl (JuliaLang/JuliaC.jl), pinned in `juliac/toolenv`.
+# The driver is the registered package JuliaC.jl (JuliaLang/JuliaC.jl), resolved in `juliac/toolenv`
+# from `[compat] JuliaC = "0.3"`. That environment keeps no tracked Manifest, so the exact version
+# floats with the registry: the driver stays free to track upstream trim fixes, and anything a build
+# needs held steady is stated by the build rather than inherited. The AOT codegen target is one such
+# parameter — JuliaC picks its own when nothing sets JULIA_CPU_TARGET — which is why the Apple branch
+# below names a target, and why `.github/workflows/CI.yml` names one for the trim gate.
 # Julia ships no driver of its own: `share/julia/test/trimming/juliac-{buildscript,trim-base,
 # trim-stdlib}.jl` are test fixtures, not an entry point. The driver runs in its own environment, so
 # the package being built is named explicitly with `--project=$ROOT`.
