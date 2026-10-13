@@ -8,7 +8,12 @@ const OUTDIR = joinpath(@__DIR__, "build")
 mkpath(OUTDIR)
 
 # ── juliac driver: the JuliaC.jl package ───────────────────────────────────────────────────────────
-# The driver is the registered package JuliaC.jl (JuliaLang/JuliaC.jl), pinned in `juliac/toolenv`.
+# The driver is the registered package JuliaC.jl (JuliaLang/JuliaC.jl), pinned in `juliac/toolenv` by a
+# TRACKED Manifest.toml — the one path the repo-wide `Manifest.toml` ignore excepts. The pin has to be
+# the Manifest and not the `[compat] JuliaC = "0.3"` range, because the driver chooses the AOT codegen
+# target: its version decides what this build compiles. 0.3.10 inherits the calling session's single
+# `-C`; 0.3.11 takes PackageCompiler's multiversioned default instead, which is four codegen passes
+# rather than one, and the hosted runner in `.github/workflows/CI.yml` kills the step partway through.
 # Julia ships no driver of its own: `share/julia/test/trimming/juliac-{buildscript,trim-base,
 # trim-stdlib}.jl` are test fixtures, not an entry point. The driver runs in its own environment, so
 # the package being built is named explicitly with `--project=$ROOT`.

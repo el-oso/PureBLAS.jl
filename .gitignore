@@ -1,5 +1,9 @@
 # Julia
 Manifest.toml
+# ...except the juliac build-tool environment, whose Manifest is TRACKED. JuliaC chooses the AOT
+# codegen target, so the driver version is part of what the authoritative trim gate compiles; a
+# loosely-resolved one changes that target with no change in this repo.
+!juliac/toolenv/Manifest.toml
 *.jl.cov
 *.jl.*.cov
 *.jl.mem
