@@ -105,15 +105,56 @@ const _ARENA_ALIGN = max(_SIMD_BYTES, _CACHELINE)
 # spilled? allocating? trim-safe?), whereas fencing released memory is SANITIZER behaviour, and overloading
 # `checks_enabled()` with that meaning would muddy both.
 
+# SLAB PAYLOADS ARE RAW MEMORY, NOT `Vector{UInt8}`. The design is unchanged — bump pointer, slab
+# chain, high-water mark, fold at depth 0 — but the payload comes from `Libc.malloc` instead of the GC
+# heap. That is what lets the allocation guarantee be PROVED rather than exempted: a static all-paths
+# prover states path properties, never "once", so a `Vector{UInt8}(undef, n)` on the growth path is
+# reported however cold it is. Measured with a positive control (AllocCheck 0.2.7): a malloc/realloc/
+# free path reports 0 allocation sites, the equivalent `Vector{Float64}(undef, n)` reports 2.
+#
+# `slabs`/`caps` are sized ONCE at construction and written BY INDEX, never `push!`ed: a `push!` past
+# capacity is itself a GC allocation on a reachable path. Growth doubles, so `_ARENA_MAXSLABS` slots
+# cover any size a scope chain can reach before the fold; past it `_throw_arena_slabs` fires, which is
+# fail-fast and (being a throw) outside what the proof counts.
+const _ARENA_MAXSLABS = 32
+@noinline _throw_arena_slabs() = error("arena: slab chain exceeded $_ARENA_MAXSLABS blocks")
+@noinline _throw_arena_malloc() = error("arena: malloc failed")
+
 mutable struct Arena
-    slabs::Vector{Vector{UInt8}}   # slab k+1 is used only once slab k overflowed; kept live until depth 0
+    slabs::Vector{Ptr{UInt8}}      # slab k+1 is used only once slab k overflowed; kept live until depth 0
+    caps::Vector{Int}              # payload capacity of slabs[k], parallel to it
+    nblk::Int                      # slabs currently held (1..nblk are live); replaces length(slabs)
     cur::Int                       # index of the slab currently being bumped
     off::Int                       # bytes consumed in slabs[cur]
     depth::Int                     # scope nesting; coalesce to one slab when it returns to 0
     carried::Int                   # bytes already consumed in slabs 1..cur-1 of THIS scope chain
     high::Int                      # peak bytes ever actually demanded, in one contiguous run
 end
-Arena() = Arena([UInt8[]], 1, 0, 0, 0, 0)
+Arena() = Arena(fill(Ptr{UInt8}(C_NULL), _ARENA_MAXSLABS), zeros(Int, _ARENA_MAXSLABS), 1, 1, 0, 0, 0, 0)
+
+# Payload allocation for one slab. Separate so the growth path has ONE place that touches libc.
+# NO FINALIZER, DELIBERATELY. `_ARENA` is a `OncePerThread` memo holding a strong reference for the
+# process lifetime, and default-pool threads do not exit, so an `Arena` never becomes unreachable
+# while the process runs: a finalizer could only ever fire at teardown, which is when the OS reclaims
+# these pages anyway. Registering one would also put `finalizer` into the proven call graph, and that
+# machinery (`enable_finalizers`) is already the largest reported group on every driver that borrows
+# here. One slab per thread outstanding at exit is the whole cost.
+#
+# Two consequences a future editor must not undo by accident:
+#   * If the owner ever becomes per-TASK, revisit this. `@scope` checks the token's escape at macro
+#     expansion and explicitly does NOT check the handle, so a borrow can outlive a task-local arena.
+#   * `_arena_efence_alloc` obtains its blocks by `mmap`, not malloc. Fence blocks are held in their
+#     own FIFO and released by `_arena_efence_release!` — they never enter `slabs`/`caps`. Routing
+#     them through here would mean `Libc.free` on an `mmap` pointer: undefined behaviour, and visible
+#     only under the fence, i.e. only while someone is already chasing memory corruption.
+#
+# A `.so` unloaded without the process exiting is the one case this leaves open; that wants an
+# explicit teardown entry the host calls, not `atexit` (which a dlclose does not reach).
+@inline function _arena_slab_alloc(bytes::Int)
+    p = Ptr{UInt8}(Libc.malloc(bytes))
+    p == C_NULL && _throw_arena_malloc()
+    return p
+end
 
 # The scope token. Only `@scope` constructs one, and the macro forbids it from being stored or passed
 # anywhere except as `borrow!`'s first argument — that is what makes the escape hazard a compile error.
@@ -219,7 +260,7 @@ end
     # allocator, and re-growing a slab we just released would put an allocation back on a hot path.
     if a.depth == 0
         a.carried = 0
-        length(a.slabs) > 1 && _arena_coalesce!(a)
+        a.nblk > 1 && _arena_coalesce!(a)
     end
     return nothing
 end
@@ -237,9 +278,18 @@ end
 # exit nothing. Measured, potrf/potri/sysv at n=16..128, eight processes per arm: no cell moved by
 # more than its own across-process spread, the largest |ratio-1| being 0.041 against a 0.181 floor.
 @noinline function _arena_coalesce!(a::Arena)
-    want = max(a.high, length(a.slabs[1]))
-    resize!(a.slabs, 1)
-    a.slabs[1] = Vector{UInt8}(undef, want)
+    want = max(a.high, a.caps[1])
+    for k in 2:a.nblk
+        Libc.free(a.slabs[k])
+        a.slabs[k] = Ptr{UInt8}(C_NULL)
+        a.caps[k] = 0
+    end
+    if a.caps[1] < want
+        a.slabs[1] == Ptr{UInt8}(C_NULL) || Libc.free(a.slabs[1])
+        a.slabs[1] = _arena_slab_alloc(want)
+        a.caps[1] = want
+    end
+    a.nblk = 1
     a.cur = 1
     a.off = 0
     return nothing
@@ -255,10 +305,13 @@ end
     a.carried += a.off
     a.high = max(a.high, a.carried + need)
     a.cur += 1
-    if a.cur > length(a.slabs) || length(a.slabs[a.cur]) < need
-        a.cur > length(a.slabs) && push!(a.slabs, UInt8[])
-        prev = length(a.slabs[a.cur - 1])
-        a.slabs[a.cur] = Vector{UInt8}(undef, max(need, 2 * prev))
+    a.cur > _ARENA_MAXSLABS && _throw_arena_slabs()
+    if a.cur > a.nblk || a.caps[a.cur] < need
+        a.cur > a.nblk && (a.nblk = a.cur)
+        want = max(need, 2 * a.caps[a.cur - 1])
+        a.slabs[a.cur] == Ptr{UInt8}(C_NULL) || Libc.free(a.slabs[a.cur])
+        a.slabs[a.cur] = _arena_slab_alloc(want)
+        a.caps[a.cur] = want
     end
     a.off = 0
     return nothing
@@ -329,12 +382,12 @@ on a part with a wider line or a wider vector it is wider, and the code must not
     bytes = ld * n * sizeof(T)
     a = s.a
     slab = a.slabs[a.cur]
-    base = UInt(pointer(slab)) + a.off
+    base = UInt(slab) + a.off
     adj = Int((-base) & (_ARENA_ALIGN - 1))
-    if a.off + adj + bytes > length(slab)
+    if a.off + adj + bytes > a.caps[a.cur]
         _arena_grow!(a, adj + bytes + _ARENA_ALIGN)
         slab = a.slabs[a.cur]
-        base = UInt(pointer(slab))
+        base = UInt(slab)
         adj = Int((-base) & (_ARENA_ALIGN - 1))
     end
     a.off += adj + bytes + _arena_offway(bytes)
