@@ -124,6 +124,13 @@ jobs:
         with:
           version: '1.13'
       - uses: julia-actions/cache@v2
+        # THE DEPOT CACHE KEY MUST CARRY THE CPU TARGET. Precompiled images are stored per target, and
+        # this job sets JULIA_CPU_TARGET while the action's default key covers only workflow, job and
+        # OS — so a depot saved under a different target restores here and `using JuliaC` fails with
+        # `Precompiled image ... not available with flags CacheFlags(...)`, before any compiling starts.
+        # Naming the target in the prefix keeps one cache namespace per target.
+        with:
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu=${{ env.JULIA_CPU_TARGET }}
       - uses: julia-actions/julia-buildpkg@v1
       - name: Build libpureblas.so (juliac --trim=safe --compile-ccallable)
         run: julia --project=. juliac/build.jl
