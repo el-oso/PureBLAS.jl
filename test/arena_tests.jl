@@ -124,7 +124,7 @@ end
     # cells unreproducible). Only meaningful when the real bump path ran, not under the fence.
     begin   # `@scope` is always the bump path — the fence is a different scope type, not a mode
         a = P._arena()
-        @test length(a.slabs) == 1
+        @test a.nblk == 1
         @test a.off == 0
         @test a.depth == 0
     end
@@ -137,15 +137,15 @@ end
     begin
         a = P._arena()
         for _ in 1:6
-            want = length(a.slabs[1]) + 8
+            want = a.caps[1] + 8
             P.@scope s begin
                 v = P.borrow!(s, UInt8, want)
                 v[1] = 0x01
                 v[end] = 0x02
             end
         end
-        cap = length(a.slabs[1])
-        @test length(a.slabs) == 1
+        cap = a.caps[1]
+        @test a.nblk == 1
         @test cap >= a.high                       # it must still cover the peak demand
         @test cap <= 4 * a.high                   # …without the geometric blow-up (was 3^k of it)
     end
@@ -510,7 +510,7 @@ end
         # Every thread's arena is back at depth 0 with its slabs folded into one.
         depths = zeros(Int, nt); slabs = zeros(Int, nt)
         Threads.@threads :static for t in 1:nt
-            a = P._arena(); depths[t] = a.depth; slabs[t] = length(a.slabs)
+            a = P._arena(); depths[t] = a.depth; slabs[t] = a.nblk
         end
         @test all(iszero, depths)
         @test all(isone, slabs)
