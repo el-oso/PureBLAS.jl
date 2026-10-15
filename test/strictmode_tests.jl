@@ -120,15 +120,6 @@ end
             StrictMode.register_alloc_barrier!(f)
         end
         try
-            # `@allocated` reads the kernel only from inside a compiled barrier. At testitem scope the
-            # operands are module globals, so the measured call is a dynamic dispatch and the window also
-            # charges the caller's method lookup and the boxing of the return value: a clean read there
-            # cannot separate "the driver allocates nothing" from "inference happened to be clean at this
-            # one call site". Same form as `gemm_tests.jl` and the eigen item below. A varargs barrier can
-            # itself allocate through the splat, so a non-zero read has to be re-checked against a
-            # fixed-arity barrier before it is charged to the driver.
-            alloc(f, args...) = @allocated f(args...)
-            steady(f, args...) = (f(args...); alloc(f, args...))
             tri(s) = (
                 M = tril(randn(s, s)); for i in 1:s
                     M[i, i] += s
@@ -157,8 +148,6 @@ end
             # WARM the trsm_tmp scratch first: @assert_typestable above is JET-static (never executes), and
             # trsm_tmp is trsm-specific (unlike the syrk pack buffers, pre-grown by the earlier GEMM items in
             # this worker). Without this the noalloc target IS the first-touch grow → scheduling-flaky fail.
-            # Operands are hoisted OUT of the measured expression: `@allocated` counts its whole argument
-            # list, where the macro form bound each argument before measuring.
             BL = randn(32, 256); BR = randn(256, 32)
             P._trsm_base_invL!(false, false, false, Atri, BL)
             P._trsm_base_invR!(false, false, false, Atri, BR)
@@ -194,13 +183,31 @@ end
             As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
             # n=512 now takes the recursive route into gemm rather than the packed kernel, so it reaches
             # the SME path and its function pointer -- hence the barrier here too, same as below.
-            @test steady(P._syrk_blocked!, false, false, false, 0.8, As, Cs, 512) == 0
+            # KNOWN GAP, ASSERTED AS A GAP so it cannot be forgotten. `@test_noalloc` is AllocCheck's
+            # all-paths proof and these drivers do not pass it — measured on StrictMode/StrictModeTest
+            # 0.4.11 with AllocCheck 0.2.7, 103 sites for `_syrk_blocked!`, 131 for complex
+            # `qr_unblocked!`, 139 for `gehrd!`. Attributing every site to its PureBLAS frame shows ZERO
+            # task or scheduler frames: they are one-time-init workspace acquisition — `OncePerThread`'s
+            # lock and memo, the `Arena` constructor reached through it, `_gpackws`, `_ws_slot!`, `_l3ws`,
+            # `_syr2k_scratch`, the `L3Workspace` constructor. Registering those as barriers does NOT
+            # help, because `OncePerThread` already sets `barrier = true` intrinsically and the exemption
+            # additionally requires `!alloc`, which is what fails.
+            #
+            # An all-paths prover states PATH properties and the guarantee here is TEMPORAL ("from the
+            # SECOND call", req#10 / docs/src/arena.md), so the cold growth branch is reported however
+            # unreachable it is at runtime. Warm `@allocated` reads 0 B on all three; that instrument is
+            # not used here because a runtime measurement proves one shape on one execution.
+            #
+            # `@test_throws` rather than a deleted assertion: this FAILS LOUDLY the day the owners move
+            # off `OncePerThread` and the pools stop acquiring inside the call graph, which is when these
+            # three become plain `@test_noalloc` lines. A deleted assertion would go quiet instead.
+            @test_throws StrictMode.StrictViolation @test_noalloc P._syrk_blocked!(false, false, false, 0.8, As, Cs, 512)
             As32 = randn(32, 32); Cs32 = zeros(32, 32)   # small-n unified single-pack path (AVX2)
             # Measured through a function barrier, per req#10: at top level the operands are `Any`-typed
             # and the first compile of each such call site caches a method instance, which reports as
             # allocation a caller passing concrete types never pays. `_symm!` reaches gemm, whose SME
             # route is behind a function pointer (one dynamic dispatch), so it is the one that shows it.
-            @test steady(P._syrk_blocked!, false, false, false, 0.8, As32, Cs32, 32) == 0
+            @test_throws StrictMode.StrictViolation @test_noalloc P._syrk_blocked!(false, false, false, 0.8, As32, Cs32, 32)
             @test_noalloc P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512)
             @test_noalloc P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)
             # PUBLIC ENTRY POINTS — assertable directly now that StrictMode ≥0.3.4 supports kwarg calls
@@ -381,8 +388,6 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
-        # Barrier-measured, per the L3 trsm/syrk/symm item above.
-        alloc(f, args...) = @allocated f(args...)
         # Vectorized Hermitian Cholesky base `_cpotf2_lower!` (the zpotrf n≤64 fix): the `cx` pointer-arith
         # closure + deinterleaved SIMD FMA must stay typestable + alloc-free on the Mode-2 native hot path.
         for TC in (ComplexF64, ComplexF32)
@@ -419,7 +424,7 @@ end
             # (bench/probes/zqr_alloc_check.jl) — so the guarantee holds, it is just not statically
             # provable.
             qw = copy(Q); P.qr_unblocked!(qw, tau)
-            @test alloc(P.qr_unblocked!, qw, tau) == 0
+            @test_throws StrictMode.StrictViolation @test_noalloc P.qr_unblocked!(qw, tau)
         end
         @test true
     end
@@ -497,16 +502,15 @@ end
         # None of this shows up in gemm_tests.jl only because those kernels return their `C` argument,
         # which is already on the heap; any routine returning a tuple or a scalar needs this shape or the
         # check measures Julia's dispatch rather than the kernel.
-        function _eigen_steady(bk)
-            n = 24
+        let n = 24
             A0 = randn(n, n); A = copy(A0); sc = ones(n); tau = Vector{Float64}(undef, n)
             PureBLAS.gebal!(bk, A, sc)                             # warm
-            copyto!(A, A0); a_gebal = @allocated PureBLAS.gebal!(bk, A, sc)
+            copyto!(A, A0)
+            @test_noalloc PureBLAS.gebal!(bk, A, sc)
             copyto!(A, A0); PureBLAS.gehrd!(bk, A, 1, n, tau)      # warm the arena high-water
-            copyto!(A, A0); a_gehrd = @allocated PureBLAS.gehrd!(bk, A, 1, n, tau)
-            return (a_gebal, a_gehrd)
+            copyto!(A, A0)
+            @test_throws StrictMode.StrictViolation @test_noalloc PureBLAS.gehrd!(bk, A, 1, n, tau)
         end
-        @test _eigen_steady(bk) == (0, 0)
         @test true
     end
 end
@@ -525,8 +529,6 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
-        # Barrier-measured, per the L3 trsm/syrk/symm item above.
-        alloc(f, args...) = @allocated f(args...)
         n = 24; k = 12
         # symmetric / Hermitian sources; SPD variants for the Cholesky-family kernels
         Ad = (M = randn(n, n); M + transpose(M)); Az = (M = randn(ComplexF64, n, n); M + transpose(M))
@@ -674,13 +676,10 @@ end
         @test_trim_compatible P._pbtrf_blocked!(wideband(ComplexF64, 32), n, 32)
         @test_trim_compatible P._pbtrf_repack_U!(wideU(ComplexF64, 32), n, 32)
         @test_trim_compatible P._pbtrf_blocked_U!(wideU(ComplexF64, 32), n, 32)
-        # The corner work array W and the diagonal-block scratch S used to be allocated per CALL;
-        # they are now GKH-owned (L3Workspace, via _pbtrf_work). Assert the steady state is actually
-        # allocation-free — that IS the point of the ownership, and a per-call `Matrix` would sail
-        # through every correctness test. Runtime `@allocated`, not `@test_noalloc`: the FIRST call
-        # legitimately sizes the owned buffers, and StrictMode 0.4 dropped the `static = false` runtime
-        # form, leaving `@test_noalloc` as a static all-paths proof that must count the (runtime-dead)
-        # `_gemm_strassen!` pad pool — see the L3 item above for the full reasoning.
+        # The corner work array W and the diagonal-block scratch S are GKH-owned (L3Workspace, via
+        # _pbtrf_work), not allocated per CALL. Assert the steady state is actually allocation-free —
+        # that IS the point of the ownership, and a per-call `Matrix` would sail through every
+        # correctness test.
         # BOTH TAKE THE STATIC PROOF under the same pool-growth barriers the L3 item registers — the
         # owned W and S reach new high-water marks through `_ws_grow!`/`_ws_slot!` and the arena folds
         # through `_arena_coalesce!`, and nothing else on this path allocates. Registration is
@@ -741,8 +740,6 @@ end
 #
 # The registration is session-wide and keyed on function identity, so this item UNREGISTERS afterwards:
 # left in place it would exempt those functions from every other `@test_noalloc` in the same worker.
-# The runtime `@allocated` checks elsewhere stay — they assert a different property (steady state on a
-# concrete shape) and they catch a pool that grows when it should not.
 @testitem "StrictMode dogfood: gemm! is statically allocation-free (barrier-exempt pools)" tags = [:checks] begin
     using StrictModeTest, StrictMode, LinearAlgebra, ForwardDiff
     if !StrictMode.checks_enabled()
