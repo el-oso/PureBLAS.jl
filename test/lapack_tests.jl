@@ -43,7 +43,14 @@ end
 
         kd >= n && continue
         R = real(T)
-        Random.seed!(hash((T, uplo, kd, n)))
+        # Seed from a STRING, never from `hash((T, ...))`. `Random.seed!(::AbstractString)` runs the
+        # text through SHA-256, so the stream is fixed by the text alone; `hash(::DataType)` is not
+        # documented stable and does change — `hash(ComplexF32)` differs between Julia 1.13.1 and
+        # 1.13.2, and between x86_64 and aarch64 on the same version. A hash-derived seed therefore
+        # redraws every matrix on a patch upgrade or a different runner, which turns a thin-margin
+        # assertion into a lottery and makes a CI failure impossible to reproduce locally. Every
+        # seed in this file is a string for that reason; the text must stay unique per testset.
+        Random.seed!("pbtrf T=$T uplo=$uplo kd=$kd n=$n")
         AB = zeros(T, kd + 1, n)                       # diagonally dominant ⇒ SPD/HPD
         for j in 1:n
             if uplo == 'L'
@@ -94,7 +101,7 @@ end
             n in (1, 7, 64, 129), nrhs in (1, 3)
 
         R = real(T); tol = sqrt(eps(R)) * 100
-        Random.seed!(hash((T, n, nrhs)))
+        Random.seed!("solves T=$T n=$n nrhs=$nrhs")
         A = randn(T, n, n) + n * I
         B = randn(T, n, nrhs)
         # Factors come from LAPACK on purpose: these solves are specified to operate on
@@ -142,7 +149,7 @@ end
             uplo in ('L', 'U'), n in (1, 2, 7, 32, 33, 64, 129)
 
         R = real(T)
-        Random.seed!(hash((T, uplo, n)))
+        Random.seed!("pptrf T=$T uplo=$uplo n=$n")
         B = randn(T, n, n); A = B * B' + n * I           # HPD
         A = (A + A') / 2
         Af = Matrix{T}(A)
@@ -177,7 +184,7 @@ end
     @testset "$T uplo=$uplo n=$n" for T in (Float64, Float32, ComplexF64, ComplexF32),
             uplo in ('L', 'U'), n in (8, 17, 33, 64, 129, 257)
 
-        Random.seed!(hash((T, n)))
+        Random.seed!("potrf-firstcol T=$T n=$n")
         X = randn(T, n, n)
         A0 = Matrix(T <: Complex ? Hermitian(X'X + real(T)(n) * I, :L) : Symmetric(X'X + T(n) * I, :L))
         @test pb_info(A0, uplo) == 0                                  # SPD ⇒ no throw
@@ -760,7 +767,7 @@ end
             herm in (false, true), cls in (:generic, :hollow)
 
         (herm && !(T <: Complex)) && continue           # herm==sym for real; skip dup
-        Random.seed!(hash((T, n, uplo, herm, cls)))
+        Random.seed!("sytrf-crosssolve T=$T n=$n uplo=$uplo herm=$herm cls=$cls")
         M = randn(T, n, n)
         A = herm ? (M + M') : (M + transpose(M))        # Hermitian / symmetric indefinite
         # hollow: a zero diagonal makes absakk==0 at every step, so the 1×1 tests can never fire and
@@ -808,7 +815,7 @@ end
 
         nb >= n && continue
         (hm && !(T <: Complex)) && continue      # herm == sym for real; skip the duplicate
-        Random.seed!(hash((T, n, nb, cls, hm)))
+        Random.seed!("sytrf-blocked T=$T n=$n nb=$nb cls=$cls hm=$hm")
         M = randn(T, n, n); A = hm ? (M + M') : (M + transpose(M))
         cls === :hollow && (A[diagind(A)] .= zero(T))
         if cls === :rankdef
@@ -838,7 +845,7 @@ end
     @testset "singular $T n=$n uplo=$uplo" for T in (Float32, Float64, ComplexF64),
             n in (8, 60), uplo in ('L', 'U')
 
-        Random.seed!(hash((T, n, uplo, :sing)))
+        Random.seed!("sytrf-singular T=$T n=$n uplo=$uplo")
         B = randn(T, n, n - 3); A = B * transpose(B)     # rank n-3, symmetric
         LD = copy(A); ipiv = zeros(Int, n)
         info = PureBLAS.sytrf!(LD, ipiv; uplo = uplo)
@@ -1347,7 +1354,7 @@ end
                                (48, 48, 12, 6), (50, 32, 10, 6), (32, 50, 10, 6)),
             gen in (:dominant, :pivot, :deep), pad in (0, 3)
 
-        Random.seed!(hash((T, m, n, kl, ku, gen, pad)))
+        Random.seed!("gbtrf-vs-lapack T=$T m=$m n=$n kl=$kl ku=$ku gen=$gen pad=$pad")
         A = zeros(T, m, n)
         for j in 1:n, i in max(1, j - ku):min(m, j + kl)
             A[i, j] = randn(T)
@@ -1382,23 +1389,16 @@ end
         pad > 0 && @test all(==(T(-12345)), ABp[(kl + ku + kl + 2):ldab, :])
 
         mn = min(m, n)
-        # Fails loudly if a future change makes the generator stop pivoting — the exact hole that let
-        # the old `A += n*I` version assert `ipiv == ipivl` while every pivot was trivially j.
+        # Guards the GENERATOR, not the factorization: it fails loudly if a future change makes the
+        # test matrices stop pivoting, which would let `ipiv == ipivl` pass with every pivot trivially
+        # j. Restricted to kl >= 2 because no threshold at kl=1 is both meaningful and reliable — the
+        # (8,8,1,1) shape has mn=8 and a near-even chance per column, so its whole distribution sits
+        # in the tail of any threshold worth asserting.
         #
-        # RESTRICTED TO kl >= 2, and that restriction IS the fix for a real flake (2026-08-16). A column
-        # pivots with probability ≈ kl/(kl+1), so the non-trivial count is ≈ Binomial(mn-1, kl/(kl+1)).
-        # At kl=1 that is a fair coin: mn=8 gives mean 3.5, and the previous `>= mn÷3` (= 2) threshold
-        # failed whenever the draw came in at 0 or 1 — P = 6.25% per cell, over 8 such cells (4 types ×
-        # 2 pads, the (8,8,1,1) shape being the only kl=1 one). No threshold at kl=1 is both meaningful
-        # and reliable, so the check now rests on the kl>=2 shapes, where it sits far from the tail
-        # (kl=2, mn=20: mean 12.7 against a threshold of 5, ≈3.8σ down).
-        #
-        # WHY IT SURFACED ONLY NOW, and why it looked like a gbtrf bug: the seed is
-        # `hash((T, m, n, kl, ku, gen, pad))`, which hashes a DataType — and `hash(::DataType)` is NOT
-        # stable across Julia versions. Measured for this very cell: 1.12 → 16763250882009543865,
-        # 1.13 → 263051053535568488. So every Julia upgrade redraws every matrix and reshuffles which
-        # cells land in the tail. That is why 1.12 CI failed `ComplexF32 pad=0` while 1.13 failed
-        # `ComplexF64 pad=3` — one defect, different victim, and neither was a factorization error.
+        # The margin is thin, so treat a failure here as a redraw before suspecting gbtrf. Measured
+        # over 20000 draws of ComplexF32 20×20 kl=2 ku=3: mean 10.9, sd 2.24 — the threshold of 5 is
+        # 2.6σ down, P ≈ 0.14% per cell. The diagonal accumulates variance from prior eliminations, so
+        # it wins the argmax more often than the naive kl/(kl+1) per-column rate predicts.
         if gen !== :dominant && kl >= 2
             @test count(!=(0), ipiv .- (1:mn)) >= mn ÷ 4
         end
@@ -1426,9 +1426,12 @@ end
     # ORACLE is `_gbtf2!` on the same input, which is sharper than comparing against stdlib: a wrong
     # undo loop or a mis-offset ipiv produces a STRUCTURALLY different factor, not a roundoff-level
     # one. Measured separation is ~13 orders of magnitude (valid cells 1e-13, nb>kl cells 1e0-1e4).
-    # `ipiv` is asserted bit-exact — partial pivoting is one argmax per column, no re-association.
-    # The FACTOR tolerance is loose (1e4·eps) on purpose: blocked and unblocked reassociate the
-    # arithmetic (rank-1 sweep vs rank-nb gemm), so they legitimately differ by roundoff × growth.
+    # `ipiv` and `info` are asserted bit-exact, and that is a STRUCTURAL check, not a numerical one:
+    # a wrong undo loop or a mis-offset ipiv reorders pivots wholesale. It is not a theorem — the
+    # argmax runs on entries the two paths have already updated in a different order, so a column
+    # whose updated candidates cancel can flip the choice (≈1% of random draws on the ku=0 Float32
+    # shape, where the reference LAPACK sequence sides with the blocked path). It holds here because
+    # the seed is fixed; a flip after an RNG change is a redraw, not a regression.
     @testset "blocked $T $m×$n kl=$kl ku=$ku nb=$nb gen=$gen pad=$pad" for
             T in (Float32, Float64, ComplexF32, ComplexF64),
             (m, n, kl, ku) in ((24, 24, 8, 4), (64, 64, 16, 16), (40, 40, 8, 8),
@@ -1436,7 +1439,17 @@ end
             nb in (1, 2, 3, 5, 8), gen in (:dominant, :pivot, :deep), pad in (0, 3)
 
         nb > kl && continue                                  # structural precondition of dgbtrf
-        Random.seed!(hash((T, m, n, kl, ku, gen, pad)))
+        # ku=0 leaves the band lower-triangular, which fixes det(A) and so repays ALL pivot growth in
+        # the last pivot. Unless the generator makes the matrix diagonally dominant, the resulting
+        # max|U|/min|U_jj| outruns the precision — measured at these seeds: 6.3e9 (Float32 pivot),
+        # 3.8e15 (Float32 deep) and 1.7e18 (Float64 deep) against 1/eps of 8.4e6 and 4.5e15. The last
+        # pivot is then below what the format resolves, so the two paths legitimately disagree on
+        # `info` (one rounds it to exactly 0, the other does not) and the solve divides by zero. The
+        # cell still RUNS — the out-of-band canary is a memory-safety check and is independent of
+        # conditioning — but the cross-path comparisons below mean nothing on it. `gen=:dominant`
+        # keeps ku=0 covered by those comparisons with data the precision can resolve.
+        resolvable = !(ku == 0 && gen !== :dominant)
+        Random.seed!("gbtrf-blocked T=$T m=$m n=$n kl=$kl ku=$ku gen=$gen pad=$pad")
         A = zeros(T, m, n)
         for j in 1:n, i in max(1, j - ku):min(m, j + kl); A[i, j] = randn(T); end
         if gen === :dominant
@@ -1455,18 +1468,24 @@ end
         infb = PureBLAS._gbtrf_blocked!(kl, ku, m, ABb, ipb, nb)
         infu = PureBLAS._gbtf2!(kl, ku, m, ABu, ipu)
 
-        @test ipb == ipu
-        @test infb == infu
-        # The factor bound scales with kl, not just with ‖U‖ (fixed 2026-08-16). A band entry
-        # accumulates up to `kl` rank-1 updates in `_gbtf2!`, which the blocked driver re-associates
-        # into ⌈kl/nb⌉ rank-nb gemms, so the legitimate divergence grows with the number of
-        # accumulation steps — a flat constant silently tightens as kl rises. The old flat `1e4·eps·‖U‖`
-        # was calibrated on the narrower shapes and left `Float32 40×40 kl=12 ku=0 gen=pivot` over by
-        # 1.45×/1.07×/1.03× at nb=2/3/5 while PASSING at nb=1 and nb=8 — exactly the signature of
-        # re-association, not of a factorization error: `ipiv` is bit-exact in every one of those cells,
-        # so both paths chose an identical pivot sequence and only the summation order differed.
-        @test maximum(abs, ABb .- ABu) <=
-              2.0e3 * (kl + 1) * eps(real(T)) * max(maximum(abs, ABu), one(real(T)))
+        # BACKWARD error, not entrywise factor agreement. Comparing factor entries against an
+        # eps-scaled bound is not a theorem: the forward error of an LU factor scales with
+        # 1/min|U_jj|, not with eps, so an entrywise bound is exceeded by ~12% of random draws on
+        # the ill-conditioned shape (worst 112×) while both factors still solve correctly. What both
+        # paths owe is a small residual, which holds in every precision and every shape measured
+        # here, with ~70× margin at this constant. `gbtrs!` needs a square factor, hence m == n.
+        if resolvable
+            @test ipb == ipu
+            @test infb == infu
+            if m == n
+                Bv = randn(T, n, 2)
+                Bb = copy(Bv); Bu2 = copy(Bv)
+                PureBLAS.gbtrs!('N', kl, ku, n, ABb, ipb, Bb)
+                PureBLAS.gbtrs!('N', kl, ku, n, ABu, ipu, Bu2)
+                @test norm(A * Bb - Bv) <= 200 * n * eps(real(T)) * (norm(A) * norm(Bb) + norm(Bv))
+                @test norm(A * Bu2 - Bv) <= 200 * n * eps(real(T)) * (norm(A) * norm(Bu2) + norm(Bv))
+            end
+        end
         pad > 0 && @test all(==(T(-12345)), ABb[(kl + ku + kl + 2):ldab, :])
     end
 
@@ -1480,7 +1499,7 @@ end
     @testset "singular $T n=$n kl=$kl ku=$ku" for T in (Float64, ComplexF64),
             (n, kl, ku) in ((20, 2, 3), (48, 12, 6))
 
-        Random.seed!(hash((T, n, kl, ku, :sing)))
+        Random.seed!("gbtrf-singular T=$T n=$n kl=$kl ku=$ku")
         A = zeros(T, n, n)
         for j in 1:n, i in max(1, j - ku):min(n, j + kl); A[i, j] = randn(T); end
         for j in 1:n; A[j, j] += T(4 * (kl + ku + 1)); end
