@@ -605,10 +605,22 @@ const _SME_INPLACE_NJP = @load_preference("sme_inplace_njp", 16)::Int
 #    4096  128     8      1    0.998    1.001    1.005   10/15
 #    2048  256    16      1    0.959    1.012    1.282    8/15
 #    4096  256    16      1    1.235    1.547    1.690   15/15
-# The two controls pin the predicate: a stride it rejects reads 1.000 and 1.001, so no square shape
-# moves and no gate cell can. No one-set cell loses in the median, and the p10/p90 spread at lda=2048
-# n=256 is the shape of the gain — small losses against large wins, which is why the estimator is a
-# median over pooled rounds and not a mean over a batch.
+# The two controls are a NULL CHECK ON THE HARNESS rather than evidence about the gate: at a
+# predicate-false stride both arms return the flat cut, so they run the same code, and 1.000/1.001 is
+# what a working instrument must report there. What keeps the gate shapes safe is the identity
+# instead — the predicate is false for every `lda` that is not a multiple of
+# `_L1_WAY_BYTES / sizeof(T)`, and there this function returns `_SME_INPLACE_NJP` for every override
+# value, exactly as a cut taking no `lda` would. No one-set cell loses in the median, and the p10/p90
+# spread at lda=2048 n=256 is the shape of the gain — small losses against large wins, which is why
+# the estimator is a median over pooled rounds and not a mean over a batch.
+#
+# THE TEST ITSELF COSTS NOTHING, CHECKED RATHER THAN ASSUMED. `_sme_blocks` gives ONE (ic, pc)
+# iteration for every square gate shape up to n = 512 and two at n = 1024, so this admission test runs
+# once or twice per gemm call; at n = 128 the residency cap admits before it is reached at all. Cold
+# round robin against a build whose cut takes no `lda`, arms interleaved with the within-pair order
+# flipped each round, 15 rounds, old over new: medians 1.0014 / 1.0000 / 1.0016 / 1.0004 / 0.9994 /
+# 1.0008 at gemm 128 / 192 / 256 / 512 / 1024 and syrk 512, every one inside 0.16% of flat. gemm 192,
+# the shape the admission is worth most on, spans only 0.9987 to 1.0013 across all 15 rounds.
 #
 # A QUARTER of the cut is NOT safe: it reads 1.172 at lda=4096 njp=8 and 1.129 at lda=2048 njp=16 but
 # 0.891 at lda=2048 njp=8, and a cut that regresses a cell is inadmissible here. Halving is the
