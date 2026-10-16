@@ -528,12 +528,15 @@ end
 # measured, which is the better resting state for a route every BLAS-3 routine reaches.
 #
 # WHY THE CUT IS RESIDENCY AND NOT AN ALIASING PREDICATE. `_alias_ld` exists for this class of
-# problem, but its period is `_L1_WAY_D` = L1 ÷ associativity, and associativity comes from a CPUID
-# leaf that does not exist on aarch64 — `_L1D_ASSOC` is the fallback 8 here, not a detected value. So
-# `_alias_ld` is false for every stride that actually loses on this machine (lda = 256, 512, 768,
-# 1024), and a set-conflict criterion cannot be founded on a number we are guessing. A residency cut
-# holds for any stride; widening it to admit friendly strides is left open, and the 7-20% it gives up
-# at blocks of 5-30 L1-fuls is recorded above rather than claimed.
+# problem, and its period `_L1_WAY_D` = L1 ÷ associativity is sound on this part even though
+# `_L1D_ASSOC` is the fallback 8 on aarch64 rather than a CPUID reading: a pointer chase over `n`
+# addresses one period apart, linked into a random cycle so no prefetcher can run ahead, holds L1
+# latency through n = 8 and has fallen to L2 latency by n = 10, which places the associativity at 8
+# (bench/probes/l1d_assoc.jl). So the predicate is founded on a measured number, not a guessed one.
+# A residency criterion is still the right one here because it holds at ANY stride; the set-count
+# criterion `_sme_inplace_njp` keys on separates strides only by how many sets their columns
+# occupy, which is a different question. The 7-20% this cut gives up at blocks of 5-30 L1-fuls is
+# recorded above rather than claimed.
 # req8-ok: a coefficient over the DETECTED L1 with the falsifying tables above, not a fitted magic
 # number — the criterion is A-block residency, and the coefficient sits one step inside the measured
 # flip so a caller with its own cache traffic does not land on the edge.
@@ -546,6 +549,10 @@ const _SME_INPLACE_MAX =
     return ov > 0 ? ov : _SME_INPLACE_MAX
 end
 
+# RATIO DIRECTION IN THIS BLOCK. The cost tables divide in-place time by packed time, or a candidate
+# cut's time by the shipped cut's, so higher is WORSE. The one speedup table says so where it sits,
+# and there higher is better.
+#
 # The macrokernel re-reads the A block once per column panel, so `njp` is the multiplier on an
 # in-place walk's cost: `njp` strided passes over the block against one strided pass plus `njp`
 # contiguous ones. There is no closed form over the block's size and its page geometry that places
@@ -557,26 +564,70 @@ end
 # square gemm reads 1.078 at a cut of 32 (njp = 32 there) and 1.079 at a cut of 64 at n = 1024
 # (njp = 64), both gate cells. Everything the rank-k ops have to gain is already in by 16 — syrk at
 # n = 512 reads 0.883 at a cut of 16 and 0.880 to 0.883 at 24, 32 and 64, inside their own SE. So 16
-# is the largest value that is both saturating and safe. (bench/probes/sme_inplace_njp.jl for the
+# is the largest value that is both saturating and safe AT THE FOUR-SET COLUMN GEOMETRY THOSE SQUARE
+# SHAPES HAVE (lda = n = 512 puts the columns in four L1 sets); `_sme_inplace_njp` halves it
+# where a stride puts every column in ONE L1 set.
+# (bench/probes/sme_inplace_njp.jl for the
 # end-to-end table, sme_inplace_njp_sweep.jl for the cut value, sme_inplace_njp_l3sz.jl for the gemm
 # gate; each declares the regime its figures belong to.)
-# PDM: Measured — the column-panel re-read count at which packing A starts to pay; no formula over block size and page geometry places the crossover, and the value is bounded above by the gate cells that lose when the cut admits their own panel count. | tune: _EXPINT[10]
-# req8-ok: a measured crossover bounded above by the two gate cells that lose when the cut reaches their own panel count -- the tables above are the whole justification, and there is no hardware ratio to derive it from.
+# PDM: Measured — the column-panel re-read count at which packing A starts to pay, for a stride whose columns spread over two or more L1 sets; neither block size nor page geometry places it, and the value is bounded above by the gate cells that lose when the cut admits their own panel count. `_sme_inplace_njp` halves it for a one-set stride, which it identifies from the detected `_L1_WAY_BYTES`. | tune: _EXPINT[10]
+# req8-ok: a measured crossover bounded above by the two gate cells that lose when the cut reaches their own panel count -- the tables above are the whole justification. It is the value for a stride whose columns spread over two or more L1 sets; the one-set case takes half of it, from the cross-process table beside `_sme_inplace_njp`, and which strides those are is derived from the detected `_L1_WAY_BYTES`.
 const _SME_INPLACE_NJP = @load_preference("sme_inplace_njp", 16)::Int
 
-@inline function _sme_inplace_njp()
+# A COLUMN STRIDE THAT PUTS EVERY COLUMN IN ONE L1 SET HALVES THIS CUT. The in-place walk reads one
+# cache line per MR-row micro-panel per k-step, `lda*sizeof(T)` bytes apart, so those lines occupy
+#     sets = _L1_WAY_BYTES / gcd(lda*sizeof(T), _L1_WAY_BYTES)
+# distinct L1 sets, and the cost of one in-place column panel against one packed panel is a step
+# function of THAT COUNT, not of the stride's magnitude. Differencing two `njp` values so the kernel's
+# fixed entry cost cancels, with the strides PAIRED — two per set count, 2-3x apart in magnitude, so
+# magnitude is controlled (bench/probes/sme_inplace_njp_sets.jl):
+#     sets            16        8          4          2          1
+#     cost ratio    1.00      1.10       1.12       2.20       4.68
+#     lda pair   128/384   256/768   512/1536  1024/3072  2048/4096
+# Inside each group the two strides agree to 1-2%; between groups they differ up to 4x. Block size and
+# columns per page do not place the crossover; this count does, and it comes from a detected constant.
+# One set is exactly `lda*sizeof(T) % _L1_WAY_BYTES == 0` — `_alias_ld` (level3.jl) spells the same
+# test in doubles, but that file is included after this one, so the byte form off `_L1_WAY_BYTES` is
+# used here, as `level2.jl` does for the same reason. Two sets behave like four and keep the flat cut.
+#
+# EVERY FIGURE FOR THIS BRANCH IS CROSS-PROCESS, AND HAS TO BE. The in-place arm's cost is drawn per
+# PROCESS and then held for that process's life — 14 fresh operand sets inside one process span 1.10x
+# and agree on the verdict, while cold processes span 2.6x — so a warm session reports ONE draw with a
+# convincing SE, and two such sessions on identical source disagree in SIGN. The draws also drift and
+# cluster over minutes, so cells must be sampled ROUND-ROBIN, one draw each per round: nine
+# consecutive draws of one cell and then nine of the next align the drift with the variable under
+# test, and a table built that way reverses between runs. Below: 15 rounds, arms paired INSIDE each
+# process, SPEEDUP of the halved cut over the flat cut, so above 1.00 the halving pays.
+#     lda    n   njp   sets      p10   median      p90   rounds won
+#    1536  256    16      4    0.998    1.000    1.001   control, predicate false
+#    3072  256    16      2    0.992    1.001    1.005   control, predicate false
+#    2048  128     8      1    0.989    1.000    1.005    7/15
+#    4096  128     8      1    0.998    1.001    1.005   10/15
+#    2048  256    16      1    0.959    1.012    1.282    8/15
+#    4096  256    16      1    1.235    1.547    1.690   15/15
+# The two controls pin the predicate: a stride it rejects reads 1.000 and 1.001, so no square shape
+# moves and no gate cell can. No one-set cell loses in the median, and the p10/p90 spread at lda=2048
+# n=256 is the shape of the gain — small losses against large wins, which is why the estimator is a
+# median over pooled rounds and not a mean over a batch.
+#
+# A QUARTER of the cut is NOT safe: it reads 1.172 at lda=4096 njp=8 and 1.129 at lda=2048 njp=16 but
+# 0.891 at lda=2048 njp=8, and a cut that regresses a cell is inadmissible here. Halving is the
+# largest reduction that pays or holds at every cell measured.
+
+@inline function _sme_inplace_njp(lda::Int)
     ov = @inbounds _EXPINT[10]          # sweep override; 0 = the shipped cut, negative = residency only
-    return ov == 0 ? _SME_INPLACE_NJP : ov
+    ov == 0 || return ov
+    return (lda * sizeof(Float64)) % _L1_WAY_BYTES == 0 ? _SME_INPLACE_NJP >> 1 : _SME_INPLACE_NJP
 end
 
 # TWO ADMISSIONS, ANSWERING DIFFERENT QUESTIONS. The residency cut keeps the strided re-reads CHEAP by
 # holding the block in L1; this one keeps them FEW. At a small column-panel count the pack cannot
 # amortize whatever the block's size, so a block far above the residency cut still wants to be read
 # in place.
-@inline function _sme_inplace_a(mce::Int, kce::Int, njp::Int, alpha::Float64, tA::Bool)
+@inline function _sme_inplace_a(mce::Int, kce::Int, njp::Int, lda::Int, alpha::Float64, tA::Bool)
     (!tA && alpha == 1.0 && !(@inbounds _EXPFLAG[_EXP17])) || return false
     mce * kce <= _sme_inplace_cap() && return true
-    njp <= _sme_inplace_njp() || return false
+    njp <= _sme_inplace_njp(lda) || return false
     # Witness: the widest panel count this branch has admitted, so a sweep can tell a shape that
     # declined the branch from one the knob never reached. Diagnostic only -- a racing update
     # under-reports and changes nothing the kernel reads.
@@ -733,7 +784,7 @@ function _sme_gemm!(
                 mce = min(MC, m - ic)
                 mpad = cld(mce, MR) * MR
                 local pa::Ptr{Float64}, aip::Int, aks::Int
-                if _sme_inplace_a(mce, kce, njp, alpha, tA)
+                if _sme_inplace_a(mce, kce, njp, lda, alpha, tA)
                     # A itself IS the panel: the kernel walks it at `lda` and no copy happens.
                     pa = A + (ic + pc * lda) * 8
                     aip = MR
