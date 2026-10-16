@@ -611,6 +611,71 @@ Preference→frozen `.so` · first-use→`OncePerProcess` (Mode-2 end users) · 
 measurement. Acceptable only as a stopgap with a stated physical mechanism; the clean fix is a genuine
 analytical formula, an empirical calibration, or a kernel that needs neither.
 
+### ⚠ OPEN — ORPHANED KNOBS: 13 of the 23 Measured knobs have no calibrator (2026-10-16)
+
+**A Measured knob with no calibrator is ORPHANED.** The tier says the optimum is not derivable and
+"Wants a `tune!()` pin" (`docs/src/knobs.md:13`), but `tune!()` can only set a knob that
+`bench/calibrate.jl`'s `KNOBS` writes. Thirteen do not appear there, so no `tune!()` run can ever
+set them, and a second box has no automated path to its own value:
+
+    sme_inplace_njp  sme_min        sme_min_exact   sme_panel_bytes  sme_asum_min
+    sme_axpy_min     sme_dot_min    sme_scal_min    sme_ger_groups   sme_l1_groups
+    sme_rmw_groups   symv_sme_min   strassen_base
+
+Nearly all are SME, which is why this went unnoticed: the coprocessor exists on one family of parts,
+so no second machine has yet disagreed. That is the reason the gap survived, not a reason it is sound.
+
+**ORPHANED IS NOT PROVISIONAL — the two words name different faults and need different fixes.**
+*Provisional* is already in use for a value whose SWEEP HAS A HOLE (`src/lapack/packed_chol.jl:42`:
+"has NOT been measured between 8 and 32, and this value is provisional"). *Orphaned* is a value that
+was measured completely and has no tooling to reproduce it elsewhere. `sme_inplace_njp` is BOTH, and
+independently so: orphaned for lack of a calibrator, and provisional because square gemm at n = 384,
+which sits at njp 24, is untested — fixing either does nothing for the other.
+
+**THE REGISTRY CURRENTLY MISREPORTS THIS.** `test/knob_registry.jl:12` specifies the marker's `tune:`
+field as the COST IN `tune!()`, so `ger_panel_np` reads `22 s`. The orphans put something else there —
+`sme_inplace_njp` reads `_EXPINT[10]`, a probe sweep handle — and a reader sees a populated column and
+concludes a tuning path exists. `test/tuner_tests.jl:160` asserts only `KNOBS ⊆ _TUNABLE_KEYS`; the
+reverse direction is unchecked, which is how thirteen accumulated silently.
+
+**Step 1 — make the registry honest (small, no measurement risk, fixes all 13).** Require `tune:` to
+hold either a calibrator cost or the literal `none`, with any sweep handle after it
+(`tune: none — sweep via _EXPINT[10]`); report coverage in the tally line
+(`23 Measured (10 calibrated · 13 orphaned)`); and assert the reverse direction, so every Measured knob
+either appears in `KNOBS` or declares `tune: none`.
+
+**Step 2 — adopt the orphans, starting with `sme_inplace_njp`.** Scoped design:
+
+- **Decomposition, not a search.** Time `P` (`_sme_pack_A!` alone), and the marginal cost of one column
+  panel with packed strides `C` and with in-place strides `S`, each differenced between two `njp` values
+  so the kernel's fixed streaming-entry cost cancels; then `njp* = P / (S - C)`. Five timings, ~2 s per
+  process against `ger_panel_np`'s 22 s. `bench/probes/sme_inplace_njp_decompose.jl` already computes it.
+  An end-to-end search over cuts does not fit `ab`/`decide`, because the answer is the largest cut that
+  loses no gate shape — a constrained maximum, not an arm-versus-arm duel.
+- **Do not decide inside one process.** The in-place arm's cost is DRAWN PER PROCESS and held for that
+  process's life, so one process measures precisely but conditionally, and two disagree in sign.
+  `tune!()` already runs `repeats = 3` fresh processes and pins only unanimous agreement, which is the
+  guard; the calibrator returns its own process's verdict and nothing more.
+- **Round to a coarse grid** — {8, 16, 24, 32} — or three continuous estimates never match and the knob
+  can never pin.
+- **Measure at a stride spanning FOUR L1 sets** (`lda = n = 512`), the geometry the square gate shapes
+  have, and take the block from `_sme_blocks` rather than a held 64x2048. A one-set stride must not be
+  measured: that case is derived as `>> 1` off the detected `_L1_WAY_BYTES`.
+- **Clamp the ceiling by derivation, not measurement.** The cut must stay strictly below the smallest
+  `njp` among the gate shapes that lose when it reaches their own panel count, and `_sme_blocks` gives
+  those counts.
+- **Decline** when there is no live SME build (`!_SME_F64` or `_SME_ENTRY[] == C_NULL`), when `S <= C`
+  (no crossover exists), or when the chosen stride is one-set — the shape `calibrate_gemm_mt_work` uses
+  for a knob it cannot measure.
+
+**The cost that lands on everything else:** `_TUNE_NKNOBS` (`src/cpuinfo.jl:914`) is the Bonferroni
+denominator splitting `_TUNE_ALPHA`, so every knob that gains a calibrator raises `_TUNE_ROUNDS` for
+every duel in the tuner. Adopting orphans makes calibration slower by design.
+
+**Accepted risk:** at `lda = 2048, n = 256` the effect was close to a coin flip (8 of 15 rounds), so a
+calibrator may straddle a grid boundary and decline forever. Declining is the correct outcome, but then
+the work buys reporting rather than a pin.
+
 ## M1 — BLAS Level 1 vertical slice (✅ COMPLETE — history below)
 
 Goal: prove the whole pipeline cheaply on bandwidth-bound BLAS-1 (no GEMM perf risk, no Fortran
