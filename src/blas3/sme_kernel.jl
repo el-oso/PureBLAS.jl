@@ -567,10 +567,20 @@ end
 # is the largest value that is both saturating and safe AT THE FOUR-SET COLUMN GEOMETRY THOSE SQUARE
 # SHAPES HAVE (lda = n = 512 puts the columns in four L1 sets); `_sme_inplace_njp` halves it
 # where a stride puts every column in ONE L1 set.
+# A SECOND ROUTE MEASURES THE CROSSOVER, AND IT CANNOT RAISE THIS CUT. `bench/calibrate.jl` searches
+# no cuts: it times the pack alone (`P`) and the marginal cost of one column panel with packed strides
+# (`C`) and with in-place strides (`S`), differenced between two `njp` values so the kernel's fixed
+# streaming-entry cost cancels, and reports `njp* = P/(S-C)`. That divisor is about a seventh of
+# either panel time, so a 1% error in one of them moves `njp*` by some 7%: at the four-set geometry of
+# the square gate shapes, seventeen cold processes span 13.2 to 23.0. What it locates is where packing
+# starts to pay, which is not the property this cut carries — the bound above is the largest cut that
+# loses no gate shape, and the cuts between 16 and a losing shape's own panel count are unmeasured.
+# So the calibrator caps its grid at this value and can only lower the cut: every draw in that
+# measured range rounds back onto 16 and pins nothing, and only a draw near 8 would move it.
 # (bench/probes/sme_inplace_njp.jl for the
 # end-to-end table, sme_inplace_njp_sweep.jl for the cut value, sme_inplace_njp_l3sz.jl for the gemm
 # gate; each declares the regime its figures belong to.)
-# PDM: Measured — the column-panel re-read count at which packing A starts to pay, for a stride whose columns spread over two or more L1 sets; neither block size nor page geometry places it, and the value is bounded above by the gate cells that lose when the cut admits their own panel count. `_sme_inplace_njp` halves it for a one-set stride, which it identifies from the detected `_L1_WAY_BYTES`. | tune: _EXPINT[10]
+# PDM: Measured — the column-panel re-read count at which packing A starts to pay, for a stride whose columns spread over two or more L1 sets; neither block size nor page geometry places it, and the value is bounded above by the gate cells that lose when the cut admits their own panel count. `_sme_inplace_njp` halves it for a one-set stride, which it identifies from the detected `_L1_WAY_BYTES`. | tune: 2 s; _EXPINT[10] sweeps it by hand
 # req8-ok: a measured crossover bounded above by the two gate cells that lose when the cut reaches their own panel count -- the tables above are the whole justification. It is the value for a stride whose columns spread over two or more L1 sets; the one-set case takes half of it, from the cross-process table beside `_sme_inplace_njp`, and which strides those are is derived from the detected `_L1_WAY_BYTES`.
 const _SME_INPLACE_NJP = @load_preference("sme_inplace_njp", 16)::Int
 

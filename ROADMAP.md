@@ -611,16 +611,16 @@ Preference→frozen `.so` · first-use→`OncePerProcess` (Mode-2 end users) · 
 measurement. Acceptable only as a stopgap with a stated physical mechanism; the clean fix is a genuine
 analytical formula, an empirical calibration, or a kernel that needs neither.
 
-### ⚠ OPEN — ORPHANED KNOBS: 13 of the 23 Measured knobs have no calibrator (2026-10-16)
+### ⚠ OPEN — ORPHANED KNOBS: 12 of the 23 Measured knobs have no calibrator (2026-10-16)
 
 **A Measured knob with no calibrator is ORPHANED.** The tier says the optimum is not derivable and
 "Wants a `tune!()` pin" (`docs/src/knobs.md:13`), but `tune!()` can only set a knob that
-`bench/calibrate.jl`'s `KNOBS` writes. Thirteen do not appear there, so no `tune!()` run can ever
+`bench/calibrate.jl`'s `KNOBS` writes. Twelve do not appear there, so no `tune!()` run can ever
 set them, and a second box has no automated path to its own value:
 
-    sme_inplace_njp  sme_min        sme_min_exact   sme_panel_bytes  sme_asum_min
-    sme_axpy_min     sme_dot_min    sme_scal_min    sme_ger_groups   sme_l1_groups
-    sme_rmw_groups   symv_sme_min   strassen_base
+    sme_min          sme_min_exact  sme_panel_bytes sme_asum_min     sme_axpy_min
+    sme_dot_min      sme_scal_min   sme_ger_groups  sme_l1_groups    sme_rmw_groups
+    symv_sme_min     strassen_base
 
 Nearly all are SME, which is why this went unnoticed: the coprocessor exists on one family of parts,
 so no second machine has yet disagreed. That is the reason the gap survived, not a reason it is sound.
@@ -638,13 +638,17 @@ field as the COST IN `tune!()`, so `ger_panel_np` reads `22 s`. The orphans put 
 concludes a tuning path exists. `test/tuner_tests.jl:160` asserts only `KNOBS ⊆ _TUNABLE_KEYS`; the
 reverse direction is unchecked, which is how thirteen accumulated silently.
 
-**Step 1 — make the registry honest (small, no measurement risk, fixes all 13).** Require `tune:` to
+**Step 1 — make the registry honest (small, no measurement risk, fixes all 12).** Require `tune:` to
 hold either a calibrator cost or the literal `none`, with any sweep handle after it
 (`tune: none — sweep via _EXPINT[10]`); report coverage in the tally line
 (`23 Measured (10 calibrated · 13 orphaned)`); and assert the reverse direction, so every Measured knob
 either appears in `KNOBS` or declares `tune: none`.
 
-**Step 2 — adopt the orphans, starting with `sme_inplace_njp`.** Scoped design:
+**Step 2 — adopt the orphans.** ✅ `sme_inplace_njp` is adopted as `calibrate_sme_inplace_njp`
+(`bench/calibrate.jl`), declared in `_TUNABLE_KEYS`, and its marker now carries a real cost. It
+measures the crossover by an independent route and pins nothing here: `njp*` spans 13.2 to 23.0 over
+seventeen cold processes, and the grid is capped at the shipped value so every draw in that
+range rounds back onto 16. The design is the template for the remaining twelve:
 
 - **Decomposition, not a search.** Time `P` (`_sme_pack_A!` alone), and the marginal cost of one column
   panel with packed strides `C` and with in-place strides `S`, each differenced between two `njp` values
@@ -658,6 +662,12 @@ either appears in `KNOBS` or declares `tune: none`.
   guard; the calibrator returns its own process's verdict and nothing more.
 - **Round to a coarse grid** — {8, 16, 24, 32} — or three continuous estimates never match and the knob
   can never pin.
+- **Cap the grid at the shipped value when the knob carries a bound the calibrator does not measure.**
+  A decomposition yields the crossover; this knob's value is the largest cut that loses no gate
+  shape, and the two coincide only while the crossover happens to land below that bound. Uncapped, a
+  draw above the midpoint between two cells pins a cut the sweep never measured — 5 of the 17
+  draws exceed it and propose 24, where `gemm 384` at `njp 24` is the one untested cell. Capped,
+  the calibrator can only lower the cut, which is the direction its evidence supports.
 - **Measure at a stride spanning FOUR L1 sets** (`lda = n = 512`), the geometry the square gate shapes
   have, and take the block from `_sme_blocks` rather than a held 64x2048. A one-set stride must not be
   measured: that case is derived as `>> 1` off the detected `_L1_WAY_BYTES`.
