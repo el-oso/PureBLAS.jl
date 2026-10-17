@@ -42,13 +42,20 @@
 #   * A borrow ESCAPING its scope would read memory the next borrow overwrites. `@scope` rejects the
 #     TOKEN's escape at MACRO-EXPANSION time: `s` may appear only as `borrow!`'s first argument, so no
 #     new borrow can be taken after the block. A compile error, not a lint finding.
-#     ⚠ THE HANDLE IS NOT CHECKED, and cannot be by this mechanism — it is an ordinary local. Both of
-#     these compile, and both are use-after-free:
-#         @scope s begin; A = borrow!(s, Float64, 4, 4); A; end     # returned as the block's value
-#         @scope s begin; f(borrow!(s, Float64, 4, 4)); end          # if `f` retains it
-#     (test/arena_tests.jl's fence testitem does the first ON PURPOSE, to have something to fault on.)
-#     So the escape rule buys "the token cannot leak", not "no borrow can outlive the scope"; the
-#     latter is what `@fenced_scope` is for. Audit new call sites for a returned/stored handle.
+#     THE HANDLE IS PARTLY CHECKED. A handle RETURNED from the block — including as the block's
+#     trailing value — is rejected at expansion: "the borrowed handle `A` is returned from the scope"
+#     (built below, and `test/arena_tests.jl:312` asserts the message). What is NOT checked, and
+#     cannot be lexically, is a handle leaving by any other route. All three of these compile, and all
+#     three are use-after-free:
+#         @scope s begin; f(borrow!(s, Float64, 4, 4)); end              # if `f` retains it
+#         @scope s begin; v = borrow!(s, Float64, 4, 4); SINK[] = v; end # stored
+#         @scope s begin; v = borrow!(s, Float64, 4, 4); () -> v; end    # captured
+#     ⚠ `@fenced_scope` DOES permit the return, and `test/arena_tests.jl:399` relies on that to have a
+#     released borrow to fault on. The two macros differ here, so the fence item is not evidence that
+#     `@scope` allows it.
+#     So the escape rule buys "the token cannot leak" AND "the handle cannot be returned", not "no
+#     borrow can outlive the scope"; the last is what `@fenced_scope` is for. Audit new call sites for
+#     a handle retained by a callee, stored, or captured — those three, not the return.
 #   * A borrow inside a LOOP would consume Σ(iterations) of arena rather than one buffer — at
 #     n=k=4096 the per-tile `_trsm_tmp` sites would be ~16k borrows ≈ 128 MB. `@scope` rejects a
 #     `borrow!` lexically inside any loop/comprehension/closure in its block: hoist it (both real sites
