@@ -53,8 +53,7 @@ end
 #   Zen3: wants 8 (AVX2 re-exposes FMA latency; 8 accumulators cover it)
 # So 8 is right on two of three boxes and Zen4's 4 is recoverable by calibration — which is the whole
 # contract of the Measure tier, and the only form that is also correct on silicon nobody has benchmarked.
-# PDM: Measured — the PANEL path's height; see `_gemvn_rowblock_mr` below, which DERIVES the row-block
-# path's height instead. A pin still wins for both (P tier), and disables the derivation.
+# PDM: Measured — the PANEL path's height; `_gemvn_rowblock_mr` below DERIVES the row-block path's height instead, and a pin wins for both tiers, disabling that derivation. | tune: 0.3 s
 const _GEMV_MR_PREF = @load_preference("gemv_mr", nothing)
 const _GEMV_MR = something(_GEMV_MR_PREF, 8)::Int
 
@@ -3064,7 +3063,7 @@ const _SYMV_SME_NB = @load_preference("symv_sme_nb", 128)::Int   # req8-ok: swep
 # The n below which the fused single-pass kernel still beats the split. Placed one step above the
 # measured break-even (256 ties, 320 wins by 15%) so a caller with its own cache traffic does not
 # land on the crossing — the same margin lesson the SME in-place cap records. INERT without SME.
-# PDM: Measured — where a single-pass symmetric kernel stops beating a two-pass split that reaches the matrix unit; the arms are structurally different and no cache size predicts the crossing. | tune: sweep n
+# PDM: Measured — where a single-pass symmetric kernel stops beating a two-pass split that reaches the matrix unit; the arms are structurally different and no cache size predicts the crossing. | tune: none — orphaned; sweep n
 const _SYMV_SME_MIN = @load_preference("symv_sme_min", _SME_F64 ? 384 : typemax(Int))::Int
 
 function _symv!(up::Bool, n::Integer, α::Number, A, x, incx::Integer, β::Number, y, incy::Integer)

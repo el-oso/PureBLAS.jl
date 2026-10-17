@@ -3529,13 +3529,16 @@ end
 #   _EXPINT[8]  1 = restore the old `m >= _CHOLW` gate in `_trsm_dense_R!` (A/B arm; 0 ships: tile for any m)
 #   _EXPINT[9]  1 = restore the PADDED W-lane slab for the fused side-L leaf's ragged column tail (A/B arm; 0 ships
 #               the W÷2-lane tail, see `_gemmtrsm_u_slab_l!`)
+#   _EXPINT[10] SME in-place-A column-panel cut (0 = `_SME_INPLACE_NJP`, negative = residency only) --
+#               see `_sme_inplace_njp`
+#   _EXPINT[11] witness: the widest column-panel count the cut above admitted (proves the arm was live)
 #
 # ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
 # OUT-OF-BOUNDS READ that no test will catch — `@inbounds` deletes the check, and a stale heap value
 # that happens to be 0 looks exactly like "knob off". That is not hypothetical: on 2026-08-18 a revert
 # removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
 # read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
-const _EXPINT = fill(0, 9)
+const _EXPINT = fill(0, 11)
 const _EXPFLAG = fill(false, 19)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
