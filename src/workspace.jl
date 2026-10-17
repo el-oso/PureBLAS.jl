@@ -72,12 +72,7 @@ mutable struct L3Workspace{T}
     # meets the other workers at a barrier while the packed B panel is live, and a per-thread buffer
     # can be taken by a task that lands on the thread during that yield. Removed rather than left
     # dead so nobody re-points an accessor at a per-thread copy — same reasoning as `m3` below.
-    # `cg` WAS HERE and is now `_cgws`, a per-TASK owner. The complex split-pack is produced once per
-    # call and read for the whole macrokernel, so the moment `_gemm_threaded!` accepts a complex type
-    # those four buffers are live across the join — the same role `m3` has and the same reason it
-    # moved. Converted BEFORE the pool's `T <: BlasReal` bound widens, because afterwards the window
-    # in which a task can land on the thread and take them is already open. Removed rather than left
-    # dead so nobody re-points an accessor at a per-thread copy.
+    cg::NTuple{4, Vector{T}}   # _gemm_scratch_cmplx: complex split-pack (2×A, 2×B)
     s2::NTuple{4, Vector{T}}   # _syr2k_scratch:      fused two-product (2×A, 2×B)
     # `m3` WAS HERE and is now `_m3ws`, a per-TASK owner — it is the one role held across a threaded
     # join (`_trmm_dual!`/`_trsm_dual!` call public `trmm!` while holding it). Removed rather than left
@@ -95,6 +90,7 @@ end
 # the stage-1 conversion mis-aligned it by two — shipping `BoundsError: 0×0 Matrix at [1:6,1:6]`.
 # The tags are the guard rail: they must read in the same order as the struct above.
 L3Workspace{T}() where {T} = L3Workspace{T}(
+    (T[], T[], T[], T[]),                        # cg
     (T[], T[], T[], T[]),                        # s2
 )
 # Owner accessors. Const-dispatch (GKH ownership: bare field load, no lookup) EVERY gated hot type — the
@@ -156,27 +152,6 @@ const _M3_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any})
 @noinline _m3ws(::Type{Float64}) = _M3_F64()
 @noinline _m3ws(::Type{Float32}) = _M3_F32()
 @noinline _m3ws(::Type{T}) where {T} = get!(() -> ntuple(_ -> T[], 9), _M3_OTHER(), T)::NTuple{9, Vector{T}}
-
-# The complex split-pack, per TASK for the reason given where `cg` used to sit in `L3Workspace`.
-# `@noinline` on the same grounds as `_m3ws`: it has to BE the `:invoke` callee to serve as the
-# registered allocation barrier in `test/strictmode_tests.jl`'s `gemm!` proof, which is where the
-# one-off first touch of a new task's buffers would otherwise surface as allocation sites.
-#
-# ALL FOUR BLAS TYPES GET A CONST OWNER, not only the complex two. `_l3ws` const-dispatches every one
-# of them, so `cg` was reached by a bare field load whichever type called it, and routing any of them
-# to the `IdDict` fallback instead would be a silent tier regression — the note above `_l3ws` records
-# that costing the complex L3 hot path about 130 ns per call when complex was on the fallback. Two
-# extra `OncePerTask` objects are cheaper than having to prove which element types can reach this.
-const _CG_C64 = Base.OncePerTask{NTuple{4, Vector{ComplexF64}}}(() -> ntuple(_ -> ComplexF64[], 4))
-const _CG_C32 = Base.OncePerTask{NTuple{4, Vector{ComplexF32}}}(() -> ntuple(_ -> ComplexF32[], 4))
-const _CG_F64 = Base.OncePerTask{NTuple{4, Vector{Float64}}}(() -> ntuple(_ -> Float64[], 4))
-const _CG_F32 = Base.OncePerTask{NTuple{4, Vector{Float32}}}(() -> ntuple(_ -> Float32[], 4))
-const _CG_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any})
-@noinline _cgws(::Type{ComplexF64}) = _CG_C64()
-@noinline _cgws(::Type{ComplexF32}) = _CG_C32()
-@noinline _cgws(::Type{Float64}) = _CG_F64()
-@noinline _cgws(::Type{Float32}) = _CG_F32()
-@noinline _cgws(::Type{T}) where {T} = get!(() -> ntuple(_ -> T[], 4), _CG_OTHER(), T)::NTuple{4, Vector{T}}
 
 # Per-role accessors. Each returns/grows one owned field.
 
@@ -296,7 +271,7 @@ function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
 end
 
 function _gemm_scratch_cmplx(::Type{T}, lenA::Int, lenB::Int) where {T}
-    t = _cgws(T)                   # PER-TASK — live across a threaded complex join; see `_cgws`
+    t = _l3ws(T).cg
     _ws_grow!(t[1], lenA); _ws_grow!(t[2], lenA)
     _ws_grow!(t[3], lenB); _ws_grow!(t[4], lenB)
     return t

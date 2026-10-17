@@ -27,7 +27,7 @@
 # threaded join, which a per-thread buffer cannot survive. `gpackA`/`gpackB` → `_gpackws` (cooperative
 # A-packing meets the other workers at a barrier while the packed B panel is live), `str`/`strbt` →
 # `_strws` (the Winograd recursion hands each leaf to the threaded path while holding its level
-# slots), `cg` → `_cgws` (the complex split-pack is read for a whole macrokernel), `m3` → `_m3ws`
+# slots), `m3` → `_m3ws`
 # (`_trmm_dual!`/`_trsm_dual!` claim it and then call the PUBLIC `trmm!`/`trsm!` on the planes, whose
 # join yields, with no arena scope on that path for the depth guard to help). A per-thread buffer held
 # across a join is the shape that measured `getrf!` wrong 20 times in 96. See the threading note in
