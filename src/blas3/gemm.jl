@@ -2166,13 +2166,18 @@ end
 # Complex split-pack buffers are the `cg` field of the per-THREAD `L3Workspace`;
 # `_gemm_scratch_cmplx(T, lenA, lenB)` grows and returns them.
 #
-# ⚠ THE OWNER TIER IS UNRESOLVED HERE AND THE POOL ALREADY ADMITS COMPLEX. The split-pack is produced
-# once per call and read for the whole macrokernel, so it is live across the join on any threaded
-# complex product, and `zgemm` reaches the pool through the dedicated complex route below. A buffer in
-# that position is what `src/arena.jl`'s threading note requires to be per-TASK — but per-task
-# ownership allocates on a task's first touch, which the static `@test_noalloc` proof sees and which
-# may not be waived by registering an allocation barrier. Resolving it needs the buffers to come from
-# the arena or from caller-supplied workspace, not from task-local storage.
+# PER-THREAD IS SOUND HERE BECAUSE THE CLAIM IS THE CHUNK'S, NOT THE DRIVER'S. `_gemm_threaded!` packs
+# nothing before publishing: the only claim is in `_gemm_cmplx_impl!`, which every worker — and the
+# driver for its own chunk — reaches through `_gemm_run_chunk` on its own thread, and which packs, runs
+# the macrokernel and returns without a task-switch point. That is safe shape (b) of
+# `test/perthread_lint.jl`, and `_L3WS_C64`/`_L3WS_C32` are baselined under it. The buffer is never
+# live across the join, so it is NOT in the position of `_m3ws`/`_strws`/`_gpackws`, each of which is
+# held by a driver or a recursion level that then makes a threaded call.
+#
+# ⚠ WHAT WOULD INVALIDATE THIS: a holder of these buffers calling a threaded public entry while the
+# pack is live — a complex cooperative A-pack meeting at a barrier, say, the shape `_gpackws` has. Then
+# the claim spans a join and per-thread stops being sound. `test/yield_lint.jl` fails on any new
+# task-switch point in `src/`, which is the guard that keeps the statement above true.
 
 # Complex blocked driver, specialized on conj signs SA,SB (resolved once at the boundary below).
 function _gemm_cmplx_impl!(
@@ -5328,8 +5333,8 @@ end
         # ⚠ A COMPLEX CHUNK THEREFORE GROWS ITS OWN PACK SCRATCH INSIDE THE PUBLISHED JOB.
         # `_gemm_scratch_cmplx` grows four buffers and `_gemm_3m_scratch` nine. `_m3ws` is
         # `OncePerTask`, so the driver cannot touch a worker task's copy at all; the complex
-        # split-pack is still the per-THREAD `cg` field, whose tier is unresolved (see the note above
-        # `_gemm_scratch_cmplx`). Either way there is no
+        # split-pack is the per-THREAD `cg` field, claimed inside this chunk body and so per-chunk in
+        # practice (see the note above `_gemm_scratch_cmplx`). Either way there is no
         # prefit to write without first moving them to a worker-indexed process-wide pool, the shape
         # `_gpack_shared`/`_trmmr_prefit!` use. That is a real exposure and it is stated rather than
         # implied: the rule elsewhere in this driver is that a chunk body which grows a buffer
