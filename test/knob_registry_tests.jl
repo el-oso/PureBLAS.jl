@@ -94,3 +94,41 @@ end
         `_TUNABLE_KEYS`." keys = unlisted
     @test isempty(unlisted)
 end
+
+# The `tune:` field is what a reader consults to find out whether `tune!()` can set a knob, and a
+# Measured knob is the only tier that asks for a pin, so a wrong answer there sends someone to run a
+# tuner that will never touch it. `none` declares that no calibrator exists — the ORPHANED case. This
+# lint checks the declaration against `bench/calibrate.jl` IN BOTH DIRECTIONS; it does not require a
+# calibrator to exist, which would contradict the deliberate gap documented in test/tuner_tests.jl.
+@testitem "knob registry: every Measured knob's tune: field matches calibrate.jl" begin
+    include(joinpath(@__DIR__, "knob_registry.jl"))
+    src = read(joinpath(@__DIR__, "..", "bench", "calibrate.jl"), String)
+    emitted = Set{String}()
+    for blk in eachmatch(r"Pair\{String,\s*Any\}\[(.*?)\]"s, src),
+        m in eachmatch(r"\"([a-z][a-z0-9_]*)\"\s*=>", blk.captures[1])
+
+        push!(emitted, m.captures[1])
+    end
+    @test !isempty(emitted)               # if KNOBS is restructured, update this lint, do not delete it
+
+    measured = [r for r in knob_rows() if r.tier == "Measured"]
+    @test !isempty(measured)
+    undeclared = [r.key for r in measured if _kr_undeclared(r.pdm)]
+    isempty(undeclared) || @error "Measured knob(s) with no ` | tune: …` tail. State the cost in \
+        `tune!()`, or the literal `none` when no calibrator can reach the knob." knobs = undeclared
+    @test isempty(undeclared)
+
+    # Declares `none` yet a calibrator writes it: the knob is reachable and the marker hides it.
+    stale = [r.key for r in measured if _kr_orphaned(r.pdm) && r.key in emitted]
+    isempty(stale) || @error "Measured knob(s) declaring `tune: none` that bench/calibrate.jl DOES \
+        write. Replace `none` with the cost." knobs = stale
+    @test isempty(stale)
+
+    # Declares a cost yet no calibrator writes it: the pin it advertises is unreachable.
+    claimed = [r.key for r in measured if !_kr_orphaned(r.pdm) && !_kr_undeclared(r.pdm) &&
+                                          !(r.key in emitted)]
+    isempty(claimed) || @error "Measured knob(s) whose ` | tune: …` names a cost although \
+        bench/calibrate.jl writes no such key. These are ORPHANED — declare `tune: none` and give \
+        the hand-sweep handle after it." knobs = claimed
+    @test isempty(claimed)
+end

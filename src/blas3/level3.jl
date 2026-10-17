@@ -3543,13 +3543,16 @@ end
 #   _EXPINT[8]  1 = restore the old `m >= _CHOLW` gate in `_trsm_dense_R!` (A/B arm; 0 ships: tile for any m)
 #   _EXPINT[9]  1 = restore the PADDED W-lane slab for the fused side-L leaf's ragged column tail (A/B arm; 0 ships
 #               the W÷2-lane tail, see `_gemmtrsm_u_slab_l!`)
+#   _EXPINT[10] SME in-place-A column-panel cut (0 = `_SME_INPLACE_NJP`, negative = residency only) --
+#               see `_sme_inplace_njp`
+#   _EXPINT[11] witness: the widest column-panel count the cut above admitted (proves the arm was live)
 #
 # ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
 # OUT-OF-BOUNDS READ that no test will catch — `@inbounds` deletes the check, and a stale heap value
 # that happens to be 0 looks exactly like "knob off". That is not hypothetical: on 2026-08-18 a revert
 # removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
 # read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
-const _EXPINT = fill(0, 9)
+const _EXPINT = fill(0, 11)
 const _EXPFLAG = fill(false, 19)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
@@ -7172,18 +7175,16 @@ const _SYMM_SCR_C32 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF32}}}(() -
 # never yields, so it keeps the cheap per-thread owner and pays nothing.
 const _SYMM_SCR_MT_F64 = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
 const _SYMM_SCR_MT_F32 = Base.OncePerTask{Base.RefValue{Matrix{Float32}}}(() -> Ref(Matrix{Float32}(undef, 0, 0)))
-@inline function _symm_scr_mt(::Type{Float64}, n::Int)
-    r = _SYMM_SCR_MT_F64()
-    m = r[]
-    size(m, 1) < n && (m = Matrix{Float64}(undef, n, n); r[] = m)
-    return m
-end
-@inline function _symm_scr_mt(::Type{Float32}, n::Int)
-    r = _SYMM_SCR_MT_F32()
-    m = r[]
-    size(m, 1) < n && (m = Matrix{Float32}(undef, n, n); r[] = m)
-    return m
-end
+# `@noinline`, AND REGISTERED AS AN ALLOCATION BARRIER, exactly as `_m3ws` is (workspace.jl states the
+# reason there). `Base.OncePerTask`'s call is `@inline get!(init, task_local_storage(), once)`, so an
+# inlined accessor puts the task-local `IdDict{Any,Any}` — its `Memory{Any}` grow, its `jl_eqtable_*`
+# lookups and the initializer's `Matrix` — in the DRIVER's own body. For `_symm!` that read as a bare
+# allocation, an abstract-eltype container (`Memory{Any}`) and a runtime dict lookup all at once, none
+# of them attributable to a barrier, so the static all-paths proof fell through to the per-site report.
+# Behind a call the first touch of a new task is attributable and the proof holds. Only a threaded symm
+# reaches these, which is by construction a call large enough for the extra call to be invisible.
+@noinline _symm_scr_mt(::Type{Float64}, n::Int) = _ws_grow!(_SYMM_SCR_MT_F64(), n)
+@noinline _symm_scr_mt(::Type{Float32}, n::Int) = _ws_grow!(_SYMM_SCR_MT_F32(), n)
 # THIS FALLBACK IS A PER-THREAD OWNER AND MUST NEVER BE REACHED FROM A THREADED CALL. `Ad` is handed
 # to the workers as an operand and so is held across the join; guarantee 3 puts such a buffer in the
 # `OncePerTask` tier, which the two methods above satisfy and this one does not. What keeps it safe is
@@ -7196,29 +7197,31 @@ end
 # prove unreachable.
 @inline _symm_scr_mt(::Type{T}, n::Int) where {T} = _symm_scr(T, n)
 
+# The owner lookup and the size test stay INLINE — a bare field load and a compare, which is what the
+# const dispatch above is for — and only the cold GROW goes behind the barrier (`_ws_grow!`,
+# workspace.jl's one growth point). Spelling the `Matrix{T}(undef, n, n)` here instead inlines it into
+# `_symm!`, where the static all-paths proof has no barrier to attribute it to; moving the whole
+# accessor behind the call instead would put a non-inlined call on the tiny-n symm/hemm path these
+# const owners exist to keep free.
 @inline function _symm_scr(::Type{Float64}, n::Int)
     r = _SYMM_SCR_F64()
     m = r[]
-    size(m, 1) < n && (m = Matrix{Float64}(undef, n, n); r[] = m)
-    return m
+    return size(m, 1) < n ? _ws_grow!(r, n) : m
 end
 @inline function _symm_scr(::Type{Float32}, n::Int)
     r = _SYMM_SCR_F32()
     m = r[]
-    size(m, 1) < n && (m = Matrix{Float32}(undef, n, n); r[] = m)
-    return m
+    return size(m, 1) < n ? _ws_grow!(r, n) : m
 end
 @inline function _symm_scr(::Type{ComplexF64}, n::Int)
     r = _SYMM_SCR_C64()
     m = r[]
-    size(m, 1) < n && (m = Matrix{ComplexF64}(undef, n, n); r[] = m)
-    return m
+    return size(m, 1) < n ? _ws_grow!(r, n) : m
 end
 @inline function _symm_scr(::Type{ComplexF32}, n::Int)
     r = _SYMM_SCR_C32()
     m = r[]
-    size(m, 1) < n && (m = Matrix{ComplexF32}(undef, n, n); r[] = m)
-    return m
+    return size(m, 1) < n ? _ws_grow!(r, n) : m
 end
 # Tile edge for the symmetric/Hermitian → dense fill. DERIVE tier: the mirror half is a TRANSPOSE, so
 # the criterion is that a source tile and its destination tile are both L1-resident while the tile is

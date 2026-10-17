@@ -529,6 +529,125 @@ function calibrate_gemm_mt_work(::Type{T} = Float64) where {T}
     return Pair{String, Any}["gemm_mt_work" => floor_flops]
 end
 
+# ── SME in-place-A column-panel cut — DECOMPOSED, NOT SEARCHED ──────────────────────────────────────
+# The macrokernel re-reads the A block once per column panel, so reading A in place costs `njp*S`
+# while packing it costs `P + njp*C`, and the crossover is `njp* = P/(S-C)`. Three costs settle the
+# knob in five timings. Searching candidate cuts end to end does NOT fit this harness: the answer is
+# the largest cut that loses no gate shape, a constrained maximum, and `decide` adjudicates one arm
+# against another.
+#
+# `C` and `S` are MARGINALS, differenced between two `njp` values, so the kernel's fixed
+# streaming-region entry cost — identical in both arms — cancels and only the per-panel cost survives.
+#
+# ⚠ THE IN-PLACE ARM'S COST IS DRAWN PER PROCESS AND HELD FOR THAT PROCESS'S LIFE. Fourteen fresh
+# operand sets inside one process span 1.10x and agree on the verdict, while cold processes span 2.6x.
+# So one process measures precisely but CONDITIONALLY, and two processes on identical source disagree
+# in sign. This function returns ONE process's verdict and claims nothing beyond it; `tune!()` runs
+# `repeats` independent processes and pins only a unanimous answer, which IS the cross-process guard.
+# The verdict is rounded onto a coarse grid for the same reason: three continuous estimates never
+# agree to the integer, and a knob that can never pin is worse than no calibrator at all.
+const SME_NJP_GRID = (8, 16, 24, 32)
+# TWO BOUNDS LIMIT THE CUT, AND THIS FUNCTION MEASURES NEITHER. The crossover below says where
+# packing starts to pay; it does not say which cuts leave every gate shape whole. Square gemm loses
+# as soon as the cut admits its own panel count — 1.078 at a cut of 32 where njp is 32, and 1.079 at
+# a cut of 64 at n = 1024 where njp is 64 — and `_sme_blocks` gives those panel counts, so that bound
+# follows from the blocking. It is the weaker of the two: it bars only a cut EQUAL to a losing
+# shape's panel count, and leaves the cuts between the shipped value and that count untested. The
+# binding bound is the shipped value itself, which the rank-k sweep establishes as the largest cut
+# measured safe. The grid is capped by both, so this function can only ever LOWER the cut — the one
+# direction its own evidence supports.
+const SME_NJP_CEIL_N = (512, 1024)
+
+"""Crossover `njp` for reading A in place, or no pin when this machine cannot be adjudicated."""
+function calibrate_sme_inplace_njp(::Type{T} = Float64) where {T}
+    if !(PureBLAS._SME_F64 && PureBLAS._SME_ENTRY[] != C_NULL)
+        println("  sme_inplace_njp: DECLINED — no live SME build. The knob gates the coprocessor path " *
+                "only, and its kernels are not callable in this process.")
+        return Pair{String, Any}[]
+    end
+    MR = PureBLAS._SME_MR; NR = PureBLAS._SME_NR; L = PureBLAS._SME_L
+    # MEASURE AT THE GEOMETRY THE GATE'S SQUARE SHAPES HAVE: `lda = n = 512` puts the columns in
+    # `_L1_WAY_BYTES / gcd(lda*sizeof(T), _L1_WAY_BYTES)` distinct L1 sets, and the cost of one
+    # in-place column panel is a step function of that count rather than of the stride's magnitude.
+    # This knob is the TWO-OR-MORE-SET value; the one-set case is derived from it as `>> 1` off the
+    # same detected constant, so a one-set stride must not be measured here.
+    n = 512
+    lda = n
+    sets = PureBLAS._L1_WAY_BYTES ÷ gcd(lda * sizeof(T), PureBLAS._L1_WAY_BYTES)
+    if sets < 2
+        println("  sme_inplace_njp: DECLINED — lda=$(lda) spans $(sets) L1 set on this part, which is " *
+                "the derived half of this knob, not the knob.")
+        return Pair{String, Any}[]
+    end
+    MC, _, KC = PureBLAS._sme_blocks(n, n, n)
+    mce = min(MC, n)
+    kce = min(KC, n)
+    kpad = cld(kce, L) * L
+    mpad = cld(mce, MR) * MR
+    nip = mpad ÷ MR
+    j1, j2 = 4, 16
+    inc = PureBLAS._SME_INPLACE_NJP
+    blockceil = minimum(nn -> cld(PureBLAS._sme_blocks(nn, nn, nn)[2], NR), SME_NJP_CEIL_N) - 1
+    ceil_njp = min(inc, blockceil)
+    grid = filter(<=(ceil_njp), SME_NJP_GRID)
+    if isempty(grid)
+        println("  sme_inplace_njp: DECLINED — no grid value sits at or below the ceiling " *
+                "njp=$(ceil_njp), so every candidate would raise the cut past where it is safe.")
+        return Pair{String, Any}[]
+    end
+    @printf("  sme_inplace_njp @ n=%d: block %dx%d, %d L1 set(s), ceiling njp %d, grid %s\n",
+            n, mce, kce, sets, ceil_njp, grid)
+    A = randn(T, lda, kpad)
+    Ap = zeros(T, mpad * kpad)
+    Bp = randn(T, kpad * NR * j2)
+    Cp = zeros(T, mpad * NR * j2)
+    # The macrokernel runs whole `mpad x (njp*NR)` tiles, so it is timed into a PRIVATE PADDED C with
+    # `ldc = mpad`, never a real operand, which it would write past.
+    costs, ok, drift = with_anchor(; tol = TOL) do
+        GC.@preserve A Ap Bp Cp begin
+            pA = pointer(A); pa = pointer(Ap); pb = pointer(Bp); pc = pointer(Cp)
+            mac(p, aip, aks, njp) = PureBLAS._sme_macro!(
+                pc, mpad, p, pb, nip, njp, kpad, aip, aks, kpad * NR, NR,
+                mce - (nip - 1) * MR, NR, true)
+            pk() = PureBLAS._sme_pack_A!(pa, pA, lda, 0, 0, mce, kce, kpad, 1.0)
+            pk()                                          # warm, and fills Ap for the packed arm
+            mac(pa, kpad * MR, MR, j1)
+            mac(pA, MR, lda, j1)
+            # estimator-ok: `median` IS the sanctioned estimator; `Measure.tstat` reduces ARM RATIOS,
+            # and these are five absolute latencies with no arm to divide by.
+            tP = median(@be pk() seconds = 0.3).time
+            cp1 = median(@be mac(pa, kpad * MR, MR, j1) seconds = 0.3).time
+            cp2 = median(@be mac(pa, kpad * MR, MR, j2) seconds = 0.3).time
+            ip1 = median(@be mac(pA, MR, lda, j1) seconds = 0.3).time
+            ip2 = median(@be mac(pA, MR, lda, j2) seconds = 0.3).time
+            (P = tP, cp1 = cp1, cp2 = cp2, ip1 = ip1, ip2 = ip2)
+        end
+    end
+    if !ok
+        @printf("    ⇒ REFUSED: machine state moved %.1f%% across the measurement — not adjudicable\n",
+                100 * drift)
+        return Pair{String, Any}[]
+    end
+    Cm = (costs.cp2 - costs.cp1) / (j2 - j1)
+    Sm = (costs.ip2 - costs.ip1) / (j2 - j1)
+    @printf("    pack %.2fus  packed panel %.3fus  in-place panel %.3fus  sigma %.3f\n",
+            costs.P * 1e6, Cm * 1e6, Sm * 1e6, Cm > 0 ? Sm / Cm : NaN)
+    if !(Sm > Cm)
+        println("    ⇒ no pin: a panel costs no more in place than packed here, so no crossover " *
+                "exists and this evidence cannot move the cut.")
+        return Pair{String, Any}[]
+    end
+    njpstar = costs.P / (Sm - Cm)
+    pin = grid[argmin(abs.(grid .- njpstar))]
+    @printf("    njp* %.1f  ⇒ grid %d (incumbent %d)\n", njpstar, pin, inc)
+    if pin == inc
+        println("    ⇒ no pin: the measured crossover rounds to the in-code default. That is a " *
+                "result — the default is adequate here.")
+        return Pair{String, Any}[]
+    end
+    return Pair{String, Any}["sme_inplace_njp" => pin]
+end
+
 const KNOBS = (
     (name = "gemm_mt_work", fn = calibrate_gemm_mt_work),
     (name = "gemv_mr", fn = calibrate_gemv_mr),
@@ -539,6 +658,7 @@ const KNOBS = (
     (name = "gemvt_pf", fn = calibrate_gemvt_pf),
     (name = "trmv_fused_min", fn = calibrate_trmv_fused_min),
     (name = "gbtrf_cmult", fn = calibrate_gbtrf_cmult),
+    (name = "sme_inplace_njp", fn = calibrate_sme_inplace_njp),
 )
 
 # ── driver ──────────────────────────────────────────────────────────────────────────────────────────

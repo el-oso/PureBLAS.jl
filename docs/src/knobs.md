@@ -5,17 +5,18 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 172 of them.
+Every `@load_preference` key in `src/` — 173 of them.
 
 | Tier | Meaning |
 |---|---|
 | **Derived** | Default is a formula over detected hardware consts. |
 | **Measured** | Not derivable — the optimum depends on something we cannot detect. Wants a `tune!()` pin. |
+| **Measured, orphaned** | Measured with no calibrator in `bench/calibrate.jl`, so `tune!()` can never set it and the pin it wants is unreachable. Its `tune!()` cell reads `none`. A missing tool, not a missing verdict — the tier says where the number came from and does not change when a calibrator arrives. |
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 80 Derived · 22 Measured · 52 Literal · 18 Exempt.
-**Default form** (mechanical): 69 formula · 22 delegates · 8 sibling · 63 literal · 5 flag · 5 other.
+**Tier:** 80 Derived · 23 Measured (11 calibrated · 12 orphaned) · 52 Literal · 18 Exempt.
+**Default form** (mechanical): 69 formula · 22 delegates · 8 sibling · 64 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -40,7 +41,7 @@ Every `@load_preference` key in `src/` — 172 of them.
 | `cgemvt_nc` | literal | Exempt | legacy pin, superseded by _cgemvt_cfg; retained only so an old preference still parses. | n/a, dead |
 | `cgemvt_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
 | `cger_cold_den` | literal | Derived | DRAM residency of A with cache headroom, the `_trmv_blk!` criterion; fleet table above. | candidate |
-| `gemv_mr` | delegates | Measured | the PANEL path's height; see `_gemvn_rowblock_mr` below, which DERIVES the row-block | — |
+| `gemv_mr` | delegates | Measured | the PANEL path's height; `_gemvn_rowblock_mr` below DERIVES the row-block path's height instead, and a pin wins for both tiers, disabling that derivation. | 0.3 s |
 | `gemvn_mb` | formula | Derived | formula over detected consts: `max(_vwidth(Float64), _L1_BYTES ÷ 2 ÷ sizeof(Float64` | — |
 | `gemvn_minner` | delegates | Derived | `_at_gemvn_minner(hw) = _datapath_bytes(hw) < 64`; the µarch split IS the datapath. | n/a — derived, no host measurement needed |
 | `gemvn_minner_maxa` | formula | Derived | formula over detected consts: `4 * _L3_BYTES` | — |
@@ -55,7 +56,7 @@ Every `@load_preference` key in `src/` — 172 of them.
 | `gemvt_pf` | delegates | Measured | prefetch distance depends on L2 hit latency and the hw streamer, neither detected; bounds derived, choice measured. | candidate, 0/2/4/8 lines |
 | `gemvt_u` | delegates | Derived | row unroll capped by the register file: NC*U + U + 2 <= _NVREG. | n/a |
 | `ger_panel_np` | delegates | Measured | optimum 8/4/1 on boxes that agree on L2/L3/width; tracks DRAM write streams. | 22 s |
-| `symv_sme_min` | sibling | Measured | where a single-pass symmetric kernel stops beating a two-pass split that reaches the matrix unit; the arms are structurally different and no cache size predicts the crossing. | sweep n |
+| `symv_sme_min` | sibling | Measured | where a single-pass symmetric kernel stops beating a two-pass split that reaches the matrix unit; the arms are structurally different and no cache size predicts the crossing. | none — orphaned; sweep n |
 | `symv_sme_nb` | literal | Literal | a block width for a decomposition, not a hardware knob: it sets how many columns share one pass over x and y in the split, and 128 measured best or tied at every size swept. | candidate, (32,64,128,256) |
 | `tri_c_blk_min` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 256 : 1024` | — |
 | `tri_c_t_unb` | literal | Literal | complex transpose unblocked/blocked crossover. | candidate |
@@ -248,7 +249,7 @@ Every `@load_preference` key in `src/` — 172 of them.
 | `gemm_split_max` | formula | Derived | formula over detected consts: `_at_gemm_split_max(_HW)` | — |
 | `gemm_unpack_max` | formula | Derived | formula over detected consts: `_at_gemm_unpack_max(_HW)` | — |
 | `strassen` | formula | Exempt | capability flag; Strassen's flop cut is ISA-independent. | n/a |
-| `strassen_base` | literal | Measured | the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | no calibrator yet. The threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048 |
+| `strassen_base` | literal | Measured | the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | none — orphaned; the threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048 |
 | `strassen_maxdepth` | literal | Literal | accuracy budget (~3x error per level, type-independent); the performance side is | — |
 | `strassen_min` | formula | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
 | `strassen_nopad` | literal | Literal | prefer depth-reduction over an O(n^2) pad; fleet table above, no-op off native AVX-512. | candidate |
@@ -261,23 +262,24 @@ Every `@load_preference` key in `src/` — 172 of them.
 | `sme_gemvt_minm` | literal | Derived | the per-column ZA fill and readback is O(1) against O(m) of streamed column, so the crossover is a row count; it sits at the measured break against the NEON path it displaces. | sweep m at fixed n |
 | `sme_gemvt_nc` | literal | Literal | a falsified-derivation literal: the criterion would be "widest NC that still saves x traffic", and it predicts 8, which measures WORSE at every size. Four is what the table above says. | candidate, (4,8) |
 | `sme_gemvt_resident_max` | formula | Derived | L2 residency of A, m*n*8 <= 3/4 * _L2_BYTES; the quarter left over is x (re-read per column block), y, the deferred strips and the core's own lines; measured crossover 15 MB of 20. | candidate, sweep m*n at fixed m across _L2_BYTES |
-| `sme_ger_groups` | literal | Measured | each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | candidate, (1,2,4,8) |
+| `sme_ger_groups` | literal | Measured | each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | none — orphaned; candidates (1,2,4,8) |
 | `sme_ger_minm` | literal | Derived | formula over detected consts: the kernel's own row granularity, `4 * _SME_L`, below and outside of which it has nothing to run. | — |
 | `sme_inplace_max` | formula | Derived | A-block residency against the detected L1: an in-place walk stays as cheap as a contiguous stream while the block the kernel re-reads is a couple of L1-fuls, and the coefficient is set one step inside where that was measured to flip under a worst-case stride, because a caller with extra cache traffic tips the edge. | n/a, follows _L1_BYTES |
-| `sme_min` | literal | Measured | tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | sweep |
-| `sme_min_exact` | literal | Measured | the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | sweep |
-| `sme_panel_bytes` | literal | Measured | a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | sweep |
+| `sme_inplace_njp` | literal | Measured | the column-panel re-read count at which packing A starts to pay, for a stride whose columns spread over two or more L1 sets; neither block size nor page geometry places it, and the value is bounded above by the gate cells that lose when the cut admits their own panel count. `_sme_inplace_njp` halves it for a one-set stride, which it identifies from the detected `_L1_WAY_BYTES`. | 2 s; _EXPINT[10] sweeps it by hand |
+| `sme_min` | literal | Measured | tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | none — orphaned; sweep |
+| `sme_min_exact` | literal | Measured | the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | none — orphaned; sweep |
+| `sme_panel_bytes` | literal | Measured | a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | none — orphaned; sweep |
 
 ## sme_l1
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
-| `sme_asum_min` | literal | Measured | the same crossing for the one-stream form, which turns later because half the outstanding requests. | sweep n |
-| `sme_axpy_min` | literal | Measured | the same cold crossing for the three-stream form. | sweep n |
-| `sme_dot_min` | literal | Measured | where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | sweep n |
-| `sme_l1_groups` | literal | Measured | every fmla into one ZA slice is a serial chain, so this is dependency depth, not residency or width; the optimum inverts either side of two. | candidate, (1,2,4,8) |
-| `sme_rmw_groups` | literal | Measured | each group carries its own load and store, so this is stream count and dependency depth together, not residency or width. | candidate, (1,2,4,8) |
-| `sme_scal_min` | literal | Measured | where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | sweep n |
+| `sme_asum_min` | literal | Measured | the same crossing for the one-stream form, which turns later because half the outstanding requests. | none — orphaned; sweep n |
+| `sme_axpy_min` | literal | Measured | the same cold crossing for the three-stream form. | none — orphaned; sweep n |
+| `sme_dot_min` | literal | Measured | where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | none — orphaned; sweep n |
+| `sme_l1_groups` | literal | Measured | every fmla into one ZA slice is a serial chain, so this is dependency depth, not residency or width; the optimum inverts either side of two. | none — orphaned; candidates (1,2,4,8) |
+| `sme_rmw_groups` | literal | Measured | each group carries its own load and store, so this is stream count and dependency depth together, not residency or width. | none — orphaned; candidates (1,2,4,8) |
+| `sme_scal_min` | literal | Measured | where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | none — orphaned; sweep n |
 
 ## workspace
 
@@ -289,6 +291,29 @@ Every `@load_preference` key in `src/` — 172 of them.
 
 Const names, defaults and files are deliberately NOT tabulated: they are one `grep` away
 and made this table too wide to read. The knob key is the identifier that matters.
+
+## Orphaned Measured knobs
+
+12 of the 23 Measured knobs have no entry in
+`bench/calibrate.jl`, so `tune!()` cannot set them however many times it runs. The tier is
+still correct — the value was reached by measurement — but the pin it asks for is
+unreachable until a calibrator exists. Each row's `tune!()` cell reads `none`, and the
+handle after it is what a person would sweep by hand meanwhile.
+
+| Knob | Hand-sweep handle |
+|---|---|
+| `symv_sme_min` | sweep n |
+| `strassen_base` | the threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048 |
+| `sme_ger_groups` | candidates (1,2,4,8) |
+| `sme_min` | sweep |
+| `sme_min_exact` | sweep |
+| `sme_panel_bytes` | sweep |
+| `sme_asum_min` | sweep n |
+| `sme_axpy_min` | sweep n |
+| `sme_dot_min` | sweep n |
+| `sme_l1_groups` | candidates (1,2,4,8) |
+| `sme_rmw_groups` | candidates (1,2,4,8) |
+| `sme_scal_min` | sweep n |
 
 ## Tuning constants that are NOT knobs
 

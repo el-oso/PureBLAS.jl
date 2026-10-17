@@ -223,6 +223,17 @@ end
     length(v) < n && resize!(v, n)
     return v
 end
+# Square-matrix owner variant: the pool holds an n×n `Matrix` behind a `Ref`, so a grow REPLACES the
+# buffer rather than resizing one. The claim is the same — grow-only on `size(m, 1) < n`, i.e. a pool
+# reaching a new high-water mark — so it belongs behind this same barrier. It has to live here and not
+# at the call site: an owner accessor is `@inline`d into its caller, which leaves a bare
+# `Matrix{T}(undef, n, n)` in the DRIVER's own body, where no barrier can be attributed to it and the
+# static all-paths proof falls through to reporting the growth per site.
+@noinline function _ws_grow!(r::Base.RefValue{Matrix{T}}, n::Int) where {T}
+    m = r[]
+    size(m, 1) < n && (m = Matrix{T}(undef, n, n); r[] = m)
+    return m
+end
 
 # transB-Strassen Bᵀ buffer, k×n over a GROW-ONLY flat slot viewed at ld == k. `transpose!` needs an
 # exact-shape dest and the recursion's quadrant reads need contiguity, and a `PtrMatrix` over the first
