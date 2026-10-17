@@ -686,6 +686,57 @@ every duel in the tuner. Adopting orphans makes calibration slower by design.
 calibrator may straddle a grid boundary and decline forever. Declining is the correct outcome, but then
 the work buys reporting rather than a pin.
 
+### ⚠ OPEN — TWO CALIBRATORS NAME A DIFFERENT WINNER EACH PROCESS (2026-10-17)
+
+Two of the nine existing calibrators return a different verdict on consecutive runs of
+`tune!(dryrun = true)` on an idle box. Neither is a noise problem: both adjudicate a margin their own
+evidence does not separate, so `tune!()`'s unanimity discards a real win rather than a false one.
+
+**`potrf_upper_direct_max` — no tie-break among candidates that all beat the incumbent.** Higher is
+better; the incumbent is 20.
+
+```
+run 1:   8  1.0741 [1.0598, 1.0909]    12  1.0776 [1.0517, 1.0909]   ⇒ WINNER 12
+run 2:   8  1.0756 [1.0444, 1.0756]    12  1.0677 [1.0364, 1.0923]   ⇒ WINNER 8
+```
+
+Both candidates clear 1.0 decisively, so a pin IS justified — about 7%, the largest unclaimed win in
+the tuner. But their intervals overlap almost entirely, and the winner is the larger point estimate
+with no test that the top two differ from EACH OTHER. Three processes therefore split 8-vs-12 and pin
+nothing. `decide` compares each candidate against the incumbent; what is missing is a second round
+among the survivors, or a rule that collapses a tied set to its most conservative member.
+
+**`gemvt_percol_window` — fits a window from margins below the adjudicable floor.** Its per-size A/B
+flips which size wins, so the fitted window flips with it: run 1 took `n = 4096` at `1.0014
+[1.0002, 1.0028]` and emitted `amin = 40960 KiB, xmax = 64 KiB, mode = 1`; run 2 took `n = 512` the
+other way at `0.9996 [0.9992, 0.9999]` and concluded mode 0. Those are 0.14% and 0.04% effects.
+Req#1 fixes the gate at two significant digits because per-cell drift on this fleet runs 1-6%, so
+`1.0014` rounds to `1.0` and is a TIE by the project's own criterion. The window fit needs the same
+rounding applied to its per-size verdicts before a size is allowed to be a "win".
+
+**Stable across both runs**, for contrast: `sytrf_cmult` named 2 twice, and `gemv_mr`,
+`ger_panel_np`, `gemvt_pf`, `trmv_fused_min` and `gbtrf_cmult` each returned no pin twice.
+
+### THE CONTENTION GUARDS ARE INERT ON APPLE SILICON, AND THAT IS THE RIGHT STATE (2026-10-17)
+
+`contention()` (`bench/tune_harness.jl:105`) and `_wait_idle()` (`src/tune.jl:128`) both read
+`/proc/loadavg`, which does not exist on macOS: the first catches to `0.0` and never refuses, the
+second returns at once and never waits. `Sys.loadavg()` would restore the reading, and must NOT be
+substituted, because the load average does not measure CPU contention on this platform — this box
+reads 1.37 against a `MAXLOAD` of 1.5 while `top` reports 97.1% idle, the figure coming from the
+desktop compositor rather than from work. A naive swap converts a guard that never fires into one
+that refuses to tune an idle machine.
+
+The instability above is the evidence that matters: it was measured at 97% idle, so a contention guard
+would have passed it either way. What protects a pin is structural and platform-independent —
+`with_anchor`'s drift refusal, `decide`'s interval, and unanimity across fresh processes. Note also
+that `_wait_idle` exists only to stop `contention()` refusing run 2, so with the first inert the
+second has nothing to prevent.
+
+The real unguarded variable here is frequency: `tune!()` prints `freq: no cpufreq — unchecked` on this
+part, there is no Apple-silicon equivalent of `bench/fleet_freqlock.sh lock`, and `stabilise!` burning
+the boost window is the whole of the mitigation.
+
 ## M1 — BLAS Level 1 vertical slice (✅ COMPLETE — history below)
 
 Goal: prove the whole pipeline cheaply on bandwidth-bound BLAS-1 (no GEMM perf risk, no Fortran
