@@ -690,7 +690,7 @@ end
 # So KC is made as large as a packed-panel memory budget allows (minimizing C passes) rather than
 # sized for L1 residency, and NC spans the whole of n so A is packed exactly once. MC then sets
 # the A-panel working set against L2.
-# PDM: Measured — a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | tune: sweep
+# PDM: Measured — a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | tune: none — orphaned; sweep
 const _SME_PANEL_BUDGET = @load_preference("sme_panel_bytes", 64 * 1024 * 1024)::Int
 
 @inline function _sme_blocks(m::Int, n::Int, k::Int)
@@ -866,9 +866,9 @@ end
 #
 # Sampling every OTHER n hides this: a 2-step sweep reads 48, 56, 64 and concludes 3*MR is safe,
 # which regressed gemm@50 by 38% (1142 -> 1582 us) before the dense sweep found 49, 51, 53.
-# PDM: Measured — tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | tune: sweep
+# PDM: Measured — tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | tune: none — orphaned; sweep
 const _SME_MIN = @load_preference("sme_min", 6 * _SME_MR)::Int
-# PDM: Measured — the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | tune: sweep
+# PDM: Measured — the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | tune: none — orphaned; sweep
 const _SME_MIN_EXACT = @load_preference("sme_min_exact", 3 * _SME_MR)::Int
 
 # THE KERNEL MUST NOT ENTER THE PACKAGE IMAGE, and `@noinline` alone does not achieve that.
@@ -2706,7 +2706,7 @@ end
 #     G=8          -   479   402   435
 #
 # Four is the best or within noise of it at every size and the ladder is flat from there.
-# PDM: Measured — each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | tune: candidate, (1,2,4,8)
+# PDM: Measured — each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | tune: none — orphaned; candidates (1,2,4,8)
 const _SME_GER_G = @load_preference("sme_ger_groups", 4)::Int   # req8-ok: swept, see the table above
 
 # The groups span COLUMNS, so a matrix narrower than G needs a narrower kernel; the driver picks the
