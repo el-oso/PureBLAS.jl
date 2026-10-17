@@ -800,9 +800,82 @@ knob's effect through the public path. A hook for these is a function-pointer ta
 group kernels, not a mutable cell.
 
 **The four that are adoptable without touching `src/`:** `sme_dot_min`, `sme_asum_min`, `sme_axpy_min`
-and `sme_scal_min` all default to 65536 and are crossovers between two code paths that are each
-separately callable, so the decomposition route applies — time both paths across candidate `n` and
-report where they cross, as the `sme_inplace_njp` calibrator does for the pack.
+and `sme_scal_min` are crossovers between two code paths that are each separately callable, so the
+decomposition route applies — time both paths across candidate `n` and report where they cross, as
+the `sme_inplace_njp` calibrator does for the pack. **The decomposition is now written and run** (see
+below); what remains for these four is wiring it into `bench/calibrate.jl` as a calibrator, which is
+`bench/` work only.
+
+### ✅ MEASURED — THE FOUR SME LEVEL-1 FLOORS ARE FOUR DIFFERENT CROSSINGS (2026-10-17)
+
+All four shipped 65536 on the claim that the crossing "is a property of the ZA route rather than of
+any one operation". Measured with both kernels called directly — so no row depends on where a floor
+sits — that claim is false and three floors admitted a kernel that LOSES. Cold, `evals=1`, median,
+three draws agreeing to 0.06; gain = displaced kernel / ZA, so above 1 the ZA route is right:
+
+```
+n         8192  16384  32768  65536  131072  262144  524288  976000
+dot       0.54   0.72   0.83   1.63    3.08    3.90    1.64    1.44
+asum      0.30   0.46   0.61   0.70    1.12    1.32    1.51    1.42
+scal      0.30   0.51   0.68   0.85    0.87    1.18    2.19    2.02
+axpy      0.43   0.60   0.75   0.93    1.67    2.50    1.90    1.58
+```
+
+Defaults corrected to the measured crossings: `dot` 65536 (unchanged), `asum` **131072**, `axpy`
+**131072**, `scal` **262144**. At the old floor `asum` was taking a route **41% slower** than the one
+it displaced. The ordering tracks STREAM COUNT — the one-stream reduction turns earliest, the
+read-modify-write form last — which is why four constants and not one shared cut. Routing
+re-verified per operation against its own call counter.
+
+⚠ **A FLOOR-GATED MEASUREMENT COULD NOT HAVE FOUND THIS.** The previous probe timed the PUBLIC entry
+against the displaced kernel, and the entry takes ZA only at or above its floor, so every sub-floor
+row compared the same kernel against itself — and nothing in the output said so. A knob cannot be
+calibrated by an instrument the knob steers.
+
+⛔ **GATE RATIO UNMEASURED** (req#9): these are kernel-against-kernel ratios, not PB against a
+reference. Raising a floor is conservative — it restores the kernel SME displaced, so it cannot fall
+below the pre-SME baseline — but that is an argument, not a number.
+
+### ✅ FIXED — THE SIDE-R SOLVE HAD TWO ROUTE DEFECTS (2026-10-17)
+
+`_trsm_right!` carried a fused substitution leaf (`_trsm_rl_split_f64!`, the kernel `potrf`'s panel
+solve uses) that **only the lower triangle could reach**, and it took that leaf even at the widths
+where the recursion's trailing products are stronger.
+
+**Defect 1 — an upper triangle is the same leaf with the coefficients transposed.** `Λ = Aᵀ` is lower
+whenever A is upper, so `X·A = B` is `X·Λᵀ = B` and `X·Aᵀ = B` is `X·Λ = B`: each upper case is the
+lower case carrying the opposite transpose flag, for one O(k²) triangle copy the lower non-transpose
+arm already paid under the same amortization test. The alternative is the recursion, whose trailing
+products only reach the SME route above `2·_SME_MR` — at m=5000, k=50 it issues ZERO SME products
+while a standalone product on the same operand shape sustains 250 GF/s.
+
+**Defect 2 — the leaf must decline where the recursion's products are EXACT SME tiles.** Leaf time /
+recursion time, both triangles, m from k to 40·k:
+
+```
+k              50      100      128      200      400      512
+leaf/recursion  0.60-0.94  0.63-0.81  1.12-1.56  0.68-0.78  0.75-0.84  1.07-1.37
+```
+
+`_sme_tile_ok`'s exact arm admits a tile from `2·_SME_MR` when both extents are whole `_SME_MR`
+blocks, while a ragged tile of the same size is slower than the NEON path and waits for
+`_SME_MIN_EXACT`. The split is `k ÷ 2`, so the modulus is `2·_SME_MR` — which is why k=400 is
+divisible by `_SME_MR` and still ragged at its split.
+
+Result, one thread, median: tall-narrow upper **1.26-1.66x**, 512 square **1.45x** upper and **1.56x**
+lower, k=128 m=5120 **2.71x**, `potrf` lower **1.09-1.22x** at n=256..2048. No cell of a 60-cell map
+regresses. Worst residual 2.9e-15 over 8 triangle/transpose/diagonal combinations × 12 widths × 7
+heights, plus views.
+
+⛔ **An m/k aspect-ratio rule was the first hypothesis and the map falsified it** — m/k over 1..40
+changes nothing, only `k` does. ⛔ **Widening `_trsm_base` so a narrow triangle is inverted whole is
+also falsified**: +24% at 64 and +89% at 128, with residuals identical at all five swept widths.
+
+⚠ `potrf` UPPER is on side **L** and a side-L control at six panel shapes measures identical with and
+without the change (0.1-0.8%), so an 11% cross-session potrf-upper difference is NOT attributable
+here. ⚠⚠ **A `git stash` in a live Revise session KILLED THE SME ENTRY** — zero SME calls everywhere,
+still zero after `git stash pop`, and a potrf A/B that read as a 4x win which was really SME-on
+against SME-off. An A/B across a stash needs a session restart per arm and a re-asserted witness.
 
 ### ⚠ OPEN — THE REMAINING ORPHANS (2026-10-17)
 

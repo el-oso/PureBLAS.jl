@@ -654,6 +654,97 @@ function calibrate_sme_inplace_njp(::Type{T} = Float64) where {T}
     return Pair{String, Any}["sme_inplace_njp" => pin]
 end
 
+# ── sme_{dot,asum,scal,axpy}_min: where a fixed ZA prologue disappears into the stream ──────────────
+# DECOMPOSITION ROUTE, no runtime hook needed: each floor selects between two kernels that are both
+# separately callable, so the crossover is measured by timing them against each other instead of by
+# moving the floor and timing the public entry. That distinction is load-bearing. The entry takes the
+# ZA route only at or above its floor, so a floor-gated sweep compares the SAME kernel against itself
+# at every candidate below the floor and reports a clean row that means nothing — a knob cannot be
+# calibrated by an instrument the knob steers.
+#
+# COLD REGIME, because that is what BLAS-1 is graded in: `evals = 1` re-runs setup per sample, so
+# every call gets a freshly allocated operand touched once. Warm, a rep loop amortizes the prologue
+# over many passes and the crossing sits 16-64x lower, which is a different question.
+#
+# THE FOUR DO NOT SHARE A CROSSING — it tracks the operation's stream count, the one-stream reduction
+# turning earliest and the read-modify-write form last — so each is adjudicated separately and each
+# may pin, decline or tie on its own evidence.
+const SME_L1_MIN_GRID = (32768, 65536, 131072, 262144, 524288)
+
+"""Crossover for one ZA level-1 floor: the smallest grid size where the ZA kernel wins by the margin."""
+function _sme_l1_cross(key::String, ::Type{T} = Float64) where {T}
+    if !(PureBLAS._SME_F64 && PureBLAS._SME_DOT_ENTRY[] != C_NULL)
+        println("  $key: DECLINED — no live SME build, so the ZA kernels are not callable here.")
+        return nothing
+    end
+    ops = (
+        (key = "sme_dot_min", inc = PureBLAS._SME_DOT_MIN,
+         za = n -> (x = randn(T, n); y = randn(T, n); () -> PureBLAS._sme_dot(n, x, y)),
+         nb = n -> (x = randn(T, n); y = randn(T, n); () -> PureBLAS._dot_simd(n, x, y, T))),
+        (key = "sme_asum_min", inc = PureBLAS._SME_ASUM_MIN,
+         za = n -> (x = randn(T, n); () -> PureBLAS._sme_asum(n, x)),
+         nb = n -> (x = randn(T, n); () -> PureBLAS._asum_simd(n, x, T))),
+        (key = "sme_scal_min", inc = PureBLAS._SME_SCAL_MIN,
+         za = n -> (x = randn(T, n); () -> PureBLAS._sme_scal!(n, T(1.5), x)),
+         nb = n -> (x = randn(T, n); () -> PureBLAS._scal_simd!(n, T(1.5), x))),
+        (key = "sme_axpy_min", inc = PureBLAS._SME_AXPY_MIN,
+         za = n -> (x = randn(T, n); y = randn(T, n); () -> PureBLAS._sme_axpy!(n, T(1.5), x, y)),
+         nb = n -> (x = randn(T, n); y = randn(T, n); () -> PureBLAS._axpy_simd!(n, T(1.5), x, y))),
+    )
+    op = ops[findfirst(o -> o.key == key, ops)::Int]
+    gains, ok, drift = with_anchor(; tol = TOL) do
+        # estimator-ok: `median` IS the sanctioned estimator; `Measure.tstat` reduces ARM RATIOS, and
+        # each of these is one absolute latency with no arm to divide by until the gain below.
+        map(SME_L1_MIN_GRID) do n
+            tz = median(@be op.za(n) (f -> f()) evals = 1 seconds = 0.4).time
+            tn = median(@be op.nb(n) (f -> f()) evals = 1 seconds = 0.4).time
+            tn / tz
+        end
+    end
+    if !ok
+        @printf("  %s: REFUSED — machine state moved %.1f%% across the measurement\n", key, 100 * drift)
+        return nothing
+    end
+    @printf("  %-13s gains %s\n", key,
+            join((@sprintf("%d:%.2f", n, g) for (n, g) in zip(SME_L1_MIN_GRID, gains)), "  "))
+    # The floor belongs at the SMALLEST candidate the ZA route wins by more than the margin. Below it
+    # the route loses, and a floor sitting below its own crossing is the defect this measures away from.
+    i = findfirst(>(1 + DELTA), collect(gains))
+    if isnothing(i)
+        println("    ⇒ no pin: the ZA route does not win by the margin at any candidate on this " *
+                "grid, so this evidence cannot place a floor.")
+        return nothing
+    end
+    star = SME_L1_MIN_GRID[i]
+    if star == op.inc
+        @printf("    ⇒ no pin: the crossover is the in-code default (%d). That is a result.\n", op.inc)
+        return nothing
+    end
+    @printf("    ⇒ WINNER %s=%d (incumbent %d)\n", key, star, op.inc)
+    return star
+end
+
+# One calibrator per floor rather than one that returns four pins: each knob then appears on its own
+# line of the tuner's output and in `KNOBS`, and `test/knob_registry_tests.jl` reads the emitted keys
+# out of these literals — a loop pushing computed keys would leave that lint seeing none of them and
+# the registry still calling all four orphaned.
+function calibrate_sme_dot_min(::Type{T} = Float64) where {T}
+    v = _sme_l1_cross("sme_dot_min", T)
+    return isnothing(v) ? Pair{String, Any}[] : Pair{String, Any}["sme_dot_min" => v]
+end
+function calibrate_sme_asum_min(::Type{T} = Float64) where {T}
+    v = _sme_l1_cross("sme_asum_min", T)
+    return isnothing(v) ? Pair{String, Any}[] : Pair{String, Any}["sme_asum_min" => v]
+end
+function calibrate_sme_scal_min(::Type{T} = Float64) where {T}
+    v = _sme_l1_cross("sme_scal_min", T)
+    return isnothing(v) ? Pair{String, Any}[] : Pair{String, Any}["sme_scal_min" => v]
+end
+function calibrate_sme_axpy_min(::Type{T} = Float64) where {T}
+    v = _sme_l1_cross("sme_axpy_min", T)
+    return isnothing(v) ? Pair{String, Any}[] : Pair{String, Any}["sme_axpy_min" => v]
+end
+
 const KNOBS = (
     (name = "gemm_mt_work", fn = calibrate_gemm_mt_work),
     (name = "gemv_mr", fn = calibrate_gemv_mr),
@@ -665,6 +756,10 @@ const KNOBS = (
     (name = "trmv_fused_min", fn = calibrate_trmv_fused_min),
     (name = "gbtrf_cmult", fn = calibrate_gbtrf_cmult),
     (name = "sme_inplace_njp", fn = calibrate_sme_inplace_njp),
+    (name = "sme_dot_min", fn = calibrate_sme_dot_min),
+    (name = "sme_asum_min", fn = calibrate_sme_asum_min),
+    (name = "sme_scal_min", fn = calibrate_sme_scal_min),
+    (name = "sme_axpy_min", fn = calibrate_sme_axpy_min),
 )
 
 # ── driver ──────────────────────────────────────────────────────────────────────────────────────────
