@@ -27,11 +27,16 @@
 # threaded join, which a per-thread buffer cannot survive. `gpackA`/`gpackB` → `_gpackws` (cooperative
 # A-packing meets the other workers at a barrier while the packed B panel is live), `str`/`strbt` →
 # `_strws` (the Winograd recursion hands each leaf to the threaded path while holding its level
-# slots), `m3` → `_m3ws`
-# (`_trmm_dual!`/`_trsm_dual!` claim it and then call the PUBLIC `trmm!`/`trsm!` on the planes, whose
-# join yields, with no arena scope on that path for the depth guard to help). A per-thread buffer held
-# across a join is the shape that measured `getrf!` wrong 20 times in 96. See the threading note in
-# workspace.jl for each.
+# slots), `m3` → `_m3ws` (`_trmm_dual!`, `_trsm_dual!` and `_syrk_dual!` each claim it and then call
+# the PUBLIC `trmm!`/`trsm!`/`syrk!` on the planes, whose join yields, with no arena scope on that path
+# for the depth guard to help). A per-thread buffer held across a join is the shape that measured
+# `getrf!` wrong 20 times in 96. See the threading note in workspace.jl for each.
+#
+# ⚠ `_gemm_dual3!` HOLDS `_m3ws` AND DOES NOT CROSS A JOIN — it issues `_gemm_core_out!`, which is the
+# `@noinline` twin of `_gemm_core!` and sits BELOW the pool. Judged on that caller alone the owner
+# could be per-thread. It cannot be: the three above share the buffer and do cross, and the tier is a
+# property of the OWNER, not of whichever holder you happen to be reading. Stated because the
+# single-caller argument is the plausible-looking way to break this.
 #
 # THE TWO HAZARDS, AND EXACTLY HOW FAR THE EXPANSION-TIME CHECKS GO.
 #   * A borrow ESCAPING its scope would read memory the next borrow overwrites. `@scope` rejects the
