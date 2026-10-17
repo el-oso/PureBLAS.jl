@@ -140,10 +140,16 @@ function calibrate_gemvt_window()
             if !ok
                 @printf("    n=%-5d REFUSED (machine moved %.1f%%) — treated as don't-care\n", n, 100 * drift)
                 obs[n] = nothing
-            elseif r.lo > 1.0
+            # BOTH BARS, the same two `decide` applies: a CI excluding 1.0 says the difference is
+            # resolvable, and the `DELTA` margin says it is worth acting on. The margin stops a
+            # window being fitted to an effect too small to adjudicate — req#1 settles the gate at two
+            # significant digits because per-cell drift on this fleet runs 1-6%, so a ratio inside the
+            # margin rounds to 1.00 and is a tie by the project's own criterion however tight its
+            # interval happens to come out in one process.
+            elseif r.lo > 1.0 && r.ratio > 1 + DELTA
                 @printf("    n=%-5d percol  %.4f [%.4f, %.4f]  WINS\n", n, r.ratio, r.lo, r.hi)
                 obs[n] = true
-            elseif r.hi < 1.0
+            elseif r.hi < 1.0 && r.ratio < 1 - DELTA
                 @printf("    n=%-5d blocked %.4f [%.4f, %.4f]  wins\n", n, r.ratio, r.lo, r.hi)
                 obs[n] = false
             else
