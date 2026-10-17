@@ -201,6 +201,24 @@ end
 
 _kr_esc(s) = replace(strip(s), "|" => "\\|", "\n" => " ")
 
+"Split a `# PDM:` body into its justification and its ` | tune: …` tail."
+function _kr_split(pdm::AbstractString)
+    occursin("|", pdm) || return (pdm, "")
+    a, b = split(pdm, "|"; limit = 2)
+    return (strip(a), replace(strip(b), r"^tune:\s*" => ""))
+end
+
+# A knob is ORPHANED when its marker DECLARES no calibrator, which is the literal `none`. An empty
+# tail is not the same claim: it is undeclared, counted separately so a marker that says nothing
+# cannot pass as a verdict either way.
+function _kr_orphaned(pdm::AbstractString)
+    _, tune = _kr_split(pdm)
+    t = lowercase(strip(tune))
+    return t == "none" || startswith(t, "none ") || startswith(t, "none—") || startswith(t, "none,")
+end
+
+_kr_undeclared(pdm::AbstractString) = isempty(strip(_kr_split(pdm)[2]))
+
 "Render the registry as the markdown of docs/src/knobs.md."
 function knob_markdown()
     rows = knob_rows()
@@ -218,6 +236,7 @@ function knob_markdown()
     println(io, "|---|---|")
     println(io, "| **Derived** | Default is a formula over detected hardware consts. |")
     println(io, "| **Measured** | Not derivable — the optimum depends on something we cannot detect. Wants a `tune!()` pin. |")
+    println(io, "| **Measured, orphaned** | Measured with no calibrator in `bench/calibrate.jl`, so `tune!()` can never set it and the pin it wants is unreachable. Its `tune!()` cell reads `none`. A missing tool, not a missing verdict — the tier says where the number came from and does not change when a calibrator arrives. |")
     println(io, "| **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |")
     println(io, "| **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |")
     println(io)
@@ -232,8 +251,15 @@ function knob_markdown()
         forms[r.form] = get(forms, r.form, 0) + 1
     end
     unaud = get(tiers, "Unaudited", 0)
+    # Measured splits by whether a calibrator exists, which the marker declares as `tune: none`. The
+    # count is reported because a Measured knob with no calibrator asks for a pin nothing can supply,
+    # and that is invisible in a flat tally.
+    orph = count(r -> r.tier == "Measured" && _kr_orphaned(r.pdm), rows)
+    meas = get(tiers, "Measured", 0)
     print(io, "**Tier:** ")
-    println(io, join(["$(get(tiers, t, 0)) $t" for t in _KR_TIERS if get(tiers, t, 0) > 0],  " · "),
+    println(io, join([t == "Measured" && meas > 0 ?
+                      "$meas Measured ($(meas - orph) calibrated · $orph orphaned)" :
+                      "$(get(tiers, t, 0)) $t" for t in _KR_TIERS if get(tiers, t, 0) > 0], " · "),
             unaud > 0 ? " · **$unaud Unaudited**" : "", ".")
     print(io, "**Default form** (mechanical): ")
     println(io, join(["$(get(forms, f, 0)) $f" for f in ("formula", "delegates", "sibling", "literal", "flag", "other") if get(forms, f, 0) > 0], " · "), ".")
@@ -260,12 +286,7 @@ function knob_markdown()
         end
         # The marker's ` | tune: …` tail is a SEPARATE column, not text — escaping it into the prose
         # (`\|`) is what it looked like first, and it read as noise.
-        why, tune = if occursin("|", r.pdm)
-            a, b = split(r.pdm, "|"; limit = 2)
-            (strip(a), replace(strip(b), r"^tune:\s*" => ""))
-        else
-            (r.pdm, "")
-        end
+        why, tune = _kr_split(r.pdm)
         println(io, "| `$(r.key)` | $(r.form) | $(r.tier) | $(isempty(why) ? "—" : _kr_esc(why)) | ",
                 isempty(tune) ? "—" : _kr_esc(tune), " |")
     end
@@ -274,6 +295,28 @@ function knob_markdown()
     println(io)
     println(io, "Const names, defaults and files are deliberately NOT tabulated: they are one `grep` away")
     println(io, "and made this table too wide to read. The knob key is the identifier that matters.")
+
+    # ── the Measured knobs no calibrator can reach ────────────────────────────────────────────────
+    orphans = [r for r in rows if r.tier == "Measured" && _kr_orphaned(r.pdm)]
+    if !isempty(orphans)
+        println(io)
+        println(io, "## Orphaned Measured knobs")
+        println(io)
+        println(io, "$(length(orphans)) of the $(get(tiers, "Measured", 0)) Measured knobs have no entry in")
+        println(io, "`bench/calibrate.jl`, so `tune!()` cannot set them however many times it runs. The tier is")
+        println(io, "still correct — the value was reached by measurement — but the pin it asks for is")
+        println(io, "unreachable until a calibrator exists. Each row's `tune!()` cell reads `none`, and the")
+        println(io, "handle after it is what a person would sweep by hand meanwhile.")
+        println(io)
+        println(io, "| Knob | Hand-sweep handle |")
+        println(io, "|---|---|")
+        for r in orphans
+            _, tune = _kr_split(r.pdm)
+            h = replace(strip(tune), r"^none\s*[—-]?\s*" => "")
+            h = replace(h, r"^orphaned\s*[;:]\s*" => "")
+            println(io, "| `$(r.key)` | ", isempty(h) ? "—" : _kr_esc(h), " |")
+        end
+    end
 
     # ── the constants that are NOT preference keys ────────────────────────────────────────────────
     bare = bare_rows()

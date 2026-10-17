@@ -32,7 +32,7 @@ const _SME_L1_BLK = 4 * _SME_L
 # serial chain, so this is a dependency-depth choice, not a residency or width one; the optimum
 # inverts either side of two (566 / 1000 / 973 / 628 GB/s at one / two / four / eight).
 # | tune: candidate, (1,2,4,8)
-# PDM: Measured — every fmla into one ZA slice is a serial chain, so this is dependency depth, not residency or width; the optimum inverts either side of two. | tune: candidate, (1,2,4,8)
+# PDM: Measured — every fmla into one ZA slice is a serial chain, so this is dependency depth, not residency or width; the optimum inverts either side of two. | tune: none — orphaned; candidates (1,2,4,8)
 const _SME_L1_G = @load_preference("sme_l1_groups", 2)::Int   # req8-ok: swept, see the table above
 
 function _sme_l1_ir(G::Int, kind::Symbol)
@@ -179,9 +179,9 @@ const _SME_ASUM_CALLS = Threads.Atomic{Int}(0)
 # Floors placed one step above each, because a floor set from the wrong regime is what put dot
 # at 0.842 of OpenBLAS on the first attempt.
 # PDM: Measured — where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | tune: sweep n
-# PDM: Measured — where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | tune: sweep n
+# PDM: Measured — where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | tune: none — orphaned; sweep n
 const _SME_DOT_MIN  = @load_preference("sme_dot_min", 65536)::Int   # req8-ok: measured crossover, table above
-# PDM: Measured — the same crossing for the one-stream form, which turns later because half the outstanding requests. | tune: sweep n
+# PDM: Measured — the same crossing for the one-stream form, which turns later because half the outstanding requests. | tune: none — orphaned; sweep n
 const _SME_ASUM_MIN = @load_preference("sme_asum_min", 65536)::Int  # req8-ok: measured crossover, table above
 
 const _SME_DOT_TRAMPOLINE  = Ref{Any}(nothing)
@@ -283,7 +283,7 @@ end
 # GROUP COUNT is not the same optimum as `dot`'s, because each group here carries a load AND a
 # store, so groups buy independent memory streams rather than only independent dependency chains:
 # scal reads 477 / 563 / 550 GB/s at two / four / eight groups, axpy 561 / 727 / 671.
-# PDM: Measured — each group carries its own load and store, so this is stream count and dependency depth together, not residency or width. | tune: candidate, (1,2,4,8)
+# PDM: Measured — each group carries its own load and store, so this is stream count and dependency depth together, not residency or width. | tune: none — orphaned; candidates (1,2,4,8)
 const _SME_RMW_G = @load_preference("sme_rmw_groups", 4)::Int   # req8-ok: swept, see the rates above
 
 # `kind` is `:scal` (`y = a*x`, called in place) or `:axpy` (`y = y + a*x`).
@@ -459,9 +459,9 @@ end
 # instruction mix — a staged kernel (copy / +zero / +fmla / +read) called once per sample on a
 # REUSED buffer shows no penalty at any stage. It appears only with a freshly allocated operand per
 # call, which is what the gate does and what a real caller streaming over new data does.
-# PDM: Measured — where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | tune: sweep n
+# PDM: Measured — where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | tune: none — orphaned; sweep n
 const _SME_SCAL_MIN = @load_preference("sme_scal_min", 65536)::Int   # req8-ok: measured crossover, table above
-# PDM: Measured — the same cold crossing for the three-stream form. | tune: sweep n
+# PDM: Measured — the same cold crossing for the three-stream form. | tune: none — orphaned; sweep n
 const _SME_AXPY_MIN = @load_preference("sme_axpy_min", 65536)::Int   # req8-ok: measured crossover, table above
 
 @inline _sme_scal_ok(::Type{T}, n::Int, x) where {T} =

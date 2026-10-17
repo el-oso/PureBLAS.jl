@@ -528,12 +528,15 @@ end
 # measured, which is the better resting state for a route every BLAS-3 routine reaches.
 #
 # WHY THE CUT IS RESIDENCY AND NOT AN ALIASING PREDICATE. `_alias_ld` exists for this class of
-# problem, but its period is `_L1_WAY_D` = L1 ÷ associativity, and associativity comes from a CPUID
-# leaf that does not exist on aarch64 — `_L1D_ASSOC` is the fallback 8 here, not a detected value. So
-# `_alias_ld` is false for every stride that actually loses on this machine (lda = 256, 512, 768,
-# 1024), and a set-conflict criterion cannot be founded on a number we are guessing. A residency cut
-# holds for any stride; widening it to admit friendly strides is left open, and the 7-20% it gives up
-# at blocks of 5-30 L1-fuls is recorded above rather than claimed.
+# problem, and its period `_L1_WAY_D` = L1 ÷ associativity is sound on this part even though
+# `_L1D_ASSOC` is the fallback 8 on aarch64 rather than a CPUID reading: a pointer chase over `n`
+# addresses one period apart, linked into a random cycle so no prefetcher can run ahead, holds L1
+# latency through n = 8 and has fallen to L2 latency by n = 10, which places the associativity at 8
+# (bench/probes/l1d_assoc.jl). So the predicate is founded on a measured number, not a guessed one.
+# A residency criterion is still the right one here because it holds at ANY stride; the set-count
+# criterion `_sme_inplace_njp` keys on separates strides only by how many sets their columns
+# occupy, which is a different question. The 7-20% this cut gives up at blocks of 5-30 L1-fuls is
+# recorded above rather than claimed.
 # req8-ok: a coefficient over the DETECTED L1 with the falsifying tables above, not a fitted magic
 # number — the criterion is A-block residency, and the coefficient sits one step inside the measured
 # flip so a caller with its own cache traffic does not land on the edge.
@@ -546,9 +549,112 @@ const _SME_INPLACE_MAX =
     return ov > 0 ? ov : _SME_INPLACE_MAX
 end
 
-@inline function _sme_inplace_a(mce::Int, kce::Int, alpha::Float64, tA::Bool)
+# RATIO DIRECTION IN THIS BLOCK. The cost tables divide in-place time by packed time, or a candidate
+# cut's time by the shipped cut's, so higher is WORSE. The one speedup table says so where it sits,
+# and there higher is better.
+#
+# The macrokernel re-reads the A block once per column panel, so `njp` is the multiplier on an
+# in-place walk's cost: `njp` strided passes over the block against one strided pass plus `njp`
+# contiguous ones. There is no closed form over the block's size and its page geometry that places
+# the crossover — with A held at 64x2048 so neither moves, in place reads 2.36x at njp=4, 1.85x at
+# njp=16 and 0.94x at njp=64, and holding njp while varying the columns per page from 1 to 32 moves
+# the MAGNITUDE (1.52x to 2.40x) without moving the crossover.
+#
+# WHERE THE CUT SITS AND WHY NOT HIGHER. A shape loses as soon as the cut admits its own panel count:
+# square gemm reads 1.078 at a cut of 32 (njp = 32 there) and 1.079 at a cut of 64 at n = 1024
+# (njp = 64), both gate cells. Everything the rank-k ops have to gain is already in by 16 — syrk at
+# n = 512 reads 0.883 at a cut of 16 and 0.880 to 0.883 at 24, 32 and 64, inside their own SE. So 16
+# is the largest value that is both saturating and safe AT THE FOUR-SET COLUMN GEOMETRY THOSE SQUARE
+# SHAPES HAVE (lda = n = 512 puts the columns in four L1 sets); `_sme_inplace_njp` halves it
+# where a stride puts every column in ONE L1 set.
+# A SECOND ROUTE MEASURES THE CROSSOVER, AND IT CANNOT RAISE THIS CUT. `bench/calibrate.jl` searches
+# no cuts: it times the pack alone (`P`) and the marginal cost of one column panel with packed strides
+# (`C`) and with in-place strides (`S`), differenced between two `njp` values so the kernel's fixed
+# streaming-entry cost cancels, and reports `njp* = P/(S-C)`. That divisor is about a seventh of
+# either panel time, so a 1% error in one of them moves `njp*` by some 7%: at the four-set geometry of
+# the square gate shapes, seventeen cold processes span 13.2 to 23.0. What it locates is where packing
+# starts to pay, which is not the property this cut carries — the bound above is the largest cut that
+# loses no gate shape, and the cuts between 16 and a losing shape's own panel count are unmeasured.
+# So the calibrator caps its grid at this value and can only lower the cut: every draw in that
+# measured range rounds back onto 16 and pins nothing, and only a draw near 8 would move it.
+# (bench/probes/sme_inplace_njp.jl for the
+# end-to-end table, sme_inplace_njp_sweep.jl for the cut value, sme_inplace_njp_l3sz.jl for the gemm
+# gate; each declares the regime its figures belong to.)
+# PDM: Measured — the column-panel re-read count at which packing A starts to pay, for a stride whose columns spread over two or more L1 sets; neither block size nor page geometry places it, and the value is bounded above by the gate cells that lose when the cut admits their own panel count. `_sme_inplace_njp` halves it for a one-set stride, which it identifies from the detected `_L1_WAY_BYTES`. | tune: 2 s; _EXPINT[10] sweeps it by hand
+# req8-ok: a measured crossover bounded above by the two gate cells that lose when the cut reaches their own panel count -- the tables above are the whole justification. It is the value for a stride whose columns spread over two or more L1 sets; the one-set case takes half of it, from the cross-process table beside `_sme_inplace_njp`, and which strides those are is derived from the detected `_L1_WAY_BYTES`.
+const _SME_INPLACE_NJP = @load_preference("sme_inplace_njp", 16)::Int
+
+# A COLUMN STRIDE THAT PUTS EVERY COLUMN IN ONE L1 SET HALVES THIS CUT. The in-place walk reads one
+# cache line per MR-row micro-panel per k-step, `lda*sizeof(T)` bytes apart, so those lines occupy
+#     sets = _L1_WAY_BYTES / gcd(lda*sizeof(T), _L1_WAY_BYTES)
+# distinct L1 sets, and the cost of one in-place column panel against one packed panel is a step
+# function of THAT COUNT, not of the stride's magnitude. Differencing two `njp` values so the kernel's
+# fixed entry cost cancels, with the strides PAIRED — two per set count, 2-3x apart in magnitude, so
+# magnitude is controlled (bench/probes/sme_inplace_njp_sets.jl):
+#     sets            16        8          4          2          1
+#     cost ratio    1.00      1.10       1.12       2.20       4.68
+#     lda pair   128/384   256/768   512/1536  1024/3072  2048/4096
+# Inside each group the two strides agree to 1-2%; between groups they differ up to 4x. Block size and
+# columns per page do not place the crossover; this count does, and it comes from a detected constant.
+# One set is exactly `lda*sizeof(T) % _L1_WAY_BYTES == 0` — `_alias_ld` (level3.jl) spells the same
+# test in doubles, but that file is included after this one, so the byte form off `_L1_WAY_BYTES` is
+# used here, as `level2.jl` does for the same reason. Two sets behave like four and keep the flat cut.
+#
+# EVERY FIGURE FOR THIS BRANCH IS CROSS-PROCESS, AND HAS TO BE. The in-place arm's cost is drawn per
+# PROCESS and then held for that process's life — 14 fresh operand sets inside one process span 1.10x
+# and agree on the verdict, while cold processes span 2.6x — so a warm session reports ONE draw with a
+# convincing SE, and two such sessions on identical source disagree in SIGN. The draws also drift and
+# cluster over minutes, so cells must be sampled ROUND-ROBIN, one draw each per round: nine
+# consecutive draws of one cell and then nine of the next align the drift with the variable under
+# test, and a table built that way reverses between runs. Below: 15 rounds, arms paired INSIDE each
+# process, SPEEDUP of the halved cut over the flat cut, so above 1.00 the halving pays.
+#     lda    n   njp   sets      p10   median      p90   rounds won
+#    1536  256    16      4    0.998    1.000    1.001   control, predicate false
+#    3072  256    16      2    0.992    1.001    1.005   control, predicate false
+#    2048  128     8      1    0.989    1.000    1.005    7/15
+#    4096  128     8      1    0.998    1.001    1.005   10/15
+#    2048  256    16      1    0.959    1.012    1.282    8/15
+#    4096  256    16      1    1.235    1.547    1.690   15/15
+# The two controls are a NULL CHECK ON THE HARNESS rather than evidence about the gate: at a
+# predicate-false stride both arms return the flat cut, so they run the same code, and 1.000/1.001 is
+# what a working instrument must report there. What keeps the gate shapes safe is the identity
+# instead — the predicate is false for every `lda` that is not a multiple of
+# `_L1_WAY_BYTES / sizeof(T)`, and there this function returns `_SME_INPLACE_NJP` for every override
+# value, exactly as a cut taking no `lda` would. No one-set cell loses in the median, and the p10/p90
+# spread at lda=2048 n=256 is the shape of the gain — small losses against large wins, which is why
+# the estimator is a median over pooled rounds and not a mean over a batch.
+#
+# THE TEST ITSELF COSTS NOTHING, CHECKED RATHER THAN ASSUMED. `_sme_blocks` gives ONE (ic, pc)
+# iteration for every square gate shape up to n = 512 and two at n = 1024, so this admission test runs
+# once or twice per gemm call; at n = 128 the residency cap admits before it is reached at all. Cold
+# round robin against a build whose cut takes no `lda`, arms interleaved with the within-pair order
+# flipped each round, 15 rounds, old over new: medians 1.0014 / 1.0000 / 1.0016 / 1.0004 / 0.9994 /
+# 1.0008 at gemm 128 / 192 / 256 / 512 / 1024 and syrk 512, every one inside 0.16% of flat. gemm 192,
+# the shape the admission is worth most on, spans only 0.9987 to 1.0013 across all 15 rounds.
+#
+# A QUARTER of the cut is NOT safe: it reads 1.172 at lda=4096 njp=8 and 1.129 at lda=2048 njp=16 but
+# 0.891 at lda=2048 njp=8, and a cut that regresses a cell is inadmissible here. Halving is the
+# largest reduction that pays or holds at every cell measured.
+
+@inline function _sme_inplace_njp(lda::Int)
+    ov = @inbounds _EXPINT[10]          # sweep override; 0 = the shipped cut, negative = residency only
+    ov == 0 || return ov
+    return (lda * sizeof(Float64)) % _L1_WAY_BYTES == 0 ? _SME_INPLACE_NJP >> 1 : _SME_INPLACE_NJP
+end
+
+# TWO ADMISSIONS, ANSWERING DIFFERENT QUESTIONS. The residency cut keeps the strided re-reads CHEAP by
+# holding the block in L1; this one keeps them FEW. At a small column-panel count the pack cannot
+# amortize whatever the block's size, so a block far above the residency cut still wants to be read
+# in place.
+@inline function _sme_inplace_a(mce::Int, kce::Int, njp::Int, lda::Int, alpha::Float64, tA::Bool)
     (!tA && alpha == 1.0 && !(@inbounds _EXPFLAG[_EXP17])) || return false
-    return mce * kce <= _sme_inplace_cap()
+    mce * kce <= _sme_inplace_cap() && return true
+    njp <= _sme_inplace_njp(lda) || return false
+    # Witness: the widest panel count this branch has admitted, so a sweep can tell a shape that
+    # declined the branch from one the knob never reached. Diagnostic only -- a racing update
+    # under-reports and changes nothing the kernel reads.
+    @inbounds _EXPINT[11] = max(_EXPINT[11], njp)
+    return true
 end
 
 # The same trick on the other operand, and the transpose condition is the MIRROR of A's: the kernel
@@ -584,7 +690,7 @@ end
 # So KC is made as large as a packed-panel memory budget allows (minimizing C passes) rather than
 # sized for L1 residency, and NC spans the whole of n so A is packed exactly once. MC then sets
 # the A-panel working set against L2.
-# PDM: Measured — a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | tune: sweep
+# PDM: Measured — a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | tune: none — orphaned; sweep
 const _SME_PANEL_BUDGET = @load_preference("sme_panel_bytes", 64 * 1024 * 1024)::Int
 
 @inline function _sme_blocks(m::Int, n::Int, k::Int)
@@ -700,7 +806,7 @@ function _sme_gemm!(
                 mce = min(MC, m - ic)
                 mpad = cld(mce, MR) * MR
                 local pa::Ptr{Float64}, aip::Int, aks::Int
-                if _sme_inplace_a(mce, kce, alpha, tA)
+                if _sme_inplace_a(mce, kce, njp, lda, alpha, tA)
                     # A itself IS the panel: the kernel walks it at `lda` and no copy happens.
                     pa = A + (ic + pc * lda) * 8
                     aip = MR
@@ -760,9 +866,9 @@ end
 #
 # Sampling every OTHER n hides this: a 2-step sweep reads 48, 56, 64 and concludes 3*MR is safe,
 # which regressed gemm@50 by 38% (1142 -> 1582 us) before the dense sweep found 49, 51, 53.
-# PDM: Measured — tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | tune: sweep
+# PDM: Measured — tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | tune: none — orphaned; sweep
 const _SME_MIN = @load_preference("sme_min", 6 * _SME_MR)::Int
-# PDM: Measured — the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | tune: sweep
+# PDM: Measured — the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | tune: none — orphaned; sweep
 const _SME_MIN_EXACT = @load_preference("sme_min_exact", 3 * _SME_MR)::Int
 
 # THE KERNEL MUST NOT ENTER THE PACKAGE IMAGE, and `@noinline` alone does not achieve that.
@@ -2600,7 +2706,7 @@ end
 #     G=8          -   479   402   435
 #
 # Four is the best or within noise of it at every size and the ladder is flat from there.
-# PDM: Measured — each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | tune: candidate, (1,2,4,8)
+# PDM: Measured — each group carries its own load, accumulates and store, so this is stream count and dependency depth together, not residency or width. | tune: none — orphaned; candidates (1,2,4,8)
 const _SME_GER_G = @load_preference("sme_ger_groups", 4)::Int   # req8-ok: swept, see the table above
 
 # The groups span COLUMNS, so a matrix narrower than G needs a narrower kernel; the driver picks the

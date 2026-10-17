@@ -90,6 +90,9 @@ const _TUNABLE_KEYS = (
     "brd_nb", "sytrf_cmult",
     # written by bench/calibrate.jl's KNOBS but previously unlisted here:
     "gemvt_percol_window", "gemvt_pf", "trmv_fused_min", "gbtrf_cmult",
+    # The SME in-place-A column-panel cut. Its calibrator decomposes the crossover instead of duelling
+    # candidates, so it adds no member to the multiple-comparison family `_TUNE_NKNOBS` splits.
+    "sme_inplace_njp",
     # The threading amortisation floor. Its calibrator is the only one that needs a THREADED process, so
     # it DECLINES on `julia` with one thread rather than pinning a number it could not measure — which is
     # why the knob shipped with no calibrator at all and one Zen4 recording behind it.
