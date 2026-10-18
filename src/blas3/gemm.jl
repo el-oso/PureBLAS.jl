@@ -1216,22 +1216,40 @@ function _gemm_unpacked_mr1!(
 end
 # Tall split-reduction microkernel: MR row-blocks × NR cols, S independent partial accumulators per cell,
 # summed at store — keeps MR·NR·S (=_ILP_TARGET) chains live from k=0 to cover the short-k fill the wide
-# tile leaves exposed. Full tile only (mr rows × NR cols, all in bounds); partials delegate to the wide
-# masked/edge kernels. Same store/beta folding as _microkernel_unpacked!. req#8; Zen4 n=32 0.85→1.07×.
+# tile leaves exposed. Full COLUMN tile (NR cols in bounds); a partial row block is handled here under
+# MASK, and a partial column tile goes to the edge kernel. Same store/beta folding as
+# _microkernel_unpacked!. req#8; Zen4 n=32 0.85→1.07×.
+# MASK=true computes a row block whose live row count `mre` is NOT a multiple of W: dead lanes load as
+# zero, contribute zero to every chain, and are dropped at the store. A LIVE ROW THEREFORE SUMS k IN
+# EXACTLY THE ORDER IT WOULD UNMASKED — same S chains, same fold — which is what lets the driver send
+# every row block here regardless of alignment. That uniformity is a req#11 requirement, not a tidiness
+# one: the block decomposition depends on how a caller split m, so a decomposition-dependent choice of
+# kernel makes the result depend on the worker count.
+#
+# MASK=false emits no lane arithmetic at all, so the aligned path keeps the code it was measured with.
 @generated function _microkernel_unpacked_split!(
         C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir::Int,
-        B::Ptr{T}, ldb::Int, jr::Int, k::Int, alpha::T, beta::T,
-        ::Val{MR}, ::Val{NR}, ::Val{S}, ::Val{TB}, ::Val{B0}
-    ) where {T, MR, NR, S, TB, B0}
+        B::Ptr{T}, ldb::Int, jr::Int, k::Int, alpha::T, beta::T, mre::Int,
+        ::Val{MR}, ::Val{NR}, ::Val{S}, ::Val{TB}, ::Val{B0}, ::Val{MASK}
+    ) where {T, MR, NR, S, TB, B0, MASK}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
+    if MASK
+        lanetuple = Expr(:tuple, (0:(W - 1))...)   # literal; a @generated body must be pure
+        push!(body.args, :(lanes = Vec{$W, Int}($lanetuple)))
+        for mi in 1:MR
+            push!(body.args, :($(Symbol(:msk, mi)) = (lanes + $((mi - 1) * W)) < mre))
+        end
+    end
     for mi in 1:MR, j in 1:NR, s in 0:(S - 1)
         push!(body.args, :($(Symbol(:c, mi, :_, j, :_, s)) = zero($V)))
     end
     step = (pex, s) -> begin
         q = quote end
         for mi in 1:MR
-            push!(q.args, :($(Symbol(:a, mi)) = vload($V, A + ((ir + $((mi - 1) * W)) + $pex * lda) * $sz)))
+            addr = :(A + ((ir + $((mi - 1) * W)) + $pex * lda) * $sz)
+            ld = MASK ? :(vload($V, $addr, $(Symbol(:msk, mi)))) : :(vload($V, $addr))
+            push!(q.args, :($(Symbol(:a, mi)) = $ld))
         end
         for j in 1:NR
             baddr = TB ? :(B + ((jr + $(j - 1)) + $pex * ldb) * $sz) : :(B + ($pex + (jr + $(j - 1)) * ldb) * $sz)
@@ -1264,7 +1282,13 @@ end
             for s in 1:(S - 1)
                 red = :($red + $(Symbol(:c, mi, :_, j, :_, s)))
             end
-            st = B0 ? :(vstore(av * $red, q)) : :(vstore(muladd(bv, vload($V, q), av * $red), q))
+            mk = Symbol(:msk, mi)
+            st = if MASK
+                B0 ? :(vstore(av * $red, q, $mk)) :
+                    :(vstore(muladd(bv, vload($V, q, $mk), av * $red), q, $mk))
+            else
+                B0 ? :(vstore(av * $red, q)) : :(vstore(muladd(bv, vload($V, q), av * $red), q))
+            end
             push!(
                 body.args, :(
                     let q = colp + $((mi - 1) * W * sz)
@@ -1278,8 +1302,48 @@ end
     return body
 end
 
-# Small-n split driver (wide AVX-512 only — caller gates on _SPLIT_OK). Full _SMR·W×_SNR tiles via the split
-# kernel; row remainder → wide masked-row kernel, col remainder → edge strip (reuse; remainders are small).
+# Vector-row dispatch for the split kernel: `vt` is a runtime count, `Val(MR)` a compile-time tile
+# height, and both the aligned and the masked driver branches need the same fan-out.
+#
+# THE ARMS ENUMERATE 1:_SMR AND THE `else` THROWS, because `_SMR` is NOT a hardware quantity:
+# `_at_gemm_split_mr` ignores its `hw` argument and reduces to `(_ILP_TARGET ÷ _GEMM_SPLIT_S) ÷ _SNR`,
+# so it is 4 only while `_GEMM_SPLIT_S` is 2 — and that const is tier-Literal and marked tunable. Under
+# S=1 it becomes 8 and a `vt` of 5..8 would otherwise fall to the widest arm and compute 3 vector rows
+# of up to 8, silently writing a short tile. A cold compare per row block is the right price for that.
+@inline function _split_rowtile!(
+        Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha::T, beta::T, mre::Int, vt::Int,
+        ::Val{MASK}, ::Val{TB}, ::Val{B0}
+    ) where {T, MASK, TB, B0}
+    if vt == _SMR
+        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta, mre,
+            Val(_SMR), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0), Val(MASK))
+    elseif vt == 1
+        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta, mre,
+            Val(1), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0), Val(MASK))
+    elseif vt == 2
+        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta, mre,
+            Val(2), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0), Val(MASK))
+    elseif vt == 3
+        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta, mre,
+            Val(3), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0), Val(MASK))
+    else
+        throw(ArgumentError("split row tile vt=$vt outside 1:$(_SMR); _GEMM_SPLIT_S moved and this cascade did not"))
+    end
+    return nothing
+end
+
+# Small-n split driver (wide AVX-512 only — caller gates on _SPLIT_OK). EVERY row block under a full
+# column tile goes through the split kernel, W-aligned or not — the aligned ones unmasked, the ragged
+# tail masked. Column remainder → edge strip.
+#
+# THE ROW BLOCKS MUST NOT DISAGREE ON KERNEL, and that is a correctness constraint before it is a
+# performance one. A block's row count depends on the extent the CALLER holds, and the two carvings do
+# not nest: `_trsm_rchunk` bands side-R rows in `_MR·W` = 16 while this driver tiles in `_SMR·W` = 32,
+# so m=41 is 32+9 unsplit and 16, 25 banded, which places the same rows in an aligned block one way and
+# a ragged block the other. Every block therefore takes THIS one kernel with `_GEMM_SPLIT_S` chains,
+# masked when ragged; a kernel chosen per block from its own width sums k in an order that follows the
+# worker count (req#11). No route token can reach that choice — the deciding extent is a block's own
+# width inside an already-entered kernel.
 function _gemm_unpacked_split!(
         ::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
         alpha::T, A, B, beta::T, C
@@ -1296,66 +1360,22 @@ function _gemm_unpacked_split!(
             while ir < m
                 mre = min(mr, m - ir)
                 if nre == nr && rem(mre, W) == 0
-                    # full OR W-aligned partial rows: split kernel at vr = mre/W row-blocks (keeps the
-                    # split's B-reuse for the row remainder — mrows(NR=_SNR) would lose it). _SMR=4 → vr∈1:4.
-                    vr = div(mre, W)
-                    if vr == _SMR
-                        _microkernel_unpacked_split!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            Val(_SMR), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0)
-                        )
-                    elseif vr == 1
-                        _microkernel_unpacked_split!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            Val(1), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0)
-                        )
-                    elseif vr == 2
-                        _microkernel_unpacked_split!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            Val(2), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0)
-                        )
-                    else
-                        _microkernel_unpacked_split!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            Val(3), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0)
-                        )
-                    end
+                    # W-aligned rows: no lane arithmetic, which keeps this the code the split cap was
+                    # measured with. `vr = mre/W` row-blocks preserves the split's B-reuse for a short
+                    # block — mrows(NR=_SNR) would lose it.
+                    _split_rowtile!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                        mre, div(mre, W), Val(false), Val(TB), Val(B0))
                 elseif nre == nr
-                    # NOT W-aligned. This passed Val(_SMR) unconditionally, i.e. computed all
-                    # _SMR*W = 32 rows however few were live. At m=36 the tail has mre=4 and computed
-                    # 32 rows for 4 — total row work 64 for 36 live (78% waste) against 40 for m=40,
-                    # which IS W-aligned and takes the branch above. MEASURED (Zen4, m=n=k, beta=0):
-                    #   m=36 21.86 GF, m=44 27.21   vs   m=32 39.65, m=40 40.43, m=48 41.27
-                    # so -45% and -34% from this dispatch alone. Narrow to the vector-rows actually
-                    # needed, exactly as the W-aligned branch does with `vr`. _SMR=4 ⇒ cld(mre,W) ∈ 1:4.
-                    # WHY IT SURVIVED: the split path needs max(m,n,k) ≤ _GEMM_SPLIT_MAX (48), and the
-                    # gate ladder jumps 32 → 50, so NO published cell ever reaches a non-W-aligned
-                    # remainder here. Found by sweeping m one step at a time, not by the gate.
-                    # NOT the "exact cover" (whole vectors through the split kernel + a datapath-width tail):
-                    # measured SLOWER, Zen4 paired A/B exact/masked — dgemm 50³ 1.065, zgemm 50³ (3M) 1.068,
-                    # 41×8×33 1.04-1.07, geqrf n=49..55 1.005-1.015. Two calls lose to one masked call here.
-                    vt = cld(mre, W)
-                    if vt == 1
-                        _mrows_tail!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(_SNR), Val(TB), Val(B0)
-                        )
-                    elseif vt == 2
-                        _microkernel_unpacked_mrows!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(2), Val(_SNR), Val(TB), Val(B0), Val(_vwidth(T))
-                        )
-                    elseif vt == 3
-                        _microkernel_unpacked_mrows!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(3), Val(_SNR), Val(TB), Val(B0), Val(_vwidth(T))
-                        )
-                    else
-                        _microkernel_unpacked_mrows!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(_SMR), Val(_SNR), Val(TB), Val(B0), Val(_vwidth(T))
-                        )
-                    end
+                    # RAGGED rows, same kernel as above with the last vector masked. `cld(mre, W)`, not
+                    # `_SMR`: the tile must cover the live rows and no more, or a 4-live-row tail
+                    # computes all _SMR·W = 32.
+                    #
+                    # AN "EXACT COVER" — whole vectors through this kernel plus a separate
+                    # datapath-width tail call — is excluded by req#11, not merely by speed: a second
+                    # tail kernel is a second k-summation order, which is the disagreement the note
+                    # above this function exists to prevent.
+                    _split_rowtile!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                        mre, cld(mre, W), Val(true), Val(TB), Val(B0))
                 else
                     _microkernel_unpacked_edge!(
                         Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,

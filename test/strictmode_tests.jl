@@ -358,6 +358,42 @@ end
                 1.0, 0.0, 2, Val(P._NR), Val(false), Val(true)
             )
         end
+        # SPLIT-REDUCTION kernel, BOTH mask arms. `Val{MASK}` selects two different generated bodies —
+        # the masked one emits lane arithmetic the unmasked one does not — so a guarantee proven on one
+        # says nothing about the other, and the masked arm is the one every ragged row block in
+        # `_gemm_unpacked_split!` takes. Trim-reachable from `dgemm_64_`.
+        #
+        # ITS OWN BUFFERS, `_SMR·W` rows deep: this kernel's tile is _SMR·W = 32 rows against the
+        # unpacked kernel's `_MR·W` = 16, so reusing `Cu`/`Au` above would write past the end of a
+        # 16-row column. Guarded on `_SPLIT_OK` — off wide-AVX-512 the driver const-folds away and
+        # these instances are never compiled.
+        #
+        # THE ASSERTIONS BELOW RECORD NOTHING ON SUCCESS, so a running block and a skipped one are
+        # indistinguishable from the test count. Non-vacuity here was established by a positive
+        # control — a planted `@test false` inside the loop, which failed twice, once per mask arm.
+        # Re-plant it rather than trusting this sentence if the guard or the buffers change.
+        if P._SPLIT_OK
+            smr = P._SMR * W
+            As = randn(smr * kk); Cs = zeros(smr, P._SNR)
+            GC.@preserve As Bu Cs begin
+                asp = pointer(As); csp = pointer(Cs); bsp = pointer(Bu)
+                for mask in (false, true)
+                    mv = mask ? smr - 2 : smr        # ragged vs the full tile
+                    @assert_typestable P._microkernel_unpacked_split!(
+                        csp, smr, asp, smr, 0, bsp, kk, 0, kk, 1.0, 0.0, mv,
+                        Val(P._SMR), Val(P._SNR), Val(P._GEMM_SPLIT_S), Val(false), Val(true), Val(mask)
+                    )
+                    @test_noalloc P._microkernel_unpacked_split!(
+                        csp, smr, asp, smr, 0, bsp, kk, 0, kk, 1.0, 2.0, mv,
+                        Val(P._SMR), Val(P._SNR), Val(P._GEMM_SPLIT_S), Val(false), Val(false), Val(mask)
+                    )
+                    @test_trim_compatible P._microkernel_unpacked_split!(
+                        csp, smr, asp, smr, 0, bsp, kk, 0, kk, 1.0, 0.0, mv,
+                        Val(P._SMR), Val(P._SNR), Val(P._GEMM_SPLIT_S), Val(false), Val(true), Val(mask)
+                    )
+                end
+            end
+        end
         # COMPLEX unpacked path (`_gemm_cmplx_unpacked!` → `_uker_sweep!`): the exact class that regressed
         # zgemm_64_/cgemm_64_ trim-safety (four runtime `bool ? Val(true):Val(false)` flags → a Union{Val,Val}
         # split that exceeds juliac's reachability limit). `@test_trim_compatible` in the test project's

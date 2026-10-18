@@ -600,33 +600,31 @@ end
     bitsame(X, Y) = size(X) == size(Y) &&
         reinterpret(UInt8, vec(collect(X))) == reinterpret(UInt8, vec(collect(Y)))
     nt = Threads.nthreads()
-    # ONE KNOWN REQ#11 BREAK REMAINS, and it lives INSIDE `_gemm_unpacked_split!`, below every route
-    # token. Real `Float64` side R, m=41/n=1024, at exactly two workers: uplo 'U' transA 'N' and 'T',
-    # and uplo 'L' transA 'N'.
-    #
-    # THE MECHANISM. The side-R granule is `_MR * _vwidth(Float64)` = 16, so m=41 at two workers bands
-    # 16 + 25. `_gemm_unpacked_split!` then tiles rows in `_SMR * _vwidth` = 32-row blocks and picks
-    # its microkernel per block from the block's OWN width: a W-aligned block runs two interleaved
-    # k-chains (`_microkernel_unpacked_split!`) and a ragged one runs a single chain
-    # (`_microkernel_unpacked_mrows!`). Two chains and one chain sum a k-reduction in different
-    # orders, so bands of 16 and 25 rows disagree on the last bit. The deciding extent is the block's
-    # own row count inside an already-entered kernel, which is why no route token reaches it.
-    # Confirmed by forcing `_gemm_split_max()` to 0 — with the split kernel off, every cell here is
-    # bit-identical at every worker count.
-    #
-    # WHY ONLY `Float64`. The split kernel is reachable only above `mrt >= _SMR * _vwidth(T)`. For
-    # `Float32` that floor is 64, above both m values here, so neither shape enters it. Complex does
-    # not thread at all under the present admissions.
-    #
-    # WHY `_SPLIT_OK` IS IN THE PREDICATE. It const-folds to false where the split kernel does not
-    # exist (AVX2), and there the shape passes — so a build without it must see a plain `@test`, not
-    # an unexpected `@test_broken` pass.
-    #
-    # m=41 is not a multiple of 16 and m=48 is, but DIVISIBILITY IS NOT THE RULE: m=48 bands 32 + 16,
-    # both W-aligned, and passes. W-alignment of the 32-row blocks is the rule.
+    # m=41 AND m=48 SIDE R PIN `_gemm_unpacked_split!`'s ROW BLOCKS. The side-R band granule is
+    # `_MR * _vwidth(Float64)` = 16 and the split driver tiles rows in `_SMR * _vwidth` = 32, so the two
+    # carvings do not nest: m=41 is 32+9 unsplit and 16, 25 at two workers, which places the same rows
+    # in an aligned block one way and a ragged block the other. Every block must reach the SAME
+    # microkernel with the same `_GEMM_SPLIT_S` chain count, masked when ragged — a kernel chosen per
+    # block from its own width sums k in an order that follows the worker count. m=48 is the control:
+    # 32+16 and 16+16+16 are all-aligned, so divisibility by the band granule is NOT the rule.
     tri(T, s) = (A = randn(T, s, s) ./ (2s); for i in 1:s
             A[i, i] = one(T) + abs(A[i, i])
         end; A)
+
+    # ROUTING WITNESS, derived from the consts rather than asserted about the literal 41. The three
+    # shapes above are only meaningful while m=41 still reaches a RAGGED row block inside the split
+    # driver; if `_gemm_split_max()` drops below the leaf extents, or `_SMR`/`_MR` move, the shape stops
+    # entering that kernel and the comparisons below pass without testing anything. This fails loudly
+    # instead. It cannot witness the leaf's own n and k — that needs a probe, not a predicate — so it
+    # bounds the row axis only.
+    let W = P._vwidth(Float64), m = 41
+        @test !P._SPLIT_OK || (
+            m >= P._SMR * W &&                               # clears the split driver's row floor
+                m <= P._gemm_split_max() &&                  # and its cap
+                rem(m, P._SMR * W) != 0 &&                   # leaves a ragged row block unsplit
+                rem(P._trsm_rchunk(m, 2, 2, Float64)[2], W) != 0   # and a ragged one in band 2 of 2
+        )
+    end
 
     # LIVENESS, on the real path that does thread: without this the whole item can pass with no worker
     # ever started, which is the failure mode CLAUDE.md flags for every threading gate here.
@@ -644,19 +642,11 @@ end
                 r = copy(B0)
                 P.set_num_threads(1)
                 P.trsm!(r, A; side, uplo, transA = tA, alpha = al)
-                # `Float64` ONLY: `Float32`'s split-kernel floor (`_SMR * _vwidth`) is 64, above both
-                # m values here, so it never enters the kernel that diverges. See the note above.
                 for nw in 2:nt
                     P.set_num_threads(nw)
                     g = copy(B0)
                     P.trsm!(g, A; side, uplo, transA = tA, alpha = al)
-                    # Predicated exactly, so that any change to the split kernel's per-block
-                    # microkernel choice turns a `@test_broken` into an unexpected pass and forces a
-                    # revisit here.
-                    isbroken = P._SPLIT_OK && T === Float64 && side == 'R' &&
-                        m == 41 && n == 1024 && nw == 2 &&
-                        (uplo, tA) in (('U', 'N'), ('U', 'T'), ('L', 'N'))
-                    isbroken ? (@test_broken bitsame(g, r)) : (@test bitsame(g, r))
+                    @test bitsame(g, r)
                 end
                 P.set_num_threads(1)
             end
