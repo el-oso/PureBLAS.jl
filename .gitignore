@@ -43,6 +43,7 @@ bench/archive_v2/
 # The `*.jl` rule alone let raw run output accumulate in git — 26 .log files and a .bak, ~1.1 MB of
 # July/August probe output with no reader, tracked purely because the pattern did not match them.
 bench/probes/*.jl
+bench/probes/*.sh
 bench/probes/*.log
 bench/probes/*.bak
 # EXCEPTION: cited as evidence from a src/ comment (src/blas3/gemm.jl), so it is documentation, not a
