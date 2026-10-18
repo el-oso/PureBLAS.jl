@@ -3461,7 +3461,8 @@ end
     return C
 end
 
-# `nroute` — THE COLUMN COUNT THE ROUTE IS CHOSEN FROM, which is not always the column count computed.
+# `rt` — THE EXTENTS THE ROUTE IS CHOSEN FROM, which are not always the extents computed on. Only its
+# n axis is read today; see `_RT_NONE` in core.jl for the token and `_gemm_core_body!` for the read.
 #
 # A worker computes a column slice of C, so its own `n` is the slice width. Every size-keyed predicate
 # below reads `n`, so a narrow slice can take a different route than the whole problem: `_use_unpacked`
@@ -3505,8 +3506,8 @@ end
 # on the body's generic branch is inert, because the dual path does not take that branch — it takes
 # the real one. The outlined entry gives the whole tree its own frame instead.
 @inline _gemm_core!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-        nroute::Int = -1, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
-    _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, nroute, strassen, nw, wi)
+        rt::NTuple{3, Int} = _RT_NONE, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
+    _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, rt, strassen, nw, wi)
 
 # THE SAME PRODUCT, IN ITS OWN FRAME. For a caller that issues SEVERAL `_gemm_core!` calls, inlining
 # multiplies the routing tree by the number of calls in one frame, and `_gemm_dual3!` — three plane
@@ -3514,8 +3515,16 @@ end
 # call boundary is free at every size that reaches here; the inlined entry above is kept for the
 # single-product callers, where it is worth 8.2% at the smallest gate cell (gemm@8).
 @noinline _gemm_core_out!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-        nroute::Int = -1, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
-    _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, nroute, strassen, nw, wi)
+        rt::NTuple{3, Int} = _RT_NONE, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
+    _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, rt, strassen, nw, wi)
+
+# ⚠ NO Int-TAKING METHOD HERE, DELIBERATELY. One was tried: a second method widening a scalar `nroute`
+# to `(-1, nroute, -1)`, so the then-13 call sites carrying a bare `n` route needed no edit. It is
+# idiomatic dispatch and not the `Union{Int, NTuple{3, Int}}` the design rejected, and it cost one
+# more unoptimised frame in the dual `gemm!` tree — 5 before it existed, 6 after, against the note
+# above recording that one unused parameter on `_trsm!` was enough to tip that budget.
+# `Base.@constprop :aggressive` on the forwarders made it WORSE, not better: 8 frames. So the call
+# sites carry the tuple instead, and this frame stays as small as it was.
 
 """
     _gemm_trailing!(C, A, B, alpha, beta, tA, tB; nroute = -1) -> C
@@ -3553,16 +3562,26 @@ every piece to route from the undivided width; a caller whose `C` is the whole u
         )
         return C
     end
-    _gemm_core!(C, A, B, alpha, beta, tA, tB, false, cB, nroute)
+    # `nroute` is this entry's scalar n-route; widen it at the boundary. The keyword stays `Int`
+    # until a caller needs to route on `m` as well — the same reason the sub-functions below keep it.
+    _gemm_core!(C, A, B, alpha, beta, tA, tB, false, cB, (-1, nroute, -1))
     return C
 end
 
 @inline function _gemm_core_body!(
         C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-        nroute::Int, strassen::Bool, nw::Int, wi::Int
+        rt::NTuple{3, Int}, strassen::Bool, nw::Int, wi::Int
     ) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
-    nrt = nroute < 0 ? n : nroute
+    # ⚠ ONLY THE n AXIS IS READ HERE, and one chain smuggles a ROW count through it.
+    # `_trsm_right!` (level3.jl) carries the whole problem's ROW count in its `nroute` and hands it to
+    # `_gemm_subR!`, which widens it into the n slot. So `max(m, nrt, k)` takes the larger of a band's
+    # local `m` and the undivided row count, and `nrt` is "the larger extent this predicate should
+    # see" rather than always a column count. (`_trsm_base_invR!` smuggles a row count too, but into
+    # `_gemm_unpacked!` directly — it never reaches `rt`.)
+    # Reading `_rt_m`/`_rt_k` here, and moving that caller's value to the m slot, is a per-predicate
+    # decision that changes routing and must be made with the bit-identity gate in front of you.
+    nrt = _rt_n(rt, n)
     # α==0 (or k==0) ⇒ C := βC, with A and B NOT referenced — reference ?gemm guarantees this, so a
     # caller may legally pass A/B holding Inf/NaN or uninitialised memory. The blocked routes each
     # quick-return already; the tiny, Strassen and 3M routes did NOT, and would compute the product
@@ -4410,7 +4429,7 @@ end
     # dispatches — getrf's look-ahead issues the trailing update as a narrow call plus a wide one, and
     # both must route from the full trailing width or the pair is not the single update it replaces.
     _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
-        p.lanroute >= 0 ? p.lanroute : p.n, false, nw, i)
+        (-1, p.lanroute >= 0 ? p.lanroute : p.n, -1), false, nw, i)
     return nothing
 end
 
@@ -4460,7 +4479,7 @@ end
     Ac = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.m, p.tA ? p.m : p.k, p.lda)
     # `p.n` is the whole update's width: route from the problem, compute on the slice.
     _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
-        p.lanroute, false, nw - 1, i - 1)
+        (-1, p.lanroute, -1), false, nw - 1, i - 1)
     return nothing
 end
 
@@ -5171,7 +5190,7 @@ end
             # reader comparing the two paths will expect.
             _getf2!(PtrMatrix{T}(lup.ptr, lup.m, lup.nb, lup.ld), lup.m, lup.nb, lup.roff,
                 PtrVector{Int}(lup.ipiv, lup.ioff + lup.nb), lup.ioff)
-            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)
+            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
         elseif kind == _MT_KIND_TRSM
             # `nroute` stays -1 for the same reason as gemm's: a loser solves the whole of B, so its
             # own column count IS the routing width. `C` and `B` are the same matrix here.
@@ -5262,7 +5281,7 @@ end
             isone(alpha) || _scal_all!(C, alpha)
         else
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
-            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)
+            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
         end
         return zero(T)
     end
@@ -5869,7 +5888,8 @@ function gemm!(
                 _pm(C), _pm(A), _pm(B), T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', nw
             )
         else
-            _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', -1, true, nw)
+            _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C',
+                _RT_NONE, true, nw)
         end
     elseif _pairT(T) && _strided1(C) && _strided1(A) && _strided1(B) && eltype(A) === T && eltype(B) === T &&
             max(m, n, k) > _fh_cgemm_tiny()

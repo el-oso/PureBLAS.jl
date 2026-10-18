@@ -293,3 +293,28 @@ end
     throw(ArgumentError(lazy"_gbtrf_blocked!: needs nb ≤ kl (got nb=$nb, kl=$kl)"))
 @noinline _throw_packed_len(L::Int) =
     throw(DimensionMismatch(lazy"packed length $L is not n(n+1)/2"))
+
+# ── ROUTE TOKEN: the undivided (m, n, k) a partitioned caller passes down ────────────────────────────
+#
+# A size-keyed predicate that reads a chunk's OWN extent picks different arithmetic for a band than
+# for the whole problem, and the two then disagree bit-for-bit — which req#11 forbids. So a caller
+# that has divided a dimension passes the UNDIVIDED extents here, and every predicate below it routes
+# as the unsplit problem would. `_RT_NONE` means "my own extents ARE the whole problem".
+#
+# A TUPLE, NOT THREE PARAMETERS, and not `Union{Int, NTuple{3, Int}}`. `_gemm_cmplx_blocked!` records
+# that two defaulted trailing arguments on `_gemm_threaded!` put 112 bytes on every `gemm!` call, and
+# `_gemm_core!` records that a single UNUSED parameter added to `_trsm!` tipped the dual `gemm!` frame
+# past the optimiser's effort budget. A tuple is isbits and keeps arity identical, so neither hazard is
+# touched. A `Union{Int, NTuple{3, Int}}` annotation was the other candidate and is NOT rejected for
+# inference reasons — Julia specialises per concrete argument type regardless of the annotation, with
+# or without `@noinline`, so it gets one `MethodInstance` per spelling and a concrete return either
+# way. It is rejected because two spellings at the call sites is the ambiguity this token exists to
+# remove, and because the measurement recorded above `_gemm_core!` showed a second method costs a
+# frame in the dual tree.
+#
+# `k` is carried although req#11 forbids ever dividing it, so that a 2-D split reuses one token instead
+# of growing a second name. `_rt_m` and `_rt_k` are NOT READ YET — the body resolves only `_rt_n`.
+const _RT_NONE = (-1, -1, -1)
+@inline _rt_m(rt::NTuple{3, Int}, m::Int) = rt[1] < 0 ? m : rt[1]
+@inline _rt_n(rt::NTuple{3, Int}, n::Int) = rt[2] < 0 ? n : rt[2]
+@inline _rt_k(rt::NTuple{3, Int}, k::Int) = rt[3] < 0 ? k : rt[3]

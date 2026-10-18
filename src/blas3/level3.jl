@@ -1448,12 +1448,12 @@ function _trmm_split_L!(up::Bool, tr::Bool, unit::Bool, A, B, mrv::Val)
     if (up && !tr) || (!up && tr)              # top block carries the off-diagonal update → after Bt's solve
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
         nwo = _strassen_owns(T, h, n, k - h, tr, off, Bb) ? _gemm_workers(h, n, k - h) : 1
-        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, -1, true, nwo)
+        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, _RT_NONE, true, nwo)
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
     else                                        # bottom block carries the update
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
         nwo = _strassen_owns(T, k - h, n, h, tr, off, Bt) ? _gemm_workers(k - h, n, h) : 1
-        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, -1, true, nwo)
+        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, _RT_NONE, true, nwo)
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
     end
     return B
@@ -1584,10 +1584,11 @@ end
 # as trmm, but: (1) solve the independent block FIRST, (2) the off-diagonal update SUBTRACTS the
 # already-solved block (gemm α=-1,β=1), (3) the base is a triangular solve (trsv per column / column
 # substitution). α is applied to B up front (B := α·op(A)⁻¹·B = op(A)⁻¹·(αB)).
+# `nroute` stays a scalar n-route here and widens at the boundary; these two have no `m` to carry.
 @inline _gemm_sub!(C, A, B, tr::Bool, cj::Bool, nroute::Int = -1) =                  # C -= op(A)·B
-    _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false, nroute)
+    _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false, (-1, nroute, -1))
 @inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool, nroute::Int = -1) =              # C -= B·op(A)
-    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj, nroute)
+    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj, (-1, nroute, -1))
 
 # trsm base via small triangular INVERSE + gemm (BLIS-style): a block ≤ _TRSM_BASE is solved by
 # inverting its NB×NB triangle once (O(NB³/6), tiny) then applying op(inv) as a gemm — so the diagonal
@@ -1719,7 +1720,7 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1
         if tr
             # `_gemm_core!`, not `gemm!`: the public entry routes from its own operands and has no
             # place to take the route token, which a column band must carry.
-            _gemm_core!(tmp, iv, B, one(T), zero(T), true, false, false, false, nrt)
+            _gemm_core!(tmp, iv, B, one(T), zero(T), true, false, false, false, (-1, nrt, -1))
         else
             _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp, nrt)
         end
@@ -7644,8 +7645,8 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
                 _gemm_threaded!(_pm(C), _pm(B), _pm(Ad), aT, bT, false, false, false, false, nw)
         end
     else
-        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false, -1, true, nw) :
-            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false, -1, true, nw)
+        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false, _RT_NONE, true, nw) :
+            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false, _RT_NONE, true, nw)
     end
     return C
 end

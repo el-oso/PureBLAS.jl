@@ -214,8 +214,11 @@ Both modes share ONE set of low-level kernels. Source map:
    - **A size-keyed predicate read from a chunk's own slice.** `_use_unpacked` is keyed on
      `max(m, n, k)`, and the unpacked and blocked routes differ in α placement, β handling and `kc`
      chunking, so a narrow chunk silently computes by different arithmetic. Hence `_gemm_core!`'s
-     `nroute`: a partitioned caller passes the WHOLE problem's column count and computes on its slice.
-     Any new size-keyed branch reachable from a chunk body must take its size from `nroute`.
+     `rt`, an `(m, n, k)` route token (`_RT_NONE` and `_rt_m`/`_rt_n`/`_rt_k` in `src/core.jl`): a
+     partitioned caller passes the WHOLE problem's extents and computes on its slice. Any new
+     size-keyed branch reachable from a chunk body must take its size from the token, not from its own
+     extent. Only the n axis is read so far, which is why `_gemm_unpacked!`'s `m >= _SMR * _vwidth(T)`
+     is still a live violation on a row-split caller.
    - **An algorithm a worker cannot run.** Strassen chooses its depth from the width it is handed, so
      a worker holding a slice runs a different algorithm entirely. It is therefore never column-split:
      `gemm!`, `_symm!` and `_trmm_split_L!` ask `_strassen_owns` and run the recursion serially when it
