@@ -313,7 +313,8 @@ end
 # frame in the dual tree.
 #
 # `k` is carried although req#11 forbids ever dividing it, so that a 2-D split reuses one token instead
-# of growing a second name. `_rt_m` and `_rt_k` are NOT READ YET — the body resolves only `_rt_n`.
+# of growing a second name. `_gemm_core_body!` and `_gemm_unpacked!` resolve all three axes; a caller
+# that divided only one leaves the other two at `-1` and the local extents stand.
 const _RT_NONE = (-1, -1, -1)
 @inline _rt_m(rt::NTuple{3, Int}, m::Int) = rt[1] < 0 ? m : rt[1]
 @inline _rt_n(rt::NTuple{3, Int}, n::Int) = rt[2] < 0 ? n : rt[2]

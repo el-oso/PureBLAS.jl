@@ -1584,11 +1584,15 @@ end
 # as trmm, but: (1) solve the independent block FIRST, (2) the off-diagonal update SUBTRACTS the
 # already-solved block (gemm α=-1,β=1), (3) the base is a triangular solve (trsv per column / column
 # substitution). α is applied to B up front (B := α·op(A)⁻¹·B = op(A)⁻¹·(αB)).
-# `nroute` stays a scalar n-route here and widens at the boundary; these two have no `m` to carry.
+# ⚠ THE TWO SIDES CARRY OPPOSITE DIMENSIONS IN THE SAME PARAMETER, which is why the token has named
+# slots. `_trsm_left!` is handed `p.n` (:5069) and `_trsm_right!` is handed `p.m` (:5017), and each
+# forwards it here unchanged — so side L's route is a COLUMN count and side R's is a ROW count. They
+# must land in different slots or a row-split band routes on its own rows while the unsplit solve
+# routes on the whole, which is the req#11 break the side-R shapes in test/gemm_tests.jl record.
 @inline _gemm_sub!(C, A, B, tr::Bool, cj::Bool, nroute::Int = -1) =                  # C -= op(A)·B
     _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false, (-1, nroute, -1))
 @inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool, nroute::Int = -1) =              # C -= B·op(A)
-    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj, (-1, nroute, -1))
+    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj, (nroute, -1, -1))
 
 # trsm base via small triangular INVERSE + gemm (BLIS-style): a block ≤ _TRSM_BASE is solved by
 # inverting its NB×NB triangle once (O(NB³/6), tiny) then applying op(inv) as a gemm — so the diagonal
@@ -1722,7 +1726,8 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1
             # place to take the route token, which a column band must carry.
             _gemm_core!(tmp, iv, B, one(T), zero(T), true, false, false, false, (-1, nrt, -1))
         else
-            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp, nrt)
+            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp,
+                (-1, nrt, -1))                       # side L: `nrt` IS a column count
         end
         @inbounds for j in 1:n, i in 1:nb
             B[i, j] = tmp[i, j]
@@ -1743,9 +1748,14 @@ function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1
         # branch on tr so Val{TB} is a literal (Val(tr) with runtime tr is a runtime dispatch — StrictMode
         # @typestable catches it; the dynamic call also boxes the Val, so this branch is faster too).
         if tr
-            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp, nroute)
+            # `nroute` IS A ROW COUNT HERE, so it belongs in the m slot and nowhere else. The kernel
+            # switch applies two tests to the row extent — `max(m, n, k) <= _gemm_split_max()` and
+            # `m >= _SMR·W` — and only the m slot feeds the undivided count to BOTH.
+            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp,
+                (nroute, -1, -1))
         else
-            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp, nroute)
+            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp,
+                (nroute, -1, -1))
         end
         @inbounds for j in 1:nb, i in 1:m
             B[i, j] = tmp[i, j]
@@ -5028,13 +5038,13 @@ _trmmr_prefit!(::Type{T}, ::Int, ::Int) where {T} = nothing   # non-real kinds n
 # problem and the bands are write-disjoint — the mirror of the side-R solve above, and the same
 # `_MR·W` granularity so every band but the last drives full microkernel tiles.
 #
-# NO ROUTE TOKEN, AND THAT IS A CONSTRAINT ON WHERE THIS MAY BE ARMED rather than an omission.
+# THE BANDS PASS NO ROUTE TOKEN, AND THAT IS A CONSTRAINT ON WHERE THIS MAY BE ARMED.
 # `_trmm_right!` routes on `size(A, 1)`, which a row split leaves alone, but its flat panel loop then
-# issues `_gemm_core!` calls whose kernel switch reads `max(m, nroute, k)` — and `m` there IS the
-# band's row count, so a band would take a different route than the serial call. `nroute` substitutes
-# only `n`; there is no `m` counterpart to thread. The entry therefore arms this only above
-# `_fh_trmm_rpack()`, where `_trmm_packedR!` owns the call and drives `_microkernel!` directly, with a
-# `kc` fixed by `k` and no size-keyed branch anywhere below.
+# issues `_gemm_core!` calls whose kernel switch reads the row extent — and that IS the band's row
+# count, so a band would take a different route than the serial call. The token's `m` slot (`_rt_m`,
+# core.jl) is what such a band would fill; `_trmm_right!`'s panel loop does not thread it through, so
+# the entry arms this only above `_fh_trmm_rpack()`, where `_trmm_packedR!` owns the call and drives
+# `_microkernel!` directly, with a `kc` fixed by `k` and no size-keyed branch anywhere below.
 @noinline function _trmmr_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
     i0, len = _trsm_rchunk(p.m, nw, i, T)
     len > 0 || return nothing

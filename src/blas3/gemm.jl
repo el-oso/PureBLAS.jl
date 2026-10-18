@@ -1380,9 +1380,11 @@ end
 # `_gemm_core!` already carried the token for `_use_unpacked`; it stopped one layer above here.
 function _gemm_unpacked!(
         ::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
-        alpha::T, A, B, beta::T, C, nroute::Int = -1
+        alpha::T, A, B, beta::T, C, rt::NTuple{3, Int} = _RT_NONE
     ) where {T <: BlasReal, TB, B0}
-    nrt = nroute < 0 ? n : nroute
+    # ALL THREE AXES, because the split predicate below reads two of them. A caller that divided a
+    # dimension passes the undivided extents; `_RT_NONE` means its own are the whole problem.
+    mrt = _rt_m(rt, m); nrt = _rt_n(rt, n); krt = _rt_k(rt, k)
     if iszero(alpha) || k == 0
         _scale_C!(C, m, n, beta)   # C := beta·C (or 0); no contraction to do
         return C
@@ -1397,7 +1399,11 @@ function _gemm_unpacked!(
     # that could not be done at all while the value was a load-time const: an env A/B ran three
     # identical builds and the witness printed 48 every time. The accessor reads one const-resolved Ref
     # (the GKH-owned shape, not a keyed lookup) and const-folds to the derived value when unforced.
-    if _SPLIT_OK && m >= _SMR * _vwidth(T) && max(m, nrt, k) <= _gemm_split_max()
+    # BOTH TESTS READ THE TOKEN, not the local extents, and the `>=` one is why that matters: it is a
+    # FLOOR on rows, so a row-split caller whose bands straddle `_SMR * _vwidth(T)` would admit the
+    # split kernel for the wide band and decline it for the narrow one. Those two arms do not agree
+    # bit for bit, so the call's result would depend on the worker count (req#11).
+    if _SPLIT_OK && mrt >= _SMR * _vwidth(T) && max(mrt, nrt, krt) <= _gemm_split_max()
         return _gemm_unpacked_split!(Val(TB), Val(B0), m, n, k, alpha, A, B, beta, C)
     end
     W = _vwidth(T); mr = _MR * W; nr = _NR
@@ -2937,14 +2943,15 @@ end
             if !tA && _use_unpacked(m, nrt, k)
                 _gemm_unpacked!(
                     tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                    m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt
+                    m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), (-1, nrt, -1)
                 )
             else
                 _gemm_blocked!(tA, tB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
             end
         end
     elseif !tA && _use_unpacked(m, nrt, k)
-        _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false), m, n, k, alpha, A, B, beta, C, nrt)
+        _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
+            m, n, k, alpha, A, B, beta, C, (-1, nrt, -1))
     else
         _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)   # blocked also covers the transpose case
     end
@@ -3461,8 +3468,9 @@ end
     return C
 end
 
-# `rt` — THE EXTENTS THE ROUTE IS CHOSEN FROM, which are not always the extents computed on. Only its
-# n axis is read today; see `_RT_NONE` in core.jl for the token and `_gemm_core_body!` for the read.
+# `rt` — THE EXTENTS THE ROUTE IS CHOSEN FROM, which are not always the extents computed on. See
+# `_RT_NONE` in core.jl for the token and `_gemm_core_body!` for the read, which resolves all three
+# axes; a caller that divided one dimension leaves the others at `-1`.
 #
 # A worker computes a column slice of C, so its own `n` is the slice width. Every size-keyed predicate
 # below reads `n`, so a narrow slice can take a different route than the whole problem: `_use_unpacked`
@@ -3573,15 +3581,18 @@ end
         rt::NTuple{3, Int}, strassen::Bool, nw::Int, wi::Int
     ) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
-    # ⚠ ONLY THE n AXIS IS READ HERE, and one chain smuggles a ROW count through it.
-    # `_trsm_right!` (level3.jl) carries the whole problem's ROW count in its `nroute` and hands it to
-    # `_gemm_subR!`, which widens it into the n slot. So `max(m, nrt, k)` takes the larger of a band's
-    # local `m` and the undivided row count, and `nrt` is "the larger extent this predicate should
-    # see" rather than always a column count. (`_trsm_base_invR!` smuggles a row count too, but into
-    # `_gemm_unpacked!` directly — it never reaches `rt`.)
-    # Reading `_rt_m`/`_rt_k` here, and moving that caller's value to the m slot, is a per-predicate
-    # decision that changes routing and must be made with the bit-identity gate in front of you.
-    nrt = _rt_n(rt, n)
+    # EVERY SIZE-KEYED PREDICATE BELOW ROUTES FROM THE TOKEN, not from the local extents. A caller
+    # that divided a dimension passes the undivided extents, so a band picks the same arithmetic the
+    # unsplit problem picks; `_RT_NONE` means the local extents ARE the whole problem.
+    #
+    # ALL THREE AXES, because the predicates differ in which they read. `_use_unpacked`, the
+    # `_GEMM_TINY` cut and `_strassen_depth` reduce over all three, and the unpacked and blocked arms
+    # do not agree bit-for-bit in general (see the note above `_gemm_unpacked!`), so a band that takes
+    # one arm where the whole takes the other returns different bits. Side R routes on rows and side L
+    # on columns, and reducing over the resolved triple is what makes one body serve both.
+    #
+    # `_sme_eligible` is the ONE exception and takes the local `m`; its own note below says why.
+    mrt = _rt_m(rt, m); nrt = _rt_n(rt, n); krt = _rt_k(rt, k)
     # α==0 (or k==0) ⇒ C := βC, with A and B NOT referenced — reference ?gemm guarantees this, so a
     # caller may legally pass A/B holding Inf/NaN or uninitialised memory. The blocked routes each
     # quick-return already; the tiny, Strassen and 3M routes did NOT, and would compute the product
@@ -3595,7 +3606,7 @@ end
         return _gemm_scale_only!(C, m, n, beta)   # @noinline: keep `_gemm_core!`'s inlined body small
     end
     if T <: BlasReal && _strided1(C)
-        if max(m, nrt, k) <= _GEMM_TINY && !cA && !cB
+        if max(mrt, nrt, krt) <= _GEMM_TINY && !cA && !cB
             return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
         end
         # Apple SME, ahead of Strassen. Strassen trades a 7/8 flop cut per level for extra
@@ -3605,11 +3616,20 @@ end
         # THIS BODY IS REACHED ONCE PER THREADED CHUNK, not once per call: `_gemm_threaded!`
         # arrives here through `_gemm_run_chunk`. `_sme_owns` at the threaded entry is what keeps
         # a split call off the coprocessor, because by this point the split has already happened.
-        # Routing uses `nrt`, the whole problem's n, so a chunk routes as its parent did.
+        #
+        # THE ROW EXTENT IS THE LOCAL `m`, NOT `mrt`, and that is the single departure from the
+        # route-token invariant stated at the top of this body. `_sme_tile_ok` is a FLOOR on the
+        # tile actually handed to the kernel (`min(m, n) >= 2*_SME_MR`), and the call below passes
+        # the local extents, so resolving it from the token would admit a band narrower than the
+        # kernel's minimum tile. The column extent is `nrt` for the opposite reason — it is what
+        # makes a column-split chunk route as its parent did — and the two readings are therefore
+        # not symmetric. Whether that asymmetry can produce a thread-count divergence is open: it
+        # needs a row- or column-splitting caller reaching this branch on Apple silicon, which is
+        # the only place `_SME_F64` is true, so it is not decidable on the x86 fleet.
         if _sme_eligible(T, m, nrt, k, tA, tB, cA, cB, C, A, B)
             return _gemm_sme!(C, A, B, Float64(alpha), Float64(beta), m, n, k, tA, tB)
         end
-        if strassen && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, nrt, k) > 0
+        if strassen && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(mrt, nrt, krt) > 0
             if !tB
                 return _gemm_strassen!(m, n, k, alpha, A, B, beta, C, nw)   # large-n real: 7-mult recursion beats OB
             elseif T === Float64
@@ -3645,7 +3665,7 @@ end
                 return _gemm_strassen!(m, n, k, alpha, A, Bt, beta, C, nw)
             end
         end
-        if _strided1(A) && _strided1(B) && _use_unpacked(m, nrt, k)
+        if _strided1(A) && _strided1(B) && _use_unpacked(mrt, nrt, krt)
             # NORMALIZE the container types here (see `_pm`/`_root` in ptrmat.jl). Every operand is
             # already known `_strided1` on this branch, so the conversion is information-preserving —
             # `_strided1(::PtrMatrix)` is `true` and nothing downstream consumes anything but
@@ -3658,7 +3678,7 @@ end
                 if !tA
                     _gemm_unpacked!(
                         tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                        m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt
+                        m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), rt
                     )
                 else
                     At, _ = _gemm_scratch(T, m * k, 0)
@@ -3669,7 +3689,7 @@ end
                         Am = PtrMatrix{T}(pointer(At), m, k, m)
                         _gemm_unpacked!(
                             tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                            m, n, k, alpha, Am, _pm(B), beta, _pm(C), nrt
+                            m, n, k, alpha, Am, _pm(B), beta, _pm(C), rt
                         )
                     end
                 end

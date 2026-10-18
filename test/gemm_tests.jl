@@ -600,19 +600,30 @@ end
     bitsame(X, Y) = size(X) == size(Y) &&
         reinterpret(UInt8, vec(collect(X))) == reinterpret(UInt8, vec(collect(Y)))
     nt = Threads.nthreads()
-    # KNOWN-FAILING, and it PREDATES the complex work: real `Float64` side R at narrow B already
-    # returns different bits at different worker counts. Measured on Zen4, alpha=1, nw=2..6 all
-    # diverging: (m=41, n=1024) and (m=48, n=512) at uplo 'U' with transA 'N' and 'T', and at uplo 'L'
-    # with transA 'N' — six of the twelve side-R combinations. `Float64` side R has been admitted to
-    # the pool throughout, so this is not fallout from a complex admission. The mechanism is NOT
-    # diagnosed, and the obvious guess is WRONG: it is not simply a remainder band. The side-R granule
-    # is `_MR * _vwidth(Float64)` = 16 here; m=41 does leave a 9-row remainder, but **m=48 is an exact
-    # multiple of 16 and diverges anyway**, so divisibility by the granule does not exempt a shape.
-    # What the two failing shapes share is that B is WIDE AND SHORT (m much smaller than n), not that
-    # m is awkward. Listed exactly rather than predicated on a rule, both because no rule is known and
-    # so that fixing any one of them turns its `@test_broken` into a failure and forces a revisit.
-    broken_r = Set([(41, 1024, 'U', 'N'), (41, 1024, 'U', 'T'), (41, 1024, 'L', 'N'),
-                    (48, 512, 'U', 'N'), (48, 512, 'U', 'T'), (48, 512, 'L', 'N')])
+    # ONE KNOWN REQ#11 BREAK REMAINS, and it lives INSIDE `_gemm_unpacked_split!`, below every route
+    # token. Real `Float64` side R, m=41/n=1024, at exactly two workers: uplo 'U' transA 'N' and 'T',
+    # and uplo 'L' transA 'N'.
+    #
+    # THE MECHANISM. The side-R granule is `_MR * _vwidth(Float64)` = 16, so m=41 at two workers bands
+    # 16 + 25. `_gemm_unpacked_split!` then tiles rows in `_SMR * _vwidth` = 32-row blocks and picks
+    # its microkernel per block from the block's OWN width: a W-aligned block runs two interleaved
+    # k-chains (`_microkernel_unpacked_split!`) and a ragged one runs a single chain
+    # (`_microkernel_unpacked_mrows!`). Two chains and one chain sum a k-reduction in different
+    # orders, so bands of 16 and 25 rows disagree on the last bit. The deciding extent is the block's
+    # own row count inside an already-entered kernel, which is why no route token reaches it.
+    # Confirmed by forcing `_gemm_split_max()` to 0 — with the split kernel off, every cell here is
+    # bit-identical at every worker count.
+    #
+    # WHY ONLY `Float64`. The split kernel is reachable only above `mrt >= _SMR * _vwidth(T)`. For
+    # `Float32` that floor is 64, above both m values here, so neither shape enters it. Complex does
+    # not thread at all under the present admissions.
+    #
+    # WHY `_SPLIT_OK` IS IN THE PREDICATE. It const-folds to false where the split kernel does not
+    # exist (AVX2), and there the shape passes — so a build without it must see a plain `@test`, not
+    # an unexpected `@test_broken` pass.
+    #
+    # m=41 is not a multiple of 16 and m=48 is, but DIVISIBILITY IS NOT THE RULE: m=48 bands 32 + 16,
+    # both W-aligned, and passes. W-alignment of the 32-row blocks is the rule.
     tri(T, s) = (A = randn(T, s, s) ./ (2s); for i in 1:s
             A[i, i] = one(T) + abs(A[i, i])
         end; A)
@@ -633,14 +644,18 @@ end
                 r = copy(B0)
                 P.set_num_threads(1)
                 P.trsm!(r, A; side, uplo, transA = tA, alpha = al)
-                # `Float64` ONLY, and that is measured rather than assumed: the same shapes pass for
-                # `Float32`, whose side-R band granule is twice as wide, so its bands land differently.
-                # Complex cannot thread at all under the present admissions, so it is unconditional.
-                isbroken = T === Float64 && side == 'R' && (m, n, uplo, tA) in broken_r
+                # `Float64` ONLY: `Float32`'s split-kernel floor (`_SMR * _vwidth`) is 64, above both
+                # m values here, so it never enters the kernel that diverges. See the note above.
                 for nw in 2:nt
                     P.set_num_threads(nw)
                     g = copy(B0)
                     P.trsm!(g, A; side, uplo, transA = tA, alpha = al)
+                    # Predicated exactly, so that any change to the split kernel's per-block
+                    # microkernel choice turns a `@test_broken` into an unexpected pass and forces a
+                    # revisit here.
+                    isbroken = P._SPLIT_OK && T === Float64 && side == 'R' &&
+                        m == 41 && n == 1024 && nw == 2 &&
+                        (uplo, tA) in (('U', 'N'), ('U', 'T'), ('L', 'N'))
                     isbroken ? (@test_broken bitsame(g, r)) : (@test bitsame(g, r))
                 end
                 P.set_num_threads(1)
