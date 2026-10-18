@@ -40,7 +40,7 @@ TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
 # `RuntimeDispatchReport` anywhere — and those assertions pass on every version; it is only the
 # classification that needed the newer release. Measured here: 242 pass / 2 errored on 0.4.6 against
 # 245 pass / 0 errored on 0.4.9.
-StrictModeTest = "0.4.11"
+StrictModeTest = "0.5"
 TrimCheck = "0.1.5"
 
 # `analysis = "full"` and `fail_mode = "error"` were removed here in the 0.4 migration: 0.4 deleted
