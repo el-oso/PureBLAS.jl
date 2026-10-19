@@ -611,16 +611,15 @@ Preference→frozen `.so` · first-use→`OncePerProcess` (Mode-2 end users) · 
 measurement. Acceptable only as a stopgap with a stated physical mechanism; the clean fix is a genuine
 analytical formula, an empirical calibration, or a kernel that needs neither.
 
-### ⚠ OPEN — ORPHANED KNOBS: 12 of the 23 Measured knobs have no calibrator (2026-10-16)
+### ⚠ OPEN — ORPHANED KNOBS: 8 of the 23 Measured knobs have no calibrator (2026-10-16)
 
 **A Measured knob with no calibrator is ORPHANED.** The tier says the optimum is not derivable and
 "Wants a `tune!()` pin" (`docs/src/knobs.md:13`), but `tune!()` can only set a knob that
-`bench/calibrate.jl`'s `KNOBS` writes. Twelve do not appear there, so no `tune!()` run can ever
+`bench/calibrate.jl`'s `KNOBS` writes. Eight do not appear there, so no `tune!()` run can ever
 set them, and a second box has no automated path to its own value:
 
-    sme_min          sme_min_exact  sme_panel_bytes sme_asum_min     sme_axpy_min
-    sme_dot_min      sme_scal_min   sme_ger_groups  sme_l1_groups    sme_rmw_groups
-    symv_sme_min     strassen_base
+    sme_min          sme_min_exact  sme_panel_bytes sme_ger_groups
+    sme_l1_groups    sme_rmw_groups symv_sme_min    strassen_base
 
 Nearly all are SME, which is why this went unnoticed: the coprocessor exists on one family of parts,
 so no second machine has yet disagreed. That is the reason the gap survived, not a reason it is sound.
@@ -877,7 +876,11 @@ here. ⚠⚠ **A `git stash` in a live Revise session KILLED THE SME ENTRY** —
 still zero after `git stash pop`, and a potrf A/B that read as a 4x win which was really SME-on
 against SME-off. An A/B across a stash needs a session restart per arm and a re-asserted witness.
 
-### ⚠ OPEN — THE REMAINING ORPHANS (2026-10-17)
+### ✅ SUPERSEDED — the pre-`:unresolved` reading of the two unstable calibrators (2026-10-17)
+
+The section above is the current one. This is kept for its two run tables; its conclusion that a
+tie-break among the survivors would settle `potrf_upper_direct_max` is the reading `:unresolved`
+replaced, and no statistic from that measurement can order the band.
 
 Two of the nine existing calibrators return a different verdict on consecutive runs of
 `tune!(dryrun = true)` on an idle box. Neither is a noise problem: both adjudicate a margin their own
