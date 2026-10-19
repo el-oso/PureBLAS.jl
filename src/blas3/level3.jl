@@ -4783,8 +4783,36 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::In
     # that it needs the wide-B predicate to amortize. DERIVE tier (residency over `_L1_BYTES`, req#8) —
     # gating exactly here keeps every large-m win and avoids regressing m=32/96 at k=128 (0.96→0.68 and
     # 0.87→0.81 without it). Tiling the copy was tried and is uniformly SLOWER (see the loop's comment).
-    if !up && !unit && !cj && k <= _trsm_r_fuse() && eltype(B) === Float64 && _strided1(B) &&
-            (tr || k * k * sizeof(Float64) <= _L1_BYTES || mrt > _trsm_ncut_r()) &&
+    # AN UPPER TRIANGLE IS THE SAME LEAF WITH THE COEFFICIENTS TRANSPOSED. The leaf's recurrence is
+    # lower-transpose, and `Λ = Aᵀ` is lower whenever A is upper, so `X·A = B` is `X·Λᵀ = B` and
+    # `X·Aᵀ = B` is `X·Λ = B`: each upper case is the lower case carrying the opposite transpose flag.
+    # The only extra cost is one O(k²) triangle copy, which is the copy the lower non-transpose arm
+    # already pays and is governed by the same amortization test. The alternative for an upper
+    # triangle is the recursion below, whose trailing products only reach the SME route once a block
+    # exceeds `2·_SME_MR`, so a narrow one would get neither the leaf nor the coprocessor: at
+    # m=5000, k=50 the recursion issues ZERO SME products while a standalone product on the same
+    # operand shape sustains 250 GF/s.
+    # `lowtr` is the flag the leaf runs under; `needcopy` says whether the coefficients have to be
+    # copied rather than read where they lie.
+    lowtr = up ? !tr : tr
+    needcopy = up || !tr
+    # THE RECURSION IS THE BETTER ROUTE WHEN ITS TRAILING PRODUCTS LAND ON EXACT SME TILES, and the
+    # leaf must decline there. `_sme_tile_ok` admits a tile whose both extents are whole `_SME_MR`
+    # blocks from 2·_SME_MR, while a ragged tile of the same size is SLOWER than the NEON path it
+    # displaces and does not turn until `_SME_MIN_EXACT` — so a `k` that halves into whole blocks
+    # hands the coprocessor products worth several times the leaf's rate, and a `k` that does not
+    # hands it products it loses on. Measured, both triangles, leaf time / recursion time at one
+    # thread (below 1 = the leaf is right), m from k to 40·k:
+    #     k=50  0.60-0.94   k=100 0.63-0.81   k=200 0.68-0.78   k=400 0.75-0.84
+    #     k=128 1.12-1.56   k=512 1.07-1.37
+    # The split is `k ÷ 2`, so the exact arm needs `k` to carry two whole blocks: hence the `2·_SME_MR`
+    # modulus rather than `_SME_MR`. Asking the predicate keeps this tied to the tile rule instead of
+    # restating a size of its own.
+    sme_recur = _SME_F64 && _SME_ENTRY[] !== C_NULL && _strided1(A) &&
+        k % (2 * _SME_MR) == 0 && mrt % _SME_MR == 0 &&
+        _sme_tile_ok(mrt, _trsplit(k))
+    if !unit && !cj && !sme_recur && k <= _trsm_r_fuse() && eltype(B) === Float64 && _strided1(B) &&
+            (!needcopy || k * k * sizeof(Float64) <= _L1_BYTES || mrt > _trsm_ncut_r()) &&
             (mrt > _trsm_ncut_r() || (k > _trsm_dbase() && mrt >= _trsm_r_mfloor(k)))
         # (No `Ar = A` seed here any more: it was dead once every arm gained its own `return`, and while
         # dead it still gave the `Ar` slot a second type, which is the whole cause of the boxing below.)
@@ -4856,7 +4884,7 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::In
         # that borrow happens inside a NESTED scope, i.e. at arena bytes taken after these, so the leaf
         # can no longer write its solution over the coefficients it is reading. Same base pointer, same
         # ld, one buffer was the measured wrong-answer bug; separate borrows make it unrepresentable.
-        if tr && !_EXPFLAG[_EXP10] && _RL_MR_LIVE > _NVREG && _potrf_needs_pad(A, k)
+        if !up && tr && !_EXPFLAG[_EXP10] && _RL_MR_LIVE > _NVREG && _potrf_needs_pad(A, k)
             # AVX2-ONLY ARM (`_RL_MR_LIVE > _NVREG`): no AVX-512 box can execute it, so it is verified by
             # reading, not by running. Shape and stride are exactly what `_trsm_rpad` produced: a k×k
             # lower-triangle copy of A at an odd leading dimension.
@@ -4868,7 +4896,7 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::In
                 return _trsm_rl_fused_drv!(S, B, k, !tr, _rfuse)
             end
         end
-        if !tr
+        if needcopy
             @scope arn begin
                 Ar = borrow!(arn, Float64, k, k, _odd_ld(k))
                 # Contiguous-WRITE order: the inner r-loop stores Ar[:,c] unit-stride and reads A with a
@@ -4876,13 +4904,23 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::In
                 # tile row) was tried and measured uniformly WORSE — 32×48 0.85→0.69, 256×48 1.01→0.97 vs AOCL
                 # (Zen4, 2026-07-26): the tiles' computed triangular bounds cost more than the traffic they
                 # save. Do not re-try tiling here without measuring.
-                @inbounds for c in 1:k, r in c:k
-                    Ar[r, c] = A[k + 1 - c, k + 1 - r]
+                if up && !tr                          # X·A = B: the leaf's own form, read across the diagonal
+                    @inbounds for c in 1:k, r in c:k
+                        Ar[r, c] = A[c, r]
+                    end
+                elseif up                             # X·Aᵀ = B: across the diagonal, then the reversal
+                    @inbounds for c in 1:k, r in c:k
+                        Ar[r, c] = A[k + 1 - r, k + 1 - c]
+                    end
+                else
+                    @inbounds for c in 1:k, r in c:k
+                        Ar[r, c] = A[k + 1 - c, k + 1 - r]
+                    end
                 end
-                return _trsm_rl_fused_drv!(Ar, B, k, !tr, _rfuse)
+                return _trsm_rl_fused_drv!(Ar, B, k, !lowtr, _rfuse)
             end
         end
-        return _trsm_rl_fused_drv!(A, B, k, !tr, _rfuse)
+        return _trsm_rl_fused_drv!(A, B, k, !lowtr, _rfuse)
     end
     if eltype(B) <: BlasReal && !cj
         # narrow B (few rows) → dense column-substitution base; wide → invR/gemm base. m is invariant

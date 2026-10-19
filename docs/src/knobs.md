@@ -15,7 +15,7 @@ Every `@load_preference` key in `src/` — 172 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 79 Derived · 23 Measured (11 calibrated · 12 orphaned) · 52 Literal · 18 Exempt.
+**Tier:** 79 Derived · 23 Measured (15 calibrated · 8 orphaned) · 52 Literal · 18 Exempt.
 **Default form** (mechanical): 68 formula · 22 delegates · 9 sibling · 63 literal · 5 flag · 5 other.
 
 
@@ -273,12 +273,12 @@ Every `@load_preference` key in `src/` — 172 of them.
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
-| `sme_asum_min` | literal | Measured | the same crossing for the one-stream form, which turns later because half the outstanding requests. | none — orphaned; sweep n |
-| `sme_axpy_min` | literal | Measured | the same cold crossing for the three-stream form. | none — orphaned; sweep n |
-| `sme_dot_min` | literal | Measured | where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | none — orphaned; sweep n |
+| `sme_asum_min` | literal | Measured | the same crossing for the one-stream form, which turns later because half the outstanding requests. | 4.2 s |
+| `sme_axpy_min` | literal | Measured | the same cold crossing for the three-stream form. | 4.2 s |
+| `sme_dot_min` | literal | Measured | where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | 4.2 s |
 | `sme_l1_groups` | literal | Measured | every fmla into one ZA slice is a serial chain, so this is dependency depth, not residency or width; the optimum inverts either side of two. | none — orphaned; candidates (1,2,4,8) |
 | `sme_rmw_groups` | literal | Measured | each group carries its own load and store, so this is stream count and dependency depth together, not residency or width. | none — orphaned; candidates (1,2,4,8) |
-| `sme_scal_min` | literal | Measured | where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | none — orphaned; sweep n |
+| `sme_scal_min` | literal | Measured | where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | 4.2 s |
 
 ## workspace
 
@@ -293,7 +293,7 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Orphaned Measured knobs
 
-12 of the 23 Measured knobs have no entry in
+8 of the 23 Measured knobs have no entry in
 `bench/calibrate.jl`, so `tune!()` cannot set them however many times it runs. The tier is
 still correct — the value was reached by measurement — but the pin it asks for is
 unreachable until a calibrator exists. Each row's `tune!()` cell reads `none`, and the
@@ -307,12 +307,8 @@ handle after it is what a person would sweep by hand meanwhile.
 | `sme_min` | sweep |
 | `sme_min_exact` | sweep |
 | `sme_panel_bytes` | sweep |
-| `sme_asum_min` | sweep n |
-| `sme_axpy_min` | sweep n |
-| `sme_dot_min` | sweep n |
 | `sme_l1_groups` | candidates (1,2,4,8) |
 | `sme_rmw_groups` | candidates (1,2,4,8) |
-| `sme_scal_min` | sweep n |
 
 ## Tuning constants that are NOT knobs
 
