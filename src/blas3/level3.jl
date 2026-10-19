@@ -4809,8 +4809,8 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::In
     # modulus rather than `_SME_MR`. Asking the predicate keeps this tied to the tile rule instead of
     # restating a size of its own.
     sme_recur = _SME_F64 && _SME_ENTRY[] !== C_NULL && _strided1(A) &&
-        k % (2 * _SME_MR) == 0 && size(B, 1) % _SME_MR == 0 &&
-        _sme_tile_ok(size(B, 1), _trsplit(k))
+        k % (2 * _SME_MR) == 0 && mrt % _SME_MR == 0 &&
+        _sme_tile_ok(mrt, _trsplit(k))
     if !unit && !cj && !sme_recur && k <= _trsm_r_fuse() && eltype(B) === Float64 && _strided1(B) &&
             (!needcopy || k * k * sizeof(Float64) <= _L1_BYTES || mrt > _trsm_ncut_r()) &&
             (mrt > _trsm_ncut_r() || (k > _trsm_dbase() && mrt >= _trsm_r_mfloor(k)))
