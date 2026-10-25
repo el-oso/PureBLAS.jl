@@ -289,6 +289,15 @@ end
 # THE WORKER COUNT, NOT A RAGGED `m`, IS WHAT REACHES THIS: every band is a whole `_MR·W` block, and
 # only some worker counts make them whole `_SME_MR` blocks as well. `k` must be at least 64, because
 # `_sme_tile_ok` needs `min(m, k÷2) ≥ 2·_SME_MR` before the recursion is eligible at all.
+#
+# WHAT THIS ITEM DOES NOT COVER, so that a green is not read as covering it. `_gemm_core!` carries ONE
+# route token and it lands in the `n` slot, so `_gemm_core_body!` asks `_sme_eligible` with the chunk's
+# OWN row extent (`src/blas3/gemm.jl`, whose comment there claims invariance for `nrt` only). Side-R
+# splits rows, so that row extent is a band height, and a band below `2·_SME_MR` fails
+# `_sme_tile_ok`'s first clause where the unsplit height passes it. The shape below cannot reach that:
+# bands run about `m / nw` rows, so at m=2048 one falls under `2·_SME_MR` only past sixty-four workers
+# — twelve gives 168 — while m=64, k=512 reaches it at four workers, which get 16 rows each. A second
+# family is reported at `diag = 'U'`, where the leaf declines; this item only ever solves `diag = 'N'`.
 @testitem "trsm side-R: bit-identical at every thread count" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
@@ -300,7 +309,13 @@ end
         bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
         # Liveness first: the band split has to be armed at this shape or the comparison is vacuous.
         # Then the hazard itself — a worker count whose bands are NOT whole `_SME_MR` blocks while the
-        # unsplit height is. A box that cannot reach one says so rather than passing for free.
+        # unsplit height is.
+        #
+        # THE SKIP BELOW DOES NOT SHORT-CIRCUIT, deliberately: the comparison loop is a valid req#11
+        # check wherever it runs, so it runs even on a box that cannot reach the SME hazard. The cost
+        # is that a green alone does not say the SME route was exercised — on x86, where `_SME_F64` is
+        # false, this item records one skip AND a pass for every comparison. Read the skip, not the
+        # count.
         nws = map(2:nthreads()) do nt
             P.set_num_threads(nt)
             P._trsm_workers_r(k, m, Float64)
@@ -310,8 +325,9 @@ end
         @test maximum(nws) > 1
         @test m % P._SME_MR == 0
         if !(ragged && P._SME_F64)
-            @test_skip "no reachable worker count splits m=$m into a band that is not a whole \
-                _SME_MR block, or f64 SME is off (_SME_F64 = $(P._SME_F64))"
+            @test_skip "the SME band hazard is unreachable here, so the passes below do not cover \
+                it: no worker count splits m=$m into a band that is not a whole _SME_MR block, or \
+                f64 SME is off (_SME_F64 = $(P._SME_F64))"
         end
         for (up, tr) in (('L', 'N'), ('L', 'T'), ('U', 'N'), ('U', 'T'))
             G = randn(k, k)
