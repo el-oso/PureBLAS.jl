@@ -169,20 +169,23 @@ const _SME_ASUM_CALLS = Threads.Atomic{Int}(0)
 # THE FLOOR IS A COLD CROSSING, NOT A WARM ONE, and that distinction is the whole of it. Warm, the
 # ZA prologue amortizes over repeated passes and the route turns at n = 1024; cold it is paid once,
 # on a single pass, which is what BLAS-1 is graded on. Measured cold, ZA against the kernel it
-# displaces (`bench/probes/l1_za_cold_floor.jl`):
+# displaces. Both kernels are called DIRECTLY, so no row depends on where a floor currently sits —
+# a floor-gated measurement cannot separate the two (`bench/probes/l1_za_cold_floor_all4.jl`,
+# three draws, Apple M6; gain = displaced kernel / ZA, so above 1 the ZA route is the right one):
 #
-#     n         4096   8192  16384  32768  65536  131072  262144  976000
-#     dot       0.36   0.70   0.84   0.92   1.75    3.23    3.28    1.41
-#     asum      0.21   0.33   0.59   0.66   0.77    1.22    1.46    1.43
+#     n         8192  16384  32768  65536  131072  262144  524288  976000
+#     dot       0.54   0.72   0.83   1.63    3.08    3.90    1.64    1.44
+#     asum      0.30   0.46   0.61   0.70    1.12    1.32    1.51    1.42
 #
-# so dot turns near 65536 and asum near 131072 — 32x and 16x above where the warm crossings sit.
-# Floors placed one step above each, because a floor set from the wrong regime is what put dot
-# at 0.842 of OpenBLAS on the first attempt.
-# PDM: Measured — where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | tune: sweep n
-# PDM: Measured — where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | tune: none — orphaned; sweep n
+# THE FOUR OPERATIONS DO NOT SHARE ONE CROSSING, which is why each floor is its own constant rather
+# than one shared cut: dot turns at 65536, asum only at 131072, and the two streaming forms later
+# still (see `_SME_SCAL_MIN` / `_SME_AXPY_MIN`). A floor BELOW its crossing admits a kernel that
+# loses — asum at 65536 reads 0.70, i.e. the ZA route is 41% slower there than the one it displaces.
+# A floor set from the wrong regime is what put dot at 0.842 of OpenBLAS on the first attempt.
+# PDM: Measured — where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | tune: 4.2 s
 const _SME_DOT_MIN  = @load_preference("sme_dot_min", 65536)::Int   # req8-ok: measured crossover, table above
-# PDM: Measured — the same crossing for the one-stream form, which turns later because half the outstanding requests. | tune: none — orphaned; sweep n
-const _SME_ASUM_MIN = @load_preference("sme_asum_min", 65536)::Int  # req8-ok: measured crossover, table above
+# PDM: Measured — the same crossing for the one-stream form, which turns later because half the outstanding requests. | tune: 4.2 s
+const _SME_ASUM_MIN = @load_preference("sme_asum_min", 131072)::Int # req8-ok: measured crossover, table above
 
 const _SME_DOT_TRAMPOLINE  = Ref{Any}(nothing)
 const _SME_DOT_ENTRY       = Ref{Ptr{Cvoid}}(C_NULL)
@@ -450,19 +453,28 @@ end
 #     scal     1.00   0.22   0.64   0.87    0.98    1.03     0.97
 #     axpy     1.00   0.25   0.62   0.83    0.99    1.38     0.97
 #
-# Below 65536 that cost is most of the call and the NEON kernel is far better; above it the 3.3x
-# streaming rate dominates. Both floors land on the same crossing as `dot`'s and `asum`'s, which is
-# a property of the ZA route rather than of any one operation.
+# Below the floor that cost is most of the call and the NEON kernel is far better; above it the 3.3x
+# streaming rate dominates. THE TWO STREAMING FORMS TURN LATER THAN `dot` AND LATER THAN EACH OTHER,
+# so the crossing is a property of the operation's stream count and not of the ZA route alone. Both
+# kernels called directly, cold, three draws (`bench/probes/l1_za_cold_floor_all4.jl`; gain =
+# displaced kernel / ZA, so above 1 the ZA route is the right one):
+#
+#     n         8192  16384  32768  65536  131072  262144  524288  976000
+#     scal      0.30   0.51   0.68   0.85    0.87    1.18    2.19    2.02
+#     axpy      0.43   0.60   0.75   0.93    1.67    2.50    1.90    1.58
+#
+# `scal` reaches 262144 before it turns and `axpy` 131072, against `dot`'s 65536 — the one-stream
+# reduction turns earliest and the read-modify-write form latest.
 #
 # ⛔ THE MECHANISM IS NOT IDENTIFIED, so do not tune against a model of it. Ruled out by measurement:
 # the `@cfunction` trampoline, `za.enable` (1 ns), `za.disable`, the GC, and the kernel's own
 # instruction mix — a staged kernel (copy / +zero / +fmla / +read) called once per sample on a
 # REUSED buffer shows no penalty at any stage. It appears only with a freshly allocated operand per
 # call, which is what the gate does and what a real caller streaming over new data does.
-# PDM: Measured — where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | tune: none — orphaned; sweep n
-const _SME_SCAL_MIN = @load_preference("sme_scal_min", 65536)::Int   # req8-ok: measured crossover, table above
-# PDM: Measured — the same cold crossing for the three-stream form. | tune: none — orphaned; sweep n
-const _SME_AXPY_MIN = @load_preference("sme_axpy_min", 65536)::Int   # req8-ok: measured crossover, table above
+# PDM: Measured — where a fixed ZA prologue disappears into the stream on a single cold pass; a ratio between two kernels, not a residency criterion. | tune: 4.2 s
+const _SME_SCAL_MIN = @load_preference("sme_scal_min", 262144)::Int  # req8-ok: measured crossover, table above
+# PDM: Measured — the same cold crossing for the three-stream form. | tune: 4.2 s
+const _SME_AXPY_MIN = @load_preference("sme_axpy_min", 131072)::Int  # req8-ok: measured crossover, table above
 
 @inline _sme_scal_ok(::Type{T}, n::Int, x) where {T} =
     T === Float64 && _SME_F64 && n >= _SME_SCAL_MIN &&

@@ -111,6 +111,12 @@ const _TUNABLE_KEYS = (
     # datapath correction no detected const separates Zen4 (wants 4) from
     # Zen5-mobile (wants 8); see bench/calibrate.jl `calibrate_gemv_mr`.
     "gemv_mr",
+    # The four ZA level-1 floors. Each calibrator decomposes its own crossover — it times the ZA
+    # kernel against the one it displaces across a size grid, rather than duelling candidate values
+    # through the public entry, which cannot work here because the entry takes the ZA route only at or
+    # above the floor being calibrated. So they add no member to the multiple-comparison family
+    # `_TUNE_NKNOBS` splits, for the same reason `sme_inplace_njp` does not.
+    "sme_dot_min", "sme_asum_min", "sme_scal_min", "sme_axpy_min",
 )
 
 """
