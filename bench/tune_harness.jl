@@ -160,14 +160,23 @@ Anything else is `:tie`, and a tie MUST NOT be pinned — the in-code default is
 unwritten pin is self-documenting, and it leaves the derived default free to be re-adjudicated when the
 kernel changes. Ranking by median alone is what the retired duels did, and it is how a knob comes to
 select on noise.
+
+BOTH BARS ARE AGAINST THE INCUMBENT, AND CLEARING THEM IS NOT ENOUGH. Several candidates can clear
+both while being indistinguishable FROM EACH OTHER, and the largest median then names whichever one
+drew high in this process: `potrf_upper_direct_max` returns 8 or 12 across cold processes with their
+lower bounds 0.001 apart, and ranking by the lower bound instead only moves which statistic the draw
+rides on. There is no tie-break to be had from the measurement, so the verdict is `:unresolved` —
+reported, never pinned. It is a DIFFERENT result from `:tie`: the incumbent lost, and losing to a set
+whose members cannot be ordered is a finding about the in-code default, which is code work and not a
+pin.
 """
 function decide(res; delta::Float64 = 0.02)
-    best = nothing
-    for r in res[2:end]
-        (r.lo > 1.0 && r.ratio > 1 + delta) || continue
-        (isnothing(best) || r.ratio > best.ratio) && (best = r)
-    end
-    return isnothing(best) ? (res[1].name, :tie) : (best.name, :win)
+    qual = [r for r in res[2:end] if r.lo > 1.0 && r.ratio > 1 + delta]
+    isempty(qual) && return (res[1].name, :tie)
+    leader = argmax(r -> r.ratio, qual)
+    # Separated from every rival means no rival's interval reaches the leader's lower bound.
+    all(r -> r.name == leader.name || r.hi < leader.lo, qual) || return (res[1].name, :unresolved)
+    return (leader.name, :win)
 end
 
 """
@@ -185,4 +194,8 @@ noswitch_msg(verdict::Symbol) =
     verdict === :tie ?
     "    ⇒ no pin: candidates are indistinguishable here (CI overlaps 1.0, or the margin is under the " *
     "win threshold). The in-code default is adequate on this machine — this is a result, not a failure." :
+    verdict === :unresolved ?
+    "    ⇒ no pin: the incumbent LOST, but to candidates that do not separate from each other, so " *
+    "no measurement names which. A pin would be a draw from the band and would differ per process. " *
+    "The finding is that the in-code default is beaten here: that is code work, not a pin." :
     "    ⇒ no pin: verdict $(verdict)."

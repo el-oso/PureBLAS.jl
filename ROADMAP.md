@@ -611,16 +611,15 @@ Preference→frozen `.so` · first-use→`OncePerProcess` (Mode-2 end users) · 
 measurement. Acceptable only as a stopgap with a stated physical mechanism; the clean fix is a genuine
 analytical formula, an empirical calibration, or a kernel that needs neither.
 
-### ⚠ OPEN — ORPHANED KNOBS: 12 of the 23 Measured knobs have no calibrator (2026-10-16)
+### ⚠ OPEN — ORPHANED KNOBS: 8 of the 23 Measured knobs have no calibrator (2026-10-16)
 
 **A Measured knob with no calibrator is ORPHANED.** The tier says the optimum is not derivable and
 "Wants a `tune!()` pin" (`docs/src/knobs.md:13`), but `tune!()` can only set a knob that
-`bench/calibrate.jl`'s `KNOBS` writes. Twelve do not appear there, so no `tune!()` run can ever
+`bench/calibrate.jl`'s `KNOBS` writes. Eight do not appear there, so no `tune!()` run can ever
 set them, and a second box has no automated path to its own value:
 
-    sme_min          sme_min_exact  sme_panel_bytes sme_asum_min     sme_axpy_min
-    sme_dot_min      sme_scal_min   sme_ger_groups  sme_l1_groups    sme_rmw_groups
-    symv_sme_min     strassen_base
+    sme_min          sme_min_exact  sme_panel_bytes sme_ger_groups
+    sme_l1_groups    sme_rmw_groups symv_sme_min    strassen_base
 
 Nearly all are SME, which is why this went unnoticed: the coprocessor exists on one family of parts,
 so no second machine has yet disagreed. That is the reason the gap survived, not a reason it is sound.
@@ -666,8 +665,32 @@ range rounds back onto 16. The design is the template for the remaining twelve:
   A decomposition yields the crossover; this knob's value is the largest cut that loses no gate
   shape, and the two coincide only while the crossover happens to land below that bound. Uncapped, a
   draw above the midpoint between two cells pins a cut the sweep never measured — 5 of the 17
-  draws exceed it and propose 24, where `gemm 384` at `njp 24` is the one untested cell. Capped,
-  the calibrator can only lower the cut, which is the direction its evidence supports.
+  draws exceed it and propose 24, and `gemm 384` at `njp 24` was then the untested cell. Capped,
+  the calibrator can only lower the cut, which is the direction its evidence supports. The cell has
+  since been measured (below) and does not lose; the cap stands anyway, because what it enforces is
+  that the calibrator cannot pin ahead of the sweep.
+
+### ✅ MEASURED — A CUT OF 24 COSTS `gemm 384` NOTHING (2026-10-17)
+
+`gemm 384` sits at `njp = 24` exactly, so it was the only gate shape between the shipped cut of 16 and
+the first cut measured to lose (32, where `gemm 512` reads 1.078). Ratios against a residency-only
+base, lower is faster:
+
+| shape | cut 16 | cut 24 | cut 32 |
+|---|---|---|---|
+| gemm 384 (njp 24) | 0.9960 ± 0.0051 | 1.0023 ± 0.0070 | 0.9957 ± 0.0063 |
+| gemm 256 (njp 16) | 1.0063 ± 0.0215 | 0.9968 ± 0.0218 | 0.9934 ± 0.0216 |
+| syrk 384 | 0.9112 ± 0.0010 | 0.9097 ± 0.0011 | 0.9112 ± 0.0012 |
+
+The null is ROUTED, not a dead knob: `_sme_inplace_a`'s own witness `_EXPINT[11]` reads 0 for
+`gemm 384` at cut 16 and 24 at cut 24, so the branch genuinely changes which way A is read. The block
+is 384x384 against a residency cap of 32768 elements, so residency does not admit it either — the njp
+test is what decides. The geometry explains the result: `lda = 384` spreads the columns over 16 L1
+sets against 4 at n = 512 and 2 at n = 1024, and in-place cost is a step function of that count, so
+the most benign geometry is where admitting a panel costs least.
+
+Raising the shipped cut to 24 is therefore SAFE and buys nothing measurable, so 16 stands. The same
+witness shows `gemm 512` still declines at cut 24, so 24 would admit 384 and no worse shape.
 - **Measure at a stride spanning FOUR L1 sets** (`lda = n = 512`), the geometry the square gate shapes
   have, and take the block from `_sme_blocks` rather than a held 64x2048. A one-set stride must not be
   measured: that case is derived as `>> 1` off the detected `_L1_WAY_BYTES`.
@@ -686,7 +709,178 @@ every duel in the tuner. Adopting orphans makes calibration slower by design.
 calibrator may straddle a grid boundary and decline forever. Declining is the correct outcome, but then
 the work buys reporting rather than a pin.
 
-### ⚠ OPEN — TWO CALIBRATORS NAME A DIFFERENT WINNER EACH PROCESS (2026-10-17)
+### ✅ FIXED — TWO CALIBRATORS NAMED A DIFFERENT WINNER EACH PROCESS (2026-10-17)
+
+Both are reproducible over six cold draws now. The fixes are in `decide` and in the window fit's
+per-size classifier, and both amount to applying a bar that already existed somewhere else.
+
+`decide` gained `:unresolved`. Clearing both bars against the incumbent was never enough: several
+candidates can clear them while being indistinguishable FROM EACH OTHER, and the largest median then
+names whichever drew high. An intermediate attempt ranked the tied set by LOWER bound instead and is
+recorded here because it looked principled and failed: `potrf_upper_direct_max` read 12, 12, 8, 8, 8,
+8 across six draws, the two lower bounds sitting 0.001 apart, and the tied set's own boundary moved
+too (in one draw candidate 16's `hi` fell 0.0003 below the leader's `lo`). No statistic from the
+measurement can order that band. So the verdict is now `:unresolved` when the leader is not separated
+from every rival, which is a DIFFERENT result from `:tie` — the incumbent lost, and that is a finding
+about the in-code default rather than something to pin. Six draws, same verdict.
+
+**The finding it reports is that `_NVREG` cannot separate two ISA classes that want opposite values.**
+`_at_potrf_udirect(hw) = hw.nvreg >= 32 ? 20 : 12` (`src/cpuinfo.jl:567`) is a register-capacity
+criterion, and the fleet table above it resolves 20 on both 32-register x86 boxes with a CI excluding
+1.0 — Zen4 +6.8%, Zen5 +8.2% — while the 16-register box would lose 5.4% at 20. This part reports
+`_NVREG = 32`, so the predicate selects 20, and 8, 12 and 16 all BEAT it here in 6 of 6 draws by 3 to
+9 percent. The predicate is not wrong about the fleet it was validated on: AVX-512 and NEON/SME both
+answer 32 and want the opposite cutoff, so no VALUE fixes this. It wants a third arm or a different
+physical criterion — req#8(b) working as written and then meeting a µarch class the fleet does not
+contain.
+
+**The x86 control rules out a general regression.** A fault in the upper-direct path would read the
+same from one box, so the candidate set was re-run on a frequency-locked Zen4 (AVX-512, `nvreg = 32`,
+verified 3501 MHz), six cold processes, incumbent 20 normalised to 1.0000 and higher better:
+
+| draw | 8 | 12 | 16 | 24 |
+|---|---|---|---|---|
+| 1 | 0.9328 | 0.9647 | 0.9798 | 0.9728 |
+| 2 | 0.9512 | 0.9798 | 0.9951 | 0.9863 |
+| 3 | 0.9473 | 0.9769 | 0.9931 | 0.9769 |
+| 4 | 0.9644 | 0.9807 | 0.9908 | 1.0026 |
+| 5 | 0.9381 | 0.9479 | 0.9747 | 0.9960 |
+| 6 | 0.9535 | 0.9809 | 0.9958 | 0.9867 |
+
+No candidate beats 20 in any draw; the one figure above unity carries [0.9556, 1.0456] and is a tie.
+Both boxes report `nvreg = 32` and resolve opposite cutoffs, so the criterion — not the value — is
+what needs replacing. That also reproduces the fleet table's Zen4 row from the other side, at a
+smaller magnitude (12 reads 1.9-5.2% worse than 20 here against the table's 20 at +6.8% over 12),
+which the differing normalisation and this tree's in-place-A read both bear on.
+
+**The trim build pins 12, and the reasoning behind that pin predicts this result.**
+`juliac/build.jl:120-126` justifies it: `potrf_64_` is `@ccallable`, so an unpinned `.so` ships an
+on-host benchmark whose first call times two Cholesky variants and picks from momentary machine state.
+The value sits BELOW the smallest measured crossover — ≈14-16 real and ≈22 complex
+(`bench/probes/potrf_upper_cross.jl`) — because one binary must be safe on every host, and because a
+box whose vector kernel is relatively faster moves the crossover DOWN, where being early costs only
+the tiny-n win while being late regresses n=16+. This part is that box, and 8, 12 and 16 all beating
+20 here IS the crossover sitting below 20, which that reasoning anticipates.
+
+So the two modes resolving differently on one machine is INTENDED, not a defect to remove: the `.so`
+is a portable single binary that accepts losing the tiny-n win, and the in-Julia path derives per
+host. A replacement for the `nvreg` criterion does not make the pin unnecessary either — a
+`@ccallable` entry cannot run an on-host benchmark however good the criterion becomes.
+
+The window fit's per-size classifier gained the `DELTA` margin. It tested only `r.lo > 1.0` or
+`r.hi < 1.0`, so a 0.14 percent effect with a tight interval counted as a win and the fitted window
+flipped with it (mode 1 with `amin = 40960 KiB` one run, mode 0 the next). `decide` has always
+required BOTH a CI excluding 1.0 and a margin over `DELTA`; this classifier simply omitted the second.
+Six draws now agree on mode 0.
+
+### ⚠ OPEN — THE ORPHANED KNOBS NEED A RUNTIME HOOK BEFORE THEY NEED A CALIBRATOR (2026-10-17)
+
+A calibrator reaches a knob by one of exactly two routes, and knowing which applies is what decides
+whether adopting an orphan is `bench/` work or `src/` work.
+
+- **A runtime override hook**, so the arms can be switched inside one process: `_FKR_<key>` for
+  `potrf_upper_direct_max`, `sytrf_cmult`, `gbtrf_cmult`, `ger_panel_np` and `strassen_base`, a
+  `_<KEY>_REF[]` cell for `gemvt_pf`, `trmv_fused_min` and `gemvt_perscan`, `_EXPINT[10]` for
+  `sme_inplace_njp`. Eight of the ten calibrated knobs take this route.
+- **A decomposition** that measures the physical quantity the knob trades off, needing no hook at all:
+  `gemm_mt_work` times the fork-join round trip and applies the shipped formula to it, and
+  `sme_inplace_njp` times the pack against one column panel either way.
+
+**Eleven of the twelve orphans have NEITHER.** Only `strassen_base` carries a hook, and it is blocked
+for an unrelated reason its own marker states (the split-efficiency curve has no knee). So "adopt the
+orphans" is mostly a request to add override hooks to shipped code, one knob at a time, and writing
+calibrators first would be building on nothing.
+
+Worse for three of them: `sme_l1_groups`, `sme_rmw_groups` and `sme_ger_groups` are consumed at
+PRECOMPILE time, not merely read at runtime — `_SME_DOT_IR = _sme_l1_ir(_SME_L1_G, :dot)` builds LLVM
+IR spliced into a `Base.llvmcall`, which needs a compile-time constant. `bench/probes/l1_za_groups.jl`
+sweeps them by `@eval`-ing one kernel per group count, which measures the MICROKERNEL and not the
+knob's effect through the public path. A hook for these is a function-pointer table over pre-built
+group kernels, not a mutable cell.
+
+**The four that are adoptable without touching `src/`:** `sme_dot_min`, `sme_asum_min`, `sme_axpy_min`
+and `sme_scal_min` are crossovers between two code paths that are each separately callable, so the
+decomposition route applies — time both paths across candidate `n` and report where they cross, as
+the `sme_inplace_njp` calibrator does for the pack. **The decomposition is now written and run** (see
+below); what remains for these four is wiring it into `bench/calibrate.jl` as a calibrator, which is
+`bench/` work only.
+
+### ✅ MEASURED — THE FOUR SME LEVEL-1 FLOORS ARE FOUR DIFFERENT CROSSINGS (2026-10-17)
+
+All four shipped 65536 on the claim that the crossing "is a property of the ZA route rather than of
+any one operation". Measured with both kernels called directly — so no row depends on where a floor
+sits — that claim is false and three floors admitted a kernel that LOSES. Cold, `evals=1`, median,
+three draws agreeing to 0.06; gain = displaced kernel / ZA, so above 1 the ZA route is right:
+
+```
+n         8192  16384  32768  65536  131072  262144  524288  976000
+dot       0.54   0.72   0.83   1.63    3.08    3.90    1.64    1.44
+asum      0.30   0.46   0.61   0.70    1.12    1.32    1.51    1.42
+scal      0.30   0.51   0.68   0.85    0.87    1.18    2.19    2.02
+axpy      0.43   0.60   0.75   0.93    1.67    2.50    1.90    1.58
+```
+
+Defaults corrected to the measured crossings: `dot` 65536 (unchanged), `asum` **131072**, `axpy`
+**131072**, `scal` **262144**. At the old floor `asum` was taking a route **41% slower** than the one
+it displaced. The ordering tracks STREAM COUNT — the one-stream reduction turns earliest, the
+read-modify-write form last — which is why four constants and not one shared cut. Routing
+re-verified per operation against its own call counter.
+
+⚠ **A FLOOR-GATED MEASUREMENT COULD NOT HAVE FOUND THIS.** The previous probe timed the PUBLIC entry
+against the displaced kernel, and the entry takes ZA only at or above its floor, so every sub-floor
+row compared the same kernel against itself — and nothing in the output said so. A knob cannot be
+calibrated by an instrument the knob steers.
+
+⛔ **GATE RATIO UNMEASURED** (req#9): these are kernel-against-kernel ratios, not PB against a
+reference. Raising a floor is conservative — it restores the kernel SME displaced, so it cannot fall
+below the pre-SME baseline — but that is an argument, not a number.
+
+### ✅ FIXED — THE SIDE-R SOLVE HAD TWO ROUTE DEFECTS (2026-10-17)
+
+`_trsm_right!` carried a fused substitution leaf (`_trsm_rl_split_f64!`, the kernel `potrf`'s panel
+solve uses) that **only the lower triangle could reach**, and it took that leaf even at the widths
+where the recursion's trailing products are stronger.
+
+**Defect 1 — an upper triangle is the same leaf with the coefficients transposed.** `Λ = Aᵀ` is lower
+whenever A is upper, so `X·A = B` is `X·Λᵀ = B` and `X·Aᵀ = B` is `X·Λ = B`: each upper case is the
+lower case carrying the opposite transpose flag, for one O(k²) triangle copy the lower non-transpose
+arm already paid under the same amortization test. The alternative is the recursion, whose trailing
+products only reach the SME route above `2·_SME_MR` — at m=5000, k=50 it issues ZERO SME products
+while a standalone product on the same operand shape sustains 250 GF/s.
+
+**Defect 2 — the leaf must decline where the recursion's products are EXACT SME tiles.** Leaf time /
+recursion time, both triangles, m from k to 40·k:
+
+```
+k              50      100      128      200      400      512
+leaf/recursion  0.60-0.94  0.63-0.81  1.12-1.56  0.68-0.78  0.75-0.84  1.07-1.37
+```
+
+`_sme_tile_ok`'s exact arm admits a tile from `2·_SME_MR` when both extents are whole `_SME_MR`
+blocks, while a ragged tile of the same size is slower than the NEON path and waits for
+`_SME_MIN_EXACT`. The split is `k ÷ 2`, so the modulus is `2·_SME_MR` — which is why k=400 is
+divisible by `_SME_MR` and still ragged at its split.
+
+Result, one thread, median: tall-narrow upper **1.26-1.66x**, 512 square **1.45x** upper and **1.56x**
+lower, k=128 m=5120 **2.71x**, `potrf` lower **1.09-1.22x** at n=256..2048. No cell of a 60-cell map
+regresses. Worst residual 2.9e-15 over 8 triangle/transpose/diagonal combinations × 12 widths × 7
+heights, plus views.
+
+⛔ **An m/k aspect-ratio rule was the first hypothesis and the map falsified it** — m/k over 1..40
+changes nothing, only `k` does. ⛔ **Widening `_trsm_base` so a narrow triangle is inverted whole is
+also falsified**: +24% at 64 and +89% at 128, with residuals identical at all five swept widths.
+
+⚠ `potrf` UPPER is on side **L** and a side-L control at six panel shapes measures identical with and
+without the change (0.1-0.8%), so an 11% cross-session potrf-upper difference is NOT attributable
+here. ⚠⚠ **A `git stash` in a live Revise session KILLED THE SME ENTRY** — zero SME calls everywhere,
+still zero after `git stash pop`, and a potrf A/B that read as a 4x win which was really SME-on
+against SME-off. An A/B across a stash needs a session restart per arm and a re-asserted witness.
+
+### ✅ SUPERSEDED — the pre-`:unresolved` reading of the two unstable calibrators (2026-10-17)
+
+The section above is the current one. This is kept for its two run tables; its conclusion that a
+tie-break among the survivors would settle `potrf_upper_direct_max` is the reading `:unresolved`
+replaced, and no statistic from that measurement can order the band.
 
 Two of the nine existing calibrators return a different verdict on consecutive runs of
 `tune!(dryrun = true)` on an idle box. Neither is a noise problem: both adjudicate a margin their own

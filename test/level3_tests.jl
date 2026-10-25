@@ -279,6 +279,56 @@ end
     end
 end
 
+# A side-R worker is handed a ROW BAND of B and routes from `nroute`, the whole problem's row count,
+# so it takes the algorithm the unsplit solve takes. Bands round to `_MR·W`, which is FINER than the
+# `_SME_MR` modulus the SME recursion asks for, so a band's own height can fail that modulus where
+# the unsplit height passes it — at m=2048 with three workers the bands are 680/684/684. A band
+# routing on its own height takes the fused leaf while the unsplit call recurses, and leaf and
+# recursion sum in a different order, so the result would depend on the worker count.
+#
+# THE WORKER COUNT, NOT A RAGGED `m`, IS WHAT REACHES THIS: every band is a whole `_MR·W` block, and
+# only some worker counts make them whole `_SME_MR` blocks as well. `k` must be at least 64, because
+# `_sme_tile_ok` needs `min(m, k÷2) ≥ 2·_SME_MR` before the recursion is eligible at all.
+@testitem "trsm side-R: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    m, k = 2048, 64
+    if nthreads() < 2
+        @test_skip "needs ≥2 julia threads"
+    else
+        bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
+        # Liveness first: the band split has to be armed at this shape or the comparison is vacuous.
+        # Then the hazard itself — a worker count whose bands are NOT whole `_SME_MR` blocks while the
+        # unsplit height is. A box that cannot reach one says so rather than passing for free.
+        nws = map(2:nthreads()) do nt
+            P.set_num_threads(nt)
+            P._trsm_workers_r(k, m, Float64)
+        end
+        bandlens(nw) = (P._trsm_rchunk(m, nw, i, Float64)[2] for i in 1:nw)
+        ragged = any(nw -> nw > 1 && any(l -> l % P._SME_MR != 0, bandlens(nw)), nws)
+        @test maximum(nws) > 1
+        @test m % P._SME_MR == 0
+        if !(ragged && P._SME_F64)
+            @test_skip "no reachable worker count splits m=$m into a band that is not a whole \
+                _SME_MR block, or f64 SME is off (_SME_F64 = $(P._SME_F64))"
+        end
+        for (up, tr) in (('L', 'N'), ('L', 'T'), ('U', 'N'), ('U', 'T'))
+            G = randn(k, k)
+            A = (up == 'U' ? triu(G) : tril(G)) + k * I
+            B0 = randn(m, k)
+            P.set_num_threads(1)
+            r = copy(B0); P.trsm!(r, A; side = 'R', uplo = up, transA = tr)
+            for nt in 2:nthreads()
+                P.set_num_threads(nt)
+                g = copy(B0); P.trsm!(g, A; side = 'R', uplo = up, transA = tr)
+                @test bitsame(g, r)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
+
 # Regression: the complex `hemm!` PACKED path copied the Hermitian diagonal's imaginary part verbatim
 # into the packed panel. Reference zhemm never READS imag(A[i,i]) — the Hermitian convention says it is
 # zero — so a caller may legitimately leave anything there, and LinearAlgebra's own `Hermitian` wrapper
