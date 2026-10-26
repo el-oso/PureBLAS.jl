@@ -3637,16 +3637,23 @@ end
         # arrives here through `_gemm_run_chunk`. `_sme_owns` at the threaded entry is what keeps
         # a split call off the coprocessor, because by this point the split has already happened.
         #
-        # THE ROW EXTENT IS THE LOCAL `m`, NOT `mrt`, and that is the single departure from the
-        # route-token invariant stated at the top of this body. `_sme_tile_ok` is a FLOOR on the
-        # tile actually handed to the kernel (`min(m, n) >= 2*_SME_MR`), and the call below passes
-        # the local extents, so resolving it from the token would admit a band narrower than the
-        # kernel's minimum tile. The column extent is `nrt` for the opposite reason — it is what
-        # makes a column-split chunk route as its parent did — and the two readings are therefore
-        # not symmetric. Whether that asymmetry can produce a thread-count divergence is open: it
-        # needs a row- or column-splitting caller reaching this branch on Apple silicon, which is
-        # the only place `_SME_F64` is true, so it is not decidable on the x86 fleet.
-        if _sme_eligible(T, m, nrt, k, tA, tB, cA, cB, C, A, B)
+        # EVERY EXTENT IS ROUTED, and this is the one route predicate `max` absorption cannot
+        # protect: `_sme_tile_ok` is `min(m, n) >= 2*_SME_MR` plus two moduli, so a chunk reading its
+        # own extents judges the tile on different operands than the unsplit call and the two kernels
+        # do not agree bit for bit — the SME path preloads C into ZA and accumulates on top, the
+        # vector path sums from zero and stores `fma(beta, C, alpha*acc)`.
+        #
+        # The token says which dimension it repairs, which is what makes one reading correct on both
+        # sides: side L passes `(-1, nroute, -1)`, so `mrt` is the local row count and a column split
+        # leaves that equal to the undivided one; side R passes `(nroute, -1, -1)`, so `mrt` is the
+        # undivided row count and `nrt` is the local column count, which a row split leaves whole.
+        # `_sme_tile_ok(mrt, nrt)` is therefore the undivided pair either way.
+        #
+        # Reading the local row extent instead costs reproducibility and buys nothing: the kernel
+        # pads any row count (`mpad = cld(mce, MR) * MR` in `_sme_gemm!`) and takes a partial last
+        # tile, so the predicate is a shape-and-crossover test, not a minimum a narrow band could
+        # violate. A band below the crossover is slower on the coprocessor, never wrong.
+        if _sme_eligible(T, mrt, nrt, krt, tA, tB, cA, cB, C, A, B)
             return _gemm_sme!(C, A, B, Float64(alpha), Float64(beta), m, n, k, tA, tB)
         end
         if strassen && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(mrt, nrt, krt) > 0

@@ -3,14 +3,18 @@
 # and also fails. Every entry states why it is not a req#11 defect — or, for the one that is, who owns
 # it. See test/routetoken_lint.jl for the rule.
 #
-# LIVE DEFECT, owned by the mac-mini session on branch `trsm-r-sme-band-floor`.
-# `_sme_eligible`'s row extent is the chunk's own, so a side-R band judges `_sme_tile_ok` on different
-# operands than the unsplit call. Measured: `potrf!` lower diverged at 9..12 workers on SME, clean at
-# 2..8, and clean at every count on x86 where `_SME_F64` is false. The local read is itself correct —
-# `_sme_tile_ok` is a FLOOR on the tile handed to the kernel, so routing it from the undivided shape
-# would admit a chunk below the kernel's minimum — which is why the repair caps the worker count
-# instead of rerouting the predicate. Remove this line when that lands.
-blas3/gemm.jl:not-a-max:if _sme_eligible(T, m, nrt, k, tA, tB, cA, cB, C, A, B)
+# CORRECT AND DELIBERATE. `_sme_tile_ok` is a `min` plus two moduli, so `max` absorption cannot reach
+# it and the predicate must read the token on every axis — which this site does. Baselined rather than
+# marked in source so the lint keeps reporting the class: a `min` predicate is the shape that has
+# broken req#11 repeatedly, and each new one must come here and be argued.
+#
+# Measured on SME hardware, this reading against the local row extent: 64 side-R cells at
+# uplo='L'/transA='N' go from 41 diverging to 0, `potrf!` lower from diverging at worker counts
+# 3,6,7,9..12 to clean at every count, and `potrf!` upper stays clean with its coprocessor call counts
+# unchanged at 1440 (n=1024) and 4200 (n=2048). The call count RISES where it was broken — 2170 to
+# 3000 and 6892 to 8552 — so the repair keeps chunks on the coprocessor rather than switching it off.
+# x86 cannot witness any of this: `_SME_F64` is false there and `_sme_eligible` short-circuits first.
+blas3/gemm.jl:not-a-max:if _sme_eligible(T, mrt, nrt, krt, tA, tB, cA, cB, C, A, B)
 #
 # LATENT, not reachable today. `min(m, nrt, k)` over a routed value: a `min` gets no protection from
 # the n-slot token. Under a COLUMN split `m` is undivided so raw and routed agree and the site is
