@@ -3649,10 +3649,19 @@ end
         # undivided row count and `nrt` is the local column count, which a row split leaves whole.
         # `_sme_tile_ok(mrt, nrt)` is therefore the undivided pair either way.
         #
-        # Reading the local row extent instead costs reproducibility and buys nothing: the kernel
-        # pads any row count (`mpad = cld(mce, MR) * MR` in `_sme_gemm!`) and takes a partial last
-        # tile, so the predicate is a shape-and-crossover test, not a minimum a narrow band could
-        # violate. A band below the crossover is slower on the coprocessor, never wrong.
+        # The predicate is a shape-and-crossover test, not a minimum a narrow band could violate: the
+        # kernel pads any row count (`mpad = cld(mce, MR) * MR` in `_sme_gemm!`) and takes a partial
+        # last tile. So reading the local row extent costs reproducibility and cannot buy correctness.
+        #
+        # IT DOES BUY SPEED, THOUGH, AND THAT COST LANDS ON THE WORKER COUNT. Routing the predicate
+        # ADMITS bands the local read refused — measured on a side-R solve at k=512 and twelve
+        # workers, SME calls go from 0 to 180 at m=64, 128 and 256. Padding a 4-row band to `_SME_MR`
+        # discards three quarters of the work, twelve deep on one shared coprocessor, and the solve
+        # runs 2.18x slower at m=64, 1.39x at m=128, 1.17x at m=256. The remedy belongs in the
+        # admission decision, not here: capping workers so every band reaches the kernel's tile turns
+        # those three into 1.36x, 1.55x and 1.29x FASTER than an unrouted predicate manages. A
+        # residual stands at m=512, where the cap does not bind and this reading is 4-5% slower; that
+        # one needs a crossover on the band extent, which is a routing choice rather than a token one.
         if _sme_eligible(T, mrt, nrt, krt, tA, tB, cA, cB, C, A, B)
             return _gemm_sme!(C, A, B, Float64(alpha), Float64(beta), m, n, k, tA, tB)
         end
