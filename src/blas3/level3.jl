@@ -5049,6 +5049,43 @@ end
     return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(m, _MR * _vwidth(T))))
 end
 
+# A SIDE-R ROW BAND UNDER `2·_SME_MR` TAKES A DIFFERENT GEMM ROUTE THAN THE UNDIVIDED CALL, so the
+# pool is capped at the largest count whose every band reaches that floor. `_gemm_core!` carries one
+# route token and it lands in the `n` slot; `_trsmr_run_chunk` feeds it the whole problem's ROW count
+# precisely so that each `max(m, nrt, k)` route predicate reads the serial value even though the `m`
+# argument is the band's own height. `_sme_tile_ok` is the one route predicate that is not a pure
+# `max` — it opens with `min(m, n) >= 2 * _SME_MR` — so the band height reaches it unrepaired, and a
+# short band declines the coprocessor where the undivided height accepts it. The two routes cannot
+# agree bitwise: the SME macrokernel seeds ZA from C under β=1 while NEON accumulates from zero.
+#
+# The floor is exact, not a safety margin. On an M6 at k=512, Float64, the first worker count whose
+# bits differ from the serial solve is the first whose SMALLEST band falls under 32 rows, at every m
+# measured: m=64 turns at 3 workers, m=128 at 5, m=256 at 9, and m=2048 never turns — its narrowest
+# band at twelve workers is 168 rows.
+#
+# ASKED OF `_sme_eligible` RATHER THAN RESTATED, for the reason `_trmmr_sme_owns` gives: the cap
+# spends worker counts, so it must not fire on a call gemm would route to NEON regardless. The
+# sub-gemm is `_gemm_subR!(B2, B1, off, …)`, so its three operands are B, B and A, its `m` is B's
+# undivided row count, and the widest `n` any recursion level gives it is the top split's remainder
+# `cld(k, 2)`. Off SME `_SME_F64` is false, so this is identically the uncapped count and no other
+# box's worker count moves.
+# PDM: Derived — the sub-gemm's own eligibility, asked of `_sme_eligible` with that gemm's operands
+# and shape, and a band floor read from `_sme_tile_ok` itself. | tune: n/a, follows _sme_eligible
+@inline function _trsmr_sme_nw(::Type{T}, nwr::Int, k::Int, m::Int, A, B) where {T}
+    nwr > 1 || return nwr
+    _sme_eligible(T, m, cld(k, 2), k, false, false, false, false, B, B, A) || return nwr
+    while nwr > 1
+        short = false
+        for i in 1:nwr
+            short = _trsm_rchunk(m, nwr, i, T)[2] < 2 * _SME_MR
+            short && break
+        end
+        short || break
+        nwr -= 1
+    end
+    return nwr
+end
+
 @noinline function _trsmr_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
     i0, len = _trsm_rchunk(p.m, nw, i, T)
     len > 0 || return nothing
@@ -5403,7 +5440,7 @@ function trsm!(
     # alpha=1 both diverge bitwise at every worker count 2..6. Square power-of-two B does NOT — every
     # band is then a multiple of the 8-row granule — which is why a square-only check passes it.
     if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
-        nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
+        nwr = _trsmr_sme_nw(eltype(B), _trsm_workers_r(k, size(B, 1), eltype(B)), k, size(B, 1), A, B)
         if nwr > 1
             rA = _root(A); rB = _root(B)
             GC.@preserve rA rB _gemm_threaded!(

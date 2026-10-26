@@ -556,13 +556,19 @@ end
         # serial runs and pass no matter what. The witness is the pool's generation counter rather
         # than a worker-count predicate, because it catches any veto between "the predicate says
         # yes" and the pool actually running — including one nobody has written yet.
+        #
+        # EVERY COUNT, NOT TWO SAMPLES. The invariant is quantified over the thread count, so two
+        # probe points do not cover it: the lower factorization can return the serial bits at two
+        # workers and at the top of a small pool while differing in between, which is invisible on
+        # any box with eight or fewer threads. A generation-counter witness does not close that gap
+        # — it proves the pool RAN, not that the count was varied.
         p = P._gemm_pool(Float64)
         for n in (1024, 2048)
             Random.seed!(99 + n)
             S = randn(n, n); S = S * S' + n * I
             P.set_num_threads(1)
             r = copy(S); P.potrf!(r; uplo = 'L')
-            for nw in (2, nthreads())
+            for nw in 2:nthreads()
                 P.set_num_threads(nw)
                 g = copy(S)
                 g0 = @atomic p.gen
