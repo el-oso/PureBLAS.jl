@@ -91,7 +91,52 @@ function prefsync_scan()
     return hits
 end
 
+# KNOBS WHOSE CONST IGNORES THEM OFF APPLE SILICON. `_TRMM_BASE_R` reads its preference only where
+# `_SME_F64` holds, because the recursion it selects is faster only when the off-diagonal gemms run on
+# a matrix unit — off SME it was MEASURED regressing, 35.5% slower at k=100. So a value set here on
+# any other host has no effect, and dropping it with nothing reported is a silent-continue.
+#
+# The host test is deliberately coarse. `_SME_F64` needs `+sme` in the CPU target and this lint does
+# not load PureBLAS (it reads TOML and nothing else, which is why it costs nothing). `aarch64 + Apple`
+# is a SUPERSET of SME-capable, so this never false-alarms on a box where the knob is live; the
+# residual gap is an Apple box without `+sme`, where the pin is ignored and this stays quiet.
+const _PS_SME_ONLY = ("trmm_base_r",)
+_ps_host_has_sme() = Sys.ARCH === :aarch64 && Sys.isapple()
+
+"""
+    prefsync_inert(files = _PS_FILES) -> Vector{String}
+
+Knobs that are set in `files` but cannot take effect on this host.
+
+`files` is a parameter so the POSITIVE CONTROL for this check can point at a temporary TOML. It must
+not require writing a real `LocalPreferences.toml`: the pin tier belongs to the user, and a check
+whose only control is "set a real pin and see if it fires" either goes unverified or gets verified by
+touching a file nothing else may touch. (It went unverified the first way and then the second.)
+"""
+function prefsync_inert(files = _PS_FILES)
+    _ps_host_has_sme() && return String[]
+    out = String[]
+    for path in files
+        isfile(path) || continue
+        p = prefs_of(path)
+        for k in _PS_SME_ONLY
+            haskey(p, k) && push!(out, "$(k) = $(p[k])  in $(relpath(path))")
+        end
+    end
+    return out
+end
+
 if abspath(PROGRAM_FILE) == @__FILE__
+    inert = prefsync_inert()
+    if !isempty(inert)
+        println("preference-sync lint: FAIL — $(length(inert)) pin(s) set but INERT on this host:")
+        foreach(x -> println("  ", x), inert)
+        println()
+        println("  These knobs are read only where SME is available; this host is not, so the value is")
+        println("  discarded and the derived default stands. That is a silent difference between what")
+        println("  the file says and what the library does. Remove the pin, or move it to the Apple box.")
+        exit(1)
+    end
     v = prefsync_scan()
     if isempty(v)
         println("preference-sync lint: PASS (both LocalPreferences.toml agree on every PureBLAS knob)")

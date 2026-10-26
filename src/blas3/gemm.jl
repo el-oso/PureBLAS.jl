@@ -1216,22 +1216,40 @@ function _gemm_unpacked_mr1!(
 end
 # Tall split-reduction microkernel: MR row-blocks × NR cols, S independent partial accumulators per cell,
 # summed at store — keeps MR·NR·S (=_ILP_TARGET) chains live from k=0 to cover the short-k fill the wide
-# tile leaves exposed. Full tile only (mr rows × NR cols, all in bounds); partials delegate to the wide
-# masked/edge kernels. Same store/beta folding as _microkernel_unpacked!. req#8; Zen4 n=32 0.85→1.07×.
+# tile leaves exposed. Full COLUMN tile (NR cols in bounds); a partial row block is handled here under
+# MASK, and a partial column tile goes to the edge kernel. Same store/beta folding as
+# _microkernel_unpacked!. req#8; Zen4 n=32 0.85→1.07×.
+# MASK=true computes a row block whose live row count `mre` is NOT a multiple of W: dead lanes load as
+# zero, contribute zero to every chain, and are dropped at the store. A LIVE ROW THEREFORE SUMS k IN
+# EXACTLY THE ORDER IT WOULD UNMASKED — same S chains, same fold — which is what lets the driver send
+# every row block here regardless of alignment. That uniformity is a req#11 requirement, not a tidiness
+# one: the block decomposition depends on how a caller split m, so a decomposition-dependent choice of
+# kernel makes the result depend on the worker count.
+#
+# MASK=false emits no lane arithmetic at all, so the aligned path keeps the code it was measured with.
 @generated function _microkernel_unpacked_split!(
         C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir::Int,
-        B::Ptr{T}, ldb::Int, jr::Int, k::Int, alpha::T, beta::T,
-        ::Val{MR}, ::Val{NR}, ::Val{S}, ::Val{TB}, ::Val{B0}
-    ) where {T, MR, NR, S, TB, B0}
+        B::Ptr{T}, ldb::Int, jr::Int, k::Int, alpha::T, beta::T, mre::Int,
+        ::Val{MR}, ::Val{NR}, ::Val{S}, ::Val{TB}, ::Val{B0}, ::Val{MASK}
+    ) where {T, MR, NR, S, TB, B0, MASK}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
+    if MASK
+        lanetuple = Expr(:tuple, (0:(W - 1))...)   # literal; a @generated body must be pure
+        push!(body.args, :(lanes = Vec{$W, Int}($lanetuple)))
+        for mi in 1:MR
+            push!(body.args, :($(Symbol(:msk, mi)) = (lanes + $((mi - 1) * W)) < mre))
+        end
+    end
     for mi in 1:MR, j in 1:NR, s in 0:(S - 1)
         push!(body.args, :($(Symbol(:c, mi, :_, j, :_, s)) = zero($V)))
     end
     step = (pex, s) -> begin
         q = quote end
         for mi in 1:MR
-            push!(q.args, :($(Symbol(:a, mi)) = vload($V, A + ((ir + $((mi - 1) * W)) + $pex * lda) * $sz)))
+            addr = :(A + ((ir + $((mi - 1) * W)) + $pex * lda) * $sz)
+            ld = MASK ? :(vload($V, $addr, $(Symbol(:msk, mi)))) : :(vload($V, $addr))
+            push!(q.args, :($(Symbol(:a, mi)) = $ld))
         end
         for j in 1:NR
             baddr = TB ? :(B + ((jr + $(j - 1)) + $pex * ldb) * $sz) : :(B + ($pex + (jr + $(j - 1)) * ldb) * $sz)
@@ -1264,7 +1282,13 @@ end
             for s in 1:(S - 1)
                 red = :($red + $(Symbol(:c, mi, :_, j, :_, s)))
             end
-            st = B0 ? :(vstore(av * $red, q)) : :(vstore(muladd(bv, vload($V, q), av * $red), q))
+            mk = Symbol(:msk, mi)
+            st = if MASK
+                B0 ? :(vstore(av * $red, q, $mk)) :
+                    :(vstore(muladd(bv, vload($V, q, $mk), av * $red), q, $mk))
+            else
+                B0 ? :(vstore(av * $red, q)) : :(vstore(muladd(bv, vload($V, q), av * $red), q))
+            end
             push!(
                 body.args, :(
                     let q = colp + $((mi - 1) * W * sz)
@@ -1278,8 +1302,48 @@ end
     return body
 end
 
-# Small-n split driver (wide AVX-512 only — caller gates on _SPLIT_OK). Full _SMR·W×_SNR tiles via the split
-# kernel; row remainder → wide masked-row kernel, col remainder → edge strip (reuse; remainders are small).
+# Vector-row dispatch for the split kernel: `vt` is a runtime count, `Val(MR)` a compile-time tile
+# height, and both the aligned and the masked driver branches need the same fan-out.
+#
+# THE ARMS ENUMERATE 1:_SMR AND THE `else` THROWS, because `_SMR` is NOT a hardware quantity:
+# `_at_gemm_split_mr` ignores its `hw` argument and reduces to `(_ILP_TARGET ÷ _GEMM_SPLIT_S) ÷ _SNR`,
+# so it is 4 only while `_GEMM_SPLIT_S` is 2 — and that const is tier-Literal and marked tunable. Under
+# S=1 it becomes 8 and a `vt` of 5..8 would otherwise fall to the widest arm and compute 3 vector rows
+# of up to 8, silently writing a short tile. A cold compare per row block is the right price for that.
+@inline function _split_rowtile!(
+        Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha::T, beta::T, mre::Int, vt::Int,
+        ::Val{MASK}, ::Val{TB}, ::Val{B0}
+    ) where {T, MASK, TB, B0}
+    if vt == _SMR
+        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta, mre,
+            Val(_SMR), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0), Val(MASK))
+    elseif vt == 1
+        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta, mre,
+            Val(1), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0), Val(MASK))
+    elseif vt == 2
+        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta, mre,
+            Val(2), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0), Val(MASK))
+    elseif vt == 3
+        _microkernel_unpacked_split!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta, mre,
+            Val(3), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0), Val(MASK))
+    else
+        throw(ArgumentError("split row tile vt=$vt outside 1:$(_SMR); _GEMM_SPLIT_S moved and this cascade did not"))
+    end
+    return nothing
+end
+
+# Small-n split driver (wide AVX-512 only — caller gates on _SPLIT_OK). EVERY row block under a full
+# column tile goes through the split kernel, W-aligned or not — the aligned ones unmasked, the ragged
+# tail masked. Column remainder → edge strip.
+#
+# THE ROW BLOCKS MUST NOT DISAGREE ON KERNEL, and that is a correctness constraint before it is a
+# performance one. A block's row count depends on the extent the CALLER holds, and the two carvings do
+# not nest: `_trsm_rchunk` bands side-R rows in `_MR·W` = 16 while this driver tiles in `_SMR·W` = 32,
+# so m=41 is 32+9 unsplit and 16, 25 banded, which places the same rows in an aligned block one way and
+# a ragged block the other. Every block therefore takes THIS one kernel with `_GEMM_SPLIT_S` chains,
+# masked when ragged; a kernel chosen per block from its own width sums k in an order that follows the
+# worker count (req#11). No route token can reach that choice — the deciding extent is a block's own
+# width inside an already-entered kernel.
 function _gemm_unpacked_split!(
         ::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
         alpha::T, A, B, beta::T, C
@@ -1296,66 +1360,22 @@ function _gemm_unpacked_split!(
             while ir < m
                 mre = min(mr, m - ir)
                 if nre == nr && rem(mre, W) == 0
-                    # full OR W-aligned partial rows: split kernel at vr = mre/W row-blocks (keeps the
-                    # split's B-reuse for the row remainder — mrows(NR=_SNR) would lose it). _SMR=4 → vr∈1:4.
-                    vr = div(mre, W)
-                    if vr == _SMR
-                        _microkernel_unpacked_split!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            Val(_SMR), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0)
-                        )
-                    elseif vr == 1
-                        _microkernel_unpacked_split!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            Val(1), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0)
-                        )
-                    elseif vr == 2
-                        _microkernel_unpacked_split!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            Val(2), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0)
-                        )
-                    else
-                        _microkernel_unpacked_split!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            Val(3), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0)
-                        )
-                    end
+                    # W-aligned rows: no lane arithmetic, which keeps this the code the split cap was
+                    # measured with. `vr = mre/W` row-blocks preserves the split's B-reuse for a short
+                    # block — mrows(NR=_SNR) would lose it.
+                    _split_rowtile!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                        mre, div(mre, W), Val(false), Val(TB), Val(B0))
                 elseif nre == nr
-                    # NOT W-aligned. This passed Val(_SMR) unconditionally, i.e. computed all
-                    # _SMR*W = 32 rows however few were live. At m=36 the tail has mre=4 and computed
-                    # 32 rows for 4 — total row work 64 for 36 live (78% waste) against 40 for m=40,
-                    # which IS W-aligned and takes the branch above. MEASURED (Zen4, m=n=k, beta=0):
-                    #   m=36 21.86 GF, m=44 27.21   vs   m=32 39.65, m=40 40.43, m=48 41.27
-                    # so -45% and -34% from this dispatch alone. Narrow to the vector-rows actually
-                    # needed, exactly as the W-aligned branch does with `vr`. _SMR=4 ⇒ cld(mre,W) ∈ 1:4.
-                    # WHY IT SURVIVED: the split path needs max(m,n,k) ≤ _GEMM_SPLIT_MAX (48), and the
-                    # gate ladder jumps 32 → 50, so NO published cell ever reaches a non-W-aligned
-                    # remainder here. Found by sweeping m one step at a time, not by the gate.
-                    # NOT the "exact cover" (whole vectors through the split kernel + a datapath-width tail):
-                    # measured SLOWER, Zen4 paired A/B exact/masked — dgemm 50³ 1.065, zgemm 50³ (3M) 1.068,
-                    # 41×8×33 1.04-1.07, geqrf n=49..55 1.005-1.015. Two calls lose to one masked call here.
-                    vt = cld(mre, W)
-                    if vt == 1
-                        _mrows_tail!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(_SNR), Val(TB), Val(B0)
-                        )
-                    elseif vt == 2
-                        _microkernel_unpacked_mrows!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(2), Val(_SNR), Val(TB), Val(B0), Val(_vwidth(T))
-                        )
-                    elseif vt == 3
-                        _microkernel_unpacked_mrows!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(3), Val(_SNR), Val(TB), Val(B0), Val(_vwidth(T))
-                        )
-                    else
-                        _microkernel_unpacked_mrows!(
-                            Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
-                            mre, Val(_SMR), Val(_SNR), Val(TB), Val(B0), Val(_vwidth(T))
-                        )
-                    end
+                    # RAGGED rows, same kernel as above with the last vector masked. `cld(mre, W)`, not
+                    # `_SMR`: the tile must cover the live rows and no more, or a 4-live-row tail
+                    # computes all _SMR·W = 32.
+                    #
+                    # AN "EXACT COVER" — whole vectors through this kernel plus a separate
+                    # datapath-width tail call — is excluded by req#11, not merely by speed: a second
+                    # tail kernel is a second k-summation order, which is the disagreement the note
+                    # above this function exists to prevent.
+                    _split_rowtile!(Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
+                        mre, cld(mre, W), Val(true), Val(TB), Val(B0))
                 else
                     _microkernel_unpacked_edge!(
                         Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alpha, beta,
@@ -1380,9 +1400,11 @@ end
 # `_gemm_core!` already carried the token for `_use_unpacked`; it stopped one layer above here.
 function _gemm_unpacked!(
         ::Val{TB}, ::Val{B0}, m::Int, n::Int, k::Int,
-        alpha::T, A, B, beta::T, C, nroute::Int = -1
+        alpha::T, A, B, beta::T, C, rt::NTuple{3, Int} = _RT_NONE
     ) where {T <: BlasReal, TB, B0}
-    nrt = nroute < 0 ? n : nroute
+    # ALL THREE AXES, because the split predicate below reads two of them. A caller that divided a
+    # dimension passes the undivided extents; `_RT_NONE` means its own are the whole problem.
+    mrt = _rt_m(rt, m); nrt = _rt_n(rt, n); krt = _rt_k(rt, k)
     if iszero(alpha) || k == 0
         _scale_C!(C, m, n, beta)   # C := beta·C (or 0); no contraction to do
         return C
@@ -1397,7 +1419,11 @@ function _gemm_unpacked!(
     # that could not be done at all while the value was a load-time const: an env A/B ran three
     # identical builds and the witness printed 48 every time. The accessor reads one const-resolved Ref
     # (the GKH-owned shape, not a keyed lookup) and const-folds to the derived value when unforced.
-    if _SPLIT_OK && m >= _SMR * _vwidth(T) && max(m, nrt, k) <= _gemm_split_max()
+    # BOTH TESTS READ THE TOKEN, not the local extents, and the `>=` one is why that matters: it is a
+    # FLOOR on rows, so a row-split caller whose bands straddle `_SMR * _vwidth(T)` would admit the
+    # split kernel for the wide band and decline it for the narrow one. Those two arms do not agree
+    # bit for bit, so the call's result would depend on the worker count (req#11).
+    if _SPLIT_OK && mrt >= _SMR * _vwidth(T) && max(mrt, nrt, krt) <= _gemm_split_max()
         return _gemm_unpacked_split!(Val(TB), Val(B0), m, n, k, alpha, A, B, beta, C)
     end
     W = _vwidth(T); mr = _MR * W; nr = _NR
@@ -2163,8 +2189,21 @@ function _scale_pack_cmplx!(PR::Vector{T}, PI::Vector{T}, len::Int, sr::T, si::T
     return
 end
 
-# Complex split-pack buffers live in the per-type L3Workspace `cg` field (see src/workspace.jl);
+# Complex split-pack buffers are the `cg` field of the per-THREAD `L3Workspace`;
 # `_gemm_scratch_cmplx(T, lenA, lenB)` grows and returns them.
+#
+# PER-THREAD IS SOUND HERE BECAUSE THE CLAIM IS THE CHUNK'S, NOT THE DRIVER'S. `_gemm_threaded!` packs
+# nothing before publishing: the only claim is in `_gemm_cmplx_impl!`, which every worker — and the
+# driver for its own chunk — reaches through `_gemm_run_chunk` on its own thread, and which packs, runs
+# the macrokernel and returns without a task-switch point. That is safe shape (b) of
+# `test/perthread_lint.jl`, and `_L3WS_C64`/`_L3WS_C32` are baselined under it. The buffer is never
+# live across the join, so it is NOT in the position of `_m3ws`/`_strws`/`_gpackws`, each of which is
+# held by a driver or a recursion level that then makes a threaded call.
+#
+# ⚠ WHAT WOULD INVALIDATE THIS: a holder of these buffers calling a threaded public entry while the
+# pack is live — a complex cooperative A-pack meeting at a barrier, say, the shape `_gpackws` has. Then
+# the claim spans a join and per-thread stops being sound. `test/yield_lint.jl` fails on any new
+# task-switch point in `src/`, which is the guard that keeps the statement above true.
 
 # Complex blocked driver, specialized on conj signs SA,SB (resolved once at the boundary below).
 function _gemm_cmplx_impl!(
@@ -2924,14 +2963,15 @@ end
             if !tA && _use_unpacked(m, nrt, k)
                 _gemm_unpacked!(
                     tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                    m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt
+                    m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), (-1, nrt, -1)
                 )
             else
                 _gemm_blocked!(tA, tB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C))
             end
         end
     elseif !tA && _use_unpacked(m, nrt, k)
-        _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false), m, n, k, alpha, A, B, beta, C, nrt)
+        _gemm_unpacked!(tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
+            m, n, k, alpha, A, B, beta, C, (-1, nrt, -1))
     else
         _gemm_blocked!(tA, tB, m, n, k, alpha, A, B, beta, C)   # blocked also covers the transpose case
     end
@@ -3202,6 +3242,81 @@ end
 # seven private scratch pools, and the resulting working set saturates memory bandwidth at 2.3x with
 # no improvement from four workers to seven. Here only one leaf is live at a time and the workers
 # share its packed A panel.
+# ── STRASSEN COMBINE PASSES ────────────────────────────────────────────────────────────────────────
+# ONE BROADCAST FOR THREE CALLERS, and that is what makes req#11 hold here BY CONSTRUCTION rather than
+# by argument: the serial recursion, a worker's chunk body and the lost-claim fallback all reach this
+# same function, so "identical bits at every thread count" is a property of there being one
+# implementation, not a property to be established by comparing two.
+#
+# Every combine in `_strassen_rec!` is an instance of `C = α·(A ± B ± L) + β·C`:
+#   the eight operand sums and `U`   α = 1, β = 0, no L
+#   `C11`                           α, β, no L
+#   `C12` / `C21` / `C22`           α, β, with L
+# In-place forms (`TA = TA - A11`, `TB = B22 - TB`) arrive as `C === A` or `C === B`, which is safe
+# because every element is read and written at the same index.
+#
+# ⚠ β IS NOT MULTIPLIED IN WHEN IT IS ZERO, and that is CORRECTNESS, not a speed shortcut. The
+# pre-combine targets are `undef` scratch on first touch and `0.0 * Inf` is NaN, so a uniform
+# `α·(…) + β·C` would poison `TA`/`TB` on the first node of a fresh task. The serial code this
+# replaces avoided it by not mentioning `C` at all in its β = 0 forms; this keeps that.
+#
+# The `isone(α)` arm exists for the same reason in reverse: it keeps the eight operand sums emitting
+# exactly `A ± B`, so routing them through here changes none of their arithmetic. Multiplying by 1.0
+# would in fact be exact for every IEEE value, but emitting the multiply at all would make the serial
+# recursion pay two extra flops per element on a bandwidth-bound pass for no reason.
+#
+# The branches are on SCALARS and sit outside the loops, so none of this costs anything per element.
+@inline function _elem_comb!(C, A, B, L, α::T, β::T, sB::T, sL::T, hasL::Bool) where {T}
+    if hasL
+        if iszero(β)
+            @. C = α * ((A + sB * B) + sL * L)
+        else
+            @. C = α * ((A + sB * B) + sL * L) + β * C
+        end
+    elseif isone(α) && iszero(β)
+        @. C = A + sB * B
+    elseif iszero(β)
+        @. C = α * (A + sB * B)
+    else
+        @. C = α * (A + sB * B) + β * C
+    end
+    return nothing
+end
+
+# Workers for ONE combine pass. Elementwise and bandwidth-bound, so the floor is the one BLAS-1 uses:
+# a slice whose operands fit in the private L1 is a slice smaller than the cost of waking a core for
+# it. Three blocks are touched (two read, one written), which is what `3 *` counts; the four-operand
+# C-assembly touches four, so this floor is the conservative direction.
+#
+# `nw` is the LEAF's worker count and is passed through rather than recomputed, because the column
+# geometry matching the leaf's is the point — see `_elem_run_chunk`. Capped by whole `_NR` column
+# groups so a chunk is never a partial vector.
+@inline function _elem_workers(m::Int, n::Int, nw::Int, ::Type{T}) where {T}
+    nw > 1 || return 1
+    (3 * m * n * sizeof(T) < _L1_MT_MIN) && return 1
+    return max(1, min(nw, cld(n, _NR)))
+end
+
+# One combine pass, threaded or not. `sB`/`sL` are SIGNS as booleans (true meaning minus) rather than
+# values, so they ride in the pool's existing `up`/`sym2` flags; `hasL` rides in `unit`. When `L` is
+# absent the caller passes `A` in its place — the broadcast that mentions `L` is not the one that runs,
+# so nothing dereferences a placeholder.
+@inline function _comb!(C, A, B, L, α::T, β::T, sB::Bool, sL::Bool, hasL::Bool, nw::Int) where {T}
+    ew = _elem_workers(size(C, 1), size(C, 2), nw, T)
+    if ew > 1
+        rC = _root(C); rA = _root(A); rB = _root(B); rL = _root(L)
+        Lp = _pm(L)
+        lup = hasL ? LuPanel{T}(Lp.ptr, Lp.ld, Lp.m, Lp.n, Ptr{Int}(0), 0, 0, -1) : _lupanel_none(T)
+        GC.@preserve rC rA rB rL _gemm_threaded!(
+            _pm(C), _pm(A), _pm(B), α, β, false, false, false, false, ew,
+            _MT_KIND_ELEM, sB, sL, hasL, lup
+        )
+        return nothing
+    end
+    _elem_comb!(C, A, B, L, α, β, sB ? -one(T) : one(T), sL ? -one(T) : one(T), hasL)
+    return nothing
+end
+
 @inline function _strassen_leaf!(C, A, Bm, alpha::T, beta::T, nw::Int) where {T}
     m = size(C, 1); n = size(C, 2); k = size(A, 2)
     if nw > 1 && _strided1(A) && _strided1(Bm) && _strided1(C) && _gemm_workers(m, n, k) > 1
@@ -3225,21 +3340,34 @@ function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T, nw:
     C11 = @view C[1:mh, 1:nh]; C12 = @view C[1:mh, (nh + 1):n]; C21 = @view C[(mh + 1):m, 1:nh]; C22 = @view C[(mh + 1):m, (nh + 1):n]
     TA, TB, P1, P2, P3, P4, P5, P6, P7, U = _strassen_lvl_scratch(T, level, mh, nh, kh)
     o = one(T); z = zero(T); dm = depth - 1; lv = level + 1
-    @. TA = A21 + A22; @. TB = B12 - B11; _strassen_rec!(P5, TA, TB, dm, lv, o, z, nw)   # S1,T1 → P5
-    @. TA = TA - A11;  @. TB = B22 - TB;  _strassen_rec!(P6, TA, TB, dm, lv, o, z, nw)   # S2,T2 → P6
-    @. TB = TB - B21;                     _strassen_rec!(P4, A22, TB, dm, lv, o, z, nw)  # T4 → P4
-    @. TA = A12 - TA;                     _strassen_rec!(P3, TA, B22, dm, lv, o, z, nw)  # S4 → P3
-    @. TA = A11 - A21; @. TB = B22 - B12; _strassen_rec!(P7, TA, TB, dm, lv, o, z, nw)   # S3,T3 → P7
+    # EVERY COMBINE GOES THROUGH `_comb!`, which splits the pass across the pool when the block is
+    # worth it and otherwise runs the identical broadcast inline. The `iszero(beta)` fork that used to
+    # wrap the four C-assembly lines is gone: `_elem_comb!` makes that choice itself, for the same
+    # reason the fork existed — β = 0 must not read an `undef` target.
+    #
+    # Argument order is the arithmetic order. `(A ± B) ± L` is evaluated left to right exactly as the
+    # broadcasts it replaces were, and a negative sign is applied as a multiply by -1, which is an
+    # exact IEEE negation — so `(U + P7) + (-1)·P4` is bit-for-bit `(U + P7) - P4`.
+    _comb!(TA, A21, A22, A21, o, z, false, false, false, nw)         # S1
+    _comb!(TB, B12, B11, B12, o, z, true, false, false, nw)          # T1
+    _strassen_rec!(P5, TA, TB, dm, lv, o, z, nw)                     # S1,T1 → P5
+    _comb!(TA, TA, A11, TA, o, z, true, false, false, nw)            # S2  (in place: C === A)
+    _comb!(TB, B22, TB, B22, o, z, true, false, false, nw)           # T2  (in place: C === B)
+    _strassen_rec!(P6, TA, TB, dm, lv, o, z, nw)                     # S2,T2 → P6
+    _comb!(TB, TB, B21, TB, o, z, true, false, false, nw)            # T4
+    _strassen_rec!(P4, A22, TB, dm, lv, o, z, nw)                    # T4 → P4
+    _comb!(TA, A12, TA, A12, o, z, true, false, false, nw)           # S4
+    _strassen_rec!(P3, TA, B22, dm, lv, o, z, nw)                    # S4 → P3
+    _comb!(TA, A11, A21, A11, o, z, true, false, false, nw)          # S3
+    _comb!(TB, B22, B12, B22, o, z, true, false, false, nw)          # T3
+    _strassen_rec!(P7, TA, TB, dm, lv, o, z, nw)                     # S3,T3 → P7
     _strassen_rec!(P1, A11, B11, dm, lv, o, z, nw)
     _strassen_rec!(P2, A12, B21, dm, lv, o, z, nw)
-    @. U = P1 + P6                                                                   # U1
-    if iszero(beta)
-        @. C11 = alpha * (P1 + P2); @. C12 = alpha * (U + P5 + P3)
-        @. C21 = alpha * (U + P7 - P4); @. C22 = alpha * (U + P7 + P5)
-    else
-        @. C11 = alpha * (P1 + P2) + beta * C11; @. C12 = alpha * (U + P5 + P3) + beta * C12
-        @. C21 = alpha * (U + P7 - P4) + beta * C21; @. C22 = alpha * (U + P7 + P5) + beta * C22
-    end
+    _comb!(U, P1, P6, P1, o, z, false, false, false, nw)             # U1
+    _comb!(C11, P1, P2, P1, alpha, beta, false, false, false, nw)
+    _comb!(C12, U, P5, P3, alpha, beta, false, false, true, nw)
+    _comb!(C21, U, P7, P4, alpha, beta, false, true, true, nw)
+    _comb!(C22, U, P7, P5, alpha, beta, false, false, true, nw)
     return C
 end
 # Entry: pick adaptive depth, pad m,n,k up to a multiple of 2^depth (odd-n) if needed, recurse.
@@ -3360,7 +3488,9 @@ end
     return C
 end
 
-# `nroute` — THE COLUMN COUNT THE ROUTE IS CHOSEN FROM, which is not always the column count computed.
+# `rt` — THE EXTENTS THE ROUTE IS CHOSEN FROM, which are not always the extents computed on. See
+# `_RT_NONE` in core.jl for the token and `_gemm_core_body!` for the read, which resolves all three
+# axes; a caller that divided one dimension leaves the others at `-1`.
 #
 # A worker computes a column slice of C, so its own `n` is the slice width. Every size-keyed predicate
 # below reads `n`, so a narrow slice can take a different route than the whole problem: `_use_unpacked`
@@ -3404,8 +3534,8 @@ end
 # on the body's generic branch is inert, because the dual path does not take that branch — it takes
 # the real one. The outlined entry gives the whole tree its own frame instead.
 @inline _gemm_core!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-        nroute::Int = -1, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
-    _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, nroute, strassen, nw, wi)
+        rt::NTuple{3, Int} = _RT_NONE, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
+    _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, rt, strassen, nw, wi)
 
 # THE SAME PRODUCT, IN ITS OWN FRAME. For a caller that issues SEVERAL `_gemm_core!` calls, inlining
 # multiplies the routing tree by the number of calls in one frame, and `_gemm_dual3!` — three plane
@@ -3413,8 +3543,16 @@ end
 # call boundary is free at every size that reaches here; the inlined entry above is kept for the
 # single-product callers, where it is worth 8.2% at the smallest gate cell (gemm@8).
 @noinline _gemm_core_out!(C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-        nroute::Int = -1, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
-    _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, nroute, strassen, nw, wi)
+        rt::NTuple{3, Int} = _RT_NONE, strassen::Bool = false, nw::Int = 1, wi::Int = 1) where {T} =
+    _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, rt, strassen, nw, wi)
+
+# ⚠ NO Int-TAKING METHOD HERE, DELIBERATELY. One was tried: a second method widening a scalar `nroute`
+# to `(-1, nroute, -1)`, so the then-13 call sites carrying a bare `n` route needed no edit. It is
+# idiomatic dispatch and not the `Union{Int, NTuple{3, Int}}` the design rejected, and it cost one
+# more unoptimised frame in the dual `gemm!` tree — 5 before it existed, 6 after, against the note
+# above recording that one unused parameter on `_trsm!` was enough to tip that budget.
+# `Base.@constprop :aggressive` on the forwarders made it WORSE, not better: 8 frames. So the call
+# sites carry the tuple instead, and this frame stays as small as it was.
 
 """
     _gemm_trailing!(C, A, B, alpha, beta, tA, tB; nroute = -1) -> C
@@ -3452,16 +3590,29 @@ every piece to route from the undivided width; a caller whose `C` is the whole u
         )
         return C
     end
-    _gemm_core!(C, A, B, alpha, beta, tA, tB, false, cB, nroute)
+    # `nroute` is this entry's scalar n-route; widen it at the boundary. The keyword stays `Int`
+    # until a caller needs to route on `m` as well — the same reason the sub-functions below keep it.
+    _gemm_core!(C, A, B, alpha, beta, tA, tB, false, cB, (-1, nroute, -1))
     return C
 end
 
 @inline function _gemm_core_body!(
         C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-        nroute::Int, strassen::Bool, nw::Int, wi::Int
+        rt::NTuple{3, Int}, strassen::Bool, nw::Int, wi::Int
     ) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
-    nrt = nroute < 0 ? n : nroute
+    # EVERY SIZE-KEYED PREDICATE BELOW ROUTES FROM THE TOKEN, not from the local extents. A caller
+    # that divided a dimension passes the undivided extents, so a band picks the same arithmetic the
+    # unsplit problem picks; `_RT_NONE` means the local extents ARE the whole problem.
+    #
+    # ALL THREE AXES, because the predicates differ in which they read. `_use_unpacked`, the
+    # `_GEMM_TINY` cut and `_strassen_depth` reduce over all three, and the unpacked and blocked arms
+    # do not agree bit-for-bit in general (see the note above `_gemm_unpacked!`), so a band that takes
+    # one arm where the whole takes the other returns different bits. Side R routes on rows and side L
+    # on columns, and reducing over the resolved triple is what makes one body serve both.
+    #
+    # `_sme_eligible` is the ONE exception and takes the local `m`; its own note below says why.
+    mrt = _rt_m(rt, m); nrt = _rt_n(rt, n); krt = _rt_k(rt, k)
     # α==0 (or k==0) ⇒ C := βC, with A and B NOT referenced — reference ?gemm guarantees this, so a
     # caller may legally pass A/B holding Inf/NaN or uninitialised memory. The blocked routes each
     # quick-return already; the tiny, Strassen and 3M routes did NOT, and would compute the product
@@ -3475,7 +3626,7 @@ end
         return _gemm_scale_only!(C, m, n, beta)   # @noinline: keep `_gemm_core!`'s inlined body small
     end
     if T <: BlasReal && _strided1(C)
-        if max(m, nrt, k) <= _GEMM_TINY && !cA && !cB
+        if max(mrt, nrt, krt) <= _GEMM_TINY && !cA && !cB
             return _gemm_tiny!(C, A, B, alpha, beta, tA, tB, m, n, k)
         end
         # Apple SME, ahead of Strassen. Strassen trades a 7/8 flop cut per level for extra
@@ -3485,11 +3636,20 @@ end
         # THIS BODY IS REACHED ONCE PER THREADED CHUNK, not once per call: `_gemm_threaded!`
         # arrives here through `_gemm_run_chunk`. `_sme_owns` at the threaded entry is what keeps
         # a split call off the coprocessor, because by this point the split has already happened.
-        # Routing uses `nrt`, the whole problem's n, so a chunk routes as its parent did.
+        #
+        # THE ROW EXTENT IS THE LOCAL `m`, NOT `mrt`, and that is the single departure from the
+        # route-token invariant stated at the top of this body. `_sme_tile_ok` is a FLOOR on the
+        # tile actually handed to the kernel (`min(m, n) >= 2*_SME_MR`), and the call below passes
+        # the local extents, so resolving it from the token would admit a band narrower than the
+        # kernel's minimum tile. The column extent is `nrt` for the opposite reason — it is what
+        # makes a column-split chunk route as its parent did — and the two readings are therefore
+        # not symmetric. Whether that asymmetry can produce a thread-count divergence is open: it
+        # needs a row- or column-splitting caller reaching this branch on Apple silicon, which is
+        # the only place `_SME_F64` is true, so it is not decidable on the x86 fleet.
         if _sme_eligible(T, m, nrt, k, tA, tB, cA, cB, C, A, B)
             return _gemm_sme!(C, A, B, Float64(alpha), Float64(beta), m, n, k, tA, tB)
         end
-        if strassen && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, nrt, k) > 0
+        if strassen && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(mrt, nrt, krt) > 0
             if !tB
                 return _gemm_strassen!(m, n, k, alpha, A, B, beta, C, nw)   # large-n real: 7-mult recursion beats OB
             elseif T === Float64
@@ -3525,7 +3685,7 @@ end
                 return _gemm_strassen!(m, n, k, alpha, A, Bt, beta, C, nw)
             end
         end
-        if _strided1(A) && _strided1(B) && _use_unpacked(m, nrt, k)
+        if _strided1(A) && _strided1(B) && _use_unpacked(mrt, nrt, krt)
             # NORMALIZE the container types here (see `_pm`/`_root` in ptrmat.jl). Every operand is
             # already known `_strided1` on this branch, so the conversion is information-preserving —
             # `_strided1(::PtrMatrix)` is `true` and nothing downstream consumes anything but
@@ -3538,7 +3698,7 @@ end
                 if !tA
                     _gemm_unpacked!(
                         tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                        m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt
+                        m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), rt
                     )
                 else
                     At, _ = _gemm_scratch(T, m * k, 0)
@@ -3549,7 +3709,7 @@ end
                         Am = PtrMatrix{T}(pointer(At), m, k, m)
                         _gemm_unpacked!(
                             tB ? Val(true) : Val(false), iszero(beta) ? Val(true) : Val(false),
-                            m, n, k, alpha, Am, _pm(B), beta, _pm(C), nrt
+                            m, n, k, alpha, Am, _pm(B), beta, _pm(C), rt
                         )
                     end
                 end
@@ -4069,6 +4229,18 @@ const _MT_KIND_SYMV = 17
 # PDM: Exempt — job-kind tag, not hardware tuning.
 # req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
 const _MT_KIND_GBMVN = 18
+# Strassen's combine passes: `C = α·(A ± B ± L) + β·C` over a block, elementwise. The one job kind in
+# this list that carries a FOURTH operand, and it needs no new field for it — `lap`/`lald` are already
+# on the pool for the getrf look-ahead panel, and a kind reinterpreting an existing slot is the same
+# thing `gbmvN` does when it carries `kl`/`ku` in the A slot's own dimensions.
+#
+# The two signs and the presence of `L` ride in `up`, `sym2` and `unit` respectively, which that kind
+# does not otherwise use. `α` and `β` are the pool's own.
+# An enum discriminant, host-invariant by construction: nothing about the machine can make 19 a better
+# tag than 20, so there is no residency or latency criterion to derive it from and no candidate set to
+# measure. Same category as `_STEIN_SEED0`.
+# req8-ok: enum discriminant, host-invariant by construction — see the two lines above
+const _MT_KIND_ELEM = 19
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
@@ -4282,6 +4454,7 @@ end
     p.kind == _MT_KIND_GEMVT && return _gemvt_run_chunk(p, nw, i)
     p.kind == _MT_KIND_SYMV && return _symv_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GBMVN && return _gbmvn_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_ELEM && return _elem_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4296,7 +4469,7 @@ end
     # dispatches — getrf's look-ahead issues the trailing update as a narrow call plus a wide one, and
     # both must route from the full trailing width or the pair is not the single update it replaces.
     _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
-        p.lanroute >= 0 ? p.lanroute : p.n, false, nw, i)
+        (-1, p.lanroute >= 0 ? p.lanroute : p.n, -1), false, nw, i)
     return nothing
 end
 
@@ -4346,7 +4519,7 @@ end
     Ac = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.m, p.tA ? p.m : p.k, p.lda)
     # `p.n` is the whole update's width: route from the problem, compute on the slice.
     _gemm_core!(Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
-        p.lanroute, false, nw - 1, i - 1)
+        (-1, p.lanroute, -1), false, nw - 1, i - 1)
     return nothing
 end
 
@@ -4679,6 +4852,32 @@ end
 # `x .*= a` over this worker's element range. Elementwise, so no accumulation crosses the partition —
 # but `_scal_simd!` does carry an L1-residency branch, so `p.m` is handed over as the route width for the
 # same reason axpy does it: compute on the slice, route from the whole.
+# A worker's slice of one Strassen combine pass: the SAME columns the leaf chunk of the same index
+# owned, which is deliberate. The combine reads the `P` blocks six cores have just written, and the
+# in-situ cost of these passes measures about twice their cost in isolation (0.657 ms against 0.323 at
+# n=512); the leading hypothesis is dirty remote lines, so giving assembly chunk `i` the columns leaf
+# chunk `i` wrote is the arrangement that would avoid the traffic. UNVERIFIED as the cause — the
+# geometry costs nothing either way, so it is chosen as the one that cannot be worse.
+#
+# `_gemm_chunk` groups on `_NR`, so a column band is whole vector-width multiples and every chunk
+# broadcasts over a contiguous block. Nothing here grows a buffer: every slot was fit by
+# `_strassen_lvl_scratch` before the level's first leaf ran, so a chunk body cannot allocate inside a
+# published job.
+@noinline function _elem_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    sz = sizeof(T)
+    Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sz, p.m, len, p.ldc)
+    Ac = PtrMatrix{T}(p.Ap + j0 * p.lda * sz, p.m, len, p.lda)
+    Bc = PtrMatrix{T}(p.Bp + j0 * p.ldb * sz, p.m, len, p.ldb)
+    # `L` is only read when `unit` says it is present; when it is not, the broadcast that mentions it
+    # is not the one that runs, so `Ac` stands in rather than building a handle on a null pointer.
+    Lc = p.unit ? PtrMatrix{T}(p.lap + j0 * p.lald * sz, p.m, len, p.lald) : Ac
+    _elem_comb!(Cc, Ac, Bc, Lc, p.alpha, p.beta,
+        p.up ? -one(T) : one(T), p.sym2 ? -one(T) : one(T), p.unit)
+    return nothing
+end
+
 @noinline function _scal_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
     i0, len = _l1_chunk(p.m, nw, i, T)
     len > 0 || return nothing
@@ -5017,13 +5216,21 @@ end
         # with 24 concurrent callers it is the common case, not the rare one.
         if kind == _MT_KIND_SYRK
             _syrk_serial_fallback!(C, A, B, alpha, tA, up, sym2)
+        elseif kind == _MT_KIND_ELEM
+            # A loser does the WHOLE block through the same `_elem_comb!` the winner's workers call,
+            # so it is the one arm in this dispatch where the two paths are the identical broadcast
+            # rather than two implementations that have to be shown to agree. `L` stands in as `A`
+            # when absent, exactly as the chunk body does.
+            _elem_comb!(C, A, B,
+                unit ? PtrMatrix{T}(lup.ptr, C.m, C.n, lup.ld) : A,
+                alpha, beta, up ? -one(T) : one(T), sym2 ? -one(T) : one(T), unit)
         elseif kind == _MT_KIND_LUAHEAD
             # Both halves, serially, in this order. They write disjoint memory so the order cannot
             # change the bits; doing the panel first matches the worker numbering, which is what a
             # reader comparing the two paths will expect.
             _getf2!(PtrMatrix{T}(lup.ptr, lup.m, lup.nb, lup.ld), lup.m, lup.nb, lup.roff,
                 PtrVector{Int}(lup.ipiv, lup.ioff + lup.nb), lup.ioff)
-            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)
+            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
         elseif kind == _MT_KIND_TRSM
             # `nroute` stays -1 for the same reason as gemm's: a loser solves the whole of B, so its
             # own column count IS the routing width. `C` and `B` are the same matrix here.
@@ -5079,8 +5286,14 @@ end
             _symv_blocked!(up, C.m, alpha, C, A.ptr, B.ptr, _symv_nblk(C.m, T))
         elseif kind == _MT_KIND_GBMVN
             # A loser does the whole output. Its band IS `[0, m)`, which is what the unsplit kernel
-            # already runs, and the arm choice reads `kl + ku + 1` only — so there is nothing to route
-            # and nothing that can differ from the winner's bands.
+            # already runs, so there is nothing to route.
+            #
+            # ⚠ IT DOES, HOWEVER, TAKE A DIFFERENT ARM FROM THE WINNER'S WORKERS once the band exceeds
+            # `_GBMV_CONV_MAX`: `[0, m)` is not a row band, so this runs the per-column axpy where they
+            # run convolution. That is permissible because the two arms are BITWISE IDENTICAL — both
+            # accumulate each `y[i]` over columns in ascending `j` — which is measured over 1260 shapes
+            # and gated by a test rather than argued. It is a speed difference for the loser only, and
+            # req#11 asks for identical bits, not an identical instruction stream.
             #
             # THE BANDED STORE IS REBUILT AT ITS OWN HEIGHT, exactly as `_gbmvn_run_chunk` does. `C.m`
             # is the OUTPUT ROW COUNT, so handing `C` over unchanged describes a store `m` tall where
@@ -5108,7 +5321,7 @@ end
             isone(alpha) || _scal_all!(C, alpha)
         else
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
-            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, -1)
+            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
         end
         return zero(T)
     end
@@ -5177,8 +5390,10 @@ end
         # guard is what keeps the widened bound from reaching it.
         #
         # ⚠ A COMPLEX CHUNK THEREFORE GROWS ITS OWN PACK SCRATCH INSIDE THE PUBLISHED JOB.
-        # `_gemm_scratch_cmplx` grows four buffers and `_gemm_3m_scratch` nine, both from owners the
-        # driver cannot reach — `_l3ws` is `OncePerThread` and `_m3ws` is `OncePerTask` — so there is no
+        # `_gemm_scratch_cmplx` grows four buffers and `_gemm_3m_scratch` nine. `_m3ws` is
+        # `OncePerTask`, so the driver cannot touch a worker task's copy at all; the complex
+        # split-pack is the per-THREAD `cg` field, claimed inside this chunk body and so per-chunk in
+        # practice (see the note above `_gemm_scratch_cmplx`). Either way there is no
         # prefit to write without first moving them to a worker-indexed process-wide pool, the shape
         # `_gpack_shared`/`_trmmr_prefit!` use. That is a real exposure and it is stated rather than
         # implied: the rule elsewhere in this driver is that a chunk body which grows a buffer
@@ -5490,28 +5705,41 @@ calls that have almost no work in them.
 Capped by whole output row blocks of `_vwidth(T)`, because `_gbmv_conv!` accumulates one W-row block
 at a time and a band shorter than one block would be all masked tail.
 
-ONLY THE CONVOLUTION ARM IS THREADED, and the admission turns on the SAME predicate the kernel uses
-to pick its arm. `_gbmv_n_simd!` sends `kl + ku + 1 <= _GBMV_CONV_MAX` to the row-blocked convolution
-and everything wider to a per-column axpy, and a row band does very different things to the two:
+ONLY THE CONVOLUTION ARM IS THREADED, and a row-band call takes it whatever the band — so admission
+turns on `_GBMV_MT_BAND_MAX`, NOT on the serial cut `_GBMV_CONV_MAX`. The two answer different
+questions: the serial cut is where the per-column axpy overtakes convolution on one core, while this
+asks whether convolution is still worth taking when a split is available. Keying admission on the
+serial cut declined the pool on AVX2 at the gate's band of 33, leaving the op single-threaded against
+a vendor that threads its own. A row band does very different things to the two arms:
 
 | band arm | threaded speedup over its own serial path |
 |---|---|
 | convolution (AVX-512, cut 48) | 2.82x / 2.82x / 2.96x / 3.01x / 3.72x at n = 1000…4096 |
 | per-column axpy (AVX2, cut 20) | **0.31x / 0.33x / 0.33x / 0.34x / 0.35x** at the same sizes |
 
-Same code, same shapes, same band of 33 — the two boxes differ only in which arm the cut selects, so
-threading is worth 3x on one and costs 3x on the other. The axpy arm's column loop runs over all `n`
-in every worker and keeps the small slice of each column that falls inside its row band, so each
-worker pays the whole sweep's column overhead for a fraction of the writes; why that is worth 3x
-rather than the ~1.5x that accounting predicts is not established, and the loss is reason enough to
-withdraw the claim without it.
+The axpy arm's column loop runs over all `n` in every worker and keeps the small slice of each column
+that falls inside its row band, so each worker pays the whole sweep's column overhead for a fraction
+of the writes; why that is worth 3x rather than the ~1.5x that accounting predicts is not established.
 
-So this reads the arm, not the op: an admission rule derived from measuring one arm does not transfer
-to the other, and this op is the demonstration.
+So a split call never takes that arm. The resolution is not to decline the pool but to take the arm
+that splits: `_gbmv_n_simd!` routes any row-band call to convolution regardless of the band, which is
+permissible ONLY because the two arms are bitwise identical — both walk columns in ascending `j`, so
+every `y[i]` sees its terms in the same order. That is measured over 1260 shapes and gated by a test,
+because req#11 now rests on it: the lost-claim path runs the unsplit entry and therefore the other
+arm from the winner's workers.
+
+The band bound is then about COST rather than correctness, and `_GBMV_MT_BAND_MAX` carries the
+measured penalty curve it comes from.
 """
 @inline function _gbmvn_workers(m::Int, n::Int, kl::Int, ku::Int, ::Type{T}) where {T}
     _MT_NTHREADS[] > 1 || return 1
-    (kl + ku + 1) <= _GBMV_CONV_MAX || return 1
+    # THE THREADED CUT, NOT THE SERIAL ONE. This used to read `_GBMV_CONV_MAX`, the band at which the
+    # per-column axpy overtakes the convolution arm ON ONE CORE — which is the wrong question here,
+    # because only convolution can be split and a split call takes it whatever the band. Keying
+    # admission on the serial cut therefore declined the pool on AVX2 at the gate's band of 33 and left
+    # the op single-threaded against a vendor that threads its own. See `_GBMV_MT_BAND_MAX` for the
+    # penalty curve this bound comes from.
+    (kl + ku + 1) <= _GBMV_MT_BAND_MAX || return 1
     nw = _l1_workers(n * (kl + ku + 1) * sizeof(T), m, T)
     nw > 1 || return 1
     return max(1, min(nw, m ÷ _vwidth(T)))
@@ -5700,7 +5928,8 @@ function gemm!(
                 _pm(C), _pm(A), _pm(B), T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', nw
             )
         else
-            _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', -1, true, nw)
+            _gemm_core!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C',
+                _RT_NONE, true, nw)
         end
     elseif _pairT(T) && _strided1(C) && _strided1(A) && _strided1(B) && eltype(A) === T && eltype(B) === T &&
             max(m, n, k) > _fh_cgemm_tiny()

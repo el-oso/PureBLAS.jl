@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 172 of them.
+Every `@load_preference` key in `src/` — 173 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -15,8 +15,8 @@ Every `@load_preference` key in `src/` — 172 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 79 Derived · 23 Measured (15 calibrated · 8 orphaned) · 52 Literal · 18 Exempt.
-**Default form** (mechanical): 68 formula · 22 delegates · 9 sibling · 63 literal · 5 flag · 5 other.
+**Tier:** 80 Derived · 23 Measured (15 calibrated · 8 orphaned) · 52 Literal · 18 Exempt.
+**Default form** (mechanical): 69 formula · 22 delegates · 8 sibling · 64 literal · 5 flag · 5 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -76,6 +76,7 @@ Every `@load_preference` key in `src/` — 172 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `gbmv_conv_max` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 20 : 48` | — |
+| `gbmv_mt_band_max` | formula | Derived | formula over `_vwidth`, physical criterion is the arm's `band/W` A-re-read factor; validated across band/W = 3.2..24.2 on AVX2, penalty 1.01-1.69x against a 2.8x threading gain. | candidate |
 
 ## BLAS-2 packed
 
@@ -115,7 +116,7 @@ Every `@load_preference` key in `src/` — 172 of them.
 | `syrk_pack_cut` | formula | Derived | formula over detected consts: `_at_syrk_pack_cut(_HW)` | — |
 | `syrk_sme_min` | literal | Derived | the first split's off-diagonal block must clear the tile-exact floor: 2 x _SME_MIN_EXACT. | n/a, follows the tile |
 | `syrk_unified_max` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 48 : 0` | — |
-| `trmm_base_r` | sibling | Literal | recursion-overhead floor, flat 32-48, the same floor `_POTRF_BASE` carries; SME-only, the x86 side measured and regressing. | candidate |
+| `trmm_base_r` | literal | Literal | recursion-overhead floor, flat 32-48, the same floor `_POTRF_BASE` carries; SME-only, the x86 side measured and regressing. | candidate |
 | `trmm_ddirect` | literal | Literal | wide-SIMD-safe default for the direct path; per-box override without a code push. | candidate |
 | `trmm_pack_min` | other | Derived | 5/2 x _GEMM_UNPACK_MAX, i.e. it follows gemm's own unpack bound. | n/a, follows gemm |
 | `trmm_rkc` | sibling | Literal | own k-block, borrows gemm's _KC; a triangular operand packs differently. | candidate |
@@ -312,13 +313,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-59 `const _X = <literal>` values in `src/` with no `@load_preference`.
+60 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 32 Literal · 23 Exempt · 2 Unaudited.
+**Tier:** 2 Measured · 32 Literal · 23 Exempt · 3 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -432,6 +433,7 @@ on these, not on knobs.
 | `_MT_KIND_AXPY` | 6 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_COPY` | 11 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_DOT` | 7 | Exempt | job-kind tag, not hardware tuning. |
+| `_MT_KIND_ELEM` | 19 | Unaudited | — |
 | `_MT_KIND_GBMVN` | 18 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_GEMM` | 0 | Exempt | job-kind TAGS, not hardware tuning. They name which body a chunk runs; nothing about |
 | `_MT_KIND_GEMVN` | 15 | Exempt | job-kind tag, not hardware tuning. |

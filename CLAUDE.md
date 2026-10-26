@@ -214,8 +214,18 @@ Both modes share ONE set of low-level kernels. Source map:
    - **A size-keyed predicate read from a chunk's own slice.** `_use_unpacked` is keyed on
      `max(m, n, k)`, and the unpacked and blocked routes differ in α placement, β handling and `kc`
      chunking, so a narrow chunk silently computes by different arithmetic. Hence `_gemm_core!`'s
-     `nroute`: a partitioned caller passes the WHOLE problem's column count and computes on its slice.
-     Any new size-keyed branch reachable from a chunk body must take its size from `nroute`.
+     `rt`, an `(m, n, k)` route token (`_RT_NONE` and `_rt_m`/`_rt_n`/`_rt_k` in `src/core.jl`): a
+     partitioned caller passes the WHOLE problem's extents and computes on its slice. Any new
+     size-keyed branch reachable from a chunk body must take its size from the token, not from its own
+     extent. All three axes resolve, and **the SLOT a caller fills says which dimension it repairs**:
+     `_gemm_sub!` fills `n` because side L splits columns, `_gemm_subR!` fills `m` because side R
+     splits rows. Only one dimension is ever divided, so the other two already carry whole extents and
+     a `max` over the resolved triple equals the undivided problem's `max` — those predicates are safe
+     without being touched. A `min`, a modulus or a bare one-sided bound gets no such protection, and
+     `_sme_tile_ok` (a `min` plus two moduli) is the one route predicate the absorption cannot cover.
+     Both failures are mechanical, so they are scanned rather than remembered:
+     `test/routetoken_lint.jl` flags a predicate that reads its own extent AND one that is not a `max`
+     over resolved values, against a baseline where every reviewed site states its reason.
    - **An algorithm a worker cannot run.** Strassen chooses its depth from the width it is handed, so
      a worker holding a slice runs a different algorithm entirely. It is therefore never column-split:
      `gemm!`, `_symm!` and `_trmm_split_L!` ask `_strassen_owns` and run the recursion serially when it
@@ -372,9 +382,11 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
   insensitive to window tails. Report numbers WITH their estimator and sample count (`Measure.report` →
   "0.946 (median of 8 rounds)"); a bare figure hides which statistic produced it.
   **Throwaway probes go in `bench/probes/`, never a /tmp scratch dir** — contents are gitignored but the
-  directory IS scanned by `test/estimator_lint.jl`, which fails the suite on an unapproved reduction
-  (escape hatch `# estimator-ok: <reason>` for deliberate non-gate uses like `cpuvalidate.jl`'s
-  cliff-finding). Why this is a rule and not advice: on 2026-08-03/04 the shipped kernels obeyed the
+  directory IS scanned by `test/estimator_lint.jl`, which fails the suite on an unapproved reduction.
+  **There is no escape hatch, by design** — that file's header records that the two it used to have
+  were each talked around with a plausible reason, so a probe wanting a different statistic has to
+  express the spread with quantiles instead (`q1`/`q3`, or listing the samples). Why this is a rule
+  and not advice: on 2026-08-03/04 the shipped kernels obeyed the
   median rule while the PROBES used `minimum(@elapsed …)`, which ranked an `iamax` unroll NB=2 *above*
   NB=4 at n=1e6 where the gate's median ranked it 15% *worse*. A day went into explaining that
   contradiction with tail hypotheses and a kernel port; the estimator swap was the whole of it. Sample

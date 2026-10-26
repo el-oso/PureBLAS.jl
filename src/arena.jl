@@ -15,36 +15,47 @@
 # WHERE THE CONVERSION ACTUALLY ENDED. Stage 1 (2026-09-04) took the 37 fixed-size small roles and
 # left 143 fields, and this note used to stop there, saying "conversion continues staged, riskiest
 # last" — which reads as work in progress. It is not: **173 of the original 180 fields are now
-# arena-borrowed and `L3Workspace` is down to SEVEN.**
+# arena-borrowed and `L3Workspace` holds exactly ONE field, `s2`.**
 #
-# Those seven are not leftovers, they are a decision, recorded in workspace.jl: they are the gemm and
-# syr2k PACK BUFFERS (`gpackA`, `gpackB`, `cg`, `s2`, `str`, `strbt` — `m3` left for `_m3ws`, see the
-# threading note in workspace.jl). They stay because they are
-# touched on EVERY `gemm!` call — the one frequency at which a bump-allocate could cost more than a
-# const-dispatched field load — because they are genuinely shared allocator state rather than
-# per-routine scratch, and because `str` is a pool whose disjointness is slot-index arithmetic across
-# seven recursive Winograd children, which this file's scope model cannot express.
+# `s2` is not a leftover, it is a decision recorded in workspace.jl: it is the `syr2k` fused
+# two-product pack. It stays a struct field because it is touched on every such call — the one
+# frequency at which a bump-allocate could cost more than a const-dispatched field load — and because
+# it is shared allocator state rather than per-routine scratch. Converting it has NOT been decided and
+# would need its own gate run.
 #
-# Converting the SIX that remain has NOT been decided and would need its own gate run.
+# EVERY OTHER PACK BUFFER LEFT FOR A PER-TASK OWNER, AND NOT FOR TIDINESS — each is held across a
+# threaded join, which a per-thread buffer cannot survive. `gpackA`/`gpackB` → `_gpackws` (cooperative
+# A-packing meets the other workers at a barrier while the packed B panel is live), `str`/`strbt` →
+# `_strws` (the Winograd recursion hands each leaf to the threaded path while holding its level
+# slots), `m3` → `_m3ws` (`_trmm_dual!`, `_trsm_dual!` and `_syrk_dual!` each claim it and then call
+# the PUBLIC `trmm!`/`trsm!`/`syrk!` on the planes, whose join yields, with no arena scope on that path
+# for the depth guard to help). A per-thread buffer held across a join is the shape that measured
+# `getrf!` wrong 20 times in 96. See the threading note in workspace.jl for each.
 #
-# The seventh, `m3`, was NOT a deliberate hold — it was a live hazard and is now fixed. `_trmm_dual!`
-# and `_trsm_dual!` claim it and then call the PUBLIC `trmm!`/`trsm!` on the planes; public `trmm!`
-# threads and its join yields, and there is no arena scope on that path, so the depth guard could not
-# help. A per-thread buffer held across that join is the shape that measured `getrf!` wrong 20/96. It
-# is now `_m3ws`, a per-task owner split OUT of `L3Workspace` so the pack buffers keep their cheap
-# per-thread lookup. See the threading note in workspace.jl.
+# ⚠ `_gemm_dual3!` HOLDS `_m3ws` AND DOES NOT CROSS A JOIN — it issues `_gemm_core_out!`, which is the
+# `@noinline` twin of `_gemm_core!` and sits BELOW the pool. Judged on that caller alone the owner
+# could be per-thread. It cannot be: the three above share the buffer and do cross, and the tier is a
+# property of the OWNER, not of whichever holder you happen to be reading. Stated because the
+# single-caller argument is the plausible-looking way to break this.
 #
 # THE TWO HAZARDS, AND EXACTLY HOW FAR THE EXPANSION-TIME CHECKS GO.
 #   * A borrow ESCAPING its scope would read memory the next borrow overwrites. `@scope` rejects the
 #     TOKEN's escape at MACRO-EXPANSION time: `s` may appear only as `borrow!`'s first argument, so no
 #     new borrow can be taken after the block. A compile error, not a lint finding.
-#     ⚠ THE HANDLE IS NOT CHECKED, and cannot be by this mechanism — it is an ordinary local. Both of
-#     these compile, and both are use-after-free:
-#         @scope s begin; A = borrow!(s, Float64, 4, 4); A; end     # returned as the block's value
-#         @scope s begin; f(borrow!(s, Float64, 4, 4)); end          # if `f` retains it
-#     (test/arena_tests.jl's fence testitem does the first ON PURPOSE, to have something to fault on.)
-#     So the escape rule buys "the token cannot leak", not "no borrow can outlive the scope"; the
-#     latter is what `@fenced_scope` is for. Audit new call sites for a returned/stored handle.
+#     THE HANDLE IS PARTLY CHECKED. A handle RETURNED from the block — including as the block's
+#     trailing value — is rejected at expansion: "the borrowed handle `A` is returned from the scope"
+#     (built below, and `test/arena_tests.jl:312` asserts the message). What is NOT checked, and
+#     cannot be lexically, is a handle leaving by any other route. All three of these compile, and all
+#     three are use-after-free:
+#         @scope s begin; f(borrow!(s, Float64, 4, 4)); end              # if `f` retains it
+#         @scope s begin; v = borrow!(s, Float64, 4, 4); SINK[] = v; end # stored
+#         @scope s begin; v = borrow!(s, Float64, 4, 4); () -> v; end    # captured
+#     ⚠ `@fenced_scope` DOES permit the return, and `test/arena_tests.jl:399` relies on that to have a
+#     released borrow to fault on. The two macros differ here, so the fence item is not evidence that
+#     `@scope` allows it.
+#     So the escape rule buys "the token cannot leak" AND "the handle cannot be returned", not "no
+#     borrow can outlive the scope"; the last is what `@fenced_scope` is for. Audit new call sites for
+#     a handle retained by a callee, stored, or captured — those three, not the return.
 #   * A borrow inside a LOOP would consume Σ(iterations) of arena rather than one buffer — at
 #     n=k=4096 the per-tile `_trsm_tmp` sites would be ~16k borrows ≈ 128 MB. `@scope` rejects a
 #     `borrow!` lexically inside any loop/comprehension/closure in its block: hoist it (both real sites

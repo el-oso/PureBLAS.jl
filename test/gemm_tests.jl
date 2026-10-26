@@ -221,6 +221,30 @@ end
         for t in 1:nt
             @test outs[t] ≈ want rtol = 1e-12
         end
+        # AND WITH alpha AND beta BOTH NON-TRIVIAL, because the combine passes take a DIFFERENT arm
+        # there. 300 is Strassen-claimed (min(m,n,k) >= `_STRASSEN_MIN`), so a loser here runs the
+        # combines' lost-claim fallback — and with alpha = 1, beta = 0 above, three of the four
+        # C-assembly passes take their beta-free arm and the `beta * C` form is never exercised on the
+        # losing path at all. A non-power-of-two alpha for the same reason it appears in the
+        # bit-identity item: scaling by +-2^j is exact and would hide a misplaced alpha.
+        @test P._strassen_owns(Float64, 300, 300, 300, false, A, B)
+        C0 = randn(300, 300)
+        want2 = copy(C0)
+        P.set_num_threads(1)
+        P.gemm!(want2, A, B; alpha = 3.7, beta = -1.25)
+        P.set_num_threads(nt)
+        outs2 = [copy(C0) for _ in 1:nt]
+        Threads.@threads :static for t in 1:nt
+            o = copy(C0)
+            for _ in 1:8
+                copyto!(o, C0)
+                P.gemm!(o, A, B; alpha = 3.7, beta = -1.25)
+            end
+            copyto!(outs2[t], o)
+        end
+        for t in 1:nt
+            @test outs2[t] ≈ want2 rtol = 1e-12
+        end
         P.set_num_threads(1)
     end
 end
@@ -364,6 +388,12 @@ end
         end
         @test !P._strassen_owns(Float64, n, n, kthin, false, Athin, Bthin)
         @test P._gemm_workers(n, n, kthin) > 1
+        # AND THAT THE COMBINES THEMSELVES SPLIT, which is a second witness and not a duplicate of the
+        # one above. The recursion's leaves threading says nothing about its combine passes: those are
+        # published as their own jobs and decline below an amortisation floor, so a floor that moved
+        # would leave them serial and every assertion below would still pass — the invariant holds
+        # trivially when nothing is split. The half-block is what a level-1 combine covers.
+        @test P._elem_workers(n ÷ 2, n ÷ 2, nthreads(), Float64) > 1
         bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
         S = randn(n, n); Bs = randn(n, n)
         for α in (1.0, -1.0, 2.5), β in (0.0, 0.5)
@@ -542,5 +572,84 @@ end
             end
         end
         P.set_num_threads(1)
+    end
+end
+
+# trsm had NO thread-invariance item, which is how a complex admission that violated requirement 11 in
+# four places passed its own certification: that certification used square power-of-two B, where every
+# band is a multiple of the row granule and no band ends mid-vector. This item exists so a future
+# widening of either `trsm!` admission is caught rather than measured.
+#
+# IT IS A REGRESSION GUARD, AND FOR COMPLEX IT IS CURRENTLY VACUOUS BY CONSTRUCTION — both admissions
+# are `BlasReal`, so the complex cases below cannot thread and verify trivially. That is stated rather
+# than hidden: the real cases carry the liveness witness, and the complex cases fire the moment anyone
+# admits complex. The three mechanisms they are aimed at, each measured on Zen4 before the revert:
+#   * `_CGEMM_3M`'s window reads `min(m, nrt, k)` with `m` the band's ROW count, so a band narrower
+#     than kmin declines Karatsuba while the unsplit solve takes it. B 48x512 at alpha=1 diverged.
+#   * `_trsm_cmplx_small_R!` routes on `size(B, 1)`, not `mrt`; the last band can be one row.
+#   * `_scal_all!` applies a complex alpha flat or per column, and its vector body uses an fma where
+#     its scalar tail uses the two-rounding form. ComplexF32 m=n=k=1001 at alpha=3.7-1.25i diverged.
+# Hence the shapes: NON-square and non-power-of-two B, an odd dimension, and an alpha that is not a
+# power of two. A square po2 ladder reproduces none of it.
+@testitem "trsm: bit-identical at every thread count" tags = [:checks] begin
+    using Random, LinearAlgebra
+    import PureBLAS as P
+    # BYTE-WISE, not `reinterpret(UInt64, …)`: a `Float32` is four bytes, so a fixed-width reinterpret
+    # throws on half the element types this item covers. Bytes also distinguish -0.0 and NaN payloads,
+    # which is the point of comparing patterns rather than values.
+    bitsame(X, Y) = size(X) == size(Y) &&
+        reinterpret(UInt8, vec(collect(X))) == reinterpret(UInt8, vec(collect(Y)))
+    nt = Threads.nthreads()
+    # m=41 AND m=48 SIDE R PIN `_gemm_unpacked_split!`'s ROW BLOCKS. The side-R band granule is
+    # `_MR * _vwidth(Float64)` = 16 and the split driver tiles rows in `_SMR * _vwidth` = 32, so the two
+    # carvings do not nest: m=41 is 32+9 unsplit and 16, 25 at two workers, which places the same rows
+    # in an aligned block one way and a ragged block the other. Every block must reach the SAME
+    # microkernel with the same `_GEMM_SPLIT_S` chain count, masked when ragged — a kernel chosen per
+    # block from its own width sums k in an order that follows the worker count. m=48 is the control:
+    # 32+16 and 16+16+16 are all-aligned, so divisibility by the band granule is NOT the rule.
+    tri(T, s) = (A = randn(T, s, s) ./ (2s); for i in 1:s
+            A[i, i] = one(T) + abs(A[i, i])
+        end; A)
+
+    # ROUTING WITNESS, derived from the consts rather than asserted about the literal 41. The three
+    # shapes above are only meaningful while m=41 still reaches a RAGGED row block inside the split
+    # driver; if `_gemm_split_max()` drops below the leaf extents, or `_SMR`/`_MR` move, the shape stops
+    # entering that kernel and the comparisons below pass without testing anything. This fails loudly
+    # instead. It cannot witness the leaf's own n and k — that needs a probe, not a predicate — so it
+    # bounds the row axis only.
+    let W = P._vwidth(Float64), m = 41
+        @test !P._SPLIT_OK || (
+            m >= P._SMR * W &&                               # clears the split driver's row floor
+                m <= P._gemm_split_max() &&                  # and its cap
+                rem(m, P._SMR * W) != 0 &&                   # leaves a ragged row block unsplit
+                rem(P._trsm_rchunk(m, 2, 2, Float64)[2], W) != 0   # and a ragged one in band 2 of 2
+        )
+    end
+
+    # LIVENESS, on the real path that does thread: without this the whole item can pass with no worker
+    # ever started, which is the failure mode CLAUDE.md flags for every threading gate here.
+    P.set_num_threads(nt)
+    @test P._trsm_workers(1024, 1024) > 1 || P._trsm_workers_r(1024, 1024, Float64) > 1
+    P.set_num_threads(1)
+
+    for T in (Float64, Float32, ComplexF64, ComplexF32)
+        for (side, m, n) in (('L', 1001, 257), ('L', 512, 41), ('R', 41, 1024), ('R', 48, 512))
+            k = side == 'L' ? m : n
+            for uplo in ('U', 'L'), tA in ('N', 'T', 'C'), al in (one(T), T(3.7) - T(1.25) * im)
+                T <: Real && !isreal(al) && continue          # a complex alpha is not a real alpha
+                Random.seed!(97 + m + n + Int(side) + Int(uplo) + Int(tA))
+                A = tri(T, k); B0 = randn(T, m, n)
+                r = copy(B0)
+                P.set_num_threads(1)
+                P.trsm!(r, A; side, uplo, transA = tA, alpha = al)
+                for nw in 2:nt
+                    P.set_num_threads(nw)
+                    g = copy(B0)
+                    P.trsm!(g, A; side, uplo, transA = tA, alpha = al)
+                    @test bitsame(g, r)
+                end
+                P.set_num_threads(1)
+            end
+        end
     end
 end

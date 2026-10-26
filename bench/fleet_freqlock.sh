@@ -331,15 +331,53 @@ JL
     # reads exactly like the wintermute power limit this subcommand exists to catch. An idle core is
     # not a throttled core. Frequency is per PHYSICAL core on these parts, so one CPU per core is both
     # necessary and sufficient to sample.
+    # MTCORES RESTRICTS THIS TO ONE SWEEP'S OWN MASK. Loading and sampling every core on the box makes
+    # the verdict depend on cores the caller never uses: galen's documented recipe runs the sweep on
+    # CCD1 while a co-tenant holds CCD0, so a whole-box check reports that co-tenant's clock as a
+    # failure. Accepts the same comma/range spelling as BENCH_CORE; unset means the whole box, which is
+    # right for a bare `verify-mt` asking "can this machine hold its pin".
+    _cand=""
+    if [ -n "${MTCORES:-}" ]; then
+        for _p in $(printf '%s' "$MTCORES" | tr ',' ' '); do
+            case "$_p" in
+                *-*) for _c in $(seq "${_p%-*}" "${_p#*-}"); do _cand="$_cand $_c"; done ;;
+                *)   _cand="$_cand $_p" ;;
+            esac
+        done
+    else
+        for _d in /sys/devices/system/cpu/cpu[0-9]*; do _cand="$_cand ${_d##*/cpu}"; done
+    fi
     _cores=""; _seen=" "
-    for _d in /sys/devices/system/cpu/cpu[0-9]*; do
-        [ -d "$_d/cpufreq" ] || continue
-        _n=${_d##*/cpu}
-        _id=$(cat "$_d/topology/core_id" 2>/dev/null || echo "$_n")
+    for _n in $_cand; do
+        [ -d "/sys/devices/system/cpu/cpu$_n/cpufreq" ] || continue
+        _id=$(cat "/sys/devices/system/cpu/cpu$_n/topology/core_id" 2>/dev/null || echo "$_n")
         case "$_seen" in *" $_id "*) continue ;; esac
         _seen="$_seen$_id "; _cores="${_cores:+$_cores,}$_n"
     done
     [ -n "$_cores" ] || _cores=0
+    # PRECOMPILE SYNCHRONOUSLY, OR THIS CHECK LEAKS A 100%-CPU ORPHAN EVERY TIME IT RUNS. The load
+    # below is backgrounded and killed after the sampling window. A cold load spends that window
+    # precompiling, and a precompile WORKER writes a temp pkgimage that only its parent installs — so
+    # killing the parent throws the work away, leaves the worker orphaned at PPID 1 grinding one core
+    # flat, and guarantees the next invocation precompiles again. It never converges on its own:
+    # verified by running `verify-mt` twice in a row and watching a second orphan appear.
+    #
+    # The damage is to whatever runs next. `bench/ledger/replicate.sh` screens the box for contention
+    # BEFORE calling this, so the orphan appears after the screen has passed and lands squarely on the
+    # measurements: gemvN n=192 on wintermute read median 0.1009 and 0.0554 across two 20-process
+    # batches, against 12/12 clean between 1.80 and 2.38 with no `verify-mt` in the loop.
+    # `plots.jl`'s own guard refuses and retries, so a sweep pays retries rather than recording this.
+    #
+    # Free when warm, and the cold cost is paid here where it blocks instead of where it contends. The
+    # main project is a separate environment from `bench`, so a caller that pre-warms `bench` — both
+    # `fleet_refresh.sh` and `replicate.sh` do — does not cover this.
+    # BOUNDED, AND LOUD WHEN IT DOES NOT FINISH. Swallowing the result hides the one case that still
+    # behaves like the old bug: if the environment will not precompile, the load below spends its
+    # window compiling and orphans a worker exactly as before, while this check still prints a verdict.
+    if ! timeout 1800 julia --project="$_root" -e 'using Pkg; Pkg.precompile()' >/dev/null 2>&1; then
+        echo "⚠ the main project did not precompile inside 30 min — the load below may compile during"
+        echo "  its own sampling window, which both weakens this verdict and can leave an orphan."
+    fi
     taskset -c "$_cores" julia -t "$_nt" --project="$_root" "$_ld" "$_nt" 30 >/dev/null 2>&1 &
     _jp=$!
     sleep 8                                    # past load+compile, into the sustained window
@@ -354,8 +392,39 @@ JL
         sleep 2
     done
     echo "loaded+sampled cores: $_cores"
-    kill "$_jp" 2>/dev/null || true; wait "$_jp" 2>/dev/null || true
+    # SIGTERM, THEN SIGKILL — a bare `kill` followed by `wait` can block without limit. Julia services
+    # a termination signal from its scheduler, and a process whose threads are inside a non-yielding
+    # kernel need not reach it; `wait` then holds this check open for as long as the load chooses to
+    # live. Observed once on galen: `verify-mt` sat for 53 minutes with its load as a live child, so
+    # the caller's whole measurement run stalled behind a check that normally takes 22 seconds.
+    # SIGKILL cannot be ignored, so this returns in at most five seconds more than the window.
+    kill "$_jp" 2>/dev/null || true
+    for _k in 1 2 3 4 5; do kill -0 "$_jp" 2>/dev/null || break; sleep 1; done
+    kill -9 "$_jp" 2>/dev/null || true
+    wait "$_jp" 2>/dev/null || true
     echo "pin=${_hi} MHz   under ${_nt}-thread gemm: min=${_min} MHz  max=${_max} MHz"
+    # A CHECK THAT SAMPLED NOTHING MUST NOT PASS. `_min` starts at 99999 and the sampling loop skips
+    # any core whose `scaling_cur_freq` will not read, so with zero readings the band test below is
+    # `99999 >= 88% of the pin` (true) and the spread is `0 * 100 / 99999` = 0 (true) — a confident ✅
+    # from a measurement that never happened. Everything downstream gates on that ✅: this script is
+    # called before every replication and before, between and after every sweep group.
+    if [ "$_max" -eq 0 ]; then
+        echo "❌ NO CORE CLOCK WAS READ — this check measured nothing and cannot certify anything."
+        echo "   Sampled set was '${_cores}'. Either cpufreq is unreadable here, or MTCORES named"
+        echo "   CPUs that do not exist (an unparsable spelling drops every candidate)."
+        exit 2
+    fi
+    # AND THE LOAD MUST BE AS WIDE AS THE VERDICT CLAIMS. `_nt` comes from NT and the sampled set from
+    # MTCORES, and nothing tied them together: `MTCORES=0,1 NT=6` put six threads on two CPUs, sampled
+    # two cores, and printed "6 cores HOLD" — fewer loaded cores draw less package power, so the check
+    # passed exactly the box it exists to fail. `fleet_refresh.sh` guards this upstream; this did not.
+    _ncore=$(printf '%s' "$_cores" | tr ',' '\n' | grep -c .)
+    if [ "$_nt" -gt "$_ncore" ]; then
+        echo "❌ ASKED TO CERTIFY ${_nt} THREADS ON ${_ncore} CORE(S) — refusing. ${_nt} threads over"
+        echo "   '${_cores}' draws less package power than ${_nt} cores would, so a ✅ here would"
+        echo "   certify a state the sweep never runs in. Widen MTCORES or lower NT."
+        exit 2
+    fi
     # Same 12% band as `verify`, applied to the WORST core — and a spread test, because an oscillating
     # clock can average inside the band while never holding it.
     if [ "$_min" -ge $(( _hi * 88 / 100 )) ] && [ "$(( _max * 100 / _min ))" -le 108 ]; then

@@ -2110,6 +2110,34 @@ sparse Cholesky.
 
 ### Tooling backlog
 
+- **The in-window clock sampler is bounded at ~1%, and that is below the gate's resolution (measured
+  2026-10-11).** `Measure._khz` reads `/proc/self/stat` field 39 — the calling thread's core — and it
+  samples BEFORE and AFTER each window, never during it. So the figure recorded for a threaded cell is
+  the driver's core between windows, and a package limit that binds only while six cores are loaded
+  would not appear in it. That is the gap; here is its size, pin against achieved-under-load:
+
+        wintermute  pin 3501  loaded min 3468   0.94% under
+        galen       pin 3701  loaded min 3659   1.13% under
+
+  Under 1.2% on both locked boxes, against a gate adjudicated at two significant digits — so sampling
+  around the window rather than during it cannot move a verdict, and `verify-mt` (run before every
+  measurement, and before and after every sweep group) is what bounds it. **Not worth a format
+  change**: adding a during-window field would alter what every cached arm's anchor means, or add a
+  field the ledger and `plots.jl` must both parse, to correct an error smaller than the rounding.
+  Revisit only if a box appears whose loaded clock sits further than ~2% below its pin while still
+  passing `verify-mt`.
+
+- **33.7 GB of orphaned precompile temp files to delete across the fleet (found 2026-10-11).**
+  `fleet_freqlock.sh verify-mt` backgrounded a load and killed it mid-precompile, and a precompile
+  worker writes a temp pkgimage that only its parent installs — so every call discarded ~300 MB and
+  left the file behind. Fixed in `5f4bcb6e`/`b09d1637`; the accumulated files are still on disk:
+
+        wintermute  77 files  14 G       galen  64 files  12 G       neuromancer  40 files  7.7 G
+
+  against 9-10 installed `.ji` each. They are `~/.julia/compiled/v1.13/PureBLAS/jl_*` and are inert
+  garbage, but a delete must skip any file a live precompile is writing — filter on mtime, and not
+  while a box is precompiling. Needs the user's go-ahead; it is a three-box delete outside the repo.
+
 - **Re-evaluate the gating strategy — a full sweep is too slow to run casually (raised 2026-09-03).**
   MEASURED on the 2026-09-03 fleet refresh: Zen5, full rebuild (every arm interleaved). The rate
   DECAYS through the sweep as it reaches larger `n` and the LAPACK ops, so quote an interval rate, never
@@ -2137,6 +2165,30 @@ sparse Cholesky.
   and reference windows unequally — the contention guard exists for this), and do not drop arms on a full
   rebuild (that is the refusal above, and cross-run references are what made Zen5's cache
   unusable in the first place).
+
+- **The dual groups have no threaded reference, so DL* cannot be gated with threads on.**
+  OpenBLAS and AOCL implement no dual-number arithmetic, so there is no vendor arm to compare
+  against at any thread count. `DL1`'s reference is the arm `generic` — LinearAlgebra's own fallback
+  over `Vector{Dual}`, a different Julia *implementation* rather than a different BLAS — and it is
+  single-threaded. A `pb_mt` arm divided by `generic` is therefore threaded ÷ serial: the ratio rises
+  with the thread count whatever PureBLAS does, which is the same flattering-the-numerator error that
+  a throttled reference produces. `bench/fleet_refresh.sh` keeps the dual groups out of a threaded
+  group list for this reason, and `_gemm_dual3!` calling `_gemm_core_out!` means the dual gemm plane
+  products do not thread anyway.
+
+  What a defensible dual threaded number needs, roughly by value:
+  1. **A derived reference from the real threaded vendor arms.** A dual `gemm` over `Dual{T,N}` does
+     the work of `1 + N` real `gemm`s on the value and partial planes, so `(1 + N) ×` the cached
+     `max(openblas_mt, aocl_mt)` time for the same shape is a reference with no new measurement at
+     all — it prices what a dual product *should* cost on that silicon. Needs the multiplier argued
+     per op (`trmm`/`trsm`/`syrk` have their own plane counts), and it is a roofline, so it belongs in
+     its own view rather than beside a measured arm.
+  2. **Self-speedup as the reported figure for DL\*.** `pb_mt ÷ pb` within one run is honest and
+     already measurable. It scores scaling, not competitiveness, so it cannot carry the gate — state
+     that wherever it is published rather than letting a reader read it as one.
+  3. **A threaded `generic` arm.** Thread LinearAlgebra's generic fallback in the harness so the
+     reference matches the arm's thread count. This means authoring a reference implementation whose
+     parallel efficiency then decides PureBLAS's score, which is a conflict the other two avoid.
 
 ### Wishlist
 
