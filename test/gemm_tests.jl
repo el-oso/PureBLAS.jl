@@ -222,12 +222,21 @@ end
             @test outs[t] ≈ want rtol = 1e-12
         end
         # AND WITH alpha AND beta BOTH NON-TRIVIAL, because the combine passes take a DIFFERENT arm
-        # there. 300 is Strassen-claimed (min(m,n,k) >= `_STRASSEN_MIN`), so a loser here runs the
-        # combines' lost-claim fallback — and with alpha = 1, beta = 0 above, three of the four
-        # C-assembly passes take their beta-free arm and the `beta * C` form is never exercised on the
-        # losing path at all. A non-power-of-two alpha for the same reason it appears in the
-        # bit-identity item: scaling by +-2^j is exact and would hide a misplaced alpha.
-        @test P._strassen_owns(Float64, 300, 300, 300, false, A, B)
+        # there. With alpha = 1, beta = 0 above, three of the four C-assembly passes take their
+        # beta-free arm and the `beta * C` form is never exercised on the losing path at all. A
+        # non-power-of-two alpha for the same reason it appears in the bit-identity item: scaling by
+        # +-2^j is exact and would hide a misplaced alpha.
+        #
+        # Witness, and it is a PREMISE: 300 is Strassen-claimed only where `_STRASSEN` holds, which is
+        # `_W64 == 4 || _W64 == 8` -- false wherever `_vwidth(Float64)` is 2. There the call takes the
+        # column split, so there is no claim to lose and the four C-assembly passes this paragraph is
+        # about are not reached; the comparisons below still test the invariant, and only the witness
+        # is skipped. Same shape as the big/thin witnesses further down.
+        if P._STRASSEN
+            @test P._strassen_owns(Float64, 300, 300, 300, false, A, B)
+        else
+            @test_skip "Strassen is off at _W64=$(PureBLAS._W64)"
+        end
         C0 = randn(300, 300)
         want2 = copy(C0)
         P.set_num_threads(1)
