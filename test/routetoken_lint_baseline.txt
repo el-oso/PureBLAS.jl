@@ -14,6 +14,19 @@
 # unchanged at 1440 (n=1024) and 4200 (n=2048). The call count RISES where it was broken — 2170 to
 # 3000 and 6892 to 8552 — so the repair keeps chunks on the coprocessor rather than switching it off.
 # x86 cannot witness any of this: `_SME_F64` is false there and `_sme_eligible` short-circuits first.
+#
+# THE PREDICATE IS NOT A FLOOR, AND ONE CELL SETTLES IT ARITHMETICALLY — read this before concluding
+# that a narrow band is the hazard and a worker cap the remedy. At m=80, k=128 the narrowest band at
+# twelve workers is 40 rows, and against a width-32 off-diagonal product:
+#
+#   _sme_tile_ok(80, 32) = true    min 32 >= 2*_SME_MR ✓,  80 % 16 == 0 and 32 % 16 == 0
+#   _sme_tile_ok(40, 32) = false   min 32 >= 2*_SME_MR ✓,  40 % 16 == 8  ⇒  max(40,32) < _SME_MIN_EXACT
+#
+# BOTH operands clear the minimum in BOTH calls. The answers differ on the MODULUS clause alone, so a
+# band nowhere near the floor still routes differently from the undivided shape — bands 36 and 44
+# behave the same way. Reading every axis from the token is the only thing that closes it, and a cap on
+# the worker count cannot: two workers at m=80 give bands of 40 and 40, both above the minimum, so the
+# cap admits the split and the cell stays non-reproducible.
 blas3/gemm.jl:not-a-max:if _sme_eligible(T, mrt, nrt, krt, tA, tB, cA, cB, C, A, B)
 #
 # LATENT, not reachable today. `min(m, nrt, k)` over a routed value: a `min` gets no protection from
