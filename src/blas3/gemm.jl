@@ -3654,14 +3654,24 @@ end
         # last tile. So reading the local row extent costs reproducibility and cannot buy correctness.
         #
         # IT DOES BUY SPEED, THOUGH, AND THAT COST LANDS ON THE WORKER COUNT. Routing the predicate
-        # ADMITS bands the local read refused — measured on a side-R solve at k=512 and twelve
+        # ADMITS bands the local read refused — measured on an M6, side-R solve at k=512 and twelve
         # workers, SME calls go from 0 to 180 at m=64, 128 and 256. Padding a 4-row band to `_SME_MR`
         # discards three quarters of the work, twelve deep on one shared coprocessor, and the solve
         # runs 2.18x slower at m=64, 1.39x at m=128, 1.17x at m=256. The remedy belongs in the
         # admission decision, not here: capping workers so every band reaches the kernel's tile turns
-        # those three into 1.36x, 1.55x and 1.29x FASTER than an unrouted predicate manages. A
-        # residual stands at m=512, where the cap does not bind and this reading is 4-5% slower; that
-        # one needs a crossover on the band extent, which is a routing choice rather than a token one.
+        # those three into 1.36x, 1.55x and 1.29x FASTER than an unrouted predicate manages.
+        #
+        # Those ratios are one SME implementation's, not a portable property: the padding waste follows
+        # from `_SME_MR`, and a part with a different tile width moves every figure above.
+        #
+        # A residual sits at m=512, where the cap does not bind and this reading measures 4-5% slower
+        # — NOT an adjudicated result. The cross-tree timings behind it rest on a single control shape
+        # at m=2048 agreeing to 0.2%, which shows the two windows matched there rather than that
+        # neither moved, and a mid-window clock dip is invisible to a check that reads only a window's
+        # representative clock. Settling it needs several controls straddling the routing change and
+        # per-sample spread; the large ratios above are far outside that uncertainty and the call
+        # counts are not timings at all, so only this 4-5% is in question. A fix would be a crossover
+        # on the band extent, which is a routing choice rather than a token one.
         if _sme_eligible(T, mrt, nrt, krt, tA, tB, cA, cB, C, A, B)
             return _gemm_sme!(C, A, B, Float64(alpha), Float64(beta), m, n, k, tA, tB)
         end
