@@ -290,12 +290,13 @@ end
 # only some worker counts make them whole `_SME_MR` blocks as well. `k` must be at least 64, because
 # `_sme_tile_ok` needs `min(m, k÷2) ≥ 2·_SME_MR` before the recursion is eligible at all.
 #
-# WHAT THIS ITEM DOES NOT COVER, so that a green is not read as covering it. The band-height hazard is
-# a different one and the item below owns it: `m = 2048` here, whose narrowest band at twelve workers
-# is 168 rows, so nothing here approaches the `2·_SME_MR` floor that `_sme_tile_ok` imposes on a
-# band's own height. Nor does anything here reach `diag = 'U'`, where a side-R solve at small `k`
-# returns worker-count-dependent bits with NO SME call on either side — a carrier outside the gemm
-# route entirely, still unidentified and still ungated.
+# WHAT THIS ITEM DOES NOT COVER, so that a green is not read as covering it. Two further hazards on
+# this path have items of their own below. One is a band whose OWN height falls under the
+# `2·_SME_MR` floor `_sme_tile_ok` opens with, which `m = 2048` here never approaches — its narrowest
+# band at twelve workers is 168 rows. The other is that same predicate answering differently for a
+# band than for the undivided height with BOTH operands above that floor, through its modulus clause
+# rather than its floor; `m = 2048` is a whole `_SME_MR` block and so are its bands at every count
+# here, so this shape cannot reach it.
 @testitem "trsm side-R: bit-identical at every thread count" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
@@ -398,6 +399,84 @@ end
             end
         end
         @test bound[]
+        P.set_num_threads(1)
+    end
+end
+
+# THE TILE DECISION MUST NOT DEPEND ON THE ROW SPLIT, and `_sme_tile_ok` is the one route predicate
+# that can break that rule with no operand anywhere near its minimum. It opens on
+# `min(m, n) >= 2·_SME_MR`, then takes two moduli, then falls back on `max(m, n) >= _SME_MIN_EXACT` —
+# so a band whose height clears the floor can still answer differently from the undivided height
+# through the modulus clause alone. At `m = 80` with two workers the bands are 40 and 40:
+# `_sme_tile_ok(80, 32)` is true because both operands are whole `_SME_MR` blocks, while
+# `_sme_tile_ok(40, 32)` is false because 40 is not one and `max(40, 32)` is under `_SME_MIN_EXACT`.
+# The SME macrokernel preloads C into ZA and accumulates on top; the vector path sums from zero and
+# stores `fma(β, C, α·acc)`. The two cannot agree bitwise, so the decision has to be taken on the
+# undivided pair, which is what the route token's named slots are for: side R fills the `m` slot, so
+# `_rt_m` is the whole problem's row count and `_rt_n` is the off-diagonal product's own width.
+#
+# THE LIVENESS WITNESS DEMANDS BOTH `min` OPERANDS ABOVE THE FLOOR, and that is the point of it. A
+# witness that merely found a narrow band would also be satisfied by capping the worker count until
+# every band clears `2·_SME_MR` — and such a cap leaves exactly these shapes split, because 40 and 44
+# already clear it, so the divergence survives the cap. Requiring the answer-difference with `min`
+# satisfied on BOTH sides is what ties the item to the predicate's operands rather than to band size,
+# and what stops it going quiet if a cap is ever reintroduced.
+#
+# `k = 128` so the off-diagonal widths are 64 and 32: 32 is the narrow one that separates the two
+# answers, and it is reachable because it is `_trsplit` of a level still above `_trsm_base()`. Both
+# diagonals are swept — a non-unit diagonal reaches the fused leaf and a unit one must recurse, and
+# the band split is above both, so neither is a control here.
+@testitem "trsm side-R: the SME tile decision does not depend on the row split" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    k = 128
+    # Widths of the off-diagonal products one side-R solve issues: the recursion halves `k` and
+    # updates across the split until a level fits the base.
+    offwidths(kk) = (ws = Int[]; q = kk;
+        while q > P._trsm_base(); h = P._trsplit(q); push!(ws, h); q -= h; end; ws)
+    bandlens(m, nw) = (P._trsm_rchunk(m, nw, i, Float64)[2] for i in 1:nw)
+    if nthreads() < 2
+        @test_skip "needs >= 2 julia threads: with no pool the rows are never split, so the \
+            comparisons would prove nothing"
+    elseif !P._SME_F64 || P._SME_ENTRY[] === C_NULL
+        @test_skip "f64 SME is off here (_SME_F64 = $(P._SME_F64)), so no tile decision can differ \
+            between a band and the undivided height and the comparisons would prove nothing"
+    else
+        bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        ws = offwidths(k)
+        @test !isempty(ws)
+        # `_trsm_workers_r` reads the LIVE pool size, so a sweep that forgets to set it reports no
+        # split at every shape and the difference count comes back zero — which reads exactly like a
+        # proof that none exists. The arming counter is what separates the two.
+        armed, differing = Ref(0), Ref(0)
+        for m in (80, 128), nt in 2:nthreads()
+            P.set_num_threads(nt)
+            nw = P._trsm_workers_r(k, m, Float64)
+            nw > 1 || continue
+            armed[] += 1
+            for b in bandlens(m, nw), w in ws
+                P._sme_tile_ok(m, w) == P._sme_tile_ok(b, w) && continue
+                min(b, w) >= 2 * P._SME_MR && (differing[] += 1)
+            end
+        end
+        P.set_num_threads(1)
+        @test armed[] > 0
+        @test differing[] > 0
+        for m in (80, 128)
+            B0 = randn(m, k)
+            for (up, tr) in (('L', 'N'), ('L', 'T'), ('U', 'N'), ('U', 'T')), dg in ('N', 'U')
+                G = randn(k, k)
+                A = (up == 'U' ? triu(G) : tril(G)) + k * I
+                P.set_num_threads(1)
+                r = copy(B0); P.trsm!(r, A; side = 'R', uplo = up, transA = tr, diag = dg)
+                for nt in 2:nthreads()
+                    P.set_num_threads(nt)
+                    g = copy(B0); P.trsm!(g, A; side = 'R', uplo = up, transA = tr, diag = dg)
+                    @test bitsame(g, r)
+                end
+            end
+        end
         P.set_num_threads(1)
     end
 end
