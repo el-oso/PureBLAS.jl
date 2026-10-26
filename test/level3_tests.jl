@@ -290,14 +290,12 @@ end
 # only some worker counts make them whole `_SME_MR` blocks as well. `k` must be at least 64, because
 # `_sme_tile_ok` needs `min(m, k÷2) ≥ 2·_SME_MR` before the recursion is eligible at all.
 #
-# WHAT THIS ITEM DOES NOT COVER, so that a green is not read as covering it. `_gemm_core!` carries ONE
-# route token and it lands in the `n` slot, so `_gemm_core_body!` asks `_sme_eligible` with the chunk's
-# OWN row extent (`src/blas3/gemm.jl`, whose comment there claims invariance for `nrt` only). Side-R
-# splits rows, so that row extent is a band height, and a band below `2·_SME_MR` fails
-# `_sme_tile_ok`'s first clause where the unsplit height passes it. The shape below cannot reach that:
-# bands run about `m / nw` rows, so at m=2048 one falls under `2·_SME_MR` only past sixty-four workers
-# — twelve gives 168 — while m=64, k=512 reaches it at four workers, which get 16 rows each. A second
-# family is reported at `diag = 'U'`, where the leaf declines; this item only ever solves `diag = 'N'`.
+# WHAT THIS ITEM DOES NOT COVER, so that a green is not read as covering it. The band-height hazard is
+# a different one and the item below owns it: `m = 2048` here, whose narrowest band at twelve workers
+# is 168 rows, so nothing here approaches the `2·_SME_MR` floor that `_sme_tile_ok` imposes on a
+# band's own height. Nor does anything here reach `diag = 'U'`, where a side-R solve at small `k`
+# returns worker-count-dependent bits with NO SME call on either side — a carrier outside the gemm
+# route entirely, still unidentified and still ungated.
 @testitem "trsm side-R: bit-identical at every thread count" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
@@ -341,6 +339,65 @@ end
                 @test bitsame(g, r)
             end
         end
+        P.set_num_threads(1)
+    end
+end
+
+# THE SIDE-R WORKER CAP IS A SPEED MEASURE, NOT A REPRODUCIBILITY ONE, and this item is its contract
+# check. A band narrower than the kernel's tile still reaches the coprocessor — the macrokernel pads
+# rows to `cld(mce, MR) * MR` and takes a partial last tile — so a 4-row band does 16 rows of work,
+# and twelve such bands multiply that waste across one coprocessor. `_trsmr_sme_nw` caps the pool at
+# the largest count whose every band clears `2·_SME_MR`, and only when the sub-gemm would reach the
+# coprocessor at all — asked of `_sme_eligible` itself rather than restated, so the rule
+# `_trmmr_sme_owns` already follows.
+#
+# BIT-IDENTITY AT THESE SHAPES IS NOT THIS CAP'S DOING, and a green here must not be read as
+# establishing it. `_sme_tile_ok` is resolved from the route token on every axis, so a split cannot
+# change the tile decision whatever the cap does. A cap CANNOT deliver that invariant in any case:
+# bands of 36, 40 and 44 rows all clear `2·_SME_MR` and still answer differently from an undivided
+# height through the modulus clause, so a cap keyed on the floor admits exactly those splits. The
+# sweep below is a regression net; the witness for the invariant is the item after this one.
+#
+# WHAT THIS ITEM ALONE ESTABLISHES is the cap's own contract: that it BINDS at these row counts, and
+# that every band it admits clears the tile width. The uncapped count is asserted to exceed the
+# capped one, or the contract would be untested. Two workers cannot reach it at any of these row
+# counts, hence the three-thread floor: at m=64 two bands are 32 rows each, exactly the tile width.
+# `k = 512` so the predicate is satisfied at the undivided shape and at every recursion level above
+# the base.
+@testitem "trsm side-R: the worker cap keeps every band at the SME tile width" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    k = 512
+    if nthreads() < 3
+        @test_skip "needs >= 3 julia threads: at two workers every band here is already at or above \
+            2*_SME_MR, so the cap cannot bind and its contract would go untested"
+    elseif !P._SME_F64 || P._SME_ENTRY[] === C_NULL
+        @test_skip "f64 SME is off here (_SME_F64 = $(P._SME_F64)), so no band ever reaches the \
+            coprocessor, the cap has nothing to keep off it, and its contract would go untested"
+    else
+        bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        bound = Ref(false)
+        for m in (64, 128, 256)
+            B0 = randn(m, k)
+            for (up, tr) in (('L', 'N'), ('L', 'T'), ('U', 'N'), ('U', 'T'))
+                G = randn(k, k)
+                A = (up == 'U' ? triu(G) : tril(G)) + k * I
+                P.set_num_threads(nthreads())
+                nwun = P._trsm_workers_r(k, m, Float64)
+                nwcap = P._trsmr_sme_nw(Float64, nwun, k, m, A, B0)
+                bound[] |= nwcap < nwun
+                @test all(P._trsm_rchunk(m, nwcap, i, Float64)[2] >= 2 * P._SME_MR for i in 1:nwcap)
+                P.set_num_threads(1)
+                r = copy(B0); P.trsm!(r, A; side = 'R', uplo = up, transA = tr)
+                for nt in 2:nthreads()
+                    P.set_num_threads(nt)
+                    g = copy(B0); P.trsm!(g, A; side = 'R', uplo = up, transA = tr)
+                    @test bitsame(g, r)
+                end
+            end
+        end
+        @test bound[]
         P.set_num_threads(1)
     end
 end
