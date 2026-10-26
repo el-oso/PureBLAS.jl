@@ -1000,6 +1000,12 @@ function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15
 end
 const _L1REP = s -> clamp(8_000_000 ÷ s, 30, 20000)           # O(s) work
 const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
+# The rectangular gemv cells hold their ROW count fixed and sweep `s` as the column count, so their
+# work is O(_RECT_ROWS·s) — linear in `s`, not quadratic. Repping them with `_L2REP` equalizes nothing:
+# it over-reps the short end into the 20000 clamp and under-reps the long end to 48, leaving timed
+# windows spread 155 ms to 8.9 ms across one ladder. Dividing by the actual work holds them near 50 ms.
+const _RECT_ROWS = 505   # fixed dimension of every rectangular cell; see RECTSZ/RECT3SZ below
+const _RECTREP = s -> clamp(400_000_000 ÷ (_RECT_ROWS * s), 30, 20000)
 # `cold` forces reps=1 on the L1 sweep -- no repeated-call reuse of the SAME operand buffer within one
 # timed window. WHY: `_L1REP` amortizes timer overhead for cheap ops by calling `reps` times on one
 # `setup()`-allocated buffer; at large n that buffer can be small enough to stay resident in L2/SLC
@@ -1133,6 +1139,12 @@ const L1SZ = (1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000)
 # two, so the row would not mean the same thing per box.
 const L2SZ = (50, 64, 100, 128, 256, 512, 1000, 1024, 2048, 2100, 4096)
 const L3SZ = (8, 32, 50, 100, 128, 256, 512, 1000, 1024, 2048, 2100, 4096)   # O(n³); 4096 shows large-n syrk/trmm behavior
+# Rectangular ladders. `s` is the VARYING dimension, never a square order: for `gemvNrect`/`gemvTrect`
+# it is the column count against `_RECT_ROWS` fixed rows, for `trsmRrect` the row count against
+# `_RECT_ROWS` columns. 384/448/512 bracket `_GEMVN_RB`'s row-block/column cut so one cell straddles
+# it; 758/1420/2880 set the aspect to 1.50/2.81/5.70, the spread real callers span.
+const RECTSZ = (131, 256, 384, 448, 512, 758, 1420, 2880)
+const RECT3SZ = (505, 758, 1420, 2880)
 # LAPACK factorizations, to 4096. NON-PO2 entries (50/100/1000/2100) are one per RESIDENCY BAND, the
 # same set L2SZ/L3SZ use — and they matter MORE here than anywhere else: the panel kernels these ops
 # route through (`_trsm_rl_split_f64!`, `_trsm_right_lower_f64!`) handle a sub-W row tail and a
@@ -1297,6 +1309,25 @@ function run_benchmarks()
                 end; c[3][1]
             )
         )
+        # Rectangular gemv. The covered caller stores its matrix variables-by-constraints, so `lda` is
+        # the SMALL dimension, the array is short-fat, and it is read 'T' with the reduction running
+        # down the columns. The `sq` cells above cannot reach this regime: they hold aspect at 1 by
+        # construction, and every other builder in this file is square too.
+        #
+        # ROWS ARE FIXED and `s` is the COLUMN count, which is why these carry their own ladder. Two
+        # things then vary together, both deliberately: the aspect ratio sweeps 0.26 to 5.70, and the
+        # column count crosses `_GEMVN_RB`'s cut at 448 INSIDE one cell, so a mis-sited cut shows as a
+        # kink rather than hiding between cells. Largest operand 505x2880x8 = 11.6 MB, L3-resident.
+        rN(s) = (randn(_RECT_ROWS, s), randn(s), randn(_RECT_ROWS))   # 'N': y(rows) = A*x(cols)
+        rT(s) = (randn(_RECT_ROWS, s), randn(_RECT_ROWS), randn(s))   # 'T': y(cols) = A'*x(rows)
+        _meas!(l2, "L2", "gemvNrect", () -> sweep(rN, _sizes(RECTSZ),
+            (c, m) -> (for _ in 1:m; B.gemv!(TN, 1.0, c[1], c[2], 0.0, c[3]); end; c[3][1]),
+            (c, m) -> (for _ in 1:m; PureBLAS.gemv!(c[3], c[1], c[2]; alpha = 1.0, beta = 0.0); end; c[3][1]),
+            _RECTREP))
+        _meas!(l2, "L2", "gemvTrect", () -> sweep(rT, _sizes(RECTSZ),
+            (c, m) -> (for _ in 1:m; B.gemv!(TT, 1.0, c[1], c[2], 0.0, c[3]); end; c[3][1]),
+            (c, m) -> (for _ in 1:m; PureBLAS.gemv!(c[3], c[1], c[2]; alpha = 1.0, beta = 0.0, trans = TT); end; c[3][1]),
+            _RECTREP))
         add(
             "ger", sq, (c, m) -> (
                 for _ in 1:m
@@ -1477,6 +1508,15 @@ function run_benchmarks()
             c -> (B.trsm!('R', 'L', 'T', 'N', 1.0, c[1], c[2]); c[2][1]),
             c -> (PureBLAS.trsm!(c[2], c[1]; side = 'R', uplo = 'L', transA = 'T'); c[2][1])
         )
+        # Rectangular side-R trsm, `B <- B*inv(A)` with B TALL. The covered caller forms a reduction
+        # against an upper-triangular Cholesky factor and stores B constraints-by-variables, so `lda`
+        # is the LARGE dimension — the OPPOSITE orientation from `gemvTrect`, which is why the two
+        # cannot share an operand builder. Columns are fixed at the triangular order and `s` is the row
+        # count, so the ladder sweeps rows/cols 1.0 to 5.70. Largest B is 2880x505x8 = 11.6 MB.
+        _meas!(l3, "L3", "trsmRrect", () -> sweep_heavy(s -> (tri(_RECT_ROWS), randn(s, _RECT_ROWS)),
+            c -> (B.trsm!('R', 'U', 'N', 'N', 1.0, c[1], c[2]); c[2][1]),
+            c -> (PureBLAS.trsm!(c[2], c[1]; side = 'R', uplo = 'U', transA = 'N'); c[2][1]),
+            _sizes(RECT3SZ)))
     end
 
     # ── LAPACK (O(n³) factorizations; all destructive → fresh input per round) ─────────────────────────

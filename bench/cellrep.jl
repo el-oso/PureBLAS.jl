@@ -48,12 +48,47 @@ const _OPENBLAS = B.get_config().loaded_libs[1].libname
 
 const OP = ARGS[1]
 const N = parse(Int, ARGS[2])
+# A THIRD ARGUMENT SWITCHES TO SELF-SPEEDUP and measures NO reference at all: the two arms are the
+# SAME PB closure on the SAME operands at 1 thread and at `NT`, so the comparison needs no vendor
+# library and no LBT forwarding. That is what makes K-process replication of a THREADED verdict
+# affordable — and why it carries no authorisation cost, unlike the gate mode below.
+#
+# WHY IT HAS TO BE ACROSS PROCESSES. Inter-round spread within one process cannot certify a cell: a
+# round reuses one page-colouring draw for both arms and only a new process re-rolls it. Measured here
+# at axpy n=1e6, 10 in-process rounds read 1.0153 [1.0000, 1.0214] where 10 fresh processes read
+# 0.9868 with 9 of 10 below 1.0 — the OPPOSITE SIGN, not merely a wider interval. So a tight
+# `spread_mt` in `bench/ledger/cells.tsv` disqualifies nothing and confirms nothing; this does.
+#
+#   julia --project=bench -t 7 bench/cellrep.jl trmmL 32 6 >> log     # one process, one line
+#   bench/ledger/replicate.sh trmmL 32 6 10                           # ten processes, with the verdict
+#
+# ⚠ THE OP NAMES HERE ARE NOT ALL THE LEDGER'S NAMES. `OPS` below splits trmm by side — `trmmL` and
+# `trmmR` — because each needs its own operands, while `cells.tsv` carries `plots.jl`'s names, where
+# side L is plain `trmm`. So the cell to compare `trmmL` against is row `<box> L3 trmm <n>`. There is
+# no op called `trmm` here, and asking for one is an error rather than a silent miss.
+const NT = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 0
+# Optional 4th arg: the replication index, used ONLY to rotate which arm is timed first. `plots.jl`
+# rotates its arm list per round (`circshift(armlist, r - 1)`); a fixed order biases every one of the
+# K processes the same way, and a bias common to all of them is exactly what a cross-process median
+# cannot cancel. Rotating on the index makes the order alternate across the replication instead.
+const ROT = length(ARGS) >= 4 ? iseven(parse(Int, ARGS[4])) : false
 _l1rep(s) = clamp(8_000_000 ÷ s, 30, 20000)          # plots.jl's _L1REP — the regime must match
 _l2rep(s) = clamp(400_000_000 ÷ (s * s), 30, 20000)  # plots.jl's _L2REP — O(s²) work
+_l3rep(s) = clamp(20_000_000 ÷ (s * s * s), 1, 512)  # plots.jl's _reps_cubic — O(s³) work
 # WHICH formula an op gets is part of the regime, not a detail: `_l1rep` on an O(s²) op asks for
 # 7812 reps of a 1024x1024 gemv per sample, ~1000x plots.jl's budget, and the cell would then be
 # timed deep in a steady state the gate never enters.
-const _L2OPS = ("gemvN", "gemvT", "trmv")
+const _L2OPS = ("gemvN", "gemvT", "trmv", "gbmvN")
+const _L3OPS = ("trmmL", "trmmR", "syrk", "ztrsmR", "ztrsmL", "trsmL", "trsmRg")
+# plots.jl's `tri(s)`, character for character. Conditioned so repeated in-place `B := A*B` is stable,
+# which is what lets the gate omit a per-rep restore; see the note at the L3 registry entries.
+_tri(s) = (A = randn(s, s) ./ (2s); for i in 1:s
+        A[i, i] = 1 + abs(A[i, i])
+    end; A)
+# plots.jl's `ctri(s)` for the CL3 cells, same conditioning for the same reason.
+_ctri(s) = (A = randn(ComplexF64, s, s) ./ (2s); for i in 1:s
+        A[i, i] = 1 + abs(A[i, i])
+    end; A)
 
 # op => (setup, pb work, reference work). Reference goes through LinearAlgebra.BLAS, which LBT points
 # at whichever library is forwarded below.
@@ -68,6 +103,27 @@ const OPS = Dict(
         (c, m) -> (
             for _ in 1:m
                 B.gemv!('N', 1.0, c[1], c[2], 0.0, c[3])
+            end; c[3][1]
+        ),
+    ),
+    # BANDWIDTH IS FIXED AT 16, so the work is O(s) and not O(s^2) — but the reps still come from
+    # `_l2rep`, because that is the budget `plots.jl` gives this op as a member of its L2 group and the
+    # regime has to match the gate rather than the asymptotics.
+    # `GBMV_K` overrides the half-bandwidth, defaulting to the 16 `plots.jl` sweeps (band 33). It
+    # exists because the band is what selects the arm and the arm is what decides whether the pool is
+    # used at all, so a cell at another band is a different routing question rather than a different
+    # size. Changing it changes the REGIME, so a number taken under an override is not comparable to a
+    # gate cell and must say which band it used.
+    "gbmvN" => (
+        () -> (k = parse(Int, get(ENV, "GBMV_K", "16")); (randn(2k + 1, N), randn(N), randn(N), k)),
+        (c, m) -> (
+            for _ in 1:m
+                P.gbmv!(c[3], c[1], c[2], N, c[4], c[4]; trans = 'N', alpha = 1.0, beta = 0.0)
+            end; c[3][1]
+        ),
+        (c, m) -> (
+            for _ in 1:m
+                B.gbmv!('N', N, c[4], c[4], 1.0, c[1], c[2], 0.0, c[3])
             end; c[3][1]
         ),
     ),
@@ -244,14 +300,138 @@ const OPS = Dict(
             end; s
         ),
     ),
+    # ── L3, SELF-SPEEDUP ONLY ──────────────────────────────────────────────────────────────────────
+    # The reference closure is deliberately the PB one: these entries exist for the `NT` mode, where
+    # both arms are PB and the third slot is never called. Pointing it at a vendor would make a gate
+    # run on these ops silently measure PB against itself, so it errors instead.
+    #
+    # THE OPERANDS AND FLAGS ARE plots.jl's, COPIED NOT APPROXIMATED. Its `tri(s)` is
+    # `randn(s,s) ./ (2s)` with `A[i,i] = 1 + abs(A[i,i])`, and the conditioning is the point: with a
+    # unit-ish diagonal and O(1/s) off-diagonals, repeated in-place `B := A*B` neither blows up nor
+    # decays, so the gate needs NO per-rep restore and its timing is of the kernel rather than of
+    # denormals. A first version here used `tril(randn) + N*I`, whose diagonal is ~N, which forces a
+    # `copyto!` to stay finite — and that restore is extra traffic the gate never pays. It read 0.998
+    # where the cached cell reads 0.876, i.e. it measured a different problem. `uplo` is 'U' and the
+    # sides are 'L'/'R' as the gate sets them; syrk is `trans='N'`, `uplo='U'`, C zeroed.
+    "trmmL" => (
+        () -> (_tri(N), randn(N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.trmm!(c[2], c[1]; side = 'L', uplo = 'U')
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: trmmL is self-speedup only (pass a thread count); it has no reference arm"),
+    ),
+    # The two REAL trsm cells, each at `plots.jl`'s own form. ⚠ THEY DIFFER IN MORE THAN SIDE: the
+    # ledger's `trsm` is side 'L'/uplo 'U'/transA 'N', while `trsmR` is side 'R'/uplo 'L'/transA 'T' —
+    # the potrf/getrf panel-solve shape. Copying side-L's uplo and trans across would measure a
+    # different routing question under the same name.
+    "trsmL" => (
+        () -> (_tri(N), randn(N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.trsm!(c[2], c[1]; side = 'L', uplo = 'U')
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: trsmL is self-speedup only (pass a thread count); use plots.jl for the gate"),
+    ),
+    "trsmRg" => (
+        () -> (_tri(N), randn(N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.trsm!(c[2], c[1]; side = 'R', uplo = 'L', transA = 'T')
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: trsmRg is self-speedup only (pass a thread count); use plots.jl for the gate"),
+    ),
+    # `ztrsmL` is `plots.jl`'s CL3 `ztrsm` cell — side 'L', the plain name in the ledger, spelled with
+    # the side here for the same reason trmm is (each side needs its own operands).
+    "ztrsmL" => (
+        () -> (_ctri(N), randn(ComplexF64, N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.trsm!(c[2], c[1]; side = 'L', uplo = 'U')
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: ztrsmL is self-speedup only (pass a thread count); it has no reference arm"),
+    ),
+    # `ztrsmR` is `plots.jl`'s CL3 side-R solve: side 'R', uplo 'U', no trans, non-unit, alpha=1. Its
+    # operands are conditioned like the real ones so repeated in-place solves stay stable.
+    "ztrsmR" => (
+        () -> (_ctri(N), randn(ComplexF64, N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.trsm!(c[2], c[1]; side = 'R', uplo = 'U')
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: ztrsmR is self-speedup only (pass a thread count); it has no reference arm"),
+    ),
+    "trmmR" => (
+        () -> (_tri(N), randn(N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.trmm!(c[2], c[1]; side = 'R', uplo = 'U')
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: trmmR is self-speedup only (pass a thread count); it has no reference arm"),
+    ),
+    "syrk" => (
+        () -> (randn(N, N), zeros(N, N)),
+        (c, m) -> (
+            for _ in 1:m
+                P.syrk!(c[2], c[1]; uplo = 'U', trans = 'N')
+            end; c[2][1]
+        ),
+        (c, m) -> error("cellrep: syrk is self-speedup only (pass a thread count); it has no reference arm"),
+    ),
 )
 haskey(OPS, OP) || error("cellrep: unknown op $OP (have: $(join(sort(collect(keys(OPS))), ", ")))")
+# A THREAD COUNT OF 1 MUST NOT FALL THROUGH TO THE REFERENCE MODE. The self-speedup branch is
+# `NT > 1`, so `cellrep.jl axpy 1000 1` passed a thread count and still took the `else` arm — which
+# `lbt_forward`s OpenBLAS AND AOCL. That is the one thing in this file that carries an authorisation
+# cost, and reaching it by typing `1` where `6` was meant gave no diagnostic at all. Refuse instead:
+# there is no self-speedup to measure at one thread, and silently measuring something else is worse.
+(length(ARGS) >= 3 && NT <= 1) && error("""
+    cellrep: a thread count of $(NT) has no self-speedup to measure (the ratio would be 1 by
+    construction). OMIT the third argument for the reference-arm mode — but note that mode forwards
+    OpenBLAS and AOCL, which needs authorisation. Pass 2 or more for self-speedup.""")
+(OP in _L3OPS && NT <= 1) &&
+    error("cellrep: $OP is self-speedup only — pass a thread count, e.g. `cellrep.jl $OP $N 6`")
 mk, pbw, refw = OPS[OP]
-reps = (OP in _L2OPS ? _l2rep : _l1rep)(N)
+reps = (OP in _L3OPS ? _l3rep : OP in _L2OPS ? _l2rep : _l1rep)(N)
 
-"Median-of-samples time for one arm, Chairmarks, fresh input per sample (plots.jl's `evals=1` regime)."
+# WHICH REP SHAPE AN OP GETS IS PART OF THE REGIME, exactly like which rep FORMULA it gets. `plots.jl`
+# has two drivers and they differ in more than their counts:
+#
+#   `sweep`       (L1/L2) — one operand set per sample, `reps` calls on it.
+#   `sweep_heavy` (L3)    — `reps` FRESH operand sets per sample, ONE call on each.
+#
+# The split is not stylistic. The L3 ops are DESTRUCTIVE in place: `trmm` computes `B := A*B`, so a
+# loop of `reps` calls on one pair is a different computation from `reps` single calls on fresh pairs,
+# and it diverges fast. On the `tri(s)` these entries copy, n=8 at 512 reps takes ‖B‖ from 7.88 to
+# 3.05e28; n=32 at 512 reps multiplies it by 1.8e9. It is also a different working set — one pair
+# stays resident across every call where the gate streams `reps` distinct ones.
+#
+# At large n the two coincide because `_l3rep` reaches 1 (n >= 272), which is why the L3 cells measured
+# at n >= 512 were unaffected; the small-n cells were not.
+const _HEAVY = OP in _L3OPS
+
+"Median-of-samples time for one arm, Chairmarks, in the same rep SHAPE plots.jl gives this op's group."
 function armtime(work)
-    b = @be mk() (c -> work(c, reps)) evals = 1 samples = 96 seconds = 1.0
+    b = if _HEAVY
+        # Accumulate the returned element so the calls cannot be elided, as `sweep_heavy` does. Seeded
+        # from the first context rather than `zero(Float64)` so the accumulator takes the op's own
+        # element type instead of forcing real.
+        @be [mk() for _ in 1:reps] (cs -> begin
+            s = work(cs[1], 1)
+            for i in 2:lastindex(cs)
+                s += work(cs[i], 1)
+            end
+            s
+        end) evals = 1 samples = 96 seconds = 1.0
+    else
+        @be mk() (c -> work(c, reps)) evals = 1 samples = 96 seconds = 1.0
+    end
     return Measure.tstat(Float64[s.time for s in b.samples])
 end
 
@@ -263,12 +443,55 @@ end
 # 2.9 ms single-threaded — a 4x phantom "win" that would poison every large-n screen).
 ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"
 using AOCL_jll
-out = Dict{String, Float64}()
-for (nm, lib) in ("openblas" => nothing, "aocl" => AOCL_jll.aocl_blas_ilp64)
-    isnothing(lib) ? B.lbt_forward(_OPENBLAS; clear = true) :
-        B.lbt_forward(lib; clear = true)      # clear=true, as plots.jl:66 does — clear=false leaves routing ambiguous
-    out[nm] = armtime(refw)
+
+# PIN BEFORE EITHER ARM IS TIMED, because the ratio is only comparable to a cell that was pinned too.
+# `plots.jl` binds one thread per physical core before it measures anything; unpinned, two threads can
+# share a core while another is idle, and the repo's figure for that difference is 2.14x unpinned
+# against 1.07x pinned at one cell. `taskset -c` does not do this — it restricts the CPU set and says
+# nothing about placement inside it. Pinned here rather than inside the `NT > 1` branch so the SERIAL
+# arm is measured in the same state as the threaded one.
+const PINNED = Measure.pin_threads!()
+if NT > 1
+    # SELF-SPEEDUP: no reference arm is measured and no library is forwarded, so this path costs no
+    # authorisation. Both arms are the same closure on the same operands; only `set_num_threads`
+    # differs, and it is set OUTSIDE the timed window because it takes a lock and may allocate the
+    # pools on first use. The pools are warmed once here so neither arm pays for them.
+    P.set_num_threads(NT); P.set_num_threads(1)
+    # WITNESS IN THE OUTPUT, not just in a comment: `set_num_threads` CLAMPS to
+    # `min(Threads.nthreads(), _MT_NW_MASK)`, so a process launched without enough `-t` silently
+    # measures fewer workers than asked. Printing what the pool ACCEPTED, read back after the call,
+    # means a line from such a process is identifiable afterwards instead of averaging in unnoticed.
+    #
+    # `ROT` puts the THREADED arm first on half the replication. The two orders are otherwise
+    # identical — both arms see pools already warmed at NT by the pair of calls above — and which one
+    # a process uses is decided by its index, so the order alternates across the K processes rather
+    # than biasing all of them the same way.
+    local t1, tn, ntgot
+    if ROT
+        P.set_num_threads(NT)
+        ntgot = P._MT_NTHREADS[]
+        tn = armtime(pbw)
+        P.set_num_threads(1)
+        t1 = armtime(pbw)
+    else
+        t1 = armtime(pbw)
+        P.set_num_threads(NT)
+        ntgot = P._MT_NTHREADS[]
+        tn = armtime(pbw)
+        P.set_num_threads(1)
+    end
+    # The pinned set is a WITNESS, not decoration: an unpinned threaded arm is a different regime from
+    # the cell it replicates, and an empty field here is how a reader tells that happened.
+    @printf("%s\t%d\t%d\t%d\t%.6g\t%.6g\t%.6g\t%s\n", OP, N, NT, ntgot, t1 / tn, t1, tn,
+        isempty(PINNED) ? "UNPINNED" : PINNED)
+else
+    out = Dict{String, Float64}()
+    for (nm, lib) in ("openblas" => nothing, "aocl" => AOCL_jll.aocl_blas_ilp64)
+        isnothing(lib) ? B.lbt_forward(_OPENBLAS; clear = true) :
+            B.lbt_forward(lib; clear = true)  # clear=true, as plots.jl:66 does — clear=false leaves routing ambiguous
+        out[nm] = armtime(refw)
+    end
+    tpb = armtime(pbw)                        # PB is a direct Julia call; LBT state is irrelevant to it
+    ratio = minimum(values(out)) / tpb        # the FASTER reference sets the gate
+    @printf("%s\t%d\t%.6g\t%.6g\t%.6g\t%.6g\n", OP, N, ratio, tpb, out["openblas"], out["aocl"])
 end
-tpb = armtime(pbw)                            # PB is a direct Julia call; LBT state is irrelevant to it
-ratio = minimum(values(out)) / tpb            # the FASTER reference sets the gate
-@printf("%s\t%d\t%.6g\t%.6g\t%.6g\t%.6g\n", OP, N, ratio, tpb, out["openblas"], out["aocl"])

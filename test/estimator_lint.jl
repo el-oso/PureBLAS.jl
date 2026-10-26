@@ -34,7 +34,17 @@ const _SRCBADRED = [
     r"\bmin\s*\([^)]*time_ns",           # min(t, time_ns() - s)
     r"=\s*min\s*\(\s*t[a-z]*\s*,\s*e\s*\)",   # tn = min(tn, e)  where e is an elapsed
 ]
-const _RAWTIME = r"@elapsed|\btime_ns\s*\(|@btime|@benchmark"
+# `time()` is NOT banned outright and must not be: under bench/ it legitimately supplies a cache
+# timestamp (`Libc.strftime(…, time())`), a timeout bound (`while time() - t0 < maxsecs`) and a
+# wall-clock progress line. What separates those from a measurement is what the DIFFERENCE feeds — a
+# timeout compares it, a timestamp formats it, a progress line prints it, and only a benchmark divides
+# by it. So the ban is on dividing by a clock delta, which is a hand-rolled rate:
+#     bytes * c / (time() - t0)        # one timing per window where `@be` takes hundreds
+# ⚠ THIS CATCHES A SHAPE, NOT THE SEMANTICS. Capturing the delta into a variable first and dividing by
+# that evades it, and no regex can follow the dataflow — `plots.jl`'s machine-load snapshot takes
+# exactly that form legitimately. Passing this lint is therefore not proof of compliance with the
+# Chairmarks rule; it only proves the known shapes are absent.
+const _RAWTIME = r"@elapsed|\btime_ns\s*\(|@btime|@benchmark|/\s*\(\s*time\s*\(\s*\)\s*-"
 # Unapproved reductions OF CHAIRMARKS SAMPLES. Raw clocks are already banned above, so this only has to
 # catch `min`/`mean` applied to a sample vector — deliberately anchored on `.samples` / `.time` so a
 # `minimum` over non-timing data (e.g. date strings in plots.jl's provenance line) is not a false hit.

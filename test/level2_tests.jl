@@ -822,25 +822,43 @@ end
         bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X))
         @testset "$T" for T in (Float64, Float32)
             cmax = P._GBMV_CONV_MAX
-            # One band comfortably inside the conv cutoff, one comfortably outside it.
-            @testset "band=$(2k + 1) arm=$arm" for (k, arm) in ((max(1, (cmax - 1) ÷ 4), "conv"),
-                                                                (cmax, "axpy"))
+            bmax = P._GBMV_MT_BAND_MAX
+            # THREE BANDS, because the serial arm and the admission now key on DIFFERENT constants and
+            # all three combinations are reachable:
+            #   inside the serial cut   — serial arm is conv, and the pool admits
+            #   past it, inside bmax    — serial arm is axpy while a WORKER takes conv. The informative
+            #                             case: the lost-claim path and the winners run different arms.
+            #   past bmax               — the pool declines, so the op is genuinely serial
+            @testset "band=$(2k + 1) $why" for (k, why) in (
+                    (max(1, (cmax - 1) ÷ 4), "serial-arm=conv, threads"),
+                    (cmax, "serial-arm=axpy, threads (loser and workers differ)"),
+                    (bmax, "serial-arm=axpy, pool DECLINES"),
+                )
                 b = 2k + 1
-                @test (b <= cmax) == (arm == "conv")      # the intended arm is really taken
                 # Past `_L1_MT_MIN` for this band, and m deliberately off a vector-width multiple.
                 n = max(512, cld(2 * P._L1_MT_MIN, b * sizeof(T)))
                 m = n + 3
                 AB = randn(T, b, n); x = randn(T, n); y0 = randn(T, m)
                 α = T(0.75)
-                # AND THE ADMISSION RULE ITSELF, which is what makes the axpy half of this item
-                # non-vacuous: that arm is deliberately NOT threaded, so its invariance holds
-                # trivially, and the assertion that carries information is the route.
-                # `set_num_threads` FIRST — `_gbmvn_workers` early-outs on `_MT_NTHREADS[] > 1`
-                # before it looks at the band, so asking it while threading is off answers 1 for
-                # every shape and the assertion reads as a guard that rejected the conv arm.
+                # ADMISSION KEYS ON `_GBMV_MT_BAND_MAX`, NOT ON THE SERIAL ARM. A row-band call takes
+                # the convolution arm whatever the band, so the band at which the axpy arm overtakes
+                # convolution on ONE core says nothing about whether a split is worth making.
+                # `set_num_threads` FIRST — `_gbmvn_workers` early-outs on `_MT_NTHREADS[] > 1` before
+                # it looks at the band, so asking while threading is off answers 1 for every shape.
                 P.set_num_threads(nt)
-                @test (P._gbmvn_workers(m, n, k, k, T) > 1) == (arm == "conv")
+                @test (P._gbmvn_workers(m, n, k, k, T) > 1) == (b <= bmax)
                 P.set_num_threads(1)
+                # THE INVARIANT THE ROUTING NOW RESTS ON, asserted rather than assumed. A row-band call
+                # convolves and the unsplit entry takes the serial arm, so a worker and a claim-loser
+                # can run DIFFERENT kernels on the same problem. req#11 permits that only while the two
+                # agree bit for bit — they do, because both accumulate each `y[i]` over columns in
+                # ascending `j`. Compared under `bitstring`, never a tolerance: a 1e-16 divergence here
+                # would be a divergence.
+                let ya = copy(y0), yc = copy(y0)
+                    P._gbmv_n_simd!(m, n, k, k, α, AB, x, ya, 0, m)   # unsplit: the serial arm
+                    P._gbmv_conv!(m, n, k, k, α, AB, x, yc, 0, m)     # what every worker runs
+                    @test bitsame(ya, yc)
+                end
                 @testset "beta=$β" for β in (zero(T), one(T), T(2.5))
                     P.set_num_threads(1)
                     want = (t = copy(y0); P.gbmv!(t, AB, x, m, k, k; alpha = α, beta = β); t)

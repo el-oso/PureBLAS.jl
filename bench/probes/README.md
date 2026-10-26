@@ -12,5 +12,6 @@ Contents are gitignored — the scripts are disposable, the linting is not.
 Rules for anything in here:
 - Reduce timings with `Measure.tstat` from `bench/measure.jl` (median). Never `minimum`, never `mean`.
 - When reporting a number, report its estimator and sample count with it (`Measure.report`).
-- If you genuinely need a different statistic, annotate `# estimator-ok: <why>` — the lint will then
-  accept it, and a reader can see the deviation was deliberate.
+- There is no annotation that exempts a reduction — `test/estimator_lint.jl` removed both of its
+  escape hatches because each was talked around. To show a distribution, print quantiles (`q1`/`q3`,
+  or the samples in sorted order) beside the median rather than `minimum`/`maximum`.

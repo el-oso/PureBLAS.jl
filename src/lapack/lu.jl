@@ -484,7 +484,7 @@ function _getrf_lookahead!(A, ipiv, m::Int, n::Int, k::Int, pc::Int, pb::Int, jt
     # correct to 1e-14, identical pivots, and a reproducibility failure all the same.
     splittable = pb2 > 0 && wid > pb2 && T <: BlasReal && _strided1(A) && jt0 + pb2 <= n
     if !splittable
-        _gemm_core!(C, L21, U12, mo, bo, false, false, false, false, wid)
+        _gemm_core!(C, L21, U12, mo, bo, false, false, false, false, (-1, wid, -1))
         return -1
     end
     # The narrow half: the next panel's own columns, routed from the whole width. It is threaded in
@@ -500,13 +500,13 @@ function _getrf_lookahead!(A, ipiv, m::Int, n::Int, k::Int, pc::Int, pb::Int, jt
                 nwn, _MT_KIND_GEMM, false, false, false, lupn)
         end
     else
-        _gemm_core!(Cn, L21, Un, mo, bo, false, false, false, false, wid)
+        _gemm_core!(Cn, L21, Un, mo, bo, false, false, false, false, (-1, wid, -1))
     end
     Cw = view(C, :, (pb2 + 1):wid)
     Uw = view(U12, :, (pb2 + 1):wid)
     nw = _gemm_workers(m - pc - pb + 1, wid - pb2, pb)
     if nw <= 1
-        _gemm_core!(Cw, L21, Uw, mo, bo, false, false, false, false, wid)
+        _gemm_core!(Cw, L21, Uw, mo, bo, false, false, false, false, (-1, wid, -1))
         return -1
     end
     # The wide half, fused with the next panel's factorization.

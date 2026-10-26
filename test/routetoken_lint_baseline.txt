@@ -1,0 +1,32 @@
+# Route-token lint baseline. One line per reviewed site, keyed `file:kind:text` so a line-number
+# shift is not a new defect. A NEW line fails the suite; a line here that no longer matches is stale
+# and also fails. Every entry states why it is not a req#11 defect — or, for the one that is, who owns
+# it. See test/routetoken_lint.jl for the rule.
+#
+# LIVE DEFECT, owned by the mac-mini session on branch `trsm-r-sme-band-floor`.
+# `_sme_eligible`'s row extent is the chunk's own, so a side-R band judges `_sme_tile_ok` on different
+# operands than the unsplit call. Measured: `potrf!` lower diverged at 9..12 workers on SME, clean at
+# 2..8, and clean at every count on x86 where `_SME_F64` is false. The local read is itself correct —
+# `_sme_tile_ok` is a FLOOR on the tile handed to the kernel, so routing it from the undivided shape
+# would admit a chunk below the kernel's minimum — which is why the repair caps the worker count
+# instead of rerouting the predicate. Remove this line when that lands.
+blas3/gemm.jl:not-a-max:if _sme_eligible(T, m, nrt, k, tA, tB, cA, cB, C, A, B)
+#
+# LATENT, not reachable today. `min(m, nrt, k)` over a routed value: a `min` gets no protection from
+# the n-slot token. Under a COLUMN split `m` is undivided so raw and routed agree and the site is
+# safe; under a ROW split both `m` and `nrt` would be the band's own and the 3M k-floor would differ
+# from the unsplit call. Complex side-R trsm threading was reverted for req#11 (`ee2f1a87`), so no row
+# -splitting caller reaches complex gemm at present. This line must be re-examined, not deleted, if
+# complex side-R threading is ever restored.
+blas3/gemm.jl:not-a-max:min(m, nrt, k) >= _fh_cgemm_3m_kmin()
+#
+# CORRECT AND DELIBERATE. `_sme_tile_ok` is a min plus two moduli, so it is the one route predicate the
+# `max`-absorption trick cannot repair — and this site reads `mrt`, the token, exactly because of that.
+# It is baselined rather than marked in source so the lint keeps reporting the class: the next `min`
+# predicate added anywhere must come here and be argued.
+blas3/level3.jl:not-a-max:_sme_tile_ok(mrt, _trsplit(k))
+#
+# NOT A THREADING SITE. `gemv` is not threaded (the row-band split is Phase 2 and unbuilt), so
+# `nroute` here is the serial route token and `m` is never divided. Re-examine when gemv-N threads:
+# this is a PRODUCT of both extents, which like a `min` the token cannot repair on its own.
+blas2/level2.jl:raw-extent:m * nroute * sizeof(T) >= _L3_BYTES && return _ger_paneldrv_np(m, n, α, x, y, A, _ger_np())  # ≥: A that fills L3 leaves no room for x/y ⇒ panel (Zen3 n=2048: A=L3 exactly, per-column 0.97 → panel 1.04)

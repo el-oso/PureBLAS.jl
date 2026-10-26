@@ -40,8 +40,22 @@ const _TRMM_BASE = _L3_NB     # ≤ this → _trmm_small! directly (MUST be ≤ 
 # justification is not merely unproven off Apple, it is false there, and specifically at sizes that are
 # not powers of two — 64, 128 and 256 all read favourably on that box and only n=100 exposes it.
 # Hence `_L3_NB` off SME, which keeps every non-SME box bit-for-bit on the path it has today.
+# THE PREFERENCE IS SME-ONLY, because the sentence above it is unconditional. Reading it before the
+# `_SME_F64` test made the pin reach further than its own justification: a `trmm_base_r` set on an x86
+# box took `min(pin, _L3_NB)` and changed x86 trmmR routing, contradicting "keeps every non-SME box
+# bit-for-bit on the path it has today" directly above. Off SME this is `_L3_NB` whatever is pinned.
+#
+# That also makes `_TRMM_BASE_R == _TRMM_BASE` off SME an INVARIANT rather than a coincidence of two
+# defaults, which is what a reader needs to know before trusting a mirror test: the band in which the
+# side-R mirror can disagree with its callee is `_TRMM_BASE_R < k <= _TRMM_BASE`, so off SME that band
+# is provably empty and such a test passes vacuously there. It cannot be made to fail by pinning.
+# ⚠ A PIN SET OFF SME IS DISCARDED, AND `test/prefsync_lint.jl` IS WHAT REPORTS IT. Silently dropping
+# a preference is the kind of silent-continue this project rules out, but the report does not belong
+# here: a load-time `@warn` is a side effect in a module that must stay trim-safe, and `test/yield_lint.jl`
+# flags logging on principle because it can yield. The lint already reads both `LocalPreferences.toml`
+# files for exactly this class of mistake, so the SME-only knobs are listed there instead.
 # PDM: Literal — recursion-overhead floor, flat 32-48, the same floor `_POTRF_BASE` carries; SME-only, the x86 side measured and regressing. | tune: candidate
-const _TRMM_BASE_R = min(@load_preference("trmm_base_r", _SME_F64 ? 32 : _L3_NB)::Int, _L3_NB)
+const _TRMM_BASE_R = _SME_F64 ? min(@load_preference("trmm_base_r", 32)::Int, _L3_NB) : _L3_NB
 # PDM: Literal — trmm side-R panel width. NOW A KNOB (was a bare const, unpinnable and untunable); default is the value it always had. | tune: FLAT — 64..1024 within noise on Zen3+Zen4+Zen5 except two non-replicating cells <=2.5% (2026-08-21)
 const _TRMM_RPANEL = @load_preference("trmm_rpanel", 512)::Int
 @inline _trmm_rpanel() = (f = _FKR_trmm_rpanel[]; f >= 0 ? f : _TRMM_RPANEL)
@@ -1434,12 +1448,12 @@ function _trmm_split_L!(up::Bool, tr::Bool, unit::Bool, A, B, mrv::Val)
     if (up && !tr) || (!up && tr)              # top block carries the off-diagonal update → after Bt's solve
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
         nwo = _strassen_owns(T, h, n, k - h, tr, off, Bb) ? _gemm_workers(h, n, k - h) : 1
-        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, -1, true, nwo)
+        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, _RT_NONE, true, nwo)
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
     else                                        # bottom block carries the update
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
         nwo = _strassen_owns(T, k - h, n, h, tr, off, Bt) ? _gemm_workers(k - h, n, h) : 1
-        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, -1, true, nwo)
+        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, _RT_NONE, true, nwo)
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
     end
     return B
@@ -1570,10 +1584,15 @@ end
 # as trmm, but: (1) solve the independent block FIRST, (2) the off-diagonal update SUBTRACTS the
 # already-solved block (gemm α=-1,β=1), (3) the base is a triangular solve (trsv per column / column
 # substitution). α is applied to B up front (B := α·op(A)⁻¹·B = op(A)⁻¹·(αB)).
+# ⚠ THE TWO SIDES CARRY OPPOSITE DIMENSIONS IN THE SAME PARAMETER, which is why the token has named
+# slots. `_trsm_left!` is handed `p.n` (:5069) and `_trsm_right!` is handed `p.m` (:5017), and each
+# forwards it here unchanged — so side L's route is a COLUMN count and side R's is a ROW count. They
+# must land in different slots or a row-split band routes on its own rows while the unsplit solve
+# routes on the whole, which is the req#11 break the side-R shapes in test/gemm_tests.jl record.
 @inline _gemm_sub!(C, A, B, tr::Bool, cj::Bool, nroute::Int = -1) =                  # C -= op(A)·B
-    _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false, nroute)
+    _gemm_core!(C, A, B, -one(eltype(C)), one(eltype(C)), tr, false, cj, false, (-1, nroute, -1))
 @inline _gemm_subR!(C, Bmat, A, tr::Bool, cj::Bool, nroute::Int = -1) =              # C -= B·op(A)
-    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj, nroute)
+    _gemm_core!(C, Bmat, A, -one(eltype(C)), one(eltype(C)), false, tr, false, cj, (nroute, -1, -1))
 
 # trsm base via small triangular INVERSE + gemm (BLIS-style): a block ≤ _TRSM_BASE is solved by
 # inverting its NB×NB triangle once (O(NB³/6), tiny) then applying op(inv) as a gemm — so the diagonal
@@ -1705,9 +1724,10 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1
         if tr
             # `_gemm_core!`, not `gemm!`: the public entry routes from its own operands and has no
             # place to take the route token, which a column band must carry.
-            _gemm_core!(tmp, iv, B, one(T), zero(T), true, false, false, false, nrt)
+            _gemm_core!(tmp, iv, B, one(T), zero(T), true, false, false, false, (-1, nrt, -1))
         else
-            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp, nrt)
+            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp,
+                (-1, nrt, -1))                       # side L: `nrt` IS a column count
         end
         @inbounds for j in 1:n, i in 1:nb
             B[i, j] = tmp[i, j]
@@ -1728,9 +1748,14 @@ function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1
         # branch on tr so Val{TB} is a literal (Val(tr) with runtime tr is a runtime dispatch — StrictMode
         # @typestable catches it; the dynamic call also boxes the Val, so this branch is faster too).
         if tr
-            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp, nroute)
+            # `nroute` IS A ROW COUNT HERE, so it belongs in the m slot and nowhere else. The kernel
+            # switch applies two tests to the row extent — `max(m, n, k) <= _gemm_split_max()` and
+            # `m >= _SMR·W` — and only the m slot feeds the undivided count to BOTH.
+            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp,
+                (nroute, -1, -1))
         else
-            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp, nroute)
+            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp,
+                (nroute, -1, -1))
         end
         @inbounds for j in 1:nb, i in 1:m
             B[i, j] = tmp[i, j]
@@ -5051,13 +5076,13 @@ _trmmr_prefit!(::Type{T}, ::Int, ::Int) where {T} = nothing   # non-real kinds n
 # problem and the bands are write-disjoint — the mirror of the side-R solve above, and the same
 # `_MR·W` granularity so every band but the last drives full microkernel tiles.
 #
-# NO ROUTE TOKEN, AND THAT IS A CONSTRAINT ON WHERE THIS MAY BE ARMED rather than an omission.
+# THE BANDS PASS NO ROUTE TOKEN, AND THAT IS A CONSTRAINT ON WHERE THIS MAY BE ARMED.
 # `_trmm_right!` routes on `size(A, 1)`, which a row split leaves alone, but its flat panel loop then
-# issues `_gemm_core!` calls whose kernel switch reads `max(m, nroute, k)` — and `m` there IS the
-# band's row count, so a band would take a different route than the serial call. `nroute` substitutes
-# only `n`; there is no `m` counterpart to thread. The entry therefore arms this only above
-# `_fh_trmm_rpack()`, where `_trmm_packedR!` owns the call and drives `_microkernel!` directly, with a
-# `kc` fixed by `k` and no size-keyed branch anywhere below.
+# issues `_gemm_core!` calls whose kernel switch reads the row extent — and that IS the band's row
+# count, so a band would take a different route than the serial call. The token's `m` slot (`_rt_m`,
+# core.jl) is what such a band would fill; `_trmm_right!`'s panel loop does not thread it through, so
+# the entry arms this only above `_fh_trmm_rpack()`, where `_trmm_packedR!` owns the call and drives
+# `_microkernel!` directly, with a `kc` fixed by `k` and no size-keyed branch anywhere below.
 @noinline function _trmmr_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
     i0, len = _trsm_rchunk(p.m, nw, i, T)
     len > 0 || return nothing
@@ -5364,6 +5389,19 @@ function trsm!(
     # way `_trgemm_packed!`'s seam was shown for the real packed path.
     # THREADED SIDE-R: split B's rows. `potrf`'s lower factorization is the caller that needs this —
     # it solves `A21·L11⁻ᵀ` with A21 tall and narrow, and that solve does not thread without it.
+    # `BlasReal`, NOT complex, and the reason is measured rather than assumed. Admitting complex here
+    # breaks req#11 in three independent places, each because something below reads the band's own ROW
+    # count where `mrt` only substitutes the column count:
+    #   * `_CGEMM_3M`'s window is `min(m, nrt, k) >= _fh_cgemm_3m_kmin()` with `m = size(C, 1)`, so a
+    #     band narrower than kmin=16 declines Karatsuba while the unsplit solve takes it. The real
+    #     split survives only because every real predicate is a `max`.
+    #   * `_trsm_cmplx_small_R!` routes on `size(B, 1) >= _ZGT_W`, not `mrt`, and the last band can be
+    #     a single row.
+    #   * `_trsm_cmplx_dRN!`/`_dRC!` pick their axpy arm and scalar-tail length from the band's rows,
+    #     which is `potrf`'s own `side='R', uplo='L', transA='C'` shape.
+    # Measured on Zen4, ComplexF64, uplo 'U', transA 'N': B 41x1024 at alpha=3.7-1.25i and B 48x512 at
+    # alpha=1 both diverge bitwise at every worker count 2..6. Square power-of-two B does NOT — every
+    # band is then a multiple of the 8-row granule — which is why a square-only check passes it.
     if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
         nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
         if nwr > 1
@@ -5376,6 +5414,15 @@ function trsm!(
             return B
         end
     end
+    # `BlasReal` here too, and side L fails for a narrower reason than side R: its complex routes ARE
+    # covered by `nrt`, but `_scal_all!` is not. It applies α flat when B is contiguous and per column
+    # otherwise, and `_scal_pair_simd!`'s vector body uses an fma while its scalar tail uses the
+    # two-rounding form — so where a band's flat run ends mid-vector and the unsplit one does not, the
+    # last few elements take different arithmetic. Real α is immune (one rounding either way), which is
+    # why the real split never saw it. For `ComplexF64` the band offsets happen to land on the vector
+    # width and it is safe by coincidence; `ComplexF32` has twice the lanes and does not.
+    # Measured on Zen4: `ComplexF32`, m=n=k=1001, α=3.7-1.25i diverges bitwise at worker counts 2, 4, 5
+    # and 6, while the same shape at α=1 and every `ComplexF64` shape tried are bit-identical.
     if sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 1) == k
         nw = _trsm_workers(k, size(B, 2))
         if nw > 1
@@ -7646,8 +7693,8 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
                 _gemm_threaded!(_pm(C), _pm(B), _pm(Ad), aT, bT, false, false, false, false, nw)
         end
     else
-        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false, -1, true, nw) :
-            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false, -1, true, nw)
+        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false, _RT_NONE, true, nw) :
+            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false, _RT_NONE, true, nw)
     end
     return C
 end
