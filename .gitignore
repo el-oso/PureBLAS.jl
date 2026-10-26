@@ -55,5 +55,9 @@ bench/tools/build/
 scratchpad/
 
 # Pre-sweep cache snapshots kept so bench/ledger/ledger.sh can record a genuine before/after.
-# Each is a full ~24 MB cache copy; the LEDGER ITSELF (bench/ledger/cells.tsv) is small and tracked.
+# Each is a full ~24 MB cache copy.
 bench/ledger/snapshots/
+# The ledger itself is local measurement data, not source. Its first column is a hostname, so
+# publishing it would put the fleet's machine names in a public repository; `ledger.sh` recreates it
+# by appending, so a fresh clone needs no seed. Keep the TOOL in git and the DATA out.
+bench/ledger/cells.tsv

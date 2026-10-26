@@ -217,8 +217,15 @@ Both modes share ONE set of low-level kernels. Source map:
      `rt`, an `(m, n, k)` route token (`_RT_NONE` and `_rt_m`/`_rt_n`/`_rt_k` in `src/core.jl`): a
      partitioned caller passes the WHOLE problem's extents and computes on its slice. Any new
      size-keyed branch reachable from a chunk body must take its size from the token, not from its own
-     extent. Only the n axis is read so far, which is why `_gemm_unpacked!`'s `m >= _SMR * _vwidth(T)`
-     is still a live violation on a row-split caller.
+     extent. All three axes resolve, and **the SLOT a caller fills says which dimension it repairs**:
+     `_gemm_sub!` fills `n` because side L splits columns, `_gemm_subR!` fills `m` because side R
+     splits rows. Only one dimension is ever divided, so the other two already carry whole extents and
+     a `max` over the resolved triple equals the undivided problem's `max` — those predicates are safe
+     without being touched. A `min`, a modulus or a bare one-sided bound gets no such protection, and
+     `_sme_tile_ok` (a `min` plus two moduli) is the one route predicate the absorption cannot cover.
+     Both failures are mechanical, so they are scanned rather than remembered:
+     `test/routetoken_lint.jl` flags a predicate that reads its own extent AND one that is not a `max`
+     over resolved values, against a baseline where every reviewed site states its reason.
    - **An algorithm a worker cannot run.** Strassen chooses its depth from the width it is handed, so
      a worker holding a slice runs a different algorithm entirely. It is therefore never column-split:
      `gemm!`, `_symm!` and `_trmm_split_L!` ask `_strassen_owns` and run the recursion serially when it
