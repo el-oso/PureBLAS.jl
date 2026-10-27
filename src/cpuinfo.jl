@@ -79,8 +79,10 @@ function _sysctl_int(name::String)
     return try
         out = Ref{Int64}(0)
         sz = Ref{Csize_t}(sizeof(Int64))
-        rc = ccall(:sysctlbyname, Cint, (Cstring, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
-                   name, out, sz, C_NULL, 0)
+        rc = ccall(
+            :sysctlbyname, Cint, (Cstring, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
+            name, out, sz, C_NULL, 0
+        )
         rc == 0 ? Int(out[]) : 0
     catch
         0
@@ -289,17 +291,32 @@ const _NVREG = _SIMD_BYTES >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
 # make bit 2 garbage there.
 # PDM: Exempt — a detected hardware fact like `_SIMD_BYTES`; the preference exists for cross-compile and
 # trim builds, not for tuning.
-const _FP_DATAPATH_BYTES = @load_preference("fp_datapath_bytes", let w = _SIMD_BYTES
-        ok = (Sys.ARCH === :x86_64 || Sys.ARCH === :i686) && (try
+const _FP_DATAPATH_BYTES = @load_preference(
+    "fp_datapath_bytes", let w = _SIMD_BYTES
+        ok = (Sys.ARCH === :x86_64 || Sys.ARCH === :i686) && (
+            try
                 hasleaf(0x8000_001a)
             catch
                 false
-            end)
+            end
+        )
         if !ok
             w
-        elseif (try cpufeature(:FP128) catch; false end)
+        elseif (
+                try
+                    cpufeature(:FP128)
+                catch
+                    false
+                end
+            )
             min(w, 16)
-        elseif (try cpufeature(:FP256) catch; false end)
+        elseif (
+                try
+                    cpufeature(:FP256)
+                catch
+                    false
+                end
+            )
             min(w, 32)
         else
             w
@@ -579,7 +596,22 @@ const _GEMM_SPLIT_S = 2
 # as WORSE. The mechanism prose was backwards on its face too: cheaper FMAs make Strassen's
 # flops-for-adds trade LESS attractive, not more.
 # PDM: Literal — falsified derivation, fleet table above. | req8-ok: flat on 2 boxes, measured win on the 3rd
-@inline _at_strassen_min(hw) = 256
+#
+# 256 -> 2048 (2026-10-27): the level-1 split now obeys the same leaf-width criterion as every deeper
+# level, i.e. `strassen_min == 2 * _STRASSEN_BASE`. A Strassen-claimed call is never column-split
+# (req#11), so between 256 and 2047 the only threading was inside a depth-1 recursion whose leaves are
+# 128-1023 wide, and that split runs ragged on six workers. Threaded gate on Zen4 (wintermute, locked
+# 3501 MHz, `-t 6,0` on six physical cores, 384 samples/cell, same-hour A/B through plots.jl):
+#   n            256     512     1000    1024    2048    2100    4096
+#   256 (old)    0.589   0.941   0.769   0.914   0.950   0.869   0.980
+#   2048 (new)   0.978   1.053   0.953   1.023   0.948   0.870   0.977
+#   self-speedup 2.8->4.7  4.5->5.3  4.7->5.7  4.7->5.5  (n >= 2048 keep their depth: unchanged)
+# Serial cost on the same box, same runs, against the cached serial vendor arms: 512 1.102 -> 1.042,
+# 1024 1.055 -> 1.011; 256 (0.978 -> 0.991) and 1000 (0.962 -> 0.979) are FASTER without the
+# recursion. n >= 2048 unchanged within 0.3%. ONE BOX ONLY: the Zen5 table above measured 2048 at
+# -6% for n=1024 when `_STRASSEN_BASE` was 512, so galen and neuromancer must confirm the serial
+# 512/1024 cells (margins there 1.019/1.065 and 1.086/1.060) before this default is trusted.
+@inline _at_strassen_min(hw) = 2048
 # FALSIFIED PREDICATE, now a fleet-evidenced literal — same story as `_at_strassen_min` directly above.
 # Was `_datapath_bytes(hw) >= 64 ? 1792 : 448`. FLAT on zen3/zen4; 1792 measured on Zen5
 # (2 locked runs: 1.0011/1.0813/1.0703 at n=256/512/1024) — and Zen5 is a 32 B datapath, so the
@@ -863,11 +895,13 @@ Reading `ENV` here is trim-safe by placement, not by luck: every call site sits 
 # feature. Defaults true so a normal JIT user can A/B without rebuilding.
 # PDM: Exempt — boolean switch (path on/off), not a tuned size.
 const _FORCE_HOOKS = @load_preference("force_hooks", true)::Bool
-const _FK_NAMES = ("gbtrf_cmult", "bt_nb", "cgemm_3m_kmin", "cgemm_3m_max", "cgemm_3m_min", "cgemm_tiny", "csyr2k_pack_cut", "csyrk_3m_min", "csyrk_pack_cut", "csyrk_pack_cut_t", "ctrmm_pack_min", "ctrsm_direct_max", "ctrsm_ncut", "ctrsm_rec_l", "qr_nb_c", "strassen_maxdepth", "strassen_min", "syrk_dbase", "syrk_pack_cut", "syr2k_pack_cut", "syrk_unified_max", "potrf_unative_min", "tri_c_t_unb", "tri_t_unb", "trmm_ddirect", "trmm_rkc", "trmm_rpack", "trsm_narrow_max", "zhemv_pf_tiles", "trsm_base", "trsm_ncut", "trsm_ncut_r", "trsm_dbase", "trsm_r_fuse", "trmm_rpanel", "trtri_base", "syrk_base",
-                   "ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
-                   "pbtrf_nb", "pbtrf_nb_small", "pbtrf_cross_kd", "pbtrf_u_native_kd",
-                   "axpy_unroll", "axpy_dram", "zaxpy_narrow", "gemvt_perscan", "gemm_split_max",
-                   "gemvn_rb", "gemvn_mb", "cger_cold_den", "strassen_nopad", "strassen_base")
+const _FK_NAMES = (
+    "gbtrf_cmult", "bt_nb", "cgemm_3m_kmin", "cgemm_3m_max", "cgemm_3m_min", "cgemm_tiny", "csyr2k_pack_cut", "csyrk_3m_min", "csyrk_pack_cut", "csyrk_pack_cut_t", "ctrmm_pack_min", "ctrsm_direct_max", "ctrsm_ncut", "ctrsm_rec_l", "qr_nb_c", "strassen_maxdepth", "strassen_min", "syrk_dbase", "syrk_pack_cut", "syr2k_pack_cut", "syrk_unified_max", "potrf_unative_min", "tri_c_t_unb", "tri_t_unb", "trmm_ddirect", "trmm_rkc", "trmm_rpack", "trsm_narrow_max", "zhemv_pf_tiles", "trsm_base", "trsm_ncut", "trsm_ncut_r", "trsm_dbase", "trsm_r_fuse", "trmm_rpanel", "trtri_base", "syrk_base",
+    "ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
+    "pbtrf_nb", "pbtrf_nb_small", "pbtrf_cross_kd", "pbtrf_u_native_kd",
+    "axpy_unroll", "axpy_dram", "zaxpy_narrow", "gemvt_perscan", "gemm_split_max",
+    "gemvn_rb", "gemvn_mb", "cger_cold_den", "strassen_nopad", "strassen_base",
+)
 @static if _FORCE_HOOKS
     # One NAMED const Ref per knob, so a knob read is a const-resolved Ref load — never a keyed lookup.
     #
@@ -884,7 +918,8 @@ const _FK_NAMES = ("gbtrf_cmult", "bt_nb", "cgemm_3m_kmin", "cgemm_3m_max", "cge
         @eval const $(Symbol("_FKR_", _n)) = Ref(-1)
     end
     const _FK = Dict{String, Base.RefValue{Int}}(
-        n => getfield(@__MODULE__, Symbol("_FKR_", n)) for n in _FK_NAMES)
+        n => getfield(@__MODULE__, Symbol("_FKR_", n)) for n in _FK_NAMES
+    )
     # Keyed reader — for __init__ and probes ONLY. Never call it from a kernel: it is the very lookup
     # the named Refs exist to avoid.
     @inline _fk(name::String) = _FK[name][]
@@ -1194,8 +1229,10 @@ Advisory and best-effort: any failure is ignored. Returns nothing.
                     s = (p + _HUGEPAGE_BYTES - 1) & ~UInt(_HUGEPAGE_BYTES - 1)
                     if s < p + nb
                         len = (p + nb - s) & ~UInt(_HUGEPAGE_BYTES - 1)
-                        len == 0 || @ccall madvise(Ptr{Cvoid}(s)::Ptr{Cvoid}, len::Csize_t,
-                                                   _MADV_HUGEPAGE::Cint)::Cint
+                        len == 0 || @ccall madvise(
+                            Ptr{Cvoid}(s)::Ptr{Cvoid}, len::Csize_t,
+                            _MADV_HUGEPAGE::Cint
+                        )::Cint
                     end
                 end
             end
@@ -1214,8 +1251,10 @@ end
                 s = (p + _HUGEPAGE_BYTES - 1) & ~UInt(_HUGEPAGE_BYTES - 1)
                 if s < p + nb
                     len = (p + nb - s) & ~UInt(_HUGEPAGE_BYTES - 1)
-                    len == 0 || @ccall madvise(Ptr{Cvoid}(s)::Ptr{Cvoid}, len::Csize_t,
-                                               _MADV_HUGEPAGE::Cint)::Cint
+                    len == 0 || @ccall madvise(
+                        Ptr{Cvoid}(s)::Ptr{Cvoid}, len::Csize_t,
+                        _MADV_HUGEPAGE::Cint
+                    )::Cint
                 end
             end
         end

@@ -167,13 +167,13 @@
     percol(hw, n, amin, xmax) = (n * n * 8 > amin) && (n * 8 <= xmax)
     # zen4: the DEFAULT bounds already are its optimum (percol 512..2048, blocked 4096)
     @test [percol(zen4, n, zen4.l2, zen4.l1 ÷ 2) for n in (512, 1024, 2048, 4096)] ==
-          [true, true, true, false]
+        [true, true, true, false]
     # zen3 wants percol at n=1024 ONLY -> AMIN 2 MiB (excludes 512), XMAX 8 KiB (excludes 2048)
     @test [percol(zen3, n, 2 * 1024^2, 8192) for n in (512, 1024, 2048, 4096)] ==
-          [false, true, false, false]
+        [false, true, false, false]
     # zen5 wants percol at n=512 ONLY -> XMAX 4 KiB
     @test [percol(zen5, n, zen5.l2, 4096) for n in (512, 1024, 2048, 4096)] ==
-          [true, false, false, false]
+        [true, false, false, false]
 
     @test P._at_axpy_dram(zen4) == 208
     @test P._at_axpy_dram(zen3) == 4
@@ -197,54 +197,57 @@
     @test P._CPOTRF_BASE == P._at_cpotrf_base(P._HW)
     @test P._CPOTRF_NBMAX == P._at_cpotrf_nbmax(P._HW)
     @test P._CPOTF2_MR == P._at_cpotf2_mr(P._HW)
-# ── strassen_min / trmm_rpack: FLAT LITERALS — the datapath predicate was FALSIFIED ──────────────
-# These used to key on `_datapath_bytes >= 64`, on the reasoning that "Zen3 and Zen4 measured FLAT
-# while Zen5 wants very different values". The 2026-09-09 datapath fix destroyed that argument: the
-# "Zen5" box supplying the native-512 optimum is Zen5, which reads FP256 from CPUID
-# Fn8000_001A — a 32 B datapath, the SAME side as Zen3/Zen4. So the fleet evidence is really
-# "flat on two boxes, 256/1792 wins on the third", which is a literal, and the old predicate would now
-# hand Zen5 the arm it measured as WORSE.
-@test P._datapath_bytes(zen3) == 32
-@test P._datapath_bytes(zen4) == 32
-@test P._datapath_bytes(zen5) == 64      # Granite Ridge / Turin: genuinely native
-@test P._datapath_bytes(zen5m) == 32     # Strix / Krackan: FP256, lands with zen4
-# One value everywhere — no descriptor changes it.
-for d in (zen3, zen4, zen5, zen5m, tigerlake)
-    @test P._at_strassen_min(d) == 256
-    @test P._at_trmm_rpack(d) == 1792
-end
-# Live machine agrees with the formula applied to its own detected _HW.
-@test P._STRASSEN_MIN == P._at_strassen_min(P._HW)
-@test P._TRMM_RPACK == P._at_trmm_rpack(P._HW)
-# gemv-N m-inner: was an UNCONVERTED Measure-tier knob (a datapath-gated boolean the PDM ladder flags
-# as a violation) because the Zen5 negative justifying it had been measured at 4841 MHz against a
-# 2000 MHz base. Re-measured on all three boxes freq-locked and VERIFIED before/after, quiet: Zen3 and
-# Zen4 m-inner WINS (gate 0.925 vs 0.901; 0.969 vs 0.953), Zen5 LOSES (n=512 0.916, n=1024 0.964).
-# `_vwidth<8 || _double_pumped` IS `_datapath_bytes < 64` on every part, so it is spelled physically.
-# CAVEAT recorded in tuning.md: the Zen5 negative holds only at POWER-OF-TWO lda; at non-po2 sizes
-# m-inner wins there 8-21%, and the gate's L2SZ is entirely powers of two.
-@test P._at_gemvn_minner(zen3)
-@test P._at_gemvn_minner(zen4)
-@test !P._at_gemvn_minner(zen5)
-@test !P._at_gemvn_minner(tigerlake)      # native 512 too — a PREDICTION, never benchmarked
-@test P._at_gemvn_minner(P._HW) == (P._vwidth(Float64) < 8 || P._double_pumped(P._HW))
+    # ── strassen_min / trmm_rpack: FLAT LITERALS — the datapath predicate was FALSIFIED ──────────────
+    # These used to key on `_datapath_bytes >= 64`, on the reasoning that "Zen3 and Zen4 measured FLAT
+    # while Zen5 wants very different values". The 2026-09-09 datapath fix destroyed that argument: the
+    # "Zen5" box supplying the native-512 optimum is Zen5, which reads FP256 from CPUID
+    # Fn8000_001A — a 32 B datapath, the SAME side as Zen3/Zen4. So the fleet evidence is really
+    # "flat on two boxes, 256/1792 wins on the third", which is a literal, and the old predicate would now
+    # hand Zen5 the arm it measured as WORSE.
+    @test P._datapath_bytes(zen3) == 32
+    @test P._datapath_bytes(zen4) == 32
+    @test P._datapath_bytes(zen5) == 64      # Granite Ridge / Turin: genuinely native
+    @test P._datapath_bytes(zen5m) == 32     # Strix / Krackan: FP256, lands with zen4
+    # One value everywhere — no descriptor changes it.
+    for d in (zen3, zen4, zen5, zen5m, tigerlake)
+        @test P._at_strassen_min(d) == 2048
+        @test P._at_trmm_rpack(d) == 1792
+    end
+    # The level-1 split obeys the leaf-width criterion of the deeper levels: a claimed call halves to a
+    # leaf at least `_STRASSEN_BASE` wide, so threaded leaves are never narrower than the base.
+    @test P._at_strassen_min(P._HW) == 2 * P._STRASSEN_BASE
+    # Live machine agrees with the formula applied to its own detected _HW.
+    @test P._STRASSEN_MIN == P._at_strassen_min(P._HW)
+    @test P._TRMM_RPACK == P._at_trmm_rpack(P._HW)
+    # gemv-N m-inner: was an UNCONVERTED Measure-tier knob (a datapath-gated boolean the PDM ladder flags
+    # as a violation) because the Zen5 negative justifying it had been measured at 4841 MHz against a
+    # 2000 MHz base. Re-measured on all three boxes freq-locked and VERIFIED before/after, quiet: Zen3 and
+    # Zen4 m-inner WINS (gate 0.925 vs 0.901; 0.969 vs 0.953), Zen5 LOSES (n=512 0.916, n=1024 0.964).
+    # `_vwidth<8 || _double_pumped` IS `_datapath_bytes < 64` on every part, so it is spelled physically.
+    # CAVEAT recorded in tuning.md: the Zen5 negative holds only at POWER-OF-TWO lda; at non-po2 sizes
+    # m-inner wins there 8-21%, and the gate's L2SZ is entirely powers of two.
+    @test P._at_gemvn_minner(zen3)
+    @test P._at_gemvn_minner(zen4)
+    @test !P._at_gemvn_minner(zen5)
+    @test !P._at_gemvn_minner(tigerlake)      # native 512 too — a PREDICTION, never benchmarked
+    @test P._at_gemvn_minner(P._HW) == (P._vwidth(Float64) < 8 || P._double_pumped(P._HW))
 
-# potrf uplo='U' tiny-n DIRECT cutoff: a REGISTER-CAPACITY crossover — the direct path holds the upper
-# triangle's columns live in vector registers, so the register FILE sets how large n gets before it
-# spills. Hence _NVREG, not width or cache. Calibrated per box (stabilise + anchor + 8 rounds +
-# `decide` needing a CI excluding 1.0 AND a 2% margin), freq-locked and verified:
-#   zen3 nvreg=16 -> 12   (20 costs -5.4%, 24 costs -14%)
-#   zen4 nvreg=32 -> 20 (+6.8%)      zen5 nvreg=32 -> 20 (+8.2%)
-# The 16-register box actively LOSES at 20, so this is a real separation, not a two-point fit. Its duel
-# was deleted in August as unresolvable; it was not — the duel predated stabilise/anchor/decide.
-@test P._at_potrf_udirect(zen3) == 12
-@test P._at_potrf_udirect(zen4) == 20
-@test P._at_potrf_udirect(zen5) == 20
-@test P._at_potrf_udirect(tigerlake) == 20
-# NO live-machine equality assertion here, for the same reason the axpy pair above has none:
-# `test/Project.toml` pins `potrf_upper_direct_max = 12`, so under Pkg.test() the const reads 12 while
-# the formula says 20 on a 32-register box. A preference beating a default is the system working. The
-# formula itself is fully covered by the per-descriptor assertions above, which no pin can mask.
+    # potrf uplo='U' tiny-n DIRECT cutoff: a REGISTER-CAPACITY crossover — the direct path holds the upper
+    # triangle's columns live in vector registers, so the register FILE sets how large n gets before it
+    # spills. Hence _NVREG, not width or cache. Calibrated per box (stabilise + anchor + 8 rounds +
+    # `decide` needing a CI excluding 1.0 AND a 2% margin), freq-locked and verified:
+    #   zen3 nvreg=16 -> 12   (20 costs -5.4%, 24 costs -14%)
+    #   zen4 nvreg=32 -> 20 (+6.8%)      zen5 nvreg=32 -> 20 (+8.2%)
+    # The 16-register box actively LOSES at 20, so this is a real separation, not a two-point fit. Its duel
+    # was deleted in August as unresolvable; it was not — the duel predated stabilise/anchor/decide.
+    @test P._at_potrf_udirect(zen3) == 12
+    @test P._at_potrf_udirect(zen4) == 20
+    @test P._at_potrf_udirect(zen5) == 20
+    @test P._at_potrf_udirect(tigerlake) == 20
+    # NO live-machine equality assertion here, for the same reason the axpy pair above has none:
+    # `test/Project.toml` pins `potrf_upper_direct_max = 12`, so under Pkg.test() the const reads 12 while
+    # the formula says 20 on a 32-register box. A preference beating a default is the system working. The
+    # formula itself is fully covered by the per-descriptor assertions above, which no pin can mask.
 end
 
 @testitem "trsm_base is clamped to the scratch it indexes" tags = [:unit] begin
@@ -258,7 +261,9 @@ end
     # three fleet boxes, 2026-08-21). Both the const and the force hook are clamped; this pins both.
     @test P._TRSM_BASE <= P._L3_NB
     n = 192                                    # > _L3_NB, so the recursion descends past the base
-    A = randn(n, n) ./ (2n); for i in 1:n; A[i, i] = 1 + abs(A[i, i]); end
+    A = randn(n, n) ./ (2n); for i in 1:n
+        A[i, i] = 1 + abs(A[i, i])
+    end
     B0 = randn(n, n)
     want = UpperTriangular(A) \ B0
     if PureBLAS._FORCE_HOOKS
@@ -268,7 +273,7 @@ end
                 P._FK["trsm_base"][] = v
                 @test P._trsm_base() <= P._L3_NB
                 B = copy(B0); P.trsm!(B, A; side = 'L', uplo = 'U')
-                @test norm(B - want, Inf) / max(1.0, norm(want, Inf)) < 1e-8
+                @test norm(B - want, Inf) / max(1.0, norm(want, Inf)) < 1.0e-8
             end
         finally
             P._FK["trsm_base"][] = old
@@ -296,7 +301,7 @@ end
     # And the shipped configuration factors correctly.
     n = 256; A0 = randn(n, n); H = A0 * A0' + n * I
     M = Matrix(H); P.potrf!(M; uplo = 'L'); L = tril(M)
-    @test norm(L * L' - H, Inf) / norm(H, Inf) < 1e-10
+    @test norm(L * L' - H, Inf) / norm(H, Inf) < 1.0e-10
 end
 
 @testitem "generated-meta lint: Vec-taking @generated helpers carry the inline meta" tags = [:unit] begin
@@ -329,12 +334,14 @@ end
     # Note `_L1D_ASSOC` falls back to 8-way when cpuid does not report — i.e. the fallback IS the
     # assumption that was wrong on Zen5, so unknown CPUs are exactly the risk case.
     line = P._CACHELINE
-    for (l1, assoc) in ((32 * 1024, 8),    # Zen3, Zen4
-                        (48 * 1024, 12),   # Zen5  <- the case the hardcoded form got wrong
-                        (64 * 1024, 16),   # Apple-ish / future wide L1
-                        (32 * 1024, 4),    # low-assoc part
-                        (128 * 1024, 8),   # large L1
-                        (48 * 1024, 8))    # 48K but 8-way: assoc must move the answer, not just L1
+    for (l1, assoc) in (
+            (32 * 1024, 8),    # Zen3, Zen4
+            (48 * 1024, 12),   # Zen5  <- the case the hardcoded form got wrong
+            (64 * 1024, 16),   # Apple-ish / future wide L1
+            (32 * 1024, 4),    # low-assoc part
+            (128 * 1024, 8),   # large L1
+            (48 * 1024, 8),
+        )    # 48K but 8-way: assoc must move the answer, not just L1
         want = max(64, max(line, l1 ÷ assoc) ÷ sizeof(Float64))
         @test P._way_doubles(l1, assoc) == want
         # the property that actually matters: it tracks assoc, so halving assoc doubles the stride
