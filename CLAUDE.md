@@ -404,6 +404,27 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
 
 ## Standing rules
 
+- **NEVER PUT A FLEET MACHINE NAME IN THIS REPOSITORY. It is PUBLIC, the names are the operator's, and
+  they have now been removed by hand twice** — the second time 162 occurrences across 49 files. Name
+  the **microarchitecture** instead (Zen3, Zen4, Zen5, arm64): that is what a sentence citing a box is
+  using the name to mean, and it is strictly more useful, because "measured on Zen4" tells a reader on
+  an unknown part whether the figure can apply to them while a hostname tells them nothing.
+
+  **A per-box VALUE does not go in a tracked file either.** A CPU mask, a verify core, an ssh alias
+  list — those live in the gitignored `bench/fleet.local.sh`, one per box, documented by
+  `bench/fleet.local.example.sh`. A box stating its own topology needs no table and no names.
+  `gethostname()` is fine where the value is DATA and not a key: a cache filename is per-host by
+  design and those caches are gitignored.
+
+  ⚠ **RENAMING THE CASE LABELS IS NOT A FIX.** A `case "$(hostname)"` whose arms read `Zen4)` matches
+  no hostname, so it silently falls through to the default — which is exactly how
+  `bench/fleet_refresh_g.sh` came to verify core 0 on every box, found by the lint below and not by
+  anyone reading it.
+
+  Enforced by `test/fleetname_lint.jl`, in `test/lints.sh` and as a testitem. It cannot store the names
+  it hunts, so it reads them from `hostname` and `PB_BOXES`; the NAME half is therefore inert in CI and
+  says so, and the SHAPE half — hostname-keyed dispatch — needs no names and runs everywhere.
+
 - **ITERATE PROBES THROUGH `bench/probe.sh` — never relaunch `julia` per probe, and never restart the
   session just to pick up a `src/` edit.** A fresh launch pays a full pkgimage precompile (**200–311 s**
   measured, 6m33 end to end on this box); a correctly configured Revise applies a method-body edit in
