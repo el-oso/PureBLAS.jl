@@ -1052,6 +1052,11 @@ const _L2REP = s -> clamp(400_000_000 ÷ (s * s), 30, 20000)   # O(s²) work
 # windows spread 155 ms to 8.9 ms across one ladder. Dividing by the actual work holds them near 50 ms.
 const _RECT_ROWS = 505   # fixed dimension of every rectangular cell; see RECTSZ/RECT3SZ below
 const _RECTREP = s -> clamp(400_000_000 ÷ (_RECT_ROWS * s), 30, 20000)
+# The side-R BAND cells hold the triangular order fixed at `_RBAND_K` and sweep the ROW count, so one
+# call costs O(_RBAND_K^2 * m / 2) — linear in the swept size, not cubic. `_reps_cubic` reads the swept
+# size as the problem order, which at m=64 asks for 76 contexts of a call that already fills a window.
+const _RBAND_K = 512
+const _reps_rband = s -> clamp(20_000_000 ÷ (_RBAND_K * _RBAND_K * s ÷ 2), 1, 512)
 # `cold` forces reps=1 on the L1 sweep -- no repeated-call reuse of the SAME operand buffer within one
 # timed window. WHY: `_L1REP` amortizes timer overhead for cheap ops by calling `reps` times on one
 # `setup()`-allocated buffer; at large n that buffer can be small enough to stay resident in L2/SLC
@@ -1191,6 +1196,12 @@ const L3SZ = (8, 32, 50, 100, 128, 256, 512, 1000, 1024, 2048, 2100, 4096)   # O
 # it; 758/1420/2880 set the aspect to 1.50/2.81/5.70, the spread real callers span.
 const RECTSZ = (131, 256, 384, 448, 512, 758, 1420, 2880)
 const RECT3SZ = (505, 758, 1420, 2880)
+# Side-R band ladder. `s` is the ROW count of B against `_RBAND_K` columns, so the cells run WIDER than
+# tall — the opposite aspect from RECT3SZ, whose smallest row count already equals its column count.
+# The ladder brackets `_trsmr_sme_nw`, whose binding row counts follow the WORKER count: at twelve it
+# caps 64, 128 and 256 and releases 512; at six it caps 64 and 128; at four, 64 alone. So 512 sits
+# outside the cap at every count this box reaches and 64 sits inside it at all of them.
+const RBANDSZ = (64, 128, 256, 512)
 # LAPACK factorizations, to 4096. NON-PO2 entries (50/100/1000/2100) are one per RESIDENCY BAND, the
 # same set L2SZ/L3SZ use — and they matter MORE here than anywhere else: the panel kernels these ops
 # route through (`_trsm_rl_split_f64!`, `_trsm_right_lower_f64!`) handle a sub-W row tail and a
@@ -1563,6 +1574,15 @@ function run_benchmarks()
             c -> (B.trsm!('R', 'U', 'N', 'N', 1.0, c[1], c[2]); c[2][1]),
             c -> (PureBLAS.trsm!(c[2], c[1]; side = 'R', uplo = 'U', transA = 'N'); c[2][1]),
             _sizes(RECT3SZ)))
+        # Side-R trsm with B SHORT: few rows against a fixed triangular order, the shape a threaded
+        # side-R solve splits into when it hands each worker a band of rows. `_trsmr_sme_nw` caps the
+        # worker count on exactly this shape so every band still reaches the coprocessor's tile width.
+        # No square or tall cell reaches that cap, so without this row the admission rule it guards is
+        # unmeasured. Largest B is 512x512x8 = 2.1 MB.
+        _meas!(l3, "L3", "trsmRband", () -> sweep_heavy(s -> (tri(_RBAND_K), randn(s, _RBAND_K)),
+            c -> (B.trsm!('R', 'L', 'T', 'N', 1.0, c[1], c[2]); c[2][1]),
+            c -> (PureBLAS.trsm!(c[2], c[1]; side = 'R', uplo = 'L', transA = 'T'); c[2][1]),
+            _sizes(RBANDSZ); repsof = _reps_rband))
     end
 
     # ── LAPACK (O(n³) factorizations; all destructive → fresh input per round) ─────────────────────────
