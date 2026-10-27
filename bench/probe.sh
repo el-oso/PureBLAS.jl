@@ -18,7 +18,18 @@ cd "$(dirname "$0")/.." || exit 2
 
 FIFO=${PBHOT_FIFO:-/tmp/pbhot.fifo}
 LOG=${PBHOT_LOG:-/tmp/pbhot.log}
+# `<n>,0` AND NOT A BARE `<n>`: the second field is the INTERACTIVE pool, and an empty one is what puts
+# the main thread — which drives the gemm pool and takes a chunk itself — on the default pool where
+# `_pin_threads!` can reach it. `julia -t 6` instead reports `threadpool() == :interactive` with one
+# interactive thread, and that thread is never pinned, so the driver lands on a core already running a
+# pinned worker. Measured on Zen4: the driver collided in 48 of 48 threaded rounds, and gemm's
+# self-speedup read 2.6x where the same code under `-t 6,0` reads 4.7x. `bench/fleet_refresh.sh`
+# refuses any other spec and records the per-shape table; this is the same decision for the hot session.
 NT=${PBHOT_THREADS:-6}
+case "$NT" in
+    *,*) ;;                                    # caller gave an explicit pool split — honour it
+    *)   NT="$NT,0" ;;
+esac
 TIMEOUT=${PBHOT_TIMEOUT:-1800}
 
 # One CPU per physical core plus one spare, matching `bench/fleet_refresh.sh` and the mask recorded on

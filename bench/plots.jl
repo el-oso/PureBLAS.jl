@@ -389,6 +389,29 @@ end
 
 function _pin_threads!()
     (Sys.islinux() && Threads.nthreads() > 1) || return nothing
+    # THE DRIVER MUST BE PINNABLE, AND UNDER A BARE `-t <n>` IT IS NOT. `@threads :static` below walks
+    # the DEFAULT pool, so a main thread on the interactive pool is never given an affinity mask —
+    # while it both drives the gemm pool and takes a chunk itself. It then floats onto a core already
+    # running a pinned worker.
+    #
+    # Measured on Zen4, same code and same mask, gemm self-speedup at n=1024/2048/4096: `-t 6`
+    # reads 2.6x/2.7x/2.7x with the driver colliding in 48 of 48 rounds, `-t 6,0` reads 4.7x/4.9x/4.7x
+    # with none. The slow mode is not noise — it is a second, reproducible mode, and a cache measured
+    # under it understates every threaded cell by roughly a factor of two.
+    #
+    # Refusing rather than warning: a warning scrolls past and the resulting cells are indistinguishable
+    # from honest ones once merged. `bench/fleet_refresh.sh` already refuses the same spec at launch;
+    # this is the backstop for a run started by hand.
+    if Threads.threadpool() !== :default
+        error("""
+        main thread is on the `:$(Threads.threadpool())` pool, so the gemm pool's driver cannot be
+        pinned and will collide with a pinned worker. Relaunch with an EMPTY interactive pool:
+
+            julia -t $(Threads.nthreads(:default)),0 --project=bench bench/plots.jl …
+
+        A bare `-t <n>` reserves one interactive thread and puts main there. Measured cost: gemm
+        self-speedup 2.6x against 4.7x at n=1024 on Zen4.""")
+    end
     cpus = _core_cpus()
     isempty(cpus) && return nothing
     Threads.@threads :static for i in 1:Threads.nthreads()
@@ -2822,6 +2845,15 @@ function save_cache(path, groups)
             # OpenBLAS: upgrading Julia silently swaps the reference arm, which is why a toolchain bump is
             # the one case that REQUIRES re-measuring both arms instead of `arms=pb`.
             "\tjulia=$(VERSION)\tllvm=$(Base.libllvm_version)\tob=$(_obversion())",
+            # `threads=` — THE LAUNCH GEOMETRY, and it belongs here for the same reason `llvm=` does: it
+            # is an input to every threaded number with no diff to explain it. `<default>,<interactive>`
+            # plus the main thread's pool. A non-empty interactive pool means main was not pinnable, and
+            # a cache measured that way understates threaded cells by roughly a factor of two on Zen4.
+            # `_pin_threads!` now refuses that launch, so this stamp records the geometry for caches
+            # written from here on — the 2026-10-26 threaded sweep carries no stamp and cannot be
+            # adjudicated from the file alone, which is precisely the gap being closed.
+            "\tthreads=$(Threads.nthreads(:default)),$(Threads.nthreads(:interactive))" *
+                "/main=$(Threads.threadpool())",
             "\thw=$(_hwstamp())\ttune=$(_tunestamp())",
             # `base=`/`boost=` make `freq=` self-interpreting: freq/base ~ 1.0 is a locked run, and a
             # ratio well above 1 is a boosting one, WITHOUT going back to the machine to look up its
