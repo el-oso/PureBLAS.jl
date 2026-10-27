@@ -37,7 +37,7 @@ run() {                                   # run <name> <script...>
 }
 
 echo "cheap static checks:"
-for l in armstate estimator expint fastpath generated_meta liveness perthread pin prefsync probe_refblas probe_regime req8 routetoken workspace yield; do
+for l in armstate estimator expint fastpath fleetname generated_meta liveness perthread pin prefsync probe_refblas probe_regime req8 routetoken workspace yield; do
     f="test/${l}_lint.jl"
     [[ -f $f ]] && run "$l" "$f"
 done

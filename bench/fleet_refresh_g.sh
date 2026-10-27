@@ -24,16 +24,14 @@ JL="${JULIA:-julia}"
 # sweep does not remove a co-tenant, but it makes WHICH L3 it shares a decision rather than an
 # accident, so a contending job can be `taskset` onto the other die.
 #
-# Default core per box, matching what fleet_freqlock.sh verifies under load (it must be the SAME core,
-# or the lock is verified somewhere the work does not run): Zen4 2, Zen3 6, Zen5 8.
-# Override with BENCH_CORE=<n>.
+# `PB_VCORE` comes from `bench/fleet.local.sh`, which is gitignored and describes THIS machine. It must
+# be the SAME core `fleet_freqlock.sh` verifies under load, or the lock is verified somewhere the work
+# does not run. Override for one invocation with BENCH_CORE=<n>.
 case "${BENCH_CORE:-}" in
-    "") case "$(hostname)" in
-            Zen4)  CORE=2 ;;
-            Zen3)       CORE=6 ;;
-            Zen5) CORE=8 ;;
-            *)           CORE=0 ;;
-        esac ;;
+    "") _FLEET_LOCAL="$(dirname "$0")/fleet.local.sh"
+        # shellcheck source=/dev/null
+        [ -r "$_FLEET_LOCAL" ] && . "$_FLEET_LOCAL"
+        CORE="${PB_VCORE:-0}" ;;
     *) CORE="$BENCH_CORE" ;;
 esac
 # ── MODE: `pb` (default) or `full` ───────────────────────────────────────────────────────────────────
