@@ -8,7 +8,7 @@
 # — stays at whatever it was when it was last copied. Every reader (`gate_gaps.jl`, `cellcycles.jl`,
 # `coverage_*.jl`, and any agent) then reports confidently on data that is simply old.
 #
-# Measured, 2026-08-29, and it wasted real time: the local copy of neuromancer's cache was from 08-27
+# Measured, 2026-08-29, and it wasted real time: the local copy of Zen5's cache was from 08-27
 # (`commit=c5a0692`), while the box's own cache was from 08-28 (`commit=ffbb5e6`). A whole session's
 # analysis said Zen5 had 143 red cells, 126 anchor-mismatched cells and 26 reps artifacts. The box
 # actually had 115 red, 0 mismatched, 0 artifacts — it had already been repaired. A multi-agent

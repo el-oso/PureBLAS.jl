@@ -41,7 +41,7 @@ for g in L1 L2 L3 LP CL1 CL2 CL3 CLP; do
 done
 echo "=== staleness after refresh ==="
 bash bench/cache_staleness.sh 2>&1 | tail -6
-# POST-RUN LOCK CHECK. The launch-time verify passing is NOT sufficient: on 2026-08-18 neuromancer
+# POST-RUN LOCK CHECK. The launch-time verify passing is NOT sufficient: on 2026-08-18 Zen5
 # verified at 1978 MHz and then ran the whole sweep boosting at 4.7 GHz, silently inflating every ratio
 # ~2.3x. Verify again at the END so a mid-run float is visible here, not three steps later.
 echo "=== freq lock AFTER refresh (must still match the references' clock) ==="

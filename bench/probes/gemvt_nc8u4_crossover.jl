@@ -4,7 +4,7 @@
 # directly comparable to a `plots.jl` cell.
 #
 # WHY. `_GEMVT_NC_DEEP = 8` / `_GEMVT_U_DEEP = 4` — AOCL's shape, 32 rows per iteration, one x-load per
-# 8 FMAs — already SHIPS, but `_gemvt_deep` gates it on `A <= L2`. A gate-harness A/B on wintermute
+# 8 FMAs — already SHIPS, but `_gemvt_deep` gates it on `A <= L2`. A gate-harness A/B on Zen4
 # (2026-09-11, arms=pb, one size per process) measured that same shape forced through the blocked
 # ladder at sizes the gate excludes:
 #     n=2100  (A/L3 = 2.1)  36.7 -> 43.4 GB/s  (+18.1%)

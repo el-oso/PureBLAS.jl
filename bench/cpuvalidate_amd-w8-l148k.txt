@@ -1,4 +1,4 @@
-#cpuvalidate	version=1	host=neuromancer	cpu=AMD Ryzen AI 5 340 w/ Radeon 840M	vendor=AMD	isa=512-bit	wF64=8	date=2026-07-13T21:38
+#cpuvalidate	version=1	uarch=amd-w8-l148k	cpu=AMD Ryzen AI 5 340 w/ Radeon 840M	vendor=AMD	isa=512-bit	wF64=8	date=2026-07-13T21:38
 #detect	vendor=AMD	simd_B=64	L1_B=49152	L2_B=1048576	L3_B=16777216	line_B=64	intelAVX2=false
 #derived	gemm_MR=2	gemm_NR=8	gemm_NC=1360	gemm_KC=384	unpack_max=448	potrf_base=512	trsm_base=32	chol_split=false	syrk_cut=448	csyrk_unpk=192
 op     n=256   n=512   n=1024  n=2048  worst  PB_GFlops(maxn)

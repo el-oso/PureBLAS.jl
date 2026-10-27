@@ -30,8 +30,8 @@ using Statistics: median
 
 const ANCHOR_N = 1 << 16                       # fixed workload, L2-resident, no allocation per call
 # ⚠ CALIBRATED AGAINST THE ANCHOR'S OWN NOISE, not intuition. This was 3%, which is BELOW the
-# instrument's repeatability — 10 idle freq-locked reads on 2026-08-20 gave wintermute 5.3%,
-# neuromancer 6.0%, galen 22.2%. A guard tighter than its own instrument fires on nothing but noise:
+# instrument's repeatability — 10 idle freq-locked reads on 2026-08-20 gave Zen4 5.3%,
+# Zen5 6.0%, Zen3 22.2%. A guard tighter than its own instrument fires on nothing but noise:
 # at 3% it refused a clean +20.6% ger_panel_np win because the anchor moved 3.7%. See
 # kb/findings/pureblas-run-anchor-is-not-l2-resident-on-zen3.md.
 const ANCHOR_TOL = 0.08                        # above every box's measured anchor repeatability
@@ -63,7 +63,7 @@ Is this box in the ONLY state a gate/tuning measurement is valid in — governor
 `scaling_min_freq == scaling_max_freq` (i.e. `sudo bench/fleet_freqlock.sh lock`)?
 
 ⚠ THE TUNER DID NOT CHECK THIS UNTIL 2026-08-21, AND IT SHOULD HAVE BEEN FIRST. On that date
-neuromancer ran a full calibration at an achieved 4843 MHz against a 2000 MHz base — its lock had
+Zen5 ran a full calibration at an achieved 4843 MHz against a 2000 MHz base — its lock had
 silently dropped (laptop, suspend/resume) — and produced an incoherent per-size verdict (per-column
 winning at n=512, losing at 1024, winning again at 2048 and 4096). The run was rejected only
 incidentally, because no window fitted that nonsense; had it fitted, the tuner would have PINNED a
@@ -91,7 +91,7 @@ discovering it via `with_anchor` after minutes of measurement.
 Threshold 1.5 allows for our own single-threaded load plus normal desktop idle ON A DEDICATED BOX.
 
 ⚠ IT IS NOT UNIVERSAL, AND AN ABSOLUTE THRESHOLD IS THE WRONG SHAPE FOR A LAPTOP. Measured on
-neuromancer 2026-08-21: ZERO julia processes and a load average of 1.56 / 1.73 / 1.52 — a *persistent*
+Zen5 2026-08-21: ZERO julia processes and a load average of 1.56 / 1.73 / 1.52 — a *persistent*
 desktop baseline (browser, indexers, trackers), not a decaying transient. That box therefore refuses
 to tune, forever, no matter how long anyone waits. Override with `PUREBLAS_TUNE_MAXLOAD`.
 

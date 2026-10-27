@@ -30,9 +30,9 @@
 # ("Zen4 vs OB …"); they are a per-reference detail, not a per-box verdict.
 #
 # Usage:  julia --project=bench bench/coverage_routing.jl \
-#             bench/plots_data_avx512_wintermute.txt \
-#             bench/plots_data_avx2_galen.txt \
-#             bench/plots_data_zen5_neuromancer.txt
+#             bench/plots_data_avx512_<host>.txt \
+#             bench/plots_data_avx2_<host>.txt \
+#             bench/plots_data_zen5_<host>.txt
 using Printf
 include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
 

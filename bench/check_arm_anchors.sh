@@ -11,7 +11,7 @@
 # references were captured, the RATIO compares two machine states rather than two kernels — and
 # nothing in the publish pipeline could see it. Measured 2026-08-27/28, both shipped through every
 # existing gate:
-#   * galen  — 616 of 863 cells (71%) with >5% pb-vs-reference anchor mismatch after an arms=pb
+#   * Zen3  — 616 of 863 cells (71%) with >5% pb-vs-reference anchor mismatch after an arms=pb
 #              refresh. Its red-cell count read 58; the box was not 26 cells worse, the arms were.
 #   * zen5   — 121 cells measured at anchor 26.07 against references at 18.26 (43%). That inflated
 #              Zen5's red count by 45 and cost hours before the anchor was read.
@@ -19,7 +19,7 @@
 # nor `freqgate.jl` (clock) contains the word "anchor". This is the missing check.
 #
 # THE FIX WHEN IT FIRES is a FULL-ARMS run of the affected scope — `bench group=X` with no `arms=pb`,
-# so all three arms land in one machine state and anchors match by construction. Verified: galen went
+# so all three arms land in one machine state and anchors match by construction. Verified: Zen3 went
 # from 616/863 mismatched to 0/863 that way.
 #
 #   bench/check_arm_anchors.sh [tol_pct]     # default 5; every bench/plots_data_*.txt
@@ -30,7 +30,7 @@
 # reference arms means the ratio divides two machine states and is therefore invalid. That assumption
 # was never tested, and when it finally was, IT FAILED:
 #
-#   After an `arms=pb` refresh on neuromancer that this check called 96/863 cells mismatched (galen:
+#   After an `arms=pb` refresh on Zen5 that this check called 96/863 cells mismatched (Zen3:
 #   737/893, worst 24.7%), the underlying measurements were compared directly:
 #     * all 1726 reference arms were BYTE-IDENTICAL before and after — `arms=pb` does not touch them;
 #     * for 108 cells whose kernel code had not changed, the pb TIMES were unchanged:
@@ -81,7 +81,7 @@ for f in "${files[@]}"; do
             # reference appeared first in the record — and the arms are written in the order
             # aocl, openblas, pb. A partial-arm run (`arms=pb,aocl force-arms`) refreshes pb AND aocl in
             # one machine state while leaving openblas behind, so comparing pb to aocl alone reports
-            # 0.0% and the stale openblas anchor is never looked at. Caught 2026-08-28 on galen, on
+            # 0.0% and the stale openblas anchor is never looked at. Caught 2026-08-28 on Zen3, on
             # cells this session had just written that way. Compare against the WORST reference.
             pb = 0; ref = 0; refname = ""
             nref = 0; split("", rfq); split("", rnm)

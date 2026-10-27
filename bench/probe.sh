@@ -32,20 +32,33 @@ case "$NT" in
 esac
 TIMEOUT=${PBHOT_TIMEOUT:-1800}
 
-# One CPU per physical core plus one spare, matching `bench/fleet_refresh.sh` and the mask recorded on
-# `_ARM_PB_MT`. An unknown host runs unpinned rather than guessing a topology — as does every macOS
-# host, which has no CPU affinity API at all (`taskset` does not exist and `thread_policy_set` is
-# inert on Apple silicon; QoS is the only scheduler steer there).
-case "$(hostname)" in
-    wintermute)  MASK=0,2,4,6,8,10,1 ;;
-    galen)       MASK=6,7,8,9,10,11,18 ;;
-    neuromancer) MASK=0,1,2,3,4,5,6 ;;
-    *)           MASK="" ;;
-esac
-# `PBHOT_MASK` overrides it, and `PBHOT_MASK=none` runs unpinned. The mask is itself a subject of
-# investigation — the per-box default puts SEVEN CPUs over SIX physical cores, so one core always holds
-# two of the process's threads, and whether those two are both pool WORKERS is a question the default
-# cannot be used to answer. Changing it requires a restart, which is why this exists rather than a flag.
+# ONE CPU PER PHYSICAL CORE, FROM THE BOX'S OWN CONFIG. `bench/fleet.local.sh` is gitignored and holds
+# `PB_MASK` and `PB_VCORE` for whichever machine this is; `bench/fleet.local.example.sh` documents how
+# to derive them from `lscpu -p=CPU,CORE`.
+#
+# IT USED TO BE A `case "$(hostname)"` TABLE, and that was wrong twice over: it published the fleet's
+# machine names from a public repository, and it keyed the values on a string only this fleet has, so a
+# new box silently got no mask at all. A machine stating its own topology needs neither.
+#
+# A host with no config runs UNPINNED here rather than refusing, because a probe is not always a
+# measurement — a correctness check or a code dump does not care. The measurement path refuses
+# separately: `bench/plots.jl` errors when the pool driver cannot be pinned, and `fleet_refresh.sh`
+# refuses an unlocked box. macOS reaches this branch by necessity: it has no CPU affinity API at all
+# (`taskset` does not exist and `thread_policy_set` is inert on Apple silicon; QoS is the only
+# scheduler steer there).
+_FLEET_LOCAL="$(dirname "$0")/fleet.local.sh"
+# shellcheck source=/dev/null
+[ -r "$_FLEET_LOCAL" ] && . "$_FLEET_LOCAL"
+MASK="${PB_MASK:-}"
+# `PBHOT_MASK` overrides it, and `PBHOT_MASK=none` runs unpinned. Changing the mask requires restarting
+# the session, which is why this is an environment variable and not a per-probe flag.
+#
+# `PB_MASK` NAMES ONE CPU PER PHYSICAL CORE AND NO SPARE. A mask wider than the core count leaves the
+# extra thread unpinned for `_pin_threads!` to miss, and the scheduler may then place a chunk on it
+# beside a pinned one — measured on Zen4, `-t 7,0` reads self-speedups of 2.70/2.94/3.14 against
+# `-t 6,0`'s 4.27/4.93/5.05, and both rejected shapes are bimodal with a maximum equal to the clean
+# form's median. The thread count must equal the core count for the same reason: chunk count is pool
+# width, so one chunk per thread per core is the only geometry with no doubling.
 if [ -n "${PBHOT_MASK:-}" ]; then
     [ "$PBHOT_MASK" = none ] && MASK="" || MASK="$PBHOT_MASK"
 fi
@@ -55,27 +68,23 @@ fi
 # rather than merely noisy. `fleet_refresh.sh` already refuses to sweep an unlocked box; a probe had no
 # such check, so it was left to whoever remembered.
 #
-# It was not remembered. neuromancer — a LAPTOP, where things happen around it — dropped its pin three
+# It was not remembered. The Zen5 box — a LAPTOP, where things happen around it — dropped its pin three
 # times in one session, reporting `boost=0` and `pin=2000-2000` while running at 4763 MHz, because the
 # SETTINGS look locked and only the achieved-under-load figure sees it. One whole probe was measured at
 # 2.4x the pinned clock and had to be discarded.
 #
-# `CORE` MATTERS: the default in fleet_freqlock.sh is 8, which is neuromancer's bench core, so verifying
-# on another box without setting it measures a core the work does not run on. One per box, matching
-# `MASK` above and `fleet_refresh.sh`.
+# `CORE` MATTERS: `fleet_freqlock.sh`'s own default is a single number that cannot be right everywhere,
+# so verifying on a box without setting it samples a core the work does not run on. `PB_VCORE` comes
+# from the same per-box config as `PB_MASK` and must name a core inside it.
 #
-# RELOCKING NEEDS NO SUDO ON NEUROMANCER ONLY, via the root-owned setuid helper at
-# /usr/local/sbin/pureblas-cpufreq (built from bench/tools, Go, installed there and nowhere else). That is
-# the difference between "ask a human and wait" and "relock the box and carry on" mid-session — so where
-# the helper exists this relocks and continues, and where it does not it says what to run and refuses.
+# RELOCKING NEEDS NO SUDO WHERE THE SETUID HELPER IS INSTALLED, a root-owned binary at
+# /usr/local/sbin/pureblas-cpufreq (built from bench/tools, Go). That is the difference between "ask a
+# human and wait" and "relock the box and carry on" mid-session — so where the helper exists this
+# relocks and continues, and where it does not it says what to run and refuses. It is present on one
+# machine of this fleet, not all of them.
 #
 # `PBHOT_NOLOCK=1` skips it, for a probe that is not a measurement (a correctness check, a code dump).
-case "$(hostname)" in
-    wintermute)  VCORE=2 ;;
-    galen)       VCORE=6 ;;
-    neuromancer) VCORE=8 ;;
-    *)           VCORE="" ;;
-esac
+VCORE="${PB_VCORE:-}"
 _lockok() { CORE="${VCORE:-8}" bash "$(dirname "$0")/fleet_freqlock.sh" verify 2>&1 | grep -q '✅'; }
 if [ -z "${PBHOT_NOLOCK:-}" ] && [ -n "$VCORE" ] && [ -r /sys/devices/system/cpu/amd_pstate/status ]; then
     if ! _lockok; then

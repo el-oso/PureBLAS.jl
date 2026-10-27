@@ -4,7 +4,7 @@
 # WHY THIS EXISTS, AND WHY freqgate.jl CANNOT DO IT. `bench/freqgate.jl` compares each cell's clock to
 # the CACHE HEADER's own achieved clock, so it detects cells that left a lock the rest of the sweep
 # held. It says so itself: "a run that floated for its WHOLE duration has a floated header too, and
-# nothing here will flag it." That is exactly what happened on 2026-08-18 — neuromancer's full PB-only
+# nothing here will flag it." That is exactly what happened on 2026-08-18 — Zen5's full PB-only
 # refresh verified `passive/boost=0/1978 MHz` at launch, then ran the entire sweep BOOSTING at
 # 4688-4772 MHz against reference arms cached at 1982 MHz. Every ratio was inflated ~2.3x; Zen5 dznrm2
 # "improved" 1.79 -> 3.62 and dzasum 0.985 -> 2.31 on BLAS-1 kernels that had not been touched. Nothing
@@ -160,7 +160,7 @@ for f in "${files[@]}"; do
             # A REFERENCE-SIDE MISMATCH HAS NO REMEDIATION HERE, and saying so is the point. The arm
             # that disagrees with the box pin is the cached one, measured in an earlier epoch and never
             # re-run — `arms=pb` cannot touch it. Printing the re-measure advice for those cells sent a
-            # reader round a loop that could never clear the flag, which is how 8 of the 9 on galen read.
+            # reader round a loop that could never clear the flag, which is how 8 of the 9 on Zen3 read.
             # (NO APOSTROPHES in this awk program: it is single-quoted and one would end the string.)
             if (nref > 0) printf "   %d of those are REFERENCE-side: the cached arm disagrees with this box pin, so `arms=pb`\n      cannot clear them. Exclude those cells from a score, or re-measure the references, which needs\n      the user per-run authorization.\n", nref
             if (off == 0 && looff == 0) exit 0

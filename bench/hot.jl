@@ -1,7 +1,7 @@
 # PERSISTENT REVISE SESSION — one Julia process reused across src/ edits.
 #
 # WHY. Editing `src/` invalidates the PureBLAS pkgimage, so every fresh probe launch pays a full
-# precompile (measured 311 s on wintermute, 2026-08-09). Three probes = three precompiles, and that
+# precompile (measured 311 s on Zen4, 2026-08-09). Three probes = three precompiles, and that
 # dominates an iteration far more than the benchmark does. Revise recompiles only the changed methods,
 # so the same edit-measure loop costs well under a second.
 #

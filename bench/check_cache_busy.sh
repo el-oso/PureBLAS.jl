@@ -5,7 +5,7 @@
 #
 # WHY IT HAS TO BE A SEPARATE, AFTER-THE-FACT CHECK: the guard is START-ONLY. It refuses when a foreign
 # process is already at >= 25% CPU, so a contender that appears three cells in is recorded rather than
-# refused, and `fleet_refresh.sh` sees exit 0 and prints REFRESH DONE. Measured 2026-09-26: galen's
+# refused, and `fleet_refresh.sh` sees exit 0 and prints REFRESH DONE. Measured 2026-09-26: Zen3's
 # threaded L1+L3 groups ran alongside a process at 97.2% CPU. The numbers looked like a scaling defect —
 # dot at n=3e5 read 1.13x self-speedup where a probe on the quiet box read 3.72x — and the whole
 # diagnosis pointed at the kernel. The field was in the header the entire time.

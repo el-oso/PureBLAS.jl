@@ -61,8 +61,8 @@ const _ARM_PB = "pb"
 # reference at all needs the user's explicit per-run authorisation. Everything downstream that adjudicates
 # must therefore skip this arm; `_is_vendor_ref` below is the single place that decides.
 const _ARM_PB_MT = "pb_mt"
-# Threads for the `pb_mt` arm. 6 on every box BY DECISION, not by detection: wintermute and neuromancer
-# have 6 physical cores and galen has 12, and capping galen to 6 is what keeps the three boxes
+# Threads for the `pb_mt` arm. 6 on every box BY DECISION, not by detection: Zen4 and Zen5
+# have 6 physical cores and Zen3 has 12, and capping Zen3 to 6 is what keeps the three boxes
 # comparable. Pin one CPU per PHYSICAL core when running it — a second thread on a core shares the same
 # FMA units, so logical-core scaling measures contention, not parallelism.
 #
@@ -74,13 +74,13 @@ const _ARM_PB_MT = "pb_mt"
 # runtime lands, so the workers keep their cores.
 #
 # CPU NUMBERING IS NOT THE SAME ON EVERY BOX — read `lscpu -p=CPU,CORE` before assuming a mask. On
-# wintermute the two CPUs of a core are adjacent (0,1 = core 0), on galen and neuromancer the siblings
-# are the whole second half (galen CPU 12 = core 0; neuromancer CPU 6 = core 0). So `0,2,4,6,8,10`
-# selects six distinct cores on wintermute and only three, doubled up, on neuromancer.
+# Zen4 the two CPUs of a core are adjacent (0,1 = core 0), on Zen3 and Zen5 the siblings
+# are the whole second half (Zen3 CPU 12 = core 0; Zen5 CPU 6 = core 0). So `0,2,4,6,8,10`
+# selects six distinct cores on Zen4 and only three, doubled up, on Zen5.
 #
-#   wintermute   taskset -c 0,2,4,6,8,10,1   julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt
-#   galen        taskset -c 6,7,8,9,10,11,18 julia --project=bench -t 6 …   # CCD1, its own 32 MiB L3
-#   neuromancer  taskset -c 0,1,2,3,4,5,6    julia --project=bench -t 6 …
+#   Zen4   taskset -c 0,2,4,6,8,10,1   julia --project=bench -t 6 bench/plots.jl bench arms=pb,pb_mt
+#   Zen3        taskset -c 6,7,8,9,10,11,18 julia --project=bench -t 6 …   # CCD1, its own 32 MiB L3
+#   Zen5  taskset -c 0,1,2,3,4,5,6    julia --project=bench -t 6 …
 # `mt=` overrides for a scaling curve; it is a harness setting, not a shipped tuning knob, so no PDM tier.
 const _MT_NT = let i = findfirst(a -> startswith(a, "mt="), ARGS)
     isnothing(i) ? 6 : parse(Int, ARGS[i][4:end])
@@ -308,13 +308,13 @@ const _ANY_MT = _DO_PB_MT || !isempty(_REF_MT_ARMS)
 # `plots_data_*` cell comparable with new ones. A threaded cache is stamped `pinned=` so it is
 # self-identifying, and its absence on an `mt_data_*` file means those cells predate this.
 #
-# ⚠ NOT A COMPLETE FIX, and the header stamp must not be read as one. It cleaned neuromancer and did NOT
-# clean wintermute, where `nw = 6` under `-t 6` leaves no thread for the runtime (the pool spawns
+# ⚠ NOT A COMPLETE FIX, and the header stamp must not be read as one. It cleaned Zen5 and did NOT
+# clean Zen4, where `nw = 6` under `-t 6` leaves no thread for the runtime (the pool spawns
 # `nthreads()-1` workers and the driver runs the last chunk) and reads 13x worse than `nw = 2`. Pinning
 # removes the SMT-sibling mode; it does not create a spare thread.
 const _PINNED_AT = Ref("")
-# One CPU per physical core, read from sysfs rather than assumed — siblings are adjacent on wintermute and
-# the whole second half on galen and neuromancer, so either hardcoded layout is wrong somewhere — and
+# One CPU per physical core, read from sysfs rather than assumed — siblings are adjacent on Zen4 and
+# the whole second half on Zen3 and Zen5, so either hardcoded layout is wrong somewhere — and
 # restricted to CPUs this process is actually allowed to use, so it composes with `taskset`.
 function _core_cpus()
     allowed = Int[]
@@ -352,7 +352,7 @@ end
 # one degree of freedom inside the core, and a worker can be woken on either sibling instead of
 # waiting for one specific CPU to drain.
 #
-# MEASURED, and the single-CPU form was costing a factor of two. gemm n=1000 on wintermute, one
+# MEASURED, and the single-CPU form was costing a factor of two. gemm n=1000 on Zen4, one
 # process, one reused operand set (so the window allocates nothing and no GC can run inside it),
 # `pb_mt` over `pb`, four rounds each — the pin applied mid-process was the only change:
 #
@@ -472,13 +472,13 @@ struct ArmRec
     # CACHED ratio cancels nothing. The header already stamped an anchor, but only for the CURRENT run —
     # the reference epoch's value was overwritten every time, so the correction the anchor exists for
     # could never actually be computed. Measured 2026-08-07: references were 38 h older than the PB arm
-    # on both wintermute and galen, and galen's anchor moved 13.97 → 16.46 µs (17.8%) between two
+    # on both Zen4 and Zen3, and Zen3's anchor moved 13.97 → 16.46 µs (17.8%) between two
     # freq-locked runs, which is far larger than the gaps being adjudicated.
     anchor::Float64
     # ACHIEVED CLOCK (kHz) on the core this arm was measured on, sampled AT MEASUREMENT TIME. 0 for
     # records written before this field existed.
     #
-    # Why per-cell and not just the header (added 2026-08-16): neuromancer's sweep verified ✅ at launch
+    # Why per-cell and not just the header (added 2026-08-16): Zen5's sweep verified ✅ at launch
     # (1981 MHz) and still stamped `freq=2172337kHz` against a 2000 MHz base, because the lock floated
     # DURING the run. A single header clock cannot say WHICH cells were affected, so one float condemns
     # all 85 ops — a 2.5 h re-run. With a per-cell clock the drift localises: re-measure only the cells
@@ -573,7 +573,7 @@ end
 const _ANCHOR_MT_N = 1 << 14                      # 16K Float64 = 128 KB per thread
 # THE COMPUTE MUST DOMINATE THE FORK-JOIN, or the probe measures thread wake latency instead of the
 # clock — and wake latency neither scales with frequency nor recovers promptly, so a probe dominated by
-# it reports a throttle that has already ended. Decomposed on neuromancer, 7 threads, same work each:
+# it reports a throttle that has already ended. Decomposed on Zen5, 7 threads, same work each:
 #
 #   serial, one thread                24.8 us      <- the compute
 #   @threads with an EMPTY body      118.1 us      <- fork/join alone
@@ -769,7 +769,7 @@ BLAS.set_num_threads(1)
 # ── ISA / µarch identity (derived once, up here so `save_cache` can STAMP it into the cache header). A
 # later multi-host plot loads several `plots_data_<host>.txt` and must tell Zen4/Zen3/Zen5 apart — the
 # filenames are bare hostnames and the SIMD width alone can't (Zen4 & Zen5 are both AVX-512). Same-ISA
-# boxes disambiguate via `slug=`/`isa=` CLI overrides (e.g. neuromancer runs `slug=zen5 isa=Zen5`). ─────
+# boxes disambiguate via `slug=`/`isa=` CLI overrides (e.g. Zen5 runs `slug=zen5 isa=Zen5`). ─────
 const _BENCH_VERSION = 3   # v3 = per-arm TIMES + per-arm provenance; v2 = pooled ratios (unconvertible). Bump ⇒ old caches refused.
 const _W64P = PureBLAS._vwidth(Float64)
 # µarch slug DERIVED from CPU detection (CLAUDE.md req#7 — not a manual flag), so Zen4 vs Zen5 (both
@@ -785,9 +785,9 @@ const _HWB = PureBLAS._HW
 # The slug is a BOX LABEL and must be STABLE: it names the cache file (`plots_data_$(SLUG)_$(host).txt`,
 # :1531), keys the plot series (:2098) and is referenced by bench/artifact_build.sh and
 # coverage_routing.jl. It used to key on `_double_pumped`, which was a proxy for "Zen4 vs Zen5" — that
-# stopped being true on 2026-09-09 when the datapath became a detected CPUID fact and neuromancer (a
+# stopped being true on 2026-09-09 when the datapath became a detected CPUID fact and Zen5 (a
 # Krackan mobile Zen5) correctly turned out double-pumped. Keying the LABEL on the µarch family keeps
-# neuromancer on "zen5" and avoids colliding it with wintermute's "avx512" / orphaning its cached
+# Zen5 on "zen5" and avoids colliding it with Zen4's "avx512" / orphaning its cached
 # reference arms. The physical fact is stamped separately into every header as `datapath=`/`dp=` (:315).
 const _AUTOSLUG = _W64P == 8 ? (PureBLAS._CPU_FAMILY == 0x1A ? "zen5" : "avx512") :
     _W64P == 4 ? "avx2" : _W64P == 2 ? "neon" : "simd"
@@ -1158,7 +1158,7 @@ const L1SZ = (1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000)
 #     n=1000  7.6 MiB    L3     %mr=8  %nr=0   masks m
 #     n=2100  33.6 MiB   DRAM   %mr=4  %nr=4   masks both
 # None is a way-stride multiple (n*8 % 4096 != 0), so they are clean on the aliasing axis; the po2
-# sizes beside them supply the aliasing case. n=300 was rejected: it is L3 on galen but L2 on the other
+# sizes beside them supply the aliasing case. n=300 was rejected: it is L3 on Zen3 but L2 on the other
 # two, so the row would not mean the same thing per box.
 const L2SZ = (50, 64, 100, 128, 256, 512, 1000, 1024, 2048, 2100, 4096)
 const L3SZ = (8, 32, 50, 100, 128, 256, 512, 1000, 1024, 2048, 2100, 4096)   # O(n³); 4096 shows large-n syrk/trmm behavior
@@ -1637,7 +1637,7 @@ function run_benchmarks()
         # setup already hands the core `reps` FRESH contexts, each used exactly once (`evals=1`), so
         # the copy was redundant — and at small n it dominated: 592 B per call at n=8 against a 140 ns
         # kernel, 512 calls per sample. That allocation drove GC INTO the timed window, and GC is what
-        # produced the published bands: measured on wintermute 2026-09-11, trtri@8 samples split into
+        # produced the published bands: measured on Zen4 2026-09-11, trtri@8 samples split into
         # GC-free 106 us and GC-hit 764 us (7.2x), 2% of samples at n=8 and 12% at n=32, which is
         # exactly the round-level bimodality (round medians 103/247/119/241/113/248/251/253 us).
         # Dropping the copy takes GC to 0.0% of samples and the n=8 median down 20% — the cell stops
@@ -2150,7 +2150,7 @@ function run_cmplx_benchmarks()
         #
         # LPSZ runs to 4096. DLP cannot: its REFERENCE is LinearAlgebra's generic factorization on a
         # 16-byte non-BlasFloat (`eigvals`/`qr`/`lu` with no BLAS underneath), so the reference arm is
-        # itself O(n^3) with a large constant. Measured on wintermute: the whole group at n=128 took
+        # itself O(n^3) with a large constant. Measured on Zen4: the whole group at n=128 took
         # **14.5 minutes**, which extrapolates to hours at 256 and many hours at 512 — DLP alone would
         # have dominated a full-fleet refresh that otherwise costs about an hour a box.
         #
@@ -2456,7 +2456,7 @@ end
 #
 # ── EXCEPT the pb_mt arm, which gets ITS OWN FILE, derived — not a new argument ──────────────────────
 # WHY THE GATE CACHE MUST NOT RECEIVE IT. `fleet_refresh.sh` pins the gate sweep to ONE core, on purpose:
-# an unpinned sweep let the scheduler migrate mid-measurement, and on galen (two 32 MiB L3s) a sweep
+# an unpinned sweep let the scheduler migrate mid-measurement, and on Zen3 (two 32 MiB L3s) a sweep
 # sharing a die with a GPU job moved 3.7% of cells. The `pb_mt` arm needs SIX cores, so `pb` and `pb_mt`
 # cannot share one invocation's affinity. Merging them into the gate cache would therefore REWRITE every
 # `pb` gate cell with a measurement taken at 6-core affinity instead of the sanctioned 1-core pinning —
@@ -2519,7 +2519,7 @@ _require_lock() = FreqLock.require_lock(what = "measure a gate sweep")
 # The gate is a PB/OB ratio measured in two adjacent windows on one core. A foreign job saturating
 # another core is not neutral: it contends for the shared L3 and the memory controller, which is
 # exactly where the bandwidth-bound BLAS-1/2 cells live, and it does so unevenly across the two
-# windows. On 2026-08-05 a stray `julia-1.13 --project=@plots` was found mid-sweep on neuromancer —
+# windows. On 2026-08-05 a stray `julia-1.13 --project=@plots` was found mid-sweep on Zen5 —
 # the run had to be discarded after the fact. A three-hour sweep deserves a one-second check first.
 #
 # `ps -eo` and NOT `pgrep julia | wc -l`: the count form self-matches (this process, and any wrapper
@@ -2544,7 +2544,7 @@ function _busy_procs()
     #
     # `ps -eo pcpu` reports CPU averaged over the process's ENTIRE LIFETIME, so a browser tab that
     # burned a core for two minutes and then went idle keeps reporting ~35% for as long as it lives.
-    # That false-positive refused a whole group run (CLP on neuromancer, 49 cells) on an idle box:
+    # That false-positive refused a whole group run (CLP on Zen5, 49 cells) on an idle box:
     # ps said 34.9%, a 5-second sample of the same pid said 0.4%.
     #
     # The obvious fix — diffing `ps -eo cputimes` — is ALSO wrong and worse: cputimes is INTEGER
@@ -2660,9 +2660,9 @@ _forced_knobs() = sort([k for k in keys(ENV) if startswith(k, "PUREBLAS_FORCE_")
 # GITIGNORED — so it shows in no diff, no review, and survives every `fleet_sync.sh` hard reset.
 #
 # This has now bitten twice, the second time for ten days after the first was "fixed":
-#   2026-07-30  `bench/LocalPreferences.toml` pinning `ger_panel_np = 1` found on wintermute AND galen.
-#               Removing it took wintermute ger n=2048 from 0.914 to 1.244.
-#   2026-08-09  the SAME pin was still live on neuromancer — never checked in that cleanup. Ten days of
+#   2026-07-30  `bench/LocalPreferences.toml` pinning `ger_panel_np = 1` found on Zen4 AND Zen3.
+#               Removing it took Zen4 ger n=2048 from 0.914 to 1.244.
+#   2026-08-09  the SAME pin was still live on Zen5 — never checked in that cleanup. Ten days of
 #               Zen5 ger/zgeru numbers went out through it, it falsified two source comments and a whole
 #               task premise ("Zen5 resolves _ger_np() = 1" — unpinned the box measures 8), and it
 #               laundered itself into a kb finding that later work then cited as a documented constant.
@@ -2728,7 +2728,7 @@ end
 # ── IS THIS BOX LEGITIMATELY TUNED? (user ruling 2026-08-29: the gate is the TUNED machine) ──────────
 # Before this, ANY active pin refused the write, which meant a box that had run `PureBLAS.tune!()` could
 # not publish a gate number at all — the knob defaults are a fleet-wide MINIMAX (e.g. `ger_panel_np = 1`
-# is chosen so Zen5 passes; wintermute's own optimum is 8), so the shipped default is by construction not
+# is chosen so Zen5 passes; Zen4's own optimum is 8), so the shipped default is by construction not
 # what any single machine should run.
 #
 # The carve-out is deliberately NARROW, because the blanket refusal exists for a real incident: an
@@ -2795,7 +2795,7 @@ function save_cache(path, groups)
     end
     # ── VALIDATE BEFORE TRUNCATING ────────────────────────────────────────────────────────────────
     # `open(path, "w")` truncates IMMEDIATELY, so any guard that throws from inside the do-block
-    # destroys the cache it was protecting. That happened on 2026-08-27: neuromancer drifted above its
+    # destroys the cache it was protecting. That happened on 2026-08-27: Zen5 drifted above its
     # pin, `check_achieved` correctly refused mid-write, and the 863-cell Zen5 cache — including the
     # openblas/aocl reference arms that the "never re-measure a reference" rule exists to protect —
     # was left at 0 bytes. Recovered only because an unrelated copy happened to be in /tmp.
@@ -2818,9 +2818,9 @@ function save_cache(path, groups)
         # and the RESOLVED Measure-tier tuning state (`tune=`).
         # `tune=` exists because on 2026-07-30 an UNTRACKED `bench/LocalPreferences.toml` pinning
         # `ger_panel_np = 1` was found on BOTH fleet boxes. It overrode a correctly-working auto-measure
-        # (wintermute wants 8, galen wants 4; 1 is the Zen5 value) and silently sandbagged every ger number
-        # ever committed: removing it took wintermute n=2048 from 0.914 to 1.244 and n=4096 from 0.974 to
-        # 1.408, and flipped galen's ger from FAIL to PASS vs OpenBLAS. A pin does not appear in
+        # (Zen4 wants 8, Zen3 wants 4; 1 is the Zen5 value) and silently sandbagged every ger number
+        # ever committed: removing it took Zen4 n=2048 from 0.914 to 1.244 and n=4096 from 0.974 to
+        # 1.408, and flipped Zen3's ger from FAIL to PASS vs OpenBLAS. A pin does not appear in
         # `git status`, so nothing in the cache file revealed that the run was measuring the pin rather
         # than the kernel. Stamping the resolved values makes a cache reproducible from its own header —
         # if two runs disagree, diff `tune=` first.
@@ -3270,7 +3270,7 @@ else
         # FULL run: the cache is REPLACED wholesale. That is correct only when this run measured every
         # arm — with a restricted `arms=`, saving here DELETES the reference arms for every cell in the
         # cache. The per-arm merge above protects the subset path; nothing protected this one, and on
-        # 2026-08-06 a full `bench nodraw arms=pb` on neuromancer destroyed the Zen5 v3 reference arms
+        # 2026-08-06 a full `bench nodraw arms=pb` on Zen5 destroyed the Zen5 v3 reference arms
         # (10.9 MB -> 3.65 MB, ~2h45m of OpenBLAS+AOCL measurement) — the run looked like it succeeded
         # and the loss only surfaced when gate_gaps reported `cells=0`.
         # `arms=` is for SUBSET re-measures (op=/group=), where merging keeps the references. A full run
@@ -3564,7 +3564,7 @@ isempty(_MISSING) || @warn "these ops FAILED during measurement (absent from the
 # ── CROSS-RUN MACHINE-STATE DRIFT ─────────────────────────────────────────────────────────────────
 # A same-run ratio cancels machine state; a CACHED ratio cancels nothing. Under `arms=pb` the PB arm is
 # fresh and the references can be days old, so a drifted machine is indistinguishable from a code
-# change — and the drift here is NOT small: galen's anchor moved 13.97 → 16.46 µs (17.8%) between two
+# change — and the drift here is NOT small: Zen3's anchor moved 13.97 → 16.46 µs (17.8%) between two
 # freq-locked runs on 2026-08-07, against gate gaps of 0.3%. Now that every arm carries the anchor it
 # was measured under, say so out loud. This REPORTS rather than rescales: a rescale would need the
 # anchor to be a faithful proxy for whatever moved the cell, which is unproven — an honest "this

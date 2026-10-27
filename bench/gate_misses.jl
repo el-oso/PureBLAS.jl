@@ -2,7 +2,7 @@
 # (op, size, box, baseline). Ratio is PB/baseline speed (>1 = PB faster). Gate = >= max(OB, AOCL).
 using Statistics, Printf
 include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
-const BOXES = ["wintermute" => "Zen4/AVX-512", "galen" => "Zen3/AVX2", "neuromancer" => "Zen5/AVX-512"]
+const BOXES = ["Zen4" => "Zen4/AVX-512", "Zen3" => "Zen3/AVX2", "Zen5" => "Zen5/AVX-512"]
 function parse_cache(path)
     d = Dict{Tuple{String, String, Int}, Float64}()   # (op, level, size) -> median ratio
     isfile(path) || return d

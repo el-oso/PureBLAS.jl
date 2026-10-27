@@ -45,7 +45,7 @@ echo
 echo "══ 1b  pb arm vs its reference arms: same clock?"
 # `cache_staleness.sh` answers "is this cell measured against today's CODE"; this answers "is it
 # measured in the same MACHINE STATE as the references it is divided by". Both are needed: on
-# 2026-08-18 neuromancer's refresh was 100% current AND 100% invalid, because the box boosted to
+# 2026-08-18 Zen5's refresh was 100% current AND 100% invalid, because the box boosted to
 # 4.7 GHz for the whole sweep against references cached at 2.0 GHz, inflating every Zen5 ratio ~2.3x.
 # `freqgate.jl` structurally cannot see that (its reference is the header, which floated too).
 if ! bench/check_arm_clocks.sh; then
@@ -64,7 +64,7 @@ echo "══ 1a2  is each local cache the newest its box has produced?"
 # The other three checks all reason INSIDE a file (cells vs source, arms vs arms). None of them can see
 # that the file itself is an old copy: fleet_sync.sh pushes SOURCE to the boxes, nothing pulls CACHES
 # back, so a box can re-measure and improve while the copy published from here stays behind.
-# Measured 2026-08-29: the local copy of neuromancer's cache was a day stale, and a whole analysis
+# Measured 2026-08-29: the local copy of Zen5's cache was a day stale, and a whole analysis
 # reported 143 red / 126 anchor-mismatched / 26 artifacts for a box that actually had 115 / 0 / 0.
 if ! bench/check_cache_freshness.sh; then
     if [ -n "$FORCE" ]; then
@@ -102,14 +102,14 @@ echo "══ 1c  pb arm vs its reference arms: same MACHINE STATE?"
 # around every measurement) is the only field that records it.
 #
 # Not hypothetical, and not covered by any other check here. Both incidents shipped through 1a and 1b:
-#   galen  — 616 of 863 cells (71%) anchor-mismatched after an `arms=pb` refresh; its red count read 58,
+#   Zen3  — 616 of 863 cells (71%) anchor-mismatched after an `arms=pb` refresh; its red count read 58,
 #            and the box was not 26 cells worse, the ARMS were.
 #   zen5   — 121 cells measured at anchor 26.07 against references at 18.26 (43%).
 # Neither cache_staleness.sh (commit staleness) nor check_artifacts_current.sh (rebuild compare) nor
 # freqgate.jl (clock) contains the word "anchor".
 # ADVISORY ONLY — this does NOT refuse. It was written as a blocking gate on the assumption that anchor
 # drift invalidates a ratio; that assumption was tested on 2026-08-29 and FAILED. After an `arms=pb`
-# refresh this check flagged 96/863 cells on zen5 and 737/893 on galen, yet all 1726 reference arms were
+# refresh this check flagged 96/863 cells on zen5 and 737/893 on Zen3, yet all 1726 reference arms were
 # byte-identical (arms=pb never touches them) and the pb TIMES for unchanged code were flat — median
 # post/pre 0.9997 — against the ~1.24x the drift implied. The anchor moved; the measurements did not.
 # Likely because the kernels run taskset-pinned while the anchor workload does not, so the anchor picks

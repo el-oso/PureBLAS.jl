@@ -9,7 +9,7 @@
 #     re-spells the comparison inline, which the rule exists to forbid.
 # `bench/gate_gaps.jl <cache…>` supersedes it on both counts. Refuse rather than mislead.
 using Statistics, Printf
-host = length(ARGS) >= 1 ? ARGS[1] : "galen"
+host = length(ARGS) >= 1 ? ARGS[1] : "Zen3"
 f = "bench/plots_data_$(host).txt"
 isfile(f) || error("gate_summary.jl reads the RETIRED v1 cache `$f`, which no longer exists, and its " *
                    "0.96 threshold is not the gate criterion. Use: julia --project=bench " *

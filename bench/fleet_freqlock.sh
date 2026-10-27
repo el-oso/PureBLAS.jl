@@ -8,7 +8,7 @@
 #
 # It puts the box in the ONE reproducible state: amd_pstate=passive + BOOST OFF + all cores pinned
 # (min=max) to the HIGHEST CLOCK THE BOX SUSTAINS UNDER LOAD + the achieved frequency VERIFIED. That is
-# base clock on a desktop (galen 5900X holds it), or the thermal/power ceiling on a power-limited laptop
+# base clock on a desktop (Zen3 5900X holds it), or the thermal/power ceiling on a power-limited laptop
 # (the 7640U / AI-5-340 can't hold base — a 3501 pin measured only 2367 achieved — so `lock` auto-steps
 # down to 90% of the sustained measurement, the highest FLAT clock). Run it once per box before a sweep;
 # run `verify` (no sudo) any time to confirm the box is still locked. `restore` undoes it.
@@ -29,7 +29,7 @@
 # Why base clock (boost off): the plotted number is a RATIO to OpenBLAS, so absolute speed is irrelevant;
 # what matters is that the clock does not DRIFT between the OB window and the PB window. The base clock is
 # the only thermally-sustainable one, so it stays flat across a multi-minute sweep. Boost floats with
-# thermals → wide, unreproducible ratios. (Neuromancer/Zen5 base ~2.0 GHz, boost to 4.9; the 4000 "pin"
+# thermals → wide, unreproducible ratios. (Zen5/Zen5 base ~2.0 GHz, boost to 4.9; the 4000 "pin"
 # tried earlier was in the boost range → it floated to ~4844 and was never actually locked.)
 #
 # The trap this fixes: with the amd-pstate-epp driver in `active` mode, the kernel manages frequency via EPP
@@ -56,8 +56,8 @@
 #   sudo bench/fleet_freqlock.sh restore   # back to active/epp, boost on, full range (daily-use state)
 #        bench/fleet_freqlock.sh verify     # (no sudo) achieved freq of the bench core, ONE core, integer load
 #        bench/fleet_freqlock.sh verify-mt  # (no sudo) does the pin HOLD under a threaded gemm on every core?
-# Env: CORE=<n> selects the core to verify (default 8, neuromancer's `taskset -c 8` bench core).
-#      (wintermute bench core = 2, galen = 6, neuromancer = 8 — pass CORE=<n> to match the box.)
+# Env: CORE=<n> selects the core to verify (default 8, Zen5's `taskset -c 8` bench core).
+#      (Zen4 bench core = 2, Zen3 = 6, Zen5 = 8 — pass CORE=<n> to match the box.)
 
 set -euo pipefail
 STATUS=/sys/devices/system/cpu/amd_pstate/status
@@ -103,12 +103,12 @@ achieved_mhz() {
     if command -v perf >/dev/null 2>&1; then
         # DIVIDE BY THE WINDOW perf ACTUALLY MEASURED, not by an assumed 1 s. `timeout 1` does not
         # guarantee a 1-second counting window — perf reports the enabled time in field 4 (ns), and on
-        # 2026-09-13 neuromancer returned 675463463 cycles over 341375879 ns. That is 1.98 GHz, exactly
+        # 2026-09-13 Zen5 returned 675463463 cycles over 341375879 ns. That is 1.98 GHz, exactly
         # its 2000 MHz pin; dividing by 1e6 reported it as "675 MHz" and the box looked catastrophically
         # throttled. The error is proportional (0.341 s window => 0.341x the true figure), so it always
         # UNDER-reports, i.e. it condemns a healthy box rather than passing a broken one — but it cost a
         # killed sweep and a long detour through platform_profile, RAPL and thermals before the CSV was
-        # read carefully. galen and wintermute were unaffected only because their windows landed near 1 s.
+        # read carefully. Zen3 and Zen4 were unaffected only because their windows landed near 1 s.
         local out ns
         out=$(perf stat -x, -e cycles -- taskset -c "$core" timeout 1 bash -c 'while :; do :; done' 2>&1 \
             | awk -F, 'tolower($0) ~ /cycles/ {print; exit}')
@@ -128,8 +128,8 @@ achieved_mhz() {
 
 # power-profiles-daemon (and tuned) actively manage scaling_max_freq. In `performance` mode PPD drives it
 # back up to the boost range, and on an INTERACTIVE box (open desktop sessions) it re-asserts on every
-# AC/session/activity event — silently REVERTING the pin mid-sweep (the recurring neuromancer flip-flop;
-# headless galen/wintermute never trigger the re-apply so their pin held). Stop them for the locked run;
+# AC/session/activity event — silently REVERTING the pin mid-sweep (the recurring Zen5 flip-flop;
+# headless Zen3/Zen4 never trigger the re-apply so their pin held). Stop them for the locked run;
 # `restore` brings them back. ponytail: `stop` not `mask` — if socket-activation resurrects PPD mid-sweep,
 # escalate to `mask` here (verify_or_die will catch a reverted pin regardless).
 quiesce_ppd() {
@@ -179,7 +179,7 @@ persist_grub() {
 # Hard-pin every core to $1 kHz (min=max) under the performance governor.
 #
 # UNPIN FIRST, and that is not tidiness — it is the fix for a box that reads locked and is not.
-# MEASURED on neuromancer (Zen5 mobile, 2026-09-18), mid-sweep: every readable knob said locked —
+# MEASURED on Zen5 (Zen5 mobile, 2026-09-18), mid-sweep: every readable knob said locked —
 # `amd_pstate=passive`, `boost=0`, `min=max=2000000`, and `cpuinfo_max=2000000` — while the core
 # achieved 4772 MHz under load. Re-asserting `boost 0` in place: still 4795 MHz. Toggling
 # `pstate active`→`passive` in place: no effect either. Only releasing the clamp and re-applying it
@@ -225,7 +225,7 @@ case "${1:-verify}" in
         pin_khz $(( base * 1000 ))
         got=$(achieved_mhz "$CORE")                           # does the box actually HOLD base under load?
         if [ "$got" -ge $(( base * 90 / 100 )) ]; then
-            verify_or_die "$base"                             # yes (desktop, e.g. galen) — locked at base
+            verify_or_die "$base"                             # yes (desktop, e.g. Zen3) — locked at base
         else
             # Power/thermally limited (mobile, e.g. the 7640U/AI-5-340 laptops): base does NOT hold under
             # sustained load (measured 3501-pin → 2367 achieved). Re-pin to 90% of the sustained measurement
@@ -267,7 +267,7 @@ case "${1:-verify}" in
     fi
     # `unpin` restores each core to its OWN cpuinfo_min/max, which is what the loop here used to do by
     # hand. Note the ORDER matters: boost is re-enabled first, because `cpuinfo_max` is dynamic (2.0 GHz
-    # with boost off, 4.9 GHz with it on — measured on neuromancer), so unpinning while boost is still
+    # with boost off, 4.9 GHz with it on — measured on Zen5), so unpinning while boost is still
     # off would restore the range to base rather than to the full range.
     priv_unpin
     priv_governor powersave
@@ -297,7 +297,7 @@ case "${1:-verify}" in
     fi ;;
   verify-mt)
     # THE ALL-CORE VERIFY. `verify` above loads ONE core with an INTEGER loop, and neither part is
-    # enough to prove a pin a THREADED sweep can hold. Measured on wintermute at a 2813 MHz pin and a
+    # enough to prove a pin a THREADED sweep can hold. Measured on Zen4 at a 2813 MHz pin and a
     # 60 W supply: one core held 2795 MHz indefinitely and six cores oscillated 2332-2804 MHz, at
     # 52-58 C, so the ✅ from `verify` certified a clock the box could not sustain and every threaded
     # sweep ran under it. Integer loops are not enough either — six of those also held the pin. It
@@ -327,12 +327,12 @@ JL
     # PIN ONE THREAD PER PHYSICAL CORE, AND SAMPLE ONLY THOSE CORES. Without this the check is a
     # lottery and reports a power limit that is not there: `nt` unpinned threads float across the SMT
     # siblings, two can land on one physical core, and the core they left then reads its IDLE clock.
-    # Measured on neuromancer — 6 threads over 12 CPUs gave min=1246 MHz against a 2000 MHz pin, which
-    # reads exactly like the wintermute power limit this subcommand exists to catch. An idle core is
+    # Measured on Zen5 — 6 threads over 12 CPUs gave min=1246 MHz against a 2000 MHz pin, which
+    # reads exactly like the Zen4 power limit this subcommand exists to catch. An idle core is
     # not a throttled core. Frequency is per PHYSICAL core on these parts, so one CPU per core is both
     # necessary and sufficient to sample.
     # MTCORES RESTRICTS THIS TO ONE SWEEP'S OWN MASK. Loading and sampling every core on the box makes
-    # the verdict depend on cores the caller never uses: galen's documented recipe runs the sweep on
+    # the verdict depend on cores the caller never uses: Zen3's documented recipe runs the sweep on
     # CCD1 while a co-tenant holds CCD0, so a whole-box check reports that co-tenant's clock as a
     # failure. Accepts the same comma/range spelling as BENCH_CORE; unset means the whole box, which is
     # right for a bare `verify-mt` asking "can this machine hold its pin".
@@ -364,7 +364,7 @@ JL
     #
     # The damage is to whatever runs next. `bench/ledger/replicate.sh` screens the box for contention
     # BEFORE calling this, so the orphan appears after the screen has passed and lands squarely on the
-    # measurements: gemvN n=192 on wintermute read median 0.1009 and 0.0554 across two 20-process
+    # measurements: gemvN n=192 on Zen4 read median 0.1009 and 0.0554 across two 20-process
     # batches, against 12/12 clean between 1.80 and 2.38 with no `verify-mt` in the loop.
     # `plots.jl`'s own guard refuses and retries, so a sweep pays retries rather than recording this.
     #
@@ -395,7 +395,7 @@ JL
     # SIGTERM, THEN SIGKILL — a bare `kill` followed by `wait` can block without limit. Julia services
     # a termination signal from its scheduler, and a process whose threads are inside a non-yielding
     # kernel need not reach it; `wait` then holds this check open for as long as the load chooses to
-    # live. Observed once on galen: `verify-mt` sat for 53 minutes with its load as a live child, so
+    # live. Observed once on Zen3: `verify-mt` sat for 53 minutes with its load as a live child, so
     # the caller's whole measurement run stalled behind a check that normally takes 22 seconds.
     # SIGKILL cannot be ignored, so this returns in at most five seconds more than the window.
     kill "$_jp" 2>/dev/null || true

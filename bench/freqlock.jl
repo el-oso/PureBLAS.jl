@@ -5,7 +5,7 @@
 # INVALID and must be discarded, not rationalised. That rule was spelled out in TWO places with two
 # different strictnesses, which is how it ended up half-enforced:
 #
-#   * bench/tune_harness.jl `freq_locked()` — added 2026-08-21 after neuromancer calibrated at an
+#   * bench/tune_harness.jl `freq_locked()` — added 2026-08-21 after Zen5 calibrated at an
 #     achieved 4843 MHz against a 2000 MHz base. Guards the CALIBRATOR only, and reads cpu0 ALONE.
 #   * bench/plots.jl — guarded NOTHING. The gate benchmark, the thing that produces every published
 #     number, would happily measure a boosting box. On 2026-08-23 it did: a Zen5 LP sweep ran at
@@ -88,7 +88,7 @@ driver has drifted — a suspend/resume cycle on a laptop is enough — `scaling
 scaling_max_freq == base` and `boost == 0` can all read perfectly while the core actually runs in
 the boost range.
 
-neuromancer did exactly that on 2026-08-23: pin 2000000, boost 0, and every cell of a ztrsmR run
+Zen5 did exactly that on 2026-08-23: pin 2000000, boost 0, and every cell of a ztrsmR run
 stamped ~4.8 GHz while its cached reference arms were taken at 1.98 GHz. The 2.43x clock ratio
 turned a 0.785 cell into 2.209 and an honest 1.23 into 2.88 — i.e. it would have published a
 uniform ~2.4x "win" across every size of the op. Nothing about the shape of that result looks like

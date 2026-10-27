@@ -21,7 +21,7 @@ err="bench/probes/adj_${op}_${n}_err.log"; : > "$err"
 # cache regardless of whether the run had written it. When plots.jl REFUSES — which it does, loudly and
 # by design, if the frequency lock is not in the one valid state — every replication re-read the SAME
 # STALE CELL, and the sign test below duly reported `below=0/K, sign p=0.0078, PASS`. Eight measurements
-# that never happened, presented as a confident verdict. Measured 2026-09-04, off-lock on wintermute.
+# that never happened, presented as a confident verdict. Measured 2026-09-04, off-lock on Zen4.
 # The refusal was the tool working correctly; discarding its output is what turned it into a fabrication.
 for i in $(seq 1 "$K"); do
     if ! taskset -c "$CORE" julia --startup-file=no --project=bench bench/plots.jl bench "op=$op" "size=$n" nodraw >> "$err" 2>&1; then

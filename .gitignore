@@ -61,3 +61,8 @@ bench/ledger/snapshots/
 # publishing it would put the fleet's machine names in a public repository; `ledger.sh` recreates it
 # by appending, so a fresh clone needs no seed. Keep the TOOL in git and the DATA out.
 bench/ledger/cells.tsv
+
+# Per-machine harness facts: CPU mask, verify core, and the operator's ssh aliases. One per box, never
+# committed — the aliases are that person's machine names and the mask is their topology. The template
+# is bench/fleet.local.example.sh, which IS tracked.
+bench/fleet.local.sh

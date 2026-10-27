@@ -16,7 +16,7 @@
 # PROVENANCE IS PER ARM, NEVER FROM THE HEADER. `commit` and `anchor` come from the `pb_mt` arm's own
 # record, because a targeted `op=`/`group=` merge rewrites the header while the file's other cells keep
 # the commit they were measured at — `plots.jl` writes a per-arm commit for exactly this reason. A
-# galen cache measured across two runs holds 1008 arms at one commit and 110 at another under a single
+# Zen3 cache measured across two runs holds 1008 arms at one commit and 110 at another under a single
 # header; stamping the header against all of them is a false record of 1008 cells.
 #
 # `arm_time` keeps the full `%Y-%m-%dT%H:%M` the writer stores, and the dedup key uses it. Truncating
@@ -28,7 +28,7 @@
 # EVERY RATIO IS FORMED ELEMENT-WISE OVER THE PAIRED QUANTILE VECTORS, then reduced by median. That is
 # the reduction `plots.jl` uses for both `selfsp` and `gate` (`_series`, via `_ratio`), and `_qvec`'s
 # comment insists the pairing "is preserved, nothing is approximated". Dividing two separately reduced
-# scalars is NOT the same number: measured on galen's 951 cells, 22 differ by more than 3%, the worst
+# scalars is NOT the same number: measured on Zen3's 951 cells, 22 differ by more than 3%, the worst
 # being `L1/swap@300000` at 1.5973 element-wise against 1.2141 scalar — 31.6% — and **135 cells land on
 # opposite sides of 1.0**, which is the "does this thread at all" question. A ratio formed any other way
 # will not match the published plot for the same cell.
