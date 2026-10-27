@@ -213,6 +213,20 @@ for d in (zen3, zen4, zen5, zen5m, tigerlake)
     @test P._at_strassen_min(d) == 256
     @test P._at_trmm_rpack(d) == 1792
 end
+# The level-1 claim is per CALLER (gemm.jl `_STR_FLOOR` / `_STR_LVL1`): a caller with a classical
+# threaded route holds level 1 to the leaf-width floor `2 * _STRASSEN_BASE`; one whose only
+# alternative is serial keeps the `strassen_min` criterion at level 1. The same shape asked both
+# ways is the positive control for the flag: a dead flag answers alike and the first line fails.
+let base = P._fh_strassen_base(), smin = P._fh_strassen_min()
+    s = 2 * base - 1                                   # below the floor, above strassen_min
+    @test P._strassen_depth(s, s, s, P._STR_FLOOR) == 0
+    @test P._strassen_depth(s, s, s, P._STR_LVL1) == (s >= smin ? 1 : 0)
+    @test P._strassen_depth(2 * base, 2 * base, 2 * base, P._STR_FLOOR) == 1
+    @test P._strassen_depth(2 * base, 2 * base, 2 * base, P._STR_LVL1) == 1
+    @test P._strassen_depth(4 * base, 4 * base, 4 * base, P._STR_FLOOR) ==
+        P._strassen_depth(4 * base, 4 * base, 4 * base, P._STR_LVL1)   # the floor binds from level 2 on
+    @test P._strassen_depth(4 * base, 4 * base, 4 * base, P._STR_OFF) == 0
+end
 # Live machine agrees with the formula applied to its own detected _HW.
 @test P._STRASSEN_MIN == P._at_strassen_min(P._HW)
 @test P._TRMM_RPACK == P._at_trmm_rpack(P._HW)
