@@ -144,7 +144,16 @@ echo "   artifacts match a fresh rebuild"
 
 echo
 echo "══ 4  commit these (nothing was committed or pushed):"
-git status --short -- docs/src/assets bench/gen_table.md bench/gen_table_aocl.md bench/provenance.md docs/src/coverage.md
+# `gen_table*.md` is a GLOB, quoted so git expands it rather than the shell: the second table is named
+# after whichever vendor this host has — `gen_table_aocl.md` on a Zen box, `gen_table_accelerate.md` on
+# an Apple one. Naming the Zen file literally omits the Apple table from both the status and the
+# suggested `git add`, so a publish there leaves the rendered table behind.
+#
+# The `_lite` twins are excluded, not swept in. A lite run writes `gen_table*_lite.md` and
+# `provenance_lite.md`, and lite is a smoke mode whose numbers are NOT gate numbers; a stale lite
+# table left modified from an earlier run would otherwise ride into a gate publish.
+git status --short -- docs/src/assets 'bench/gen_table*.md' ':(exclude)bench/gen_table*_lite.md' \
+    bench/provenance.md docs/src/coverage.md
 echo
 # Only the artifact paths — never bench/plots_data_*.txt (gitignored, ~11 MB each, and evidence, not output).
-echo "   git add docs/src/assets/perf_*.svg bench/gen_table.md bench/gen_table_aocl.md bench/provenance.md docs/src/coverage.md"
+echo "   git add docs/src/assets/perf_*.svg 'bench/gen_table*.md' ':(exclude)bench/gen_table*_lite.md' bench/provenance.md docs/src/coverage.md"
