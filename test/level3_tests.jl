@@ -328,13 +328,26 @@ end
         # one `_gpack_shared_pool` slot per worker, from the driver, inside the claim — so a grown slot
         # count means a job was published. Without this, "every thread count agrees" would be satisfied
         # by a build where nothing threaded at all, which is how this class of item goes quiet.
+        #
+        # THE POOL IS ONLY THE THREADED PATH WHERE THE PACK DRIVER OWNS THE CALL. A host whose matrix
+        # coprocessor takes this shape never reaches `_trmmr_prefit!`, so the slot count stays at zero
+        # and an unguarded assertion there asserts the ABSENCE of that coprocessor instead of liveness
+        # — measured on an M6 at this shape: slots 0 with the coprocessor entry live, 12 with it
+        # cleared. The guard therefore asks `_trmmr_sme_owns`, which is the predicate the arming site
+        # itself consults, rather than a proxy for it: a guard that is not the code's own question can
+        # disagree with the code. The bit-identity assertions below are NOT guarded — they must hold on
+        # every route, which is the invariant req#11 actually asks for.
         P.set_num_threads(1)
         Aw = triu(randn(k, k)) + k * I
         Bw = randn(m, k); P.trmm!(Bw, Aw; side = 'R', uplo = 'U')
         serial_slots = length(P._gpack_shared_pool(Float64))
         P.set_num_threads(maximum(2:nthreads()))
         Bw2 = randn(m, k); P.trmm!(Bw2, Aw; side = 'R', uplo = 'U')
-        @test length(P._gpack_shared_pool(Float64)) > serial_slots
+        if P._trmmr_sme_owns(Float64, k, m, Aw, Bw2)
+            @test_skip "coprocessor owns this shape — the pack driver is not the threaded path here"
+        else
+            @test length(P._gpack_shared_pool(Float64)) > serial_slots
+        end
         # alpha is not a power of two: scaling by ±2^j is exact and would hide a misplaced alpha.
         for up in ('L', 'U'), tr in ('N', 'T'), dg in ('N', 'U')
             G = randn(k, k)
