@@ -128,7 +128,7 @@ awk -F'\t' -v K="$K" '
     # A verdict only where the sign is nearly unanimous AND the median is clear of 1.0. Anything else
     # is reported as not adjudicable rather than rounded into a pass or a fail.
     # THE SIGN AND THE MAGNITUDE ARE SEPARATE CLAIMS, and a wide across-process spread kills the
-    # second without touching the first. Measured here: galen axpy@300000 reads median 2.43 with 9 of
+    # second without touching the first. Measured here: Zen3 axpy@300000 reads median 2.43 with 9 of
     # 10 processes above 1.0 — the sign is beyond doubt — while min 0.85 and max 3.81 put the spread at
     # 4.49, so "threading helps" is established and "threading gives 2.43x" is not. Reporting only the
     # median invites the second reading, so a spread past 1.5 says so in the verdict line.

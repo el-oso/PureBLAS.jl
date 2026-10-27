@@ -43,7 +43,7 @@
 # that sleeps `delay` and then signals the workload; the achieved rate saturates at a few hundred Hz
 # (CFS wakeup granularity), so any `delay` far below ~1e-2 silently delivers a small fraction of the
 # requested samples, the implied time collapses, and the consistency gate fires.
-# MEASURED (wintermute, decomp_delaycal.jl, getrf n=1024, 2026-08-04) — consistency vs requested delay:
+# MEASURED (Zen4, decomp_delaycal.jl, getrf n=1024, 2026-08-04) — consistency vs requested delay:
 #     taskset -c 4,5  delay 1e-4 → 0.043   1e-3 → 0.369   3e-3 → 0.535   1e-2 → 0.909
 #     taskset -c 4,6  delay 1e-4 → 0.039   1e-3 → 0.321   3e-3 → 0.476   1e-2 → 0.881
 # The achieved rate is ~350–480 samples/s in EVERY cell: consistency is just (achieved ÷ requested), so

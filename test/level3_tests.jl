@@ -279,6 +279,69 @@ end
     end
 end
 
+@testitem "trmm side-R: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    if nthreads() < 2
+        @test_skip "needs ≥2 julia threads"
+    else
+        bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
+        # THIS IS A REGRESSION NET, NOT A WITNESS OF THE MECHANISM, and the difference is stated because
+        # the stronger claim is the one a reader will assume. The side-R entry carries no size floor:
+        # every path a band takes receives B's undivided row count, so a band and the unsplit call key
+        # `_use_unpacked` on the same extent. The ROUTES provably diverge without that — at m = 2048,
+        # k = 256 the flat loop's off-diagonal gemm has `m` = B's rows, and
+        #
+        #     _use_unpacked(2048, …) = false    the unsplit call takes the BLOCKED path
+        #     _use_unpacked( 336, …) = true     a band takes the UNPACKED path
+        #
+        # because 2048 is above `_GEMM_UNPACK_MAX` and a 336-row band is below it.
+        #
+        # THE BITS DO NOT FOLLOW, THOUGH, AND THAT WAS MEASURED RATHER THAN ASSUMED. With the token
+        # hand-off deliberately broken, 144 armed shapes — m in 512..4096, k in 64..1536, both
+        # triangles, both transposes, every worker count 2..6 — agree bit for bit with the serial call.
+        # So on this microarchitecture the two routes compute the same bits here: `_gemm_accR!` passes
+        # alpha = beta = 1, which makes alpha placement and beta handling no-ops, and the inner k stays
+        # at or under `_KC` so neither route chunks the reduction. No positive control for the token
+        # exists on this box. It is kept because making the routes agree is the invariant req#11 asks
+        # for, not because a divergence was reproduced — and a reader must not be told otherwise.
+        #
+        # What this item DOES certify is that a worker ran and the answer did not move.
+        m, k = 2048, 256
+        nws = map(2:nthreads()) do nt
+            P.set_num_threads(nt)
+            P._trsm_workers_r(k, m, Float64)
+        end
+        @test maximum(nws) > 1
+        # LIVENESS, and it reads the driver rather than the admission predicate. `_trmmr_prefit!` grows
+        # one `_gpack_shared_pool` slot per worker, from the driver, inside the claim — so a grown slot
+        # count means a job was published. Without this, "every thread count agrees" would be satisfied
+        # by a build where nothing threaded at all, which is how this class of item goes quiet.
+        P.set_num_threads(1)
+        Aw = triu(randn(k, k)) + k * I
+        Bw = randn(m, k); P.trmm!(Bw, Aw; side = 'R', uplo = 'U')
+        serial_slots = length(P._gpack_shared_pool(Float64))
+        P.set_num_threads(maximum(2:nthreads()))
+        Bw2 = randn(m, k); P.trmm!(Bw2, Aw; side = 'R', uplo = 'U')
+        @test length(P._gpack_shared_pool(Float64)) > serial_slots
+        # alpha is not a power of two: scaling by ±2^j is exact and would hide a misplaced alpha.
+        for up in ('L', 'U'), tr in ('N', 'T'), dg in ('N', 'U')
+            G = randn(k, k)
+            A = (up == 'U' ? triu(G) : tril(G)) + k * I
+            B0 = randn(m, k)
+            P.set_num_threads(1)
+            r = copy(B0); P.trmm!(r, A; side = 'R', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+            for nt in 2:nthreads()
+                P.set_num_threads(nt)
+                g = copy(B0); P.trmm!(g, A; side = 'R', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+                @test bitsame(g, r)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
+
 # A side-R worker is handed a ROW BAND of B and routes from `nroute`, the whole problem's row count,
 # so it takes the algorithm the unsplit solve takes. Bands round to `_MR·W`, which is FINER than the
 # `_SME_MR` modulus the SME recursion asks for, so a band's own height can fail that modulus where

@@ -2119,8 +2119,8 @@ sparse Cholesky.
   the driver's core between windows, and a package limit that binds only while six cores are loaded
   would not appear in it. That is the gap; here is its size, pin against achieved-under-load:
 
-        wintermute  pin 3501  loaded min 3468   0.94% under
-        galen       pin 3701  loaded min 3659   1.13% under
+        Zen4  pin 3501  loaded min 3468   0.94% under
+        Zen3       pin 3701  loaded min 3659   1.13% under
 
   Under 1.2% on both locked boxes, against a gate adjudicated at two significant digits — so sampling
   around the window rather than during it cannot move a verdict, and `verify-mt` (run before every
@@ -2135,7 +2135,7 @@ sparse Cholesky.
   worker writes a temp pkgimage that only its parent installs — so every call discarded ~300 MB and
   left the file behind. Fixed in `5f4bcb6e`/`b09d1637`; the accumulated files are still on disk:
 
-        wintermute  77 files  14 G       galen  64 files  12 G       neuromancer  40 files  7.7 G
+        Zen4  77 files  14 G       Zen3  64 files  12 G       Zen5  40 files  7.7 G
 
   against 9-10 installed `.ji` each. They are `~/.julia/compiled/v1.13/PureBLAS/jl_*` and are inert
   garbage, but a delete must skip any file a live precompile is writing — filter on mtime, and not

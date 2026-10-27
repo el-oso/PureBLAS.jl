@@ -2846,10 +2846,10 @@ the pool claim runs serially and must return the winner's bits (req#11; the dive
 `6940a2d3`). So the fold is paid at ONE thread, on every call, and it lands on the SERIAL gate.
 
 Past roughly 2x L3 the sweep is deep-DRAM bound and symv's serial gate sits at parity — 0.995 on
-wintermute and 1.000 on galen at n=4096 — so `0.995 / 1.0023` rounds to 0.99 and even the cheapest
+Zen4 and 1.000 on Zen3 at n=4096 — so `0.995 / 1.0023` rounds to 0.99 and even the cheapest
 grid turns two green cells red. Returning 1 there means block 1 writes `y` directly and no notepad is
 ever touched: bit-for-bit AND cycle-for-cycle the unblocked kernel. Within the cut there is about 1%
-of margin (1.01 wintermute, 1.012 neuromancer, galen already red at 0.987) and the tax measures as
+of margin (1.01 Zen4, 1.012 Zen5, Zen3 already red at 0.987) and the tax measures as
 noise.
 
 The `2x` is slack over a residency boundary, the same shape as `_GEMVN_MINNER_MAXA`'s `4 * _L3_BYTES`

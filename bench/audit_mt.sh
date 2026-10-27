@@ -11,7 +11,7 @@
 # read as a serial regression. So the scripts take explicit files, and this is the file list.
 #
 # THROTTLE DETECTION DOES EXIST HERE, and step 3 is the whole reason this chain matters. Measured on
-# `mt_data_avx512_wintermute`, L1/axpy@1000000:
+# `mt_data_avx512_<host>`, L1/axpy@1000000:
 #
 #     aocl_mt / openblas_mt   2013 MHz   (in-window 1917 … 2675)
 #     pb / pb_mt              2795 MHz   (in-window 2794 … 2795)
@@ -19,7 +19,7 @@
 # The clock sample is shared by the arms timed in one window, so the THREADED reference window ran 28%
 # below the lock while the PB window held it — PB does not thread `axpy`, so it ran one core. The ratio
 # at that cell compares two machine states, which the frequency rule calls INVALID rather than noisy.
-# Fleet-wide: 204/937 cells on wintermute (worst 45.9%), 7/937 on galen, 0 on neuromancer. The error
+# Fleet-wide: 204/937 cells on Zen4 (worst 45.9%), 7/937 on Zen3, 0 on Zen5. The error
 # FLATTERS PureBLAS — a throttled reference is a slower reference.
 #
 # THE MECHANISM IS CACHE-RESIDENT POWER, NOT MEMORY TRAFFIC. Reproduced with a plain 6-thread Julia

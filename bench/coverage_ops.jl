@@ -34,7 +34,7 @@ const TOOLCHAIN = Dict{String, Tuple{String, String}}()
 const HEADCOMMIT = Dict{String, String}()
 
 # The revision a ROW describes. `mixed` is not a cosmetic detail: a row whose boxes were swept at
-# different commits is exactly the provenance lie `fleet_sync.sh` exists to prevent (2026-07-31, galen
+# different commits is exactly the provenance lie `fleet_sync.sh` exists to prevent (2026-07-31, Zen3
 # published a sweep stamped with a commit 13 behind the tree it ran). A targeted sweep moves one row to
 # a new revision; if it only reached two of three boxes, the row must SAY so rather than show the SHA of
 # whichever box happened to be listed first.
@@ -47,7 +47,7 @@ function row_commit(section, op, uarchs)
     # COMPARE ON A COMMON PREFIX, not with `==`. git chooses its abbreviation length per REPOSITORY
     # (object count), so the same commit is recorded `7aae0d6` on one box and `7aae0d6b` on another —
     # and a raw string compare then reports `⚠ mixed` for a row every box measured identically.
-    # Observed 2026-09-09: wintermute wrote 8 chars while galen and neuromancer wrote 7, and every
+    # Observed 2026-09-09: Zen4 wrote 8 chars while Zen3 and Zen5 wrote 7, and every
     # BLAS-3 row read mixed. Abbreviations of one commit are prefixes of one another, so truncating to
     # the shortest present is the correct comparison; genuinely different commits still differ.
     n = minimum(length, cs)
@@ -149,7 +149,7 @@ for path in ARGS
             push!(FREQMETA, (basename(path), fref, bf))
             # TOOLCHAIN, per box. The header has carried `julia=` and `llvm=` all along and NO artifact
             # rendered them — which is exactly how the fleet ran split for an unknown length of time
-            # without anyone seeing it: wintermute on 1.12.7/LLVM 18.1.7 while galen and neuromancer were
+            # without anyone seeing it: Zen4 on 1.12.7/LLVM 18.1.7 while Zen3 and Zen5 were
             # on 1.13.0-rc3/LLVM 20.1.8. Measured 2026-09-08 on fixed silicon, the same gbtrf inner loop
             # is 2.4-3.3x faster under LLVM 20, so a split fleet makes every CROSS-BOX comparison a
             # comparison of compilers as much as of microarchitectures. The references are native
@@ -193,7 +193,7 @@ for path in ARGS
         # THE RATIO IS FORMED EXACTLY AS plots.jl DOES IT: elementwise over the sorted sample vectors
         # (`_ratio` = qref ./ qpb), then ONE median over all of them. This used to take the median of
         # per-round medians instead, which is a different statistic and DISAGREES AT MARGINAL CELLS —
-        # measured 2026-08-05: galen iamax n=1e6 read 1.0077 vs the gate's 1.0085, and Zen5 iamax
+        # measured 2026-08-05: Zen3 iamax n=1e6 read 1.0077 vs the gate's 1.0085, and Zen5 iamax
         # n=1e3 flipped verdict outright (round-pooled <1.0, gate 1.007). A published coverage table
         # that can say 🐢 where the gate says PASS is worse than no table.
         rs = Float64[]

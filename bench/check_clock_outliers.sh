@@ -7,14 +7,14 @@
 # full arms every arm of a cell is measured together, so each cell stays internally consistent and every
 # within-cell check passes — while half the file was measured at 2.0 GHz and half at 4.8.
 #
-# Measured 2026-09-06 on neuromancer, whose cpufreq pin drops when something on its power cluster is
+# Measured 2026-09-06 on Zen5, whose cpufreq pin drops when something on its power cluster is
 # disconnected (and whose sysfs settings still read LOCKED while the cores run at 4.8 GHz against a
 # 2.0 GHz pin). `fleet_refresh.sh` verifies the lock before and after, so the drop was caught — but only
 # at the END, which condemned the whole four-hour sweep because nothing said WHEN the clock let go.
 #
 # It did say, though. `bench/plots.jl` stamps every arm with the clock it actually ran at
 # (`arm|date|commit|anchor|khz|flo|fhi|samples`), and on a locked box those figures are tight: measured
-# spreads across a whole cache are 2790-2794 MHz on wintermute and 3671-3675 on galen. A cell measured
+# spreads across a whole cache are 2790-2794 MHz on Zen4 and 3671-3675 on Zen3. A cell measured
 # after a drop stands out by more than a factor of two. So a mid-sweep drop does NOT require discarding
 # the run — it requires FILTERING it, and this script is the filter.
 #
@@ -61,6 +61,76 @@ for f in "${files[@]}"; do
         echo "      Those cells are invalid; the rest of the file is fine. Re-measure just them:"
         printf '%s\n' "$out" | awk '{split($1,a,"/"); split(a[2],b,"@"); print b[1]}' | sort -u | tr '\n' ' ' \
             | sed 's/^/        ops: /; s/ $/\n/'
+        rc=1
+    fi
+
+    # ── THE IN-WINDOW FLOOR, WHICH THE PASS ABOVE CANNOT SEE ──────────────────────────────────────
+    # The check above reads field 5, the window's REPRESENTATIVE clock. Fields 6 and 7 carry the range
+    # the window actually spanned, and a window whose representative sits at the pin can still have
+    # dipped far below it: measured on the Zen4 AVX-512 threaded cache, a `pb_mt` arm with a floor of
+    # 1543 MHz against a 3468 MHz modal passed the pass above without comment.
+    #
+    # COMPARED ACROSS THE ARMS OF ONE CELL, NOT AGAINST THE MODAL CLOCK, and that choice is the whole
+    # check. An absolute floor fires on a transient every governor produces at window entry, and the
+    # median over a window's samples barely moves for it. What biases a RATIO is the arms of one cell
+    # dipping UNEQUALLY — then the two numbers describe two machine states, which the frequency rule
+    # calls invalid rather than noisy. Same logic as the cross-arm check on field 5; different field.
+    #
+    # Why it matters per microarchitecture rather than in general, measured on the 2026-10-26 threaded
+    # caches:
+    #
+    #     uarch              cells   arms disagree >3%     >20%
+    #     Zen4 AVX-512         951        19  ( 2%)           4
+    #     Zen3 AVX2            937       118  (13%)          72
+    #     Zen5 AVX-512         951       486  (51%)         419
+    #
+    # Over half of the Zen5 part's gate cells compare arms measured at materially different in-window
+    # clocks, while the pass above flagged 59 arms there — it is the mobile part of the three, and a
+    # chip that holds its pin on the representative sample is not thereby holding it across a
+    # six-thread window.
+    #
+    # Only the arms that enter a gate ratio are compared. `pb` is excluded deliberately: PureBLAS runs
+    # it on one core, so its window legitimately holds a clock a six-thread window cannot, and including
+    # it would flag every threaded cell of every op PureBLAS does not thread.
+    fout=$(awk -F'\t' -v tol="$TOL" '
+        {
+            delete F; nar = 0
+            for (i = 4; i <= NF; i++) {
+                n = split($i, p, "|")
+                if (n < 8) continue                      # pre-range record: floor unknown, not zero
+                if (p[1] != "pb_mt" && p[1] != "openblas_mt" && p[1] != "aocl_mt" && p[1] != "accelerate_mt") continue
+                flo = p[6] + 0; if (flo <= 0) continue
+                F[p[1]] = flo; nar++
+            }
+            if (nar < 2) next
+            lo = ""; hi = ""; loa = ""; hia = ""
+            for (a in F) {
+                if (lo == "" || F[a] < lo) { lo = F[a]; loa = a }
+                if (hi == "" || F[a] > hi) { hi = F[a]; hia = a }
+            }
+            seen++
+            d = (hi - lo) * 100.0 / hi
+            if (d > tol)
+                printf "   %s/%s@%s  %s floor %d MHz vs %s %d MHz  (%.0f%%)\n",
+                       $1, $2, $3, loa, int(lo/1000), hia, int(hi/1000), d
+        }
+        # A cache with no threaded arms examines nothing here, and saying "held one clock" for that is
+        # the vacuity this chain exists to prevent — a serial cache would report the strongest possible
+        # result from zero evidence. Report the count instead, so clean and unexamined never read alike.
+        END { if (seen + 0 == 0) print "   __NOCELLS__" }' "$f")
+    if printf '%s' "$fout" | grep -q __NOCELLS__; then
+        echo "   (no cell has two threaded arms with a window range — nothing to compare, NOT a pass)"
+        continue
+    fi
+    fn=$(printf '%s' "$fout" | grep -c . || true)
+    if [ "$fn" -eq 0 ]; then
+        echo "   => every gate cell's arms held one clock ACROSS the window (tolerance ${TOL}%)"
+    else
+        printf '%s\n' "$fout" | head -8
+        [ "$fn" -gt 8 ] && echo "   … and $((fn - 8)) more"
+        echo "   => $fn cell(s) compare arms that spanned DIFFERENT in-window clocks."
+        echo "      Those ratios compare two machine states. Re-measure them with the box quiet and"
+        echo "      the lock verified UNDER LOAD (bench/fleet_freqlock.sh verify-mt), not at idle."
         rc=1
     fi
 done

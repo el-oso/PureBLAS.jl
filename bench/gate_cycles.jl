@@ -30,10 +30,10 @@
 #     rounding error either.
 #
 # ── THE WOBBLE TEST IS PER-CELL, AND IT IS NOT A GLOBAL THRESHOLD ───────────────────────────────────
-# First attempt used a global bar of `3 × the box's null-measurement floor` (0.1% wintermute, 2.3% galen,
+# First attempt used a global bar of `3 × the box's null-measurement floor` (0.1% Zen4, 2.3% Zen3,
 # from `kb/findings/pureblas-gate-repeatability-null-measurement.md`). That was wrong, and the error is
 # worth recording: the null floor measures RATIO repeatability, while `wobble` measures CLOCK spread
-# inside one timing window. Comparing them is apples to oranges, and on wintermute it flagged 176 of 863
+# inside one timing window. Comparing them is apples to oranges, and on Zen4 it flagged 176 of 863
 # cells — a threshold that condemns a fifth of the cache is measuring its own units, not the data.
 #
 # The question that actually matters is not "did the clock move?" but "could the clock have moved this

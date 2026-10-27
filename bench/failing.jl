@@ -9,7 +9,7 @@
 # Those cells are flagged `~`; re-measure with `bench/plots.jl bench op=<op>` before spending time on
 # one. Cells under ~1% need K=10 replication (bench/cellrep.jl screens, bench/adjudicate.sh decides).
 #
-#   julia bench/failing.jl bench/plots_data_avx512_wintermute.txt [more caches...]
+#   julia bench/failing.jl bench/plots_data_avx512_<host>.txt [more caches...]
 using Statistics
 include(joinpath(@__DIR__, "gatecrit.jl"))   # arm_pair — which arms this cell's tier compares
 for path in ARGS

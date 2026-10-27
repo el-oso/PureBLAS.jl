@@ -24,7 +24,7 @@
 # The ratio is (faster reference) / pb, matching plots.jl's gate definition.
 #
 # THIS IS A SCREEN, NOT THE NUMBER OF RECORD. Validated against 10 plots.jl replications of the same
-# cell (axpy n=1e6, wintermute, freq-locked, 2026-08-04):
+# cell (axpy n=1e6, Zen4, freq-locked, 2026-08-04):
 #     plots.jl  median 0.9868  IQR [0.9816, 0.9925]  spread 3.23pp   9/10 below 1.0  sign p=0.0215
 #     cellrep   median 0.9676  IQR [0.9602, 0.9798]  spread 4.73pp  10/10 below 1.0  sign p=0.00195
 # Same VERDICT, and cellrep is more decisive (P99 in ~85 s for K=10, where plots.jl needs ~5.7 min and
@@ -439,7 +439,7 @@ end
 # process variation is what the K replications sample.
 # BLIS reads these at init (BEFORE the dlopen `using AOCL_jll` triggers), exactly as plots.jl:58 does.
 # Without them the AOCL arm silently auto-threads past its small-n threshold whenever the CALLING SHELL
-# doesn't export them (measured 2026-08-05, neuromancer bare ssh env: daxpy n=3e5 AOCL arm 0.69 ms vs
+# doesn't export them (measured 2026-08-05, Zen5 bare ssh env: daxpy n=3e5 AOCL arm 0.69 ms vs
 # 2.9 ms single-threaded — a 4x phantom "win" that would poison every large-n screen).
 ENV["BLIS_NUM_THREADS"] = "1"; ENV["OMP_NUM_THREADS"] = "1"
 using AOCL_jll

@@ -22,8 +22,8 @@ CORE="${SCREEN_CORE:-4}"
 OUT=bench/probes
 mkdir -p "$OUT"
 
-# Cells carrying a sub-1% cached reading on Zen4 (wintermute). Zen3's list is disjoint and gets screened
-# on galen with the same script.
+# Cells carrying a sub-1% cached reading on Zen4 (Zen4). Zen3's list is disjoint and gets screened
+# on Zen3 with the same script.
 CELLS=(
     # asum done in the first pass (30k PASS, 100k retire, 300k + 1e6 FAIL)
     "scal 10000" "scal 30000" "scal 100000"

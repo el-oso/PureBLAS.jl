@@ -4,7 +4,7 @@
 # `fleet_sync.sh` is fire-and-forget: it puts a box at a ref and nothing afterwards notices that local
 # work has moved on. The box then measures code that is behind, or — the case this was written for —
 # code that has since been REVERTED, which is worse than behind because the commit is no longer on any
-# branch and no `git log` on master will ever mention it. galen sat at a reverted commit for hours and
+# branch and no `git log` on master will ever mention it. Zen3 sat at a reverted commit for hours and
 # the only hint was `git worktree list` printing a feature sha next to the word `master`.
 #
 # So this answers three things per box, and the third is the one that catches a reverted sync:
@@ -16,7 +16,7 @@
 #   bench/fleet_status.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
-BOXES=(galen neuromancer)
+BOXES=(Zen3 Zen5)
 REMOTE_DIR='~/Documents/claude/PureBLAS.jl'
 
 git fetch -q origin 2>/dev/null || true

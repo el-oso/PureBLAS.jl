@@ -1,4 +1,4 @@
-#cpuvalidate	version=1	host=wintermute	cpu=AMD Ryzen 5 7640U w/ Radeon 760M Graphics	vendor=AMD	isa=512-bit	wF64=8	date=2026-08-04T08:54
+#cpuvalidate	version=1	uarch=amd-w8-l132k	cpu=AMD Ryzen 5 7640U w/ Radeon 760M Graphics	vendor=AMD	isa=512-bit	wF64=8	date=2026-08-04T08:54
 #detect	vendor=AMD	simd_B=64	L1_B=32768	L2_B=1048576	L3_B=16777216	line_B=64	intelAVX2=false
 #derived	gemm_MR=2	gemm_NR=8	gemm_NC=2040	gemm_KC=256	unpack_max=448	potrf_base=32	trsm_base=32	chol_split=false	syrk_cut=8	csyrk_unpk=192
 op     n=256   worst  PB_GFlops(maxn)

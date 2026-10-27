@@ -7,7 +7,7 @@
 #   2. `min` over ~14 cells × 2 refs × 3 boxes is a MAX-OF-NOISE estimator. The minimum of k near-tied
 #      unbiased estimates is biased DOWN by ≈ σ·√(2 ln k) — 1.5–2σ at k=14–28 — and it gets worse every
 #      time a size or a box is added. The published "gate" was therefore systematically pessimistic.
-# Measured 2026-08-04, both consequences are live: galen `iamax` reads 1.029 against a cached reference
+# Measured 2026-08-04, both consequences are live: Zen3 `iamax` reads 1.029 against a cached reference
 # and 0.999 against a same-round one WITH THE CODE HELD FIXED (on AVX2 the two unroll arms resolve to the
 # same value, so the kernel is byte-identical to master). 3% of pure methodology.
 #

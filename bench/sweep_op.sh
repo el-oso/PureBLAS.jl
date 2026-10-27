@@ -2,7 +2,7 @@
 # TARGETED SWEEP — re-measure ONE op across the whole fleet at ONE revision, then publish.
 #
 #   bench/sweep_op.sh geev              # the fleet
-#   bench/sweep_op.sh geev galen        # a subset, space-separated
+#   bench/sweep_op.sh geev Zen3        # a subset, space-separated
 #   bench/sweep_op.sh geev --no-publish # measure + pull, stop before publishing
 #
 # WHY THIS EXISTS. A full sweep is hours; iterating on one routine through it wastes most of that on
@@ -14,7 +14,7 @@
 # ALL ARMS, NOT `arms=pb`. The standing rule is to reuse cached reference arms, and it is right for a
 # broad refresh — but a targeted sweep exists to adjudicate a MARGINAL cell, and a cached reference
 # measured under a different machine state cannot do that. Measured 2026-09-07: an `arms=pb` run of
-# `geev` on neuromancer came back with the harness's own verdict "MACHINE-STATE DRIFT 9.6% … gaps
+# `geev` on Zen5 came back with the harness's own verdict "MACHINE-STATE DRIFT 9.6% … gaps
 # smaller than this are NOT adjudicable", which is useless for a cell sitting at 0.93. `op=` re-measures
 # every arm inside one window, which is exactly the exception the rule carves out.
 #
@@ -42,7 +42,7 @@ for a in "$@"; do
 done
 ARMSARG=""
 [ -n "$ARMS" ] && ARMSARG="arms=$ARMS"
-[ ${#BOXES[@]} -gt 0 ] || BOXES=(galen wintermute neuromancer)
+[ ${#BOXES[@]} -gt 0 ] || BOXES=(Zen3 Zen4 Zen5)
 
 SHA="$(git rev-parse HEAD)"
 SHORT="$(git rev-parse --short HEAD)"
@@ -75,8 +75,8 @@ fi
 echo "══ targeted sweep: op=$OP  at $SHORT  on ${BOXES[*]}"
 
 # ── 1. every box must be frequency-locked, VERIFIED UNDER LOAD ───────────────────────────────────────
-# Settings that merely read locked are not enough: neuromancer has been observed reading `boost=0` while
-# its cores ran far above the pin after a power-source change (kb/memory `neuromancer-lock-drops`), and
+# Settings that merely read locked are not enough: Zen5 has been observed reading `boost=0` while
+# its cores ran far above the pin after a power-source change (kb/memory `Zen5-lock-drops`), and
 # only the achieved-under-load figure sees it. `fleet_freqlock.sh verify` measures cycles with perf.
 echo "══ 1  frequency lock"
 FAILED=0

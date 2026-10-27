@@ -1096,7 +1096,10 @@ end
 # `wi` is the caller's worker index, or 0 when serial. It reaches only `_trmm_packedR!`, which is the
 # one route below here that a threaded side-R call may take — see the entry in `trmm!`, which arms the
 # row split exactly where this branch owns the call.
-function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, wi::Int = 0)
+# `mroute`: B's UNDIVIDED row count, or -1 when this call's own rows are the whole problem. Only the
+# side-R pool passes it — every path below that reaches `_gemm_core!` writes a column block of B, whose
+# ROW extent is the band's under a split, and `_gemm_core!` picks its kernel from that extent.
+function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, wi::Int = 0, mroute::Int = -1)
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE_R
         return k <= _fh_trmm_ddirect() ? _trmm_right_base!(up, tr, cj, unit, k, A, B) :
@@ -1117,19 +1120,19 @@ function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, wi::Int = 
             jc = t * P; pc = min(P, k - jc)
             Bpan = view(B, :, (jc + 1):(jc + pc))
             Adia = view(A, (jc + 1):(jc + pc), (jc + 1):(jc + pc))
-            _trmm_right_recur!(up, tr, cj, unit, Adia, Bpan)
+            _trmm_right_recur!(up, tr, cj, unit, Adia, Bpan, mroute)
             if upM && jc > 0                     # off-diag: Bpan += B[:,1:jc]·op(A)[1:jc, jc+1:jc+pc]
                 Ablk = tr ? view(A, (jc + 1):(jc + pc), 1:jc) : view(A, 1:jc, (jc + 1):(jc + pc))
                 _gemm_core!(
                     Bpan, view(B, :, 1:jc), Ablk, one(eltype(B)), one(eltype(B)),
-                    false, tr, false, false
+                    false, tr, false, false, (mroute, -1, -1)
                 )
             elseif !upM && jc + pc < k           # off-diag: Bpan += B[:,jc+pc+1:k]·op(A)[jc+pc+1:k, …]
                 Ablk = tr ? view(A, (jc + 1):(jc + pc), (jc + pc + 1):k) :
                     view(A, (jc + pc + 1):k, (jc + 1):(jc + pc))
                 _gemm_core!(
                     Bpan, view(B, :, (jc + pc + 1):k), Ablk, one(eltype(B)), one(eltype(B)),
-                    false, tr, false, false
+                    false, tr, false, false, (mroute, -1, -1)
                 )
             end
         end
@@ -1141,10 +1144,10 @@ function _trmm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, wi::Int = 
     elseif k <= _TRMM_BASE                                # AD/generic: scalar column-axpy base
         return _trmm_right_base!(up, tr, cj, unit, k, A, B)
     end
-    return _trmm_right_recur!(up, tr, cj, unit, A, B)
+    return _trmm_right_recur!(up, tr, cj, unit, A, B, mroute)
 end
 # Halving recursion (diagonal blocks of the flat loop + the complex/AD path).
-function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
+function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, mroute::Int = -1)
     k = size(A, 1)
     # ONE BASE PER ELEMENT TYPE. The real base is `_TRMM_BASE_R`, which is two SME tiles where the
     # coprocessor exists and `_L3_NB` where it does not; complex and the generic fallback keep
@@ -1169,22 +1172,31 @@ function _trmm_right_recur!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     B1 = view(B, :, 1:h); B2 = view(B, :, (h + 1):k)
     # Mirror of left, with B column-blocks and transB carrying op(A). up≠tr → the off-diagonal feeds B2
     # (process B2's diagonal first, gemm B2+=B1·off, then B1); up==tr → feeds B1.
+    # `mroute` RIDES EVERY LEVEL, because the off-diagonal product at each one writes a column block of
+    # B whose row extent is the band's, not the problem's. The recursion halves `k` only, so the row
+    # count is invariant down the tree and one value is correct at every depth.
     if up != tr
         off = tr ? view(A, (h + 1):k, 1:h) : view(A, 1:h, (h + 1):k)
-        _trmm_right_recur!(up, tr, cj, unit, A22, B2)
-        _gemm_accR!(B2, B1, off, tr, cj)
-        _trmm_right_recur!(up, tr, cj, unit, A11, B1)
+        _trmm_right_recur!(up, tr, cj, unit, A22, B2, mroute)
+        _gemm_accR!(B2, B1, off, tr, cj, mroute)
+        _trmm_right_recur!(up, tr, cj, unit, A11, B1, mroute)
     else
         off = tr ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)
-        _trmm_right_recur!(up, tr, cj, unit, A11, B1)
-        _gemm_accR!(B1, B2, off, tr, cj)
-        _trmm_right_recur!(up, tr, cj, unit, A22, B2)
+        _trmm_right_recur!(up, tr, cj, unit, A11, B1, mroute)
+        _gemm_accR!(B1, B2, off, tr, cj, mroute)
+        _trmm_right_recur!(up, tr, cj, unit, A22, B2, mroute)
     end
     return B
 end
 # C += B·op(A): straight to the dispatch core (transB carries op; shapes guaranteed by the recursion).
-@inline _gemm_accR!(C, Bmat, A, tr::Bool, cj::Bool) =
-    _gemm_core!(C, Bmat, A, one(eltype(C)), one(eltype(C)), false, tr, false, cj)
+#
+# `mroute` IS THE UNDIVIDED ROW COUNT OF B, in the token's m slot. `C` here is a column block of B, so
+# its ROW extent is whatever the caller holds — a whole problem serially, one band under the side-R
+# split. `_gemm_core!` keys its kernel choice on that extent, so without the token a band and the
+# unsplit call take different arithmetic and the result depends on the worker count (req#11). `-1`
+# means "my rows ARE the whole problem", which is what every serial caller passes.
+@inline _gemm_accR!(C, Bmat, A, tr::Bool, cj::Bool, mroute::Int = -1) =
+    _gemm_core!(C, Bmat, A, one(eltype(C)), one(eltype(C)), false, tr, false, cj, (mroute, -1, -1))
 
 # x := op(A)·x / op(A)⁻¹·x entry: B := α·op(A)·B (side L) or α·B·op(A) (side R), A triangular.
 function _trmm!(side_left::Bool, up::Bool, tr::Bool, cj::Bool, unit::Bool, α::Number, A, B)
@@ -1501,18 +1513,22 @@ function trmm!(
     # either returns or rewrites the operands, and a split above them would hand workers a B the serial
     # path would not have multiplied.
     #
-    # `k > _fh_trmm_rpack()` IS THE REPRODUCIBILITY CONDITION, not a performance cutoff. Above it
-    # `_trmm_packedR!` owns the call and drives `_microkernel!` directly, with a `kc` fixed by `k` and
-    # no size-keyed branch below; beneath it the flat panel loop issues `_gemm_core!` calls whose
-    # kernel switch reads `max(m, nroute, k)`, where `m` is the band's own row count — so a band would
-    # take a different route than the serial call and return different bits. `Float64` for the same
-    # reason: `_trmm_packedR!` is the Float64 path and F32 falls back to the flat loop.
+    # THERE IS NO SIZE FLOOR HERE, AND THE ADMISSION TEST IS THE ONLY GATE. Every path a band can take
+    # now carries B's undivided row count: `_trmm_right!` passes `p.m` into the flat panel loop's two
+    # off-diagonal `_gemm_core!` calls and down the halving recursion through `_gemm_accR!`, so a band
+    # and the unsplit call key their kernel choice on the same extent. `_trmm_packedR!` needed no token
+    # because it drives `_microkernel!` directly with a `kc` fixed by `k`.
     #
-    # The worker count rides `_trsm_workers_r`: the amortisation floor and the `_MR·W` row granularity
-    # are the same, and its `k²·m` overstates trmm's flops by 2x, which only makes it more conservative
-    # about admitting a call — moot above this size floor, where the work dwarfs the join either way.
+    # `_trsm_workers_r` decides alone: the amortisation floor and the `_MR·W` row granularity are the
+    # same as the solve's, and its `k²·m` overstates trmm's flops by 2x, which only makes it more
+    # conservative about admitting a call. A derived flop floor is the right gate for "is this worth a
+    # join"; a size literal was standing in for a reproducibility argument, not a work estimate.
+    #
+    # `Float64` STAYS, and it is now the only restriction left that is wider than it needs to be: F32
+    # takes the same flat loop and the same token, so it is admissible on the same argument. Widening
+    # it is a separate change with its own bit-identity run, not a free rider on this one.
     if !sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
-            _strided1(A) && _strided1(B) && size(B, 2) == k && k > _fh_trmm_rpack() &&
+            _strided1(A) && _strided1(B) && size(B, 2) == k &&
             !_trmmr_sme_owns(Float64, k, size(B, 1), A, B)
         nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
         if nwr > 1
@@ -5125,7 +5141,11 @@ _trmmr_prefit!(::Type{T}, ::Int, ::Int) where {T} = nothing   # non-real kinds n
     len > 0 || return nothing
     Ac = PtrMatrix{T}(p.Ap, p.n, p.n, p.lda)          # A is n×n for side R
     Bc = PtrMatrix{T}(p.Bp + i0 * sizeof(T), len, p.n, p.ldb)
-    _trmm_right!(p.up, p.tA, p.cA, p.unit, Ac, Bc, i)  # `i`: this worker's own pre-sized pack slot
+    # `i`: this worker's own pre-sized pack slot. `p.m`: the whole problem's ROW count, which every
+    # `_gemm_core!` below reads in place of this band's — the flat panel loop and the halving recursion
+    # both write column blocks of `Bc`, so the extent their kernel choice keys on is the one the split
+    # divided.
+    _trmm_right!(p.up, p.tA, p.cA, p.unit, Ac, Bc, i, p.m)
     isone(p.alpha) || _scal_all!(Bc, p.alpha)          # α after the product, as `trmm!` applies it
     return nothing
 end
