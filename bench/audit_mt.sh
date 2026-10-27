@@ -11,7 +11,7 @@
 # read as a serial regression. So the scripts take explicit files, and this is the file list.
 #
 # THROTTLE DETECTION DOES EXIST HERE, and step 3 is the whole reason this chain matters. Measured on
-# `mt_data_avx512_Zen4`, L1/axpy@1000000:
+# `mt_data_avx512_<host>`, L1/axpy@1000000:
 #
 #     aocl_mt / openblas_mt   2013 MHz   (in-window 1917 … 2675)
 #     pb / pb_mt              2795 MHz   (in-window 2794 … 2795)

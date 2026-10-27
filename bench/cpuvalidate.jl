@@ -11,7 +11,7 @@
 # Run (no bench env needed — only PureBLAS + stdlib):
 #   julia --project=/path/to/PureBLAS.jl bench/cpuvalidate.jl
 #   # optional: sizes=256,512,1024   (override the default 256,512,1024,2048)
-# Output: printed table + a self-describing  bench/cpuvalidate_<host>.txt  to send back for analysis.
+# Output: printed table + a self-describing  bench/cpuvalidate_<uarch>.txt  to send back for analysis.
 
 using PureBLAS, LinearAlgebra, Printf, Dates
 using Chairmarks: @be
@@ -115,7 +115,13 @@ sizes = let a = filter(x -> startswith(x, "sizes="), ARGS)
     isempty(a) ? [256, 512, 1024, 2048] : parse.(Int, split(split(a[1], "=")[2], ","))
 end
 
-host = gethostname()
+# IDENTIFIED BY MICROARCHITECTURE, NOT BY MACHINE. This file is committed and shared, so a hostname in
+# its name or body would publish the operator's machine. The slug must still separate the parts the
+# extrapolation compares, and vendor+ISA+width alone does NOT: two AMD generations here are both
+# 512-bit with wF64=8 and would collide and overwrite each other. L1 size separates them (32 KB against
+# 48 KB) and is already one of the detected consts this file exists to report.
+uarch = lowercase(replace(
+    "$(_c(:_CPU_VENDOR))-w$(wF64)-l1$(div(parse(Int, _c(:_L1_BYTES)), 1024))k", r"[^a-z0-9]+" => "-"))
 cpu = try
     strip(read(pipeline(`lscpu`, `grep -m1 "Model name"`), String))
 catch
@@ -124,7 +130,7 @@ end
 cpu = replace(cpu, r"Model name:\s*" => "")
 
 io = IOBuffer()
-println(io, "#cpuvalidate\tversion=1\thost=$host\tcpu=$cpu\tvendor=$(_c(:_CPU_VENDOR))\tisa=$isa_lbl\twF64=$wF64\tdate=$(Dates.format(now(), "yyyy-mm-ddTHH:MM"))")
+println(io, "#cpuvalidate\tversion=1\tuarch=$uarch\tcpu=$cpu\tvendor=$(_c(:_CPU_VENDOR))\tisa=$isa_lbl\twF64=$wF64\tdate=$(Dates.format(now(), "yyyy-mm-ddTHH:MM"))")
 print(io, "#detect"); for (s, l) in DETECT
     print(io, "\t$l=$(_c(s))")
 end; println(io)
@@ -152,6 +158,6 @@ gm = exp(sum(log, allr) / length(allr)); worst = minimum(allr)
 
 out = String(take!(io))
 print(out)
-path = joinpath(@__DIR__, "cpuvalidate_$(host).txt")
+path = joinpath(@__DIR__, "cpuvalidate_$(uarch).txt")
 write(path, out)
 println("\nwrote $path  — send this back for the extrapolation analysis")
