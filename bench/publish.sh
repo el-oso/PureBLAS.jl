@@ -144,10 +144,19 @@ echo "   artifacts match a fresh rebuild"
 
 echo
 echo "══ 4  commit these (nothing was committed or pushed):"
-# `gen_table*.md` is a GLOB, quoted so git expands it rather than the shell: the second table is named
-# after whichever vendor this host has — `gen_table_aocl.md` on a Zen box, `gen_table_accelerate.md` on
-# an Apple one. Naming the Zen file literally omits the Apple table from both the status and the
-# suggested `git add`, so a publish there leaves the rendered table behind.
+# THE STATUS LINE AND THE PRINTED COMMAND MUST CARRY THE SAME PATHSPECS, or the operator is shown a
+# set of changed files and then handed a command that does not add them — which is worse than showing
+# nothing, because the status output is what makes the command look trustworthy.
+#
+# `docs/src/assets` stays BARE on both, and that is load-bearing rather than lazy. A per-host render
+# writes into a subdirectory (`docs/src/assets/apple/`), and neither a shell glob nor a git pathspec
+# crosses a `/` with a single `*`: `docs/src/assets/perf_*.svg` matches none of the 31 tracked files
+# under `apple/`, not merely the three that are not SVGs. The bare directory covers every host's
+# subdirectory, including the per-host `gen_table*.md` and `provenance.md` that live beside the plots.
+#
+# `gen_table*.md` is a GLOB, quoted so git expands it rather than the shell, because the bench-level
+# table is named after whichever vendor this host has — `gen_table_aocl.md` on a Zen box,
+# `gen_table_accelerate.md` on an Apple one.
 #
 # The `_lite` twins are excluded, not swept in. A lite run writes `gen_table*_lite.md` and
 # `provenance_lite.md`, and lite is a smoke mode whose numbers are NOT gate numbers; a stale lite
@@ -156,4 +165,4 @@ git status --short -- docs/src/assets 'bench/gen_table*.md' ':(exclude)bench/gen
     bench/provenance.md docs/src/coverage.md
 echo
 # Only the artifact paths — never bench/plots_data_*.txt (gitignored, ~11 MB each, and evidence, not output).
-echo "   git add docs/src/assets/perf_*.svg 'bench/gen_table*.md' ':(exclude)bench/gen_table*_lite.md' bench/provenance.md docs/src/coverage.md"
+echo "   git add docs/src/assets 'bench/gen_table*.md' ':(exclude)bench/gen_table*_lite.md' bench/provenance.md docs/src/coverage.md"
