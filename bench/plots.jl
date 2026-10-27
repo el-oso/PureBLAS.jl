@@ -511,6 +511,24 @@ struct ArmRec
     # `"core"` for every record written before this field existed, which is the correct reading: those
     # ranges ARE single-core samples.
     span::String
+    # THE TOOLCHAIN THAT COMPILED THIS ARM, per arm for the reason `span` is per arm: a header stamp is
+    # rewritten by any targeted `op=`/`group=` merge while the file's other cells keep theirs, so a
+    # merged cache can hold arms built by two different compilers under one `julia=` line. `span`'s note
+    # above names exactly this as an open hazard ("the same per-row provenance hazard `coverage_ops.jl`
+    # documents for `julia=`/`llvm=`"); this is that hazard closed.
+    #
+    # IT IS NOT A CURIOSITY. PureBLAS kernels are Julia source compiled by LLVM at load time, so the
+    # compiler is as much an input to a measured number as the source commit — and `julia=` also pins
+    # the BUNDLED OpenBLAS, which is a reference arm. 2026-10-27: juliaup rolled the `1.13` channel from
+    # 1.13.2 to 1.13.3 mid-session and deleted the old binary, so every arm measured after that point
+    # sat in the same file as 1.13.2 vendor arms with nothing per-row to say so. The before/after that
+    # mattered survived only because the effect was five-fold; a few-percent cell would have been
+    # unadjudicable and would not have looked it.
+    #
+    # EMPTY for every record written before this field existed, which reads as UNKNOWN and not as
+    # "matches mine" — a consumer comparing two arms must treat an empty value as a reason it cannot
+    # adjudicate, the same way `flo == 0` means the window was not sampled rather than 0 Hz.
+    tc::String
     q::Vector{Float64}      # the 48 `_QS` quantiles of that arm's sample times, in seconds
 end
 const ArmData = Dict{String, Vector{Float64}}   # in-run:  arm => pooled quantile samples
@@ -534,7 +552,12 @@ function _stamp(acc::ArmData)
             # min-over-threads sampler, whose values are not clocks (a parked core reads the setpoint)
             # and which readers must refuse; `core` is the single-core sysfs read, valid for a serial
             # run because there the sampled core IS the work.
-            _ANY_MT ? "mtanchor" : "core", q
+            _ANY_MT ? "mtanchor" : "core",
+            # `VERSION` and the LLVM version together, because either can move without the other: a
+            # Julia patch release can carry a new LLVM, and a locally built Julia can carry a different
+            # one at the same version. Same two values the header records, now attached to the arm that
+            # was actually compiled by them.
+            "$(VERSION)/$(Base.libllvm_version)", q
         )
     end
     _arm_khz_reset!()
@@ -2892,7 +2915,7 @@ function save_cache(path, groups)
             # rather than `limit = 4`. That invariant is the extension mechanism — append before the
             # csv, never after it.
             fields = [
-                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1.0e6; digits = 3))|$(rec.freq == 0 ? "" : rec.freq)|$(rec.flo == 0 ? "" : rec.flo)|$(rec.fhi == 0 ? "" : rec.fhi)|$(rec.span)|$(join(rec.q, ","))"
+                "$(a)|$(rec.time)|$(rec.commit)|$(isnan(rec.anchor) ? "" : round(rec.anchor * 1.0e6; digits = 3))|$(rec.freq == 0 ? "" : rec.freq)|$(rec.flo == 0 ? "" : rec.flo)|$(rec.fhi == 0 ? "" : rec.fhi)|$(rec.span)|$(rec.tc)|$(join(rec.q, ","))"
                     for (a, rec) in sort!(collect(cell); by = first)
             ]
             println(io, lvl, "\t", nm, "\t", s, "\t", join(fields, "\t"))
@@ -2954,8 +2977,14 @@ function load_cache(path)
             # csv, so the check is `>= 9` and not `>= 8`; anything older is a single-core sample, which
             # is what "core" means — not a missing value to be guessed at.
             span = length(p) >= 9 ? String(p[8]) : "core"
+            # 10-field records add the TOOLCHAIN that compiled this arm. A 9-field record's p[9] is the
+            # csv, so the check is `>= 10`, and the fallback is EMPTY rather than this process's own
+            # version: an arm measured before the field existed was compiled by something unknown, and
+            # claiming it matches whatever is running now is the error the field exists to prevent.
+            tc = length(p) >= 10 ? String(p[9]) : ""
             cell[String(a)] = ArmRec(
-                String(tstamp), String(cmt), anc, khz, flo, fhi, span, parse.(Float64, split(csv, ","))
+                String(tstamp), String(cmt), anc, khz, flo, fhi, span, tc,
+                parse.(Float64, split(csv, ","))
             )
         end
         ops = get!(g, lvl, OpData[])
