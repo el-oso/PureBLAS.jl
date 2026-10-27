@@ -289,6 +289,70 @@ end
 # THE WORKER COUNT, NOT A RAGGED `m`, IS WHAT REACHES THIS: every band is a whole `_MR·W` block, and
 # only some worker counts make them whole `_SME_MR` blocks as well. `k` must be at least 64, because
 # `_sme_tile_ok` needs `min(m, k÷2) ≥ 2·_SME_MR` before the recursion is eligible at all.
+@testitem "trmm side-L: bit-identical at every thread count" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    if nthreads() < 2
+        @test_skip "needs ≥2 julia threads"
+    else
+        bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
+        # Side L splits the COLUMNS of B, and the one thing that could make a band disagree with the
+        # unsplit call is the off-diagonal `_gemm_acc!`, whose kernel choice reads `n`. The band
+        # carries the parent's width as a route token, so these must agree bit for bit. k is chosen
+        # inside the band the column route is armed for — above `_TRMM_BASE_R`, at or below
+        # `_TRMM_PACK_MIN` — because outside it a different driver owns the call.
+        #
+        # liveness-ok: this route's admission is decided by `_trsm_workers` against `_GEMM_MT_WORK`,
+        # not by `_L1_MT_MIN` (a BLAS-1 byte floor) and not by an SME predicate (side L has none).
+        # The item asks `_trsm_workers` DIRECTLY below and skips when it declines, so the gate is
+        # consulted rather than guessed — which is what the lint is for. The sizes are derived from
+        # the two thresholds that bound the route, not chosen.
+        k = 4 * P._TRMM_BASE_R                        # inside the band, away from both edges
+        @test k > P._TRMM_BASE_R && k <= P._TRMM_PACK_MIN
+        # the narrowest B that clears the flop floor, doubled so the floor is not the thing under test
+        n = max(2 * P._NR, 2 * cld(P._GEMM_MT_WORK, k * k))
+        # LIVENESS, read from the pool's own publish counter rather than from a buffer. `gen` is
+        # bumped to publish a job and its low bits carry the worker count, so a bumped `gen` with
+        # nw > 1 means a split actually ran. This cannot be satisfied by a build that threads
+        # nothing, which is how this class of item goes quiet — and unlike a pack-slot count it does
+        # not assume WHICH route serves the call, so it needs no per-host guard.
+        #
+        # It is still guarded on whether the entry ARMS, using the entry's own worker function: a
+        # host whose floor declines this shape would otherwise fail for threading correctly.
+        P.set_num_threads(max(2, nthreads()))
+        armed = P._trsm_workers(k, n) > 1
+        A = triu(randn(k, k)) + k * I
+        B0 = randn(k, n)
+        P.set_num_threads(1)
+        r = copy(B0); P.trmm!(r, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = 3.7)
+        if armed
+            pool = P._gemm_pool(Float64)
+            P.set_num_threads(max(2, nthreads()))
+            g0 = @atomic pool.gen
+            Bw = copy(B0); P.trmm!(Bw, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = 3.7)
+            g1 = @atomic pool.gen
+            @test g1 != g0                               # a job was published
+            @test P._mt_gen_nw(g1) > 1                   # and with more than one worker
+        else
+            @test_skip "the amortisation floor declines this shape on this host"
+        end
+        # alpha is not a power of two: scaling by ±2^j is exact and would hide a misplaced alpha.
+        for up in ('L', 'U'), tr in ('N', 'T'), dg in ('N', 'U')
+            G = up == 'U' ? triu(randn(k, k)) + k * I : tril(randn(k, k)) + k * I
+            X0 = randn(k, n)
+            P.set_num_threads(1)
+            ref = copy(X0); P.trmm!(ref, G; side = 'L', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+            for nt in 2:nthreads()
+                P.set_num_threads(nt)
+                g = copy(X0); P.trmm!(g, G; side = 'L', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+                @test bitsame(g, ref)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
+
 @testitem "trmm side-R: bit-identical at every thread count" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
