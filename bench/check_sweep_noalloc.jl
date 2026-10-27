@@ -7,7 +7,7 @@
 # call at n=8 against a 140 ns kernel, 512 calls per sample. That allocation pulled GC INTO the timed
 # window, and GC is what produced the wide bands in the published plots.
 #
-# Measured on wintermute 2026-09-11, trtri@8 under the gate's own harness shape:
+# Measured on Zen4 2026-09-11, trtri@8 under the gate's own harness shape:
 #     core COPIES    median 100.5 us   band 11.1%   GC in 2.1% of samples   GC-hit/GC-free 7.38x
 #     core NO-alloc  median  80.1 us   band  9.2%   GC in 0.0% of samples
 # and at n=32, GC 12.0% -> 0.0% and band 64.6% -> 26.1%. The kernels were never at fault: `trtri!`

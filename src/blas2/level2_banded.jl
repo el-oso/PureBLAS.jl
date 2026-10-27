@@ -31,7 +31,7 @@ const _GBMV_CONV_MAX = @load_preference("gbmv_conv_max", _vwidth(Float64) == 4 ?
 #
 # PHYSICAL CRITERION: the convolution arm re-reads A about `band / W` times (it tiles the output into
 # W-row blocks and sweeps every column reaching each block), so its serial penalty tracks `band / W`
-# and nothing else. Threading has to recover that penalty. Measured on galen (Zen3, W=4, n=2048,
+# and nothing else. Threading has to recover that penalty. Measured on Zen3 (Zen3, W=4, n=2048,
 # freq-locked, both arms in one process on shared operands, `Measure.ab` rotating them), conv relative
 # to axpy and the penalty it implies:
 #

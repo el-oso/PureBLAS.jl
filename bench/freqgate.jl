@@ -4,7 +4,7 @@
 # measurement time). A cell measured while the lock was floating is NOT ADJUDICABLE: its ratio was taken
 # at a different clock from the rest of the sweep, so averaging it into a verdict silently mixes two
 # machine states. Such a cell is EXCLUDED and REPORTED — a partially drifted run must read as partial,
-# not as quietly wrong. This exists because neuromancer's 2026-08-16 sweep verified ✅ at launch and
+# not as quietly wrong. This exists because Zen5's 2026-08-16 sweep verified ✅ at launch and
 # still stamped freq=2172337kHz against a 2000 MHz base: the lock floated DURING the run, and a single
 # run-level clock could not say which of the 85 ops were affected, so all of them were condemned.
 #

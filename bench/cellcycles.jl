@@ -57,7 +57,7 @@ for ln in readlines(CACHE)
         # `flo` is the MINIMUM over every thread in state R, sampled at the window BOUNDARIES — the two
         # instants at which the gemm pool's workers are most likely to be parked. A core caught coming
         # out of idle reports a low `scaling_cur_freq` even under a hard pin, so the low end of the
-        # range can be a sleeping core rather than slow work. Measured, galen `L1/axpy@1000000` arm
+        # range can be a sleeping core rather than slow work. Measured, Zen3 `L1/axpy@1000000` arm
         # `pb_mt`: flo = 546664, fhi = 3675043 — a 6.7x range inside ONE cell, on a box pinned
         # `scaling_min_freq == scaling_max_freq == 3701000` and POST-LOCK verified at 3674 MHz under
         # load. The midpoint there is ~2111 MHz against a real ~3675, which put a 43% error straight

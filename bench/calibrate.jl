@@ -53,7 +53,7 @@ end
 #   * more rounds, so the bootstrap CI has to survive more of the drift.
 #   * the emitted TOML is stamped `measured_unlocked = true`, so a pin's provenance is never ambiguous.
 # The achieved-vs-requested check below is NOT relaxed: a clock that reports one thing and runs at
-# another (neuromancer 2026-08-21, 4843 MHz against a 2000 MHz cap) is a LYING clock, categorically
+# another (Zen5 2026-08-21, 4843 MHz against a 2000 MHz cap) is a LYING clock, categorically
 # different from an honestly-boosting one, and no amount of cycle conversion can rescue it.
 const UNLOCKED = "unlocked" in ARGS
 const TOL = UNLOCKED ? 0.03 : ANCHOR_TOL
@@ -174,7 +174,7 @@ function calibrate_gemvt_window()
     end
     # NARROWEST fitting window, not the widest. Per-column is the NON-DEFAULT arm, so it is enabled only
     # where it demonstrably wins; a size with no verdict must not be swept in by widening.
-    # ⚠ THIS WAS "widest" AND IT PICKED A KNOWN-BAD ARM. On galen the n=512 measurement was REFUSED
+    # ⚠ THIS WAS "widest" AND IT PICKED A KNOWN-BAD ARM. On Zen3 the n=512 measurement was REFUSED
     # (anchor moved 9.5%) and so became don't-care; the widest fit then chose amin=L2, which routes
     # per-column at n=512 — where three earlier processes measured it LOSING ~4%. A refusal is MISSING
     # DATA, not a tie, and widening into missing data is how a tuner ships a regression it never measured.
@@ -233,7 +233,7 @@ end
 
 # ── sytrf complex blocking multiplier ───────────────────────────────────────────────────────────────
 # The Measure-tier quantity here is the MULTIPLIER on `_sytrf_nb_shape(n)`, not nb itself. The in-code
-# fleet table says 3 wins on wintermute (+4.8%) and galen (+3.0%) and ties on neuromancer, while the
+# fleet table says 3 wins on Zen4 (+4.8%) and Zen3 (+3.0%) and ties on Zen5, while the
 # retired duel resolved 2 in 16 of 18 samples — i.e. the duel and the gate DISAGREED. That is exactly
 # the disagreement a calibrator should re-adjudicate on the host rather than inherit.
 function calibrate_sytrf_cmult(::Type{T} = ComplexF64) where {T}
@@ -281,7 +281,7 @@ function calibrate_gemvt_pf(::Type{T} = Float64) where {T}
     cands = filter(!=(inc), collect(PureBLAS._GEMVT_PF_CANDIDATES))
     # Measure where `pf` APPLIES: the prefetch only reaches the non-deep kernel, so a size where the deep
     # shape runs times two identical arms. It used to be A ~ L2 (n = √(L2/8) ≈ 362), where deep IS the
-    # incumbent — neuromancer's pf=128 pin came from there. Smallest po2 n with A > L2: po2 ⇒ lda·8 is a
+    # incumbent — Zen5's pf=128 pin came from there. Smallest po2 n with A > L2: po2 ⇒ lda·8 is a
     # multiple of the L1 way, so deep is ineligible by `_gemvt_deep`'s own rule.
     n = nextpow(2, isqrt(PureBLAS._L2_BYTES ÷ sizeof(T)) + 1)
     PureBLAS._gemvt_deep(T, n, n, n) && (println("  gemvt_pf: deep shape eligible at n=$n — no regime to calibrate"); return Pair{String, Any}[])
@@ -797,7 +797,7 @@ anchor, khz, steady = stabilise!()
 @printf("  anchor=%.3fus  clock=%.0fMHz  steady=%s\n", anchor * 1e6, khz / 1000, steady)
 steady || @warn "did not reach steady state; results may be biased by a moving clock"
 # ACHIEVED vs REQUESTED — the settings check above is NOT sufficient, which is the whole lesson here.
-# neuromancer 2026-08-21 reported boost=0, scaling_min==scaling_max==2000 MHz, governor `performance`
+# Zen5 2026-08-21 reported boost=0, scaling_min==scaling_max==2000 MHz, governor `performance`
 # — every knob in the right position — and ran the calibration at an ACHIEVED 4843 MHz. The pstate
 # driver was not honouring the cap (it needs amd_pstate=passive), so the requested state and the real
 # clock disagreed by 2.4x. This is exactly why bench/fleet_freqlock.sh VERIFIES under load instead of
@@ -828,7 +828,7 @@ end
 # `_GEMVN_MINNER_REF`): a pinned build must not COMPILE the resolver at all, because it allocates on
 # first use and would redden the all-paths AllocCheck proof on `gemv!`/`trmv!`. So the Ref the
 # calibrator writes does not exist on a pinned box, and `PureBLAS._GEMVT_PF_REF[] = v` throws
-# `UndefVarError` — which is what killed all 3 of `tune!()`'s runs on wintermute on 2026-09-10 and,
+# `UndefVarError` — which is what killed all 3 of `tune!()`'s runs on Zen4 on 2026-09-10 and,
 # because a failed run is dropped, produced "0 of 3 runs" and pinned nothing at all.
 # Skipping is not a workaround, it is the correct answer twice over: the resolver is gone, and even
 # if it were not, the pin outranks whatever the calibration decided. Re-tuning a pinned knob means

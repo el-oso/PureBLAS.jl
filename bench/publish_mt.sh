@@ -11,7 +11,7 @@
 # `gen_threading.jl` already existed and its own header says it "is run on its own, by hand". That is
 # the gap this closes: run by hand, the audit chain gets skipped, and the page then publishes numbers
 # whose clock provenance nobody looked at. On 2026-09-26 that was not hypothetical — 204 of 937
-# wintermute cells compare a throttled reference window against an unthrottled PB one.
+# Zen4 cells compare a throttled reference window against an unthrottled PB one.
 #
 #   bench/publish_mt.sh            # audit, rebuild, verify, print the git add line
 #   bench/publish_mt.sh --force    # rebuild and verify even if the audit reports problems

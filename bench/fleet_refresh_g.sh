@@ -17,7 +17,7 @@ JL="${JULIA:-julia}"
 # it mid-measurement — between cores with different cache state, and on a multi-CCD part between
 # entirely different L3 instances.
 #
-# That is not hypothetical. Measured on galen (5900X, TWO 32 MiB L3s: cores 0-5,12-17 and 6-11,18-23)
+# That is not hypothetical. Measured on Zen3 (5900X, TWO 32 MiB L3s: cores 0-5,12-17 and 6-11,18-23)
 # on 2026-08-28: a full-arms sweep and a resident GPU job were BOTH unpinned and had landed on cores 2
 # and 3 — the same die, sharing one L3. Against an otherwise identical quiet sweep, 3.7% of cells
 # flipped their pass/fail verdict, concentrated near 1.0 where the gate decision is made. Pinning the
@@ -25,13 +25,13 @@ JL="${JULIA:-julia}"
 # accident, so a contending job can be `taskset` onto the other die.
 #
 # Default core per box, matching what fleet_freqlock.sh verifies under load (it must be the SAME core,
-# or the lock is verified somewhere the work does not run): wintermute 2, galen 6, neuromancer 8.
+# or the lock is verified somewhere the work does not run): Zen4 2, Zen3 6, Zen5 8.
 # Override with BENCH_CORE=<n>.
 case "${BENCH_CORE:-}" in
     "") case "$(hostname)" in
-            wintermute)  CORE=2 ;;
-            galen)       CORE=6 ;;
-            neuromancer) CORE=8 ;;
+            Zen4)  CORE=2 ;;
+            Zen3)       CORE=6 ;;
+            Zen5) CORE=8 ;;
             *)           CORE=0 ;;
         esac ;;
     *) CORE="$BENCH_CORE" ;;
@@ -46,7 +46,7 @@ esac
 # was. When it is not, every ratio in the file divides two machine states instead of two kernels.
 #
 # Measured, twice, both self-inflicted:
-#   galen  2026-08-27 — a whole-cache `arms=pb` refresh left 616 of 863 cells (71%) anchor-mismatched.
+#   Zen3  2026-08-27 — a whole-cache `arms=pb` refresh left 616 of 863 cells (71%) anchor-mismatched.
 #   zen5   2026-08-27 — the same, 126 cells mismatched, pb arms all at one commit against references
 #                       cached FOUR DAYS earlier from two different runs. On a laptop, whose thermal and
 #                       load state moves between days, a 4-day-old reference is a bad bet.
@@ -66,8 +66,8 @@ echo "=== PRE-LOCK ==="; bash bench/fleet_freqlock.sh verify 2>&1 | tail -2
 
 # A GROUP THAT DOES NOT LAND MUST BE LOUD. This loop used to pipe each run through `tail -4` and move
 # on, so a group that died took its exit status with it (the pipeline reports tail's status, not
-# julia's) and the refresh still printed "REFRESH DONE". Measured 2026-08-29: wintermute's L1 group
-# crashed and neuromancer's CLP never ran, and BOTH boxes reported success — 112 cells silently stayed
+# julia's) and the refresh still printed "REFRESH DONE". Measured 2026-08-29: Zen4's L1 group
+# crashed and Zen5's CLP never ran, and BOTH boxes reported success — 112 cells silently stayed
 # at the previous commit and were published. `bench/cache_staleness.sh` caught it only afterwards.
 #
 # Two failure modes, deliberately handled differently:

@@ -1796,7 +1796,7 @@ const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 1)::Int   # req8-ok: 
 # GATE-MEASURED on all three boxes, freq-locked, `arms=pb` against the cached reference arms, both
 # arms forced so neither could write a cache. Gate ratios at the cells the base moves:
 #
-#            Zen4 (wintermute)      Zen3 (galen)         Zen5 (neuromancer)
+#            Zen4 (Zen4)      Zen3 (Zen3)         Zen5 (Zen5)
 #   cell     192    512    1024     192   512   1024     192   512   1024
 #   gemm@1000 0.998 0.973  0.973    1.046 1.059 1.057    1.085 1.023 1.026
 #   gemm@2048 1.156 1.154  1.091    1.136 1.140 1.071    1.243 1.165 1.095
@@ -2847,7 +2847,7 @@ function _gemm_cmplx_unpacked!(
         # FROM `nrt`: this selects the microkernel's COLUMN TILE WIDTH, so a column band that picked a
         # different one would group its accumulators differently from the undivided problem. Live only
         # where `_CNR != _CNR_SMALL` (AVX2); on AVX-512 `_CUKER_NR6_MIN` is `typemax` and both arms are
-        # the same width, which is why wintermute cannot witness this one.
+        # the same width, which is why Zen4 cannot witness this one.
         elseif max(m, nrt, k) >= _CUKER_NR6_MIN   # full-tile mid-n: NR=6 (latency slack). tiny-n: NR=4.
             _res_tb!(Val(_CNR), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
         else
@@ -3953,10 +3953,10 @@ the thread saves.
 # LITERAL, 32 KB, spelled `_L1_BYTES`, validated on one box and carrying the falsification test above.
 #
 # ⚠ THE FALSIFICATION TEST IS STILL UNRUN, and running it has a regime trap in it. `T_forkjoin × BW_core`
-# needs the fork-join measured PER BOX (568 ns is wintermute's only) and the per-core stream rate AT THE
+# needs the fork-join measured PER BOX (568 ns is Zen4's only) and the per-core stream rate AT THE
 # SLICE SIZE IN QUESTION — a ~32 KB slice is L1-resident, where a core streams far faster than the
 # ~57 GB/s figure the estimate above uses, which is a DRAM-regime rate. Measuring the rate at n = 3e5
-# (74 / 49 / 99 GB/s on wintermute / neuromancer / galen) and multiplying would compare two different
+# (74 / 49 / 99 GB/s on Zen4 / Zen5 / Zen3) and multiplying would compare two different
 # regimes and "falsify" the proxy for the wrong reason. Get both terms in the slice's own regime, or the
 # test says nothing.
 #
@@ -4010,7 +4010,7 @@ is a worker running the scalar tail, which costs more than the thread saves.
     # ⚠ A `nw <= nthreads() - 1` CAP WAS TRIED HERE AND REVERTED — do not re-add it without a measurement
     # that reproduces. The argument for it is sound on paper: the pool holds `nthreads() - 1` workers and
     # the DRIVER runs the last chunk, so `nw == nthreads()` gives every thread a task and leaves the GC and
-    # libuv threads nowhere, which a microsecond-scale call cannot amortise. wintermute at `nw = 6` under
+    # libuv threads nowhere, which a microsecond-scale call cannot amortise. Zen4 at `nw = 6` under
     # `-t 6` does read pathologically (469 µs at n=3e5 against 25.7 at nw=5, threads pinned, 16 rounds).
     #
     # It was reverted because the numbers do not reproduce. `nw = 5` is UNCHANGED by such a cap, and across

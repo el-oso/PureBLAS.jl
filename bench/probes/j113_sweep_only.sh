@@ -2,7 +2,7 @@
 # Sweep-only re-run WITH A CLOCK WATCHDOG. For a box whose suite already passed at this exact commit
 # (re-running it would cost ~25 min and add nothing) but whose previous sweep was invalidated.
 #
-# WHY THE WATCHDOG. neuromancer's 2026-08-16 sweep verified ✅ at launch (1981 MHz) and still stamped
+# WHY THE WATCHDOG. Zen5's 2026-08-16 sweep verified ✅ at launch (1981 MHz) and still stamped
 # `freq=2172337kHz` — 2172 MHz against a 2000 MHz base — because the lock floated DURING the run. That
 # was only discoverable from the final cache header, i.e. after 2.5 h of measuring. Sampling the achieved
 # clock throughout turns a 2.5-hour loss into a ~1-minute one, and leaves a per-run record of clock

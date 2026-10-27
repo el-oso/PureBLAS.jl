@@ -17,20 +17,20 @@ JL="${JULIA:-julia}"
 # it mid-measurement — between cores with different cache state, and on a multi-CCD part between
 # entirely different L3 instances.
 #
-# That is not hypothetical. Measured on galen (5900X, TWO 32 MiB L3s: cores 0-5,12-17 and 6-11,18-23)
+# That is not hypothetical. Measured on Zen3 (5900X, TWO 32 MiB L3s: cores 0-5,12-17 and 6-11,18-23)
 # on 2026-08-28: a full-arms sweep and a resident GPU job were BOTH unpinned and had landed on cores 2
 # and 3 — the same die, sharing one L3. Against an otherwise identical quiet sweep, 3.7% of cells
 # flipped their pass/fail verdict, concentrated near 1.0 where the gate decision is made. Pinning the
 # sweep does not remove a co-tenant, but it makes WHICH L3 it shares a decision rather than an
 # accident, so a contending job can be `taskset` onto the other die.
 #
-# Default core per box, matching what fleet_freqlock.sh verifies under load (it must be the SAME core,
-# or the lock is verified somewhere the work does not run): wintermute 2, galen 6, neuromancer 8.
-# Override with BENCH_CORE=<n>.
+# The core comes from `PB_VCORE` in `bench/fleet.local.sh` and must be the SAME core
+# `fleet_freqlock.sh` verifies under load, or the lock is verified somewhere the work does not run.
+# Override for one invocation with BENCH_CORE=<n>.
 #
 # SWEEP_EXTRA passes extra words to plots.jl. Its one intended use is `force-busy` on a box with a
 # RESIDENT co-tenant pinned to the OTHER die, where the global contention guard cannot see that the
-# two share no L3 and would refuse forever. galen is the case: llama-server is pinned to CPUs
+# two share no L3 and would refuse forever. Zen3 is the case: llama-server is pinned to CPUs
 # 0-5,12-17 (CCD0's L3 domain) while CORE=6 sits in 6-11,18-23 with its own L3, so
 # `SWEEP_EXTRA=force-busy bench/fleet_refresh.sh` is honest there — and plots.jl stamps `busy=` into
 # the cache header either way, so the run is self-identifying. Do NOT use it to paper over a
@@ -60,7 +60,7 @@ esac
 # was. When it is not, every ratio in the file divides two machine states instead of two kernels.
 #
 # Measured, twice, both self-inflicted:
-#   galen  2026-08-27 — a whole-cache `arms=pb` refresh left 616 of 863 cells (71%) anchor-mismatched.
+#   Zen3  2026-08-27 — a whole-cache `arms=pb` refresh left 616 of 863 cells (71%) anchor-mismatched.
 #   zen5   2026-08-27 — the same, 126 cells mismatched, pb arms all at one commit against references
 #                       cached FOUR DAYS earlier from two different runs. On a laptop, whose thermal and
 #                       load state moves between days, a 4-day-old reference is a bad bet.
@@ -84,7 +84,7 @@ esac
 # floating, the scheduler may place a chunk on it, and that chunk shares a core with a pinned one.
 # Chunk count equals pool width, so the clean geometry is one chunk per thread per core.
 #
-# Measured on wintermute, syrk, `pb_mt` over `pb`, six INDEPENDENT processes per arm, reported as the
+# Measured on Zen4, syrk, `pb_mt` over `pb`, six INDEPENDENT processes per arm, reported as the
 # median self-speedup with the across-process spread in parentheses. `-t 6,0` reads 4.27 (1.03) at
 # n=512, 4.93 (1.01) at n=1024 and 5.05 (1.02) at n=2048. `-t 7,0` reads 2.70 (1.68), 2.94 (1.70) and
 # 3.14 (1.61) on the same cells, and a bare `-t 7` reads 4.91 (1.57) at n=1024. Both of the rejected
@@ -116,7 +116,7 @@ case "$MODE" in
     # "measure every arm" — plots.jl flipped that default to PB-ONLY on 2026-09-12 so that forgetting
     # the flag could not silently re-run the vendors, and this branch was not updated with it. The
     # result was a mode that printed "all three arms per cell" and measured one: on 2026-09-29 a
-    # wintermute re-sweep ran four groups that way, writing FRESH PureBLAS arms at a new 3501 MHz pin
+    # Zen4 re-sweep ran four groups that way, writing FRESH PureBLAS arms at a new 3501 MHz pin
     # against vendor arms still cached from 2793 MHz — a 24% error in PureBLAS's own favour, which is
     # the exact defect the re-sweep existed to remove. The banner below now prints the real string, so
     # the claim and the argument cannot drift apart again.
@@ -131,7 +131,7 @@ echo "=== pinning sweep to core $CORE ($(hostname)), mode=$MODE ==="
 echo "=== ARMS: '$ARMSARG' — every named arm measured per cell in one machine state ==="
 # PRE-LOCK MUST PASS, not merely be readable. The per-group check below compares each reading against
 # the OPENING one, so it catches a lock that lets go mid-sweep but not a box that was never locked: an
-# unlocked box reads a stable boost clock and drifts 0%. neuromancer opened a sweep at 4774 MHz against
+# unlocked box reads a stable boost clock and drifts 0%. Zen5 opened a sweep at 4774 MHz against
 # its 2000 MHz pin and the group measured to completion. Only the verify verdict distinguishes the two.
 echo "=== PRE-LOCK ==="
 _pre=$(bash bench/fleet_freqlock.sh verify 2>&1)
@@ -143,7 +143,7 @@ if ! printf '%s' "$_pre" | grep -q '✅'; then
 fi
 # AND, FOR A THREADED SWEEP, THAT THE PIN HOLDS WITH EVERY CORE BUSY. `verify` above loads ONE core
 # with an integer loop, which is not the workload a threaded sweep runs and cannot see a PACKAGE power
-# limit. wintermute passed it at a 2813 MHz pin while six cores oscillated 2332-2804 MHz on a 60 W
+# limit. Zen4 passed it at a 2813 MHz pin while six cores oscillated 2332-2804 MHz on a 60 W
 # supply, and every threaded sweep since ran under that ✅ — 1208 of its cached arms are stamped below
 # the pin, and 413 cells compare two power states rather than two libraries.
 #
@@ -158,7 +158,7 @@ if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | gre
     # note carries the mechanism and the fleet numbers behind both refusals.
     # DISTINCT PHYSICAL CORES INSIDE THE SWEEP'S MASK, which is the number `_pin_threads!` will pin:
     # it reads `Cpus_allowed_list` and takes one CPU per `topology/core_id`, so the mask bounds it, not
-    # the box. Counting the whole box instead refuses galen's documented recipe — 12 cores, swept at
+    # the box. Counting the whole box instead refuses Zen3's documented recipe — 12 cores, swept at
     # `-t 7 mt=6` on CCD1's six so the three boxes stay comparable.
     #
     # Counting rows of `lscpu -p` is wrong for a second reason: one row per LOGICAL cpu gives the
@@ -222,7 +222,7 @@ if printf '%s' "${JL_FLAGS:-}" | grep -q -- '-t' || printf '%s' "$ARMSARG" | gre
     # nowhere, so `${_MT_NT:-6}` certified six threads however wide the pool actually was: a run at
     # `SWEEP_EXTRA="mt=12"` draws twice the package power it was cleared for, and the power limit these
     # checks exist to catch stays invisible. And sampling every core on the box rather than the sweep's
-    # own mask lets a co-tenant on another CCD fail a run that never touches it — galen's documented
+    # own mask lets a co-tenant on another CCD fail a run that never touches it — Zen3's documented
     # recipe pins the sweep to CCD1 while something else holds CCD0.
     _MT_NT="$_pool"
     export MTCORES="$CORE"
@@ -261,8 +261,8 @@ echo "    bench env is warm"
 
 # A GROUP THAT DOES NOT LAND MUST BE LOUD. This loop used to pipe each run through `tail -4` and move
 # on, so a group that died took its exit status with it (the pipeline reports tail's status, not
-# julia's) and the refresh still printed "REFRESH DONE". Measured 2026-08-29: wintermute's L1 group
-# crashed and neuromancer's CLP never ran, and BOTH boxes reported success — 112 cells silently stayed
+# julia's) and the refresh still printed "REFRESH DONE". Measured 2026-08-29: Zen4's L1 group
+# crashed and Zen5's CLP never ran, and BOTH boxes reported success — 112 cells silently stayed
 # at the previous commit and were published. `bench/cache_staleness.sh` caught it only afterwards.
 #
 # Two failure modes, deliberately handled differently:
@@ -271,7 +271,7 @@ echo "    bench env is warm"
 #   anything else — a crash or a real error. Report it and keep going so one bad group does not cost
 #                the other seven, but remember it and exit non-zero at the end.
 FAILED=""
-# VERIFY THE LOCK BETWEEN GROUPS, not only at the two ends. neuromancer drops its cpufreq pin when
+# VERIFY THE LOCK BETWEEN GROUPS, not only at the two ends. Zen5 drops its cpufreq pin when
 # something on its power cluster is disconnected (user, 2026-09-06) and the SETTINGS still read locked
 # while the cores run at 4.8 GHz against a 2.0 GHz pin — so nothing short of an achieved-under-load
 # measurement sees it. With only PRE/POST checks a mid-run drop costs the WHOLE sweep: on 2026-09-06 it
@@ -324,7 +324,7 @@ for g in ${SWEEP_GROUPS:-L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP}; do
     # references were measured in. The per-cell anchor records exactly that, and `check_arm_anchors.sh`
     # then declares the cells not adjudicable — the sweep is wasted even though the clock never moved.
     #
-    # Measured 2026-09-10 on neuromancer: a back-to-back pb refresh left 697/930 cells
+    # Measured 2026-09-10 on Zen5: a back-to-back pb refresh left 697/930 cells
     # anchor-mismatched (worst 15.7%) with the lock verified at 1990 MHz throughout. Re-running the
     # single group L3 after a 300 s idle gap, nothing else changed, dropped it to 601/930 and removed
     # L3 from the affected list entirely. So the mismatch is thermal carry-over between groups, NOT an

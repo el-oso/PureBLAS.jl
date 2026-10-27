@@ -136,7 +136,7 @@ for (f, ref, bf) in FREQMETA
     # That is NOT the same as "a threaded cache carries no clock evidence", and the cells below can be
     # badly wrong for a clock reason this tool will not show. The arms timed in one window SHARE a
     # clock sample, and the threaded reference window can fall far below the lock while the PB window
-    # holds it — L1/axpy@1000000 on wintermute: aocl_mt/openblas_mt 2013 MHz against pb/pb_mt 2795,
+    # holds it — L1/axpy@1000000 on Zen4: aocl_mt/openblas_mt 2013 MHz against pb/pb_mt 2795,
     # a 28% gap, because PB does not thread axpy and ran one core. 204 of 937 cells on that box are
     # mismatched this way, worst 45.9%, and the error FLATTERS PureBLAS. `bench/check_arm_clocks.sh`
     # is the cross-arm check that finds them and `bench/audit_mt.sh` runs it; read that before

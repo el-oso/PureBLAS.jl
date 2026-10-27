@@ -1,7 +1,7 @@
 # Apple silicon — work plan for the dedicated agent
 
 You own Apple silicon. The box is an **M6 mac-mini**. A second agent owns the AMD fleet
-(Zen3 galen / Zen4 wintermute / Zen5 neuromancer) and the cross-architecture multithreading
+(Zen3 Zen3 / Zen4 Zen4 / Zen5 Zen5) and the cross-architecture multithreading
 campaign; the two meet only through `master`.
 
 **The campaign content is already written: `ROADMAP.md` "SME across the full surface (Apple
@@ -116,7 +116,7 @@ Follow `ROADMAP.md` phases 1→3 (real → complex → dual). Additions from the
   is `bench/Project.toml`, which `julia --project=bench` already uses. PR #4
   (`bench-portable-references`) generalized `plots.jl` and `probe.sh` for this box — build on that,
   do not re-fork them. There is also no sync path: `bench/fleet_sync.sh` has
-  `BOXES_ALL=(galen neuromancer)`, so the Apple cache is carried by hand.
+  `BOXES_ALL=(Zen3 Zen5)`, so the Apple cache is carried by hand.
 - **Two harness bugs were found on this path and fixed**; both may still bite elsewhere. `_L1REP`'s
   reps loop measured a warm buffer (a `cold` flag was added, and the fix is **unconfirmed on x86** —
   Zen3's 32 MiB L3 is the candidate). And `BLAS.set_num_threads(1)` not constraining Accelerate, per
@@ -187,7 +187,7 @@ expect that test to pick it up and require a reproducibility proof for it.
   "Efficiency" cores on 8 MB — is a request, not a guarantee, so a threaded Apple cell must carry its
   spread rather than a single ratio, and self-speedup is not a quantity this box can report honestly.
 
-- **`bench/fleet_sync.sh` does not cover this host** (`BOXES_ALL=(galen neuromancer)`), so the Apple
+- **`bench/fleet_sync.sh` does not cover this host** (`BOXES_ALL=(Zen3 Zen5)`), so the Apple
   cache is carried by hand. The caches are untracked, so nothing here reaches the AMD fleet's agent
   except through a committed file.
 

@@ -693,7 +693,7 @@ end
 # at every thread count including one, and the lost-claim branch calls it with its own arena notepad.
 #
 # `_symv_nblk` returns 1 past about 2x L3, because the fold costs 0.2-0.9% and symv's SERIAL gate at
-# n=4096 is 0.995 on wintermute and 1.000 on galen — it cannot afford it. So the sizes below must
+# n=4096 is 0.995 on Zen4 and 1.000 on Zen3 — it cannot afford it. So the sizes below must
 # straddle that cut: one inside (grid live, notepads used, pool admitted) and one outside (grid
 # collapsed to 1, not a single notepad touched, byte-identical to the unblocked kernel).
 @testitem "symv: bit-identical at every thread count, both sides of the nblk cut" tags = [:checks] begin

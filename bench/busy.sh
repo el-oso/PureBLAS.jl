@@ -8,7 +8,7 @@
 #      two full suite runs once before. A mid-run edit does not usually corrupt anything; what it
 #      destroys is ATTRIBUTION. You can no longer say which tree produced the result, so the run has to
 #      be thrown away either way. Cheaper to check first.
-#   2. Ran probes and a hot session on wintermute WHILE its reference sweep was measuring. The sweep's
+#   2. Ran probes and a hot session on Zen4 WHILE its reference sweep was measuring. The sweep's
 #      own contention guard only checks at STARTUP, so a job that appears later is invisible to it —
 #      214 of 1874 reference arms came out 4-10% slow, and those cells are now caveated forever.
 #   3. Watched the wrong PID. `pgrep -f "bench/plots.jl"` MATCHES ITS OWN WRAPPER and matched a shell
@@ -51,7 +51,7 @@ if [ "$l" -gt 0 ]; then
 else
     say "idle  local"
 fi
-for b in $([ "$SCOPE" = local ] && echo "" || echo "galen neuromancer"); do
+for b in $([ "$SCOPE" = local ] && echo "" || echo "Zen3 Zen5"); do
     r=$(count_remote "$b")
     if [ "$r" = "?" ]; then
         say "UNREACHABLE  $b — treat as BUSY; a box you cannot see is not a box you can measure on"

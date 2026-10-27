@@ -7,14 +7,14 @@
 # full arms every arm of a cell is measured together, so each cell stays internally consistent and every
 # within-cell check passes — while half the file was measured at 2.0 GHz and half at 4.8.
 #
-# Measured 2026-09-06 on neuromancer, whose cpufreq pin drops when something on its power cluster is
+# Measured 2026-09-06 on Zen5, whose cpufreq pin drops when something on its power cluster is
 # disconnected (and whose sysfs settings still read LOCKED while the cores run at 4.8 GHz against a
 # 2.0 GHz pin). `fleet_refresh.sh` verifies the lock before and after, so the drop was caught — but only
 # at the END, which condemned the whole four-hour sweep because nothing said WHEN the clock let go.
 #
 # It did say, though. `bench/plots.jl` stamps every arm with the clock it actually ran at
 # (`arm|date|commit|anchor|khz|flo|fhi|samples`), and on a locked box those figures are tight: measured
-# spreads across a whole cache are 2790-2794 MHz on wintermute and 3671-3675 on galen. A cell measured
+# spreads across a whole cache are 2790-2794 MHz on Zen4 and 3671-3675 on Zen3. A cell measured
 # after a drop stands out by more than a factor of two. So a mid-sweep drop does NOT require discarding
 # the run — it requires FILTERING it, and this script is the filter.
 #
