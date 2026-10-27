@@ -3,7 +3,7 @@
 #
 # WHY THIS EXISTS. The fleet used to be synced with `rsync src/ box:.../src/`. That copies the code
 # but not its identity: the box's git HEAD stays wherever it was, and `bench/plots.jl` stamps
-# `commit=` into every cache header from `git rev-parse`. On 2026-07-31 galen produced a full gate
+# `commit=` into every cache header from `git rev-parse`. On 2026-07-31 the Zen3 box produced a full gate
 # sweep stamped `commit=ac96c00` while actually running the tree from `78eafc7` — 13 commits and two
 # perf fixes later. The numbers were fine (source parity was verified by md5), but the provenance in
 # the published table was a lie, and nothing in the artifact revealed it.
@@ -15,17 +15,39 @@
 # Bench caches (bench/plots_data_*.txt) are gitignored, so a hard reset preserves them — `op=`/merge
 # runs keep working across a sync.
 #
-# Usage:  bench/fleet_sync.sh galen [ref]        # ref defaults to origin/master
+# Usage:  bench/fleet_sync.sh <box> [ref]       # box = an ssh alias from PB_BOXES; ref defaults to origin/master
 #         bench/fleet_sync.sh all   [ref]
 set -euo pipefail
 
-BOXES_ALL=(galen neuromancer)
+# SSH ALIASES COME FROM THE BOX'S OWN CONFIG, never from this file. They are entries in the operator's
+# `~/.ssh/config`, so they are that person's machine names and do not belong in a public repository —
+# and a hardcoded list is wrong for anyone else's checkout anyway. `PB_BOXES` is a space-separated
+# list in `bench/fleet.local.sh` (gitignored; see `bench/fleet.local.example.sh`).
+#
+# `all` with no list REFUSES rather than silently syncing nothing. A sync that reports success having
+# touched no box is how a three-hour sweep runs on a stale checkout, which is the exact failure this
+# script exists to prevent.
+_FLEET_LOCAL="$(dirname "$0")/fleet.local.sh"
+# shellcheck source=/dev/null
+[ -r "$_FLEET_LOCAL" ] && . "$_FLEET_LOCAL"
+# shellcheck disable=SC2206  # word splitting is the point: PB_BOXES is a space-separated alias list
+BOXES_ALL=(${PB_BOXES:-})
 REMOTE_DIR='~/Documents/claude/PureBLAS.jl'
 
 target="${1:?usage: fleet_sync.sh <box|all> [ref]}"
 ref="${2:-origin/master}"
 
-if [[ "$target" == "all" ]]; then boxes=("${BOXES_ALL[@]}"); else boxes=("$target"); fi
+if [[ "$target" == "all" ]]; then
+    if [[ ${#BOXES_ALL[@]} -eq 0 ]]; then
+        echo "fleet_sync.sh all: no boxes configured." >&2
+        echo "  Set PB_BOXES in bench/fleet.local.sh (see bench/fleet.local.example.sh), or name a" >&2
+        echo "  box explicitly. Refusing rather than reporting success having synced nothing." >&2
+        exit 2
+    fi
+    boxes=("${BOXES_ALL[@]}")
+else
+    boxes=("$target")
+fi
 
 # The commit must be ON the remote, or the box cannot fetch it. Catch the classic "synced my
 # uncommitted working tree" mistake up front rather than after a 3-hour sweep.
@@ -50,7 +72,7 @@ for box in "${boxes[@]}"; do
     # been reverted — so `git branch`, `git worktree list` and the shell prompt all name it `master`
     # while it is nothing of the kind. That is the same provenance lie this script exists to prevent,
     # one level up: rsync made the cache's `commit=` stamp false, and hijacking the branch label makes
-    # the BOX's own report of itself false. Measured consequence: galen sat on a reverted commit for
+    # the BOX's own report of itself false. Measured consequence: a box sat on a reverted commit for
     # hours under the label `master`, and `git worktree list` showed `15bd758c [master]`.
     # Detached HEAD is the honest state for a box that tracks whatever it was last told to.
     # DETACH AT CURRENT HEAD, THEN RESET. `checkout --detach <ref>` REFUSES when a tracked file is

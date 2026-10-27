@@ -35,13 +35,19 @@ JL="${JULIA:-julia}"
 # `SWEEP_EXTRA=force-busy bench/fleet_refresh.sh` is honest there — and plots.jl stamps `busy=` into
 # the cache header either way, so the run is self-identifying. Do NOT use it to paper over a
 # co-tenant on the SAME die; that is the contention the guard exists to catch.
+# `PB_VCORE` comes from `bench/fleet.local.sh`, which is gitignored and describes THIS machine. It
+# replaced a `case "$(hostname)"` table: that published the fleet's machine names from a public
+# repository and keyed the value on a string only this fleet has, so an unlisted box silently verified
+# core 0 — which on a box whose mask starts elsewhere is a core the sweep never touches.
+#
+# Falling back to 0 is kept for a machine with no config, and it is a guess rather than a default: the
+# POST-LOCK check below samples the cores the sweep actually loaded, so a wrong single-core figure here
+# is caught there rather than carried into the cache.
 case "${BENCH_CORE:-}" in
-    "") case "$(hostname)" in
-            wintermute)  CORE=2 ;;
-            galen)       CORE=6 ;;
-            neuromancer) CORE=8 ;;
-            *)           CORE=0 ;;
-        esac ;;
+    "") _FLEET_LOCAL="$(dirname "$0")/fleet.local.sh"
+        # shellcheck source=/dev/null
+        [ -r "$_FLEET_LOCAL" ] && . "$_FLEET_LOCAL"
+        CORE="${PB_VCORE:-0}" ;;
     *) CORE="$BENCH_CORE" ;;
 esac
 # ── MODE: `pb` (default) or `full` ───────────────────────────────────────────────────────────────────
