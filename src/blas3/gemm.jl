@@ -3610,8 +3610,6 @@ end
     # do not agree bit-for-bit in general (see the note above `_gemm_unpacked!`), so a band that takes
     # one arm where the whole takes the other returns different bits. Side R routes on rows and side L
     # on columns, and reducing over the resolved triple is what makes one body serve both.
-    #
-    # `_sme_eligible` is the ONE exception and takes the local `m`; its own note below says why.
     mrt = _rt_m(rt, m); nrt = _rt_n(rt, n); krt = _rt_k(rt, k)
     # α==0 (or k==0) ⇒ C := βC, with A and B NOT referenced — reference ?gemm guarantees this, so a
     # caller may legally pass A/B holding Inf/NaN or uninitialised memory. The blocked routes each

@@ -5065,19 +5065,23 @@ end
     return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(m, _MR * _vwidth(T))))
 end
 
-# A SIDE-R ROW BAND UNDER `2·_SME_MR` TAKES A DIFFERENT GEMM ROUTE THAN THE UNDIVIDED CALL, so the
-# pool is capped at the largest count whose every band reaches that floor. `_gemm_core!` carries one
-# route token and it lands in the `n` slot; `_trsmr_run_chunk` feeds it the whole problem's ROW count
-# precisely so that each `max(m, nrt, k)` route predicate reads the serial value even though the `m`
-# argument is the band's own height. `_sme_tile_ok` is the one route predicate that is not a pure
-# `max` — it opens with `min(m, n) >= 2 * _SME_MR` — so the band height reaches it unrepaired, and a
-# short band declines the coprocessor where the undivided height accepts it. The two routes cannot
-# agree bitwise: the SME macrokernel seeds ZA from C under β=1 while NEON accumulates from zero.
+# A SIDE-R ROW BAND NARROWER THAN THE COPROCESSOR'S TILE WASTES MOST OF ITS WORK, so the pool is
+# capped at the largest count whose every band clears `2 * _SME_MR`. The SME macrokernel pads rows to
+# `cld(mce, _SME_MR) * _SME_MR` and takes a partial last tile, so a 4-row band does 16 rows of work,
+# and twelve such bands multiply that waste across one coprocessor. At k=512, Float64 and twelve
+# workers the narrowest bands at m=64, 128 and 256 are 4, 8 and 20 rows.
 #
-# The floor is exact, not a safety margin. On an M6 at k=512, Float64, the first worker count whose
-# bits differ from the serial solve is the first whose SMALLEST band falls under 32 rows, at every m
-# measured: m=64 turns at 3 workers, m=128 at 5, m=256 at 9, and m=2048 never turns — its narrowest
-# band at twelve workers is 168 rows.
+# WHICH ROW COUNTS IT BINDS ON FOLLOWS THE WORKER COUNT, not the shape alone. At k=512, Float64 it
+# caps m=64 to two workers from four, six or twelve; m=128 to four, from six or twelve but not from
+# four, which already leaves 32-row bands; and m=256 to eight from twelve only, because six workers
+# leave 40. From m=512 up it never binds — twelve workers leave 40 rows there and 168 at m=2048.
+#
+# THIS IS A THROUGHPUT MEASURE, NOT A REPRODUCIBILITY ONE, AND A CAP COULD NOT BE ONE. Bands of 36,
+# 40 and 44 rows all clear `2 * _SME_MR` and still make `_sme_tile_ok` answer differently from the
+# undivided height, through its modulus clause: `_sme_tile_ok(80, 32)` is true because both operands
+# are whole `_SME_MR` blocks, `_sme_tile_ok(40, 32)` is false because 40 is not one and `max(40, 32)`
+# is under `_SME_MIN_EXACT`. Bit-identity across worker counts comes from resolving that predicate on
+# the route token on every axis — `_gemm_core!` reduces over `(mrt, nrt, krt)` — and not from here.
 #
 # ASKED OF `_sme_eligible` RATHER THAN RESTATED, for the reason `_trmmr_sme_owns` gives: the cap
 # spends worker counts, so it must not fire on a call gemm would route to NEON regardless. The
