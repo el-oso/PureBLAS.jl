@@ -4883,7 +4883,10 @@ end
     sz = sizeof(T)
     Ab = PtrMatrix{T}(p.Cp + j0 * p.ldc * sz, p.m, len, p.ldc)
     yb = p.Bp + j0 * sz
-    blk = !_gemvt_perscan(p.m, p.n, T)
+    # The DRIVER's choice, carried in the job. Recomputing it gives the same answer for the public
+    # entry and the WRONG one for a caller that forced it (`_qp_gemv_t!`), whose bands would then
+    # fold differently from its own serial arm.
+    blk = p.unit
     if p.up
         _gemv_t_simd!(p.m, len, p.alpha, Ab, p.Ap, p.beta, yb, Val(true), blk, p.n)
     else
@@ -5361,7 +5364,13 @@ end
         elseif kind == _MT_KIND_GEMVT
             # As above, transposed: the loser's own column count IS the route width, and `blk` comes
             # from it for the same reason the chunks take theirs from `p.n`.
-            blk = !_gemvt_perscan(C.m, C.n, T)
+            # `blk` from the CALLER, not from `_gemvt_perscan`. This is the second defect the
+            # fallback audit finds, and it is the opposite of the missing branch above: the branch
+            # exists and its recompute is wrong. A caller that FORCES the blocked arm would fold one
+            # way when it wins the claim and the other way when it loses — bits depending on which
+            # caller won a race, invisible to every single-threaded test, because the recompute is
+            # only correct while the route is a pure function of the dimensions.
+            blk = unit
             up ?
                 _gemv_t_simd!(C.m, C.n, alpha, C, A.ptr, beta, B.ptr, Val(true), blk, C.n) :
                 _gemv_t_simd!(C.m, C.n, alpha, C, A.ptr, beta, B.ptr, Val(false), blk, C.n)
@@ -5786,12 +5795,22 @@ end
 
 # gemv-T: `C` is the m×n matrix, `A` is x (length m) and `B` is y (length n) — the transpose of
 # gemv-N's operand lengths, same slots.
+# `blk` — the COLUMN-BLOCKING choice — travels WITH the job rather than being recomputed by each
+# consumer, and that is a req#11 requirement rather than tidiness. It changes arithmetic: the blocked
+# arm folds NC columns of accumulators where the per-column arm runs an independent dot. Recomputing
+# it works only while every consumer derives the same answer, which stops being true the moment a
+# caller FORCES it — `_qp_gemv_t!` forces `true`, worth 1.34x at n=2048 and recorded in laqps.jl.
+# Carried here, the chunks, the lost-claim fallback and the caller's own serial arm read one value.
+#
+# It rides in the pool's `unit` field, which no gemv-T job uses otherwise. `sym2` is passed
+# explicitly because `unit` sits behind it in `_gemm_threaded!`'s positional list.
 @noinline function _gemvt_threaded!(
-        m::Int, n::Int, α::T, Ap::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T}, β::T, b0::Bool, nw::Int
+        m::Int, n::Int, α::T, Ap::Ptr{T}, lda::Int, xp::Ptr{T}, yp::Ptr{T}, β::T, b0::Bool, nw::Int,
+        blk::Bool
     ) where {T <: BlasReal}
     _gemm_threaded!(
         PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, m, 1, m), PtrMatrix{T}(yp, n, 1, n),
-        α, β, false, false, false, false, nw, _MT_KIND_GEMVT, b0
+        α, β, false, false, false, false, nw, _MT_KIND_GEMVT, b0, false, blk
     )
     return nothing
 end
