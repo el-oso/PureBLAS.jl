@@ -313,13 +313,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-60 `const _X = <literal>` values in `src/` with no `@load_preference`.
+63 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 32 Literal · 23 Exempt · 3 Unaudited.
+**Tier:** 2 Measured · 32 Literal · 26 Exempt · 3 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -450,6 +450,9 @@ on these, not on knobs.
 | `_MT_KIND_TRSM` | 2 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_TRSMR` | 4 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_SPINS` | 2048 | Literal | how long an idle worker keeps spinning before it sleeps, in fence iterations. This is |
+| `_STR_FLOOR` | 1 | Exempt | level-1-claim tag, not hardware tuning. |
+| `_STR_LVL1` | 2 | Exempt | level-1-claim tag, not hardware tuning. |
+| `_STR_OFF` | 0 | Exempt | level-1-claim TAGS, not hardware tuning. They name which depth rule a caller asks |
 
 ### sme_kernel
 

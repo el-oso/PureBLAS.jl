@@ -775,7 +775,8 @@ const _REF_MT_ALL = ["openblas_mt", "aocl_mt", "accelerate_mt"]
 _refname(r) = r == "mkl" ? "MKL" : r == "aocl" ? "AOCL" : r == "accelerate" ? "Accelerate" :
     r == "generic" ? "LinearAlgebra generic" :
     r == _GATE_VIEW ? "faster of " * join((_refname(x) for x in _REF_ALL), " and ") :
-    r == _MT_GATE_VIEW ? "faster of threaded OpenBLAS and AOCL" : "OpenBLAS"
+    r == _MT_GATE_VIEW ? "faster of threaded " * join((_refname(x) for x in _REF_ALL), " and ") :
+    "OpenBLAS"
 # SVG/table filename suffix: "" for OpenBLAS (the default baseline), "_mkl"/"_aocl" otherwise
 _refsuf(r) = r == "openblas" ? "" : "_$r"
 const REFNAME = _refname(REFBK)
@@ -3538,7 +3539,8 @@ else
         println(io, "# Benchmark provenance\n")
         println(
             io, "The caches behind `bench/gen_table*.md`, `docs/src/assets/perf_*.svg` and the ",
-            "generated tables in `docs/src/coverage.md`. Both reference views (OpenBLAS, AOCL) are ",
+            "generated tables in `docs/src/coverage.md`. The reference views (",
+            join((_refname(x) for x in _REF_ALL), ", "), ") are ",
             "rendered from this one cache set. Methodology: `docs/src/methodology.md`.\n"
         )
         # Host name deliberately not published — µarch + CPU model identify the box for a reader, and

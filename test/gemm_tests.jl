@@ -108,8 +108,10 @@ end
     # so the pair also pins the routing, not just the total.
     for nc in (32, 128)
         Az = randn(ComplexF64, nc, nc); Bz = randn(ComplexF64, nc, nc); Cz = zeros(ComplexF64, nc, nc)
-        @test steady(PureBLAS.gemm!, Cz, Az, Bz;
-                     alpha = one(ComplexF64), beta = zero(ComplexF64)) == 0
+        @test steady(
+            PureBLAS.gemm!, Cz, Az, Bz;
+            alpha = one(ComplexF64), beta = zero(ComplexF64)
+        ) == 0
     end
     # complex rank-k rides the same buffers through `_ctrgemm_3m!` (n ≥ _CSYRK_3M_MIN)
     As = randn(ComplexF64, 300, 300); Cs = zeros(ComplexF64, 300, 300)
@@ -164,9 +166,11 @@ end
                 Cs = copy(C0)
                 P._gemm_core!(Cs, A, B, al, be, tA, tB, false, false)
                 Ct = copy(C0)
-                P.gemm!(Ct, A, B; alpha = al, beta = be,
-                    transA = tA ? 'T' : 'N', transB = tB ? 'T' : 'N')
-                @test Ct ≈ Cs rtol = 1e-12
+                P.gemm!(
+                    Ct, A, B; alpha = al, beta = be,
+                    transA = tA ? 'T' : 'N', transB = tB ? 'T' : 'N'
+                )
+                @test Ct ≈ Cs rtol = 1.0e-12
             end
         end
         # req#10 on the threaded path. THIS MEASURES A PROCESS, NOT A CALL, and the assertion is
@@ -210,16 +214,20 @@ end
         # jobs into one pool, i.e. torn results — not as an error.
         nt = min(4, Threads.nthreads())
         P.set_num_threads(nt)
-        A = randn(300, 300); B = randn(300, 300)
+        # The smallest square `gemm!` lets the recursion claim (`_STR_FLOOR`: level 1 obeys the leaf
+        # floor), so the combine passes below are exercised; two repetitions per caller because a
+        # claimed product is 2048^3 on every box.
+        ns = 2 * P._fh_strassen_base()
+        A = randn(ns, ns); B = randn(ns, ns)
         want = similar(A); P._gemm_core!(want, A, B, 1.0, 0.0, false, false, false, false)
-        outs = [zeros(300, 300) for _ in 1:nt]
+        outs = [zeros(ns, ns) for _ in 1:nt]
         Threads.@threads :static for t in 1:nt
-            for _ in 1:8
+            for _ in 1:2
                 P.gemm!(outs[t], A, B)
             end
         end
         for t in 1:nt
-            @test outs[t] ≈ want rtol = 1e-12
+            @test outs[t] ≈ want rtol = 1.0e-12
         end
         # AND WITH alpha AND beta BOTH NON-TRIVIAL, because the combine passes take a DIFFERENT arm
         # there. With alpha = 1, beta = 0 above, three of the four C-assembly passes take their
@@ -227,17 +235,17 @@ end
         # non-power-of-two alpha for the same reason it appears in the bit-identity item: scaling by
         # +-2^j is exact and would hide a misplaced alpha.
         #
-        # Witness, and it is a PREMISE: 300 is Strassen-claimed only where `_STRASSEN` holds, which is
+        # Witness, and it is a PREMISE: `ns` is Strassen-claimed only where `_STRASSEN` holds, which is
         # `_W64 == 4 || _W64 == 8` -- false wherever `_vwidth(Float64)` is 2. There the call takes the
         # column split, so there is no claim to lose and the four C-assembly passes this paragraph is
         # about are not reached; the comparisons below still test the invariant, and only the witness
         # is skipped. Same shape as the big/thin witnesses further down.
         if P._STRASSEN
-            @test P._strassen_owns(Float64, 300, 300, 300, false, A, B)
+            @test P._strassen_owns(Float64, ns, ns, ns, false, A, B, P._STR_FLOOR)
         else
             @test_skip "Strassen is off at _W64=$(PureBLAS._W64)"
         end
-        C0 = randn(300, 300)
+        C0 = randn(ns, ns)
         want2 = copy(C0)
         P.set_num_threads(1)
         P.gemm!(want2, A, B; alpha = 3.7, beta = -1.25)
@@ -245,14 +253,14 @@ end
         outs2 = [copy(C0) for _ in 1:nt]
         Threads.@threads :static for t in 1:nt
             o = copy(C0)
-            for _ in 1:8
+            for _ in 1:2
                 copyto!(o, C0)
                 P.gemm!(o, A, B; alpha = 3.7, beta = -1.25)
             end
             copyto!(outs2[t], o)
         end
         for t in 1:nt
-            @test outs2[t] ≈ want2 rtol = 1e-12
+            @test outs2[t] ≈ want2 rtol = 1.0e-12
         end
         P.set_num_threads(1)
     end
@@ -378,24 +386,25 @@ end
     using PureBLAS, LinearAlgebra, Random
     using Base.Threads: nthreads
     const P = PureBLAS
-    n, kbig, kthin = 512, 384, 96
+    n, kthin = 512, 96
+    nb = 2 * P._fh_strassen_base()            # the smallest square `gemm!` lets the recursion claim
     nthreads() >= 2 && P.set_num_threads(nthreads())
     if nthreads() < 2 || !(P._gemm_workers(n, n, kthin) > 1)
         P.set_num_threads(1)
         @test_skip "needs ≥2 julia threads and a shape the amortisation floor admits"
     else
-        Abig = randn(n, kbig); Bbig = randn(kbig, n)
+        Abig = randn(nb, nb); Bbig = randn(nb, nb)
         Athin = randn(n, kthin); Bthin = randn(kthin, n)
         # Witnesses: the first shape is the recursion's, the second the pool's. Strassen is unavailable
         # at vector widths whose packing path does not implement it (`_STRASSEN`), and there the big
         # shape takes the column split like the thin one -- the bit-identity below is the same
         # property either way, so the invariant is still tested and only the witness is skipped.
         if P._STRASSEN
-            @test P._strassen_owns(Float64, n, n, kbig, false, Abig, Bbig)
+            @test P._strassen_owns(Float64, nb, nb, nb, false, Abig, Bbig, P._STR_FLOOR)
         else
             @test_skip "Strassen is off at _W64=$(PureBLAS._W64)"
         end
-        @test !P._strassen_owns(Float64, n, n, kthin, false, Athin, Bthin)
+        @test !P._strassen_owns(Float64, n, n, kthin, false, Athin, Bthin, P._STR_FLOOR)
         @test P._gemm_workers(n, n, kthin) > 1
         # AND THAT THE COMBINES THEMSELVES SPLIT, which is a second witness and not a duplicate of the
         # one above. The recursion's leaves threading says nothing about its combine passes: those are
@@ -408,7 +417,7 @@ end
         for α in (1.0, -1.0, 2.5), β in (0.0, 0.5)
             for (A, B) in ((Abig, Bbig), (Athin, Bthin))
                 P.set_num_threads(1)
-                r = randn(n, n); g = copy(r)
+                r = randn(size(A, 1), size(B, 2)); g = copy(r)
                 P.gemm!(r, A, B; alpha = α, beta = β)
                 P.set_num_threads(nthreads())
                 P.gemm!(g, A, B; alpha = α, beta = β)
@@ -458,8 +467,10 @@ end
         # Both witnesses are counters a driver bumps once per dispatched job, so this keeps the
         # property the pool check was written for: an implementation that quietly does neither fails,
         # and so does one that routes to a serial NEON recursion — that bumps nothing.
-        ran(f) = (g0 = @atomic p.gen; s0 = P._SME_CALLS[]; f();
-                  (@atomic p.gen) != g0 || P._SME_CALLS[] != s0)
+        ran(f) = (
+            g0 = @atomic p.gen; s0 = P._SME_CALLS[]; f();
+            (@atomic p.gen) != g0 || P._SME_CALLS[] != s0
+        )
         for (m, n, k) in ((512, 512, 512), (1024, 1024, 1024), (1024, 1024, 128), (2048, 1024, 512))
             P._gemm_workers(m, n, k) > 1 || continue
             A = randn(m, k); B = randn(k, n); C = zeros(m, n)
@@ -622,9 +633,11 @@ end
     # microkernel with the same `_GEMM_SPLIT_S` chain count, masked when ragged — a kernel chosen per
     # block from its own width sums k in an order that follows the worker count. m=48 is the control:
     # 32+16 and 16+16+16 are all-aligned, so divisibility by the band granule is NOT the rule.
-    tri(T, s) = (A = randn(T, s, s) ./ (2s); for i in 1:s
+    tri(T, s) = (
+        A = randn(T, s, s) ./ (2s); for i in 1:s
             A[i, i] = one(T) + abs(A[i, i])
-        end; A)
+        end; A
+    )
 
     # ROUTING WITNESS, derived from the consts rather than asserted about the literal 41. The three
     # shapes above are only meaningful while m=41 still reaches a RAGGED row block inside the split

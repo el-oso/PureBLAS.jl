@@ -579,6 +579,13 @@ const _GEMM_SPLIT_S = 2
 # as WORSE. The mechanism prose was backwards on its face too: cheaper FMAs make Strassen's
 # flops-for-adds trade LESS attractive, not more.
 # PDM: Literal — falsified derivation, fleet table above. | req8-ok: flat on 2 boxes, measured win on the 3rd
+#
+# This is the SERIAL flop-cut floor, and it is consulted at level 1 only by callers whose sole
+# alternative to the recursion is serial (`_STR_LVL1`, gemm.jl). `gemm!` and `_symm!` hold level 1 to
+# the leaf-width floor `2 * _STRASSEN_BASE` instead (`_STR_FLOOR`), because they have a classical
+# threaded route that a ragged level-1 leaf split would forfeit. Raising THIS value to reach that
+# effect was measured and rejected: it doubles `_trmm_split_L!`'s split floor and takes trmm's
+# threaded 2048 / 2100 / 4096 cells on Zen4 from 0.482 / 0.515 / 0.620 to 0.170 / 0.170 / 0.279.
 @inline _at_strassen_min(hw) = 256
 # FALSIFIED PREDICATE, now a fleet-evidenced literal — same story as `_at_strassen_min` directly above.
 # Was `_datapath_bytes(hw) >= 64 ? 1792 : 448`. FLAT on zen3/zen4; 1792 measured on Zen5

@@ -209,7 +209,7 @@ const _TRMM_PACK_MIN = @load_preference("trmm_pack_min", (5 * _GEMM_UNPACK_MAX) 
     # remainder as large as the floor allows is what gets it over `_SME_MIN`. k=132 gives 36+96.
     g = (((k - 2 * _SME_MR) ÷ _SME_MR) * _SME_MR)
     hr = k - g
-    (hr >= 2 * _SME_MR && _sme_tile_ok(hr, g)) ? hr : hg
+    return (hr >= 2 * _SME_MR && _sme_tile_ok(hr, g)) ? hr : hg
 end
 @inline _opchar(tr::Bool, cj::Bool) = tr ? (cj ? 'C' : 'T') : 'N'
 
@@ -1459,13 +1459,13 @@ function _trmm_split_L!(up::Bool, tr::Bool, unit::Bool, A, B, mrv::Val)
     n = size(B, 2)
     if (up && !tr) || (!up && tr)              # top block carries the off-diagonal update → after Bt's solve
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
-        nwo = _strassen_owns(T, h, n, k - h, tr, off, Bb) ? _gemm_workers(h, n, k - h) : 1
-        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, _RT_NONE, true, nwo)
+        nwo = _strassen_owns(T, h, n, k - h, tr, off, Bb, _STR_LVL1) ? _gemm_workers(h, n, k - h) : 1
+        _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, _RT_NONE, _STR_LVL1, nwo)
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
     else                                        # bottom block carries the update
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
-        nwo = _strassen_owns(T, k - h, n, h, tr, off, Bt) ? _gemm_workers(k - h, n, h) : 1
-        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, _RT_NONE, true, nwo)
+        nwo = _strassen_owns(T, k - h, n, h, tr, off, Bt, _STR_LVL1) ? _gemm_workers(k - h, n, h) : 1
+        _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, _RT_NONE, _STR_LVL1, nwo)
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
     end
     return B
@@ -1742,8 +1742,10 @@ function _trsm_base_invL!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1
             # place to take the route token, which a column band must carry.
             _gemm_core!(tmp, iv, B, one(T), zero(T), true, false, false, false, (-1, nrt, -1))
         else
-            _gemm_unpacked!(Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp,
-                (-1, nrt, -1))                       # side L: `nrt` IS a column count
+            _gemm_unpacked!(
+                Val(false), Val(true), nb, n, nb, one(T), iv, B, zero(T), tmp,
+                (-1, nrt, -1)
+            )                       # side L: `nrt` IS a column count
         end
         @inbounds for j in 1:n, i in 1:nb
             B[i, j] = tmp[i, j]
@@ -1767,11 +1769,15 @@ function _trsm_base_invR!(up::Bool, tr::Bool, unit::Bool, A, B, nroute::Int = -1
             # `nroute` IS A ROW COUNT HERE, so it belongs in the m slot and nowhere else. The kernel
             # switch applies two tests to the row extent — `max(m, n, k) <= _gemm_split_max()` and
             # `m >= _SMR·W` — and only the m slot feeds the undivided count to BOTH.
-            _gemm_unpacked!(Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp,
-                (nroute, -1, -1))
+            _gemm_unpacked!(
+                Val(true), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp,
+                (nroute, -1, -1)
+            )
         else
-            _gemm_unpacked!(Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp,
-                (nroute, -1, -1))
+            _gemm_unpacked!(
+                Val(false), Val(true), m, nb, nb, one(T), B, iv, zero(T), tmp,
+                (nroute, -1, -1)
+            )
         end
         @inbounds for j in 1:nb, i in 1:m
             B[i, j] = tmp[i, j]
@@ -7746,7 +7752,7 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     # product threads inside the recursion instead of being column-split — see the same decision in
     # `gemm!`, and `_strassen_leaf!` for why that is still bit-identical.
     Xd, Yd = side_left ? (Ad, B) : (B, Ad)
-    if nw > 1 && !_strassen_owns(eltype(C), size(C, 1), size(C, 2), size(Yd, 1), false, Xd, Yd)
+    if nw > 1 && !_strassen_owns(eltype(C), size(C, 1), size(C, 2), size(Yd, 1), false, Xd, Yd, _STR_FLOOR)
         rA = _root(Ad); rB = _root(B); rC = _root(C)
         GC.@preserve rA rB rC begin
             side_left ?
@@ -7754,8 +7760,8 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
                 _gemm_threaded!(_pm(C), _pm(B), _pm(Ad), aT, bT, false, false, false, false, nw)
         end
     else
-        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false, _RT_NONE, true, nw) :
-            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false, _RT_NONE, true, nw)
+        side_left ? _gemm_core!(C, Ad, B, aT, bT, false, false, false, false, _RT_NONE, _STR_FLOOR, nw) :
+            _gemm_core!(C, B, Ad, aT, bT, false, false, false, false, _RT_NONE, _STR_FLOOR, nw)
     end
     return C
 end
