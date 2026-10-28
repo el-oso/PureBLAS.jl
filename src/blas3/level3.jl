@@ -215,8 +215,15 @@ end
 
 # off-diagonal update C += op(A)·B — straight to the dispatch core (skip gemm!'s kwarg/check layer;
 # the recursion guarantees the shapes).
-@inline _gemm_acc!(C, A, B, tr::Bool, cj::Bool) =
-    _gemm_core!(C, A, B, one(eltype(C)), one(eltype(C)), tr, false, cj, false)
+# `nroute` is the UNDIVIDED column count, or -1 when the caller is not a column band. A band must
+# route as its parent did: `_gemm_core!` keys its kernel choice on `(m, n, k)`, so a band passing its
+# own narrower `n` could take a different arm than the unsplit call and the two would not agree bit
+# for bit (req #11). The token's `n` slot is what carries the parent's width past that decision.
+@inline _gemm_acc!(C, A, B, tr::Bool, cj::Bool, nroute::Int = -1) =
+    _gemm_core!(
+        C, A, B, one(eltype(C)), one(eltype(C)), tr, false, cj, false,
+        nroute < 0 ? _RT_NONE : (-1, nroute, -1)
+    )
 
 # ── trmm side='L':  B := op(A)·B,  A k×k triangular (k=size(B,1)), unscaled ──────────────────────
 # NOTE: trmm! routes large real side-L to the single-pass `_trmm_packed!` (the proven-fastest path); a
@@ -888,7 +895,14 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     return B
 end
 
-function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
+# `nroute` is the UNDIVIDED column count of B, or -1 for an unsplit call. Every predicate in this
+# function and in its bases keys on `k`, the triangular dimension, which a COLUMN split leaves whole
+# — so the token is needed for one thing only: the off-diagonal `_gemm_acc!`, whose kernel choice
+# reads `n`. Carrying it makes a band's arithmetic identical to the unsplit call's at every worker
+# count (req #11); the recursion passes it down unchanged, because the parent's width is the right
+# answer at every level.
+function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::Int = -1)
+    nrt = nroute < 0 ? size(B, 2) : nroute
     k = size(A, 1)
     if eltype(B) <: BlasReal && !cj && k <= _TRMM_BASE_R
         return k <= _fh_trmm_ddirect() ? _trmm_dense_L!(up, tr, unit, A, B) :
@@ -918,14 +932,14 @@ function _trmm_left!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B)
     # transA carries op. Verified against all four (uplo×trans) cases.
     if up != tr
         off = tr ? view(A, (h + 1):k, 1:h) : view(A, 1:h, (h + 1):k)
-        _trmm_left!(up, tr, cj, unit, A11, B1)
-        _gemm_acc!(B1, off, B2, tr, cj)
-        _trmm_left!(up, tr, cj, unit, A22, B2)
+        _trmm_left!(up, tr, cj, unit, A11, B1, nroute)
+        _gemm_acc!(B1, off, B2, tr, cj, nrt)
+        _trmm_left!(up, tr, cj, unit, A22, B2, nroute)
     else
         off = tr ? view(A, 1:h, (h + 1):k) : view(A, (h + 1):k, 1:h)
-        _trmm_left!(up, tr, cj, unit, A22, B2)
-        _gemm_acc!(B2, off, B1, tr, cj)
-        _trmm_left!(up, tr, cj, unit, A11, B1)
+        _trmm_left!(up, tr, cj, unit, A22, B2, nroute)
+        _gemm_acc!(B2, off, B1, tr, cj, nrt)
+        _trmm_left!(up, tr, cj, unit, A11, B1, nroute)
     end
     return B
 end
@@ -1527,6 +1541,33 @@ function trmm!(
     # `Float64` STAYS, and it is now the only restriction left that is wider than it needs to be: F32
     # takes the same flat loop and the same token, so it is admissible on the same argument. Widening
     # it is a separate change with its own bit-identity run, not a free rider on this one.
+    # ── SIDE L: a COLUMN split of B ────────────────────────────────────────────────────────────────
+    # Columns of B are independent under `B := op(A)·B`, so the bands share nothing. Armed only where
+    # `_trmm_left!` owns the call — above `_TRMM_PACK_MIN` the split driver owns it instead and threads
+    # its own off-diagonal updates, and a column split layered on that would contend for the one pool
+    # claim. Below `_TRMM_BASE_R` the base kernels run without a recursion and there is nothing to
+    # amortise a join with.
+    #
+    # `_trsm_workers` decides, on the solve's own `k²·n`: side-L trmm has the same operand shape and
+    # the same flop count, so the amortisation floor transfers exactly rather than by analogy.
+    #
+    # `Float64` STAYS, on the same argument as the side-R block below: F32 takes the identical
+    # recursion and the identical token, so it is admissible, but widening it earns its own
+    # bit-identity run rather than riding on this one.
+    if sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
+            _strided1(A) && _strided1(B) && size(B, 1) == k &&
+            k > _TRMM_BASE_R && k <= _TRMM_PACK_MIN + _EXPINT[2]
+        nwl = _trsm_workers(k, size(B, 2))
+        if nwl > 1
+            rA = _root(A); rB = _root(B)
+            GC.@preserve rA rB _gemm_threaded!(
+                _pm(B), _pm(A), _pm(B), convert(eltype(B), alpha), zero(eltype(B)),
+                transA != 'N', false, false, false, nwl,
+                _MT_KIND_TRMM, uplo == 'U', false, diag == 'U'
+            )
+            return B
+        end
+    end
     if !sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
             _strided1(A) && _strided1(B) && size(B, 2) == k &&
             !_trmmr_sme_owns(Float64, k, size(B, 1), A, B)
@@ -5116,6 +5157,29 @@ _trmmr_prefit!(::Type{T}, ::Int, ::Int) where {T} = nothing   # non-real kinds n
     # divided.
     _trmm_right!(p.up, p.tA, p.cA, p.unit, Ac, Bc, i, p.m)
     isone(p.alpha) || _scal_all!(Bc, p.alpha)          # α after the product, as `trmm!` applies it
+    return nothing
+end
+
+# ── THREADED trmm, side 'L' ────────────────────────────────────────────────────────────────────────
+# A column band of B, the whole of A. For side L the columns of B are independent — column j of
+# `op(A)·B` reads column j of B and all of A, and nothing is reduced across columns — so the bands
+# share nothing and need no barrier. `_trmm_left!`'s bases borrow from the arena, the same shape
+# `_trsm_run_chunk` below already relies on, so there is no pre-sized pool to fit.
+#
+# `p.n` is the UNDIVIDED column count and it is what makes this reproducible: `_trmm_left!` routes on
+# `k` alone, but its off-diagonal `_gemm_acc!` keys on `n`, and a band passing its own width could
+# take a different gemm arm than the unsplit call. The token carries the parent's width past that one
+# decision (req #11).
+#
+# UNSCALED, then α once per band. The serial entry runs `_trmm_left!` through `_trmm!` and applies α
+# afterwards, so a band must do the same or the two differ by where the scale lands.
+@noinline function _trmm_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    Ac = PtrMatrix{T}(p.Ap, p.m, p.m, p.lda)                       # A is m×m for side L
+    Bc = PtrMatrix{T}(p.Bp + j0 * p.ldb * sizeof(T), p.m, len, p.ldb)
+    _trmm_left!(p.up, p.tA, p.cA, p.unit, Ac, Bc, p.n)
+    isone(p.alpha) || _scal_all!(Bc, p.alpha)
     return nothing
 end
 

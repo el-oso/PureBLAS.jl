@@ -313,13 +313,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-63 `const _X = <literal>` values in `src/` with no `@load_preference`.
+64 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 32 Literal · 26 Exempt · 3 Unaudited.
+**Tier:** 2 Measured · 32 Literal · 27 Exempt · 3 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -446,6 +446,7 @@ on these, not on knobs.
 | `_MT_KIND_SWAP` | 12 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_SYMV` | 17 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_SYRK` | 1 | Exempt | job-kind tag, not hardware tuning. (Repeated: the marker binds to the NEXT const only, |
+| `_MT_KIND_TRMM` | 20 | Exempt | job-kind tag, not hardware tuning. Nothing a machine reports could place it, and a |
 | `_MT_KIND_TRMMR` | 5 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_TRSM` | 2 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_TRSMR` | 4 | Exempt | job-kind tag, not hardware tuning. |
