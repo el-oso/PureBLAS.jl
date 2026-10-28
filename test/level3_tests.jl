@@ -331,8 +331,13 @@ end
         # sibling thread-invariance item compares bit patterns instead, because there both sides are
         # PureBLAS and any difference at all is the defect.
         rtol = 8 * k * eps(Float64)
-        # alpha is not a power of two: scaling by ±2^j is exact and would hide a misplaced alpha.
+        # alpha has to ROUND when it is applied, or a misplaced alpha is invisible: scaling by ±2^j
+        # is exact, so the same factor applied at a different point in the sum order would return the
+        # same bits. The value itself carries no other requirement, so the PROPERTY is asserted here
+        # rather than argued in a comment -- any alpha that passes this line does the job, and one
+        # edited into a power of two fails immediately instead of quietly weakening the item.
         alpha = 3.7
+        @test !isinteger(log2(alpha))
         for dg in ('N', 'U')
             ref = copy(B0)
             BLAS.trmm!('L', 'L', 'N', dg, alpha, Aref, ref)
