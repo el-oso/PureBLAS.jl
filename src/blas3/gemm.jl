@@ -1346,9 +1346,13 @@ end
 #
 # THE ROW BLOCKS MUST NOT DISAGREE ON KERNEL, and that is a correctness constraint before it is a
 # performance one. A block's row count depends on the extent the CALLER holds, and the two carvings do
-# not nest: `_trsm_rchunk` bands side-R rows in `_MR·W` = 16 while this driver tiles in `_SMR·W` = 32,
-# so m=41 is 32+9 unsplit and 16, 25 banded, which places the same rows in an aligned block one way and
-# a ragged block the other. Every block therefore takes THIS one kernel with `_GEMM_SPLIT_S` chains,
+# not nest: `_trsm_rchunk` bands side-R rows in `_MR * W` while this driver tiles in `_SMR * W`, two
+# different multipliers, so a band boundary can fall inside one of this driver's tiles. Worked at
+# `_MR * W` = 16 and `_SMR * W` = 32: m=41 is 32+9 unsplit and 16, 25 banded, which places the same
+# rows in an aligned block one way and a ragged block the other. BOTH PRODUCTS ARE HARDWARE-DERIVED
+# and smaller on a narrower vector — at W = 2 they are 4 and 8 — so read them from the constants and
+# treat the arithmetic above as one instance rather than the figures.
+# Every block therefore takes THIS one kernel with `_GEMM_SPLIT_S` chains,
 # masked when ragged; a kernel chosen per block from its own width sums k in an order that follows the
 # worker count (req#11). No route token can reach that choice — the deciding extent is a block's own
 # width inside an already-entered kernel.
@@ -3720,17 +3724,19 @@ end
         # admission decision, not here: capping workers so every band reaches the kernel's tile turns
         # those three into 1.36x, 1.55x and 1.29x FASTER than an unrouted predicate manages.
         #
+        # THE BASELINE FOR ALL SIX FIGURES IS THE UNROUTED PREDICATE. Against the ROUTED predicate
+        # with no cap the same measurements read 2.96x, 2.16x and 1.51x — the products — so a ratio
+        # quoted here without naming its baseline is ambiguous by about a factor of two.
+        #
         # Those ratios are one SME implementation's, not a portable property: the padding waste follows
         # from `_SME_MR`, and a part with a different tile width moves every figure above.
         #
-        # A residual sits at m=512, where the cap does not bind and this reading measures 4-5% slower
-        # — NOT an adjudicated result. The cross-tree timings behind it rest on a single control shape
-        # at m=2048 agreeing to 0.2%, which shows the two windows matched there rather than that
-        # neither moved, and a mid-window clock dip is invisible to a check that reads only a window's
-        # representative clock. Settling it needs several controls straddling the routing change and
-        # per-sample spread; the large ratios above are far outside that uncertainty and the call
-        # counts are not timings at all, so only this 4-5% is in question. A fix would be a crossover
-        # on the band extent, which is a routing choice rather than a token one.
+        # A residual sits at m=512, where the cap does not bind and this reading measures 4-5% slower.
+        # THAT FIGURE IS NOT ADJUDICATED: the cross-tree timings behind it rest on one control shape at
+        # m=2048 agreeing to 0.2%, and one control cannot separate two windows that matched from two
+        # that both drifted. Settling it needs several controls straddling the routing change and
+        # per-sample spread. The large ratios above sit far outside that uncertainty and the call
+        # counts are not timings at all, so only this 4-5% is open.
         if _sme_eligible(T, mrt, nrt, krt, tA, tB, cA, cB, C, A, B)
             return _gemm_sme!(C, A, B, Float64(alpha), Float64(beta), m, n, k, tA, tB)
         end
