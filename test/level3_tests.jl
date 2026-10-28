@@ -308,8 +308,14 @@ end
         # The item asks `_trsm_workers` DIRECTLY below and skips when it declines, so the gate is
         # consulted rather than guessed — which is what the lint is for. The sizes are derived from
         # the two thresholds that bound the route, not chosen.
-        k = 4 * P._TRMM_BASE_R                        # inside the band, away from both edges
-        @test k > P._TRMM_BASE_R && k <= P._TRMM_PACK_MIN
+        # THE BAND IS NOT THE SAME WIDTH ON EVERY µARCH and it can be narrow: `_TRMM_PACK_MIN` is
+        # `(5 * _GEMM_UNPACK_MAX) ÷ 2`, which is 1120 where `_GEMM_UNPACK_MAX` is 448 and 240 where it
+        # is 96. A k derived from `_TRMM_BASE_R` alone overshoots the top on the narrow hosts — this
+        # item asserted itself into that and failed on AVX2 — so k is clamped INTO the band and the
+        # band being empty is a skip rather than a false assertion.
+        lo = P._TRMM_BASE_R + 1
+        hi = P._TRMM_PACK_MIN
+        k = clamp(4 * P._TRMM_BASE_R, lo, hi)
         # the narrowest B that clears the flop floor, doubled so the floor is not the thing under test
         n = max(2 * P._NR, 2 * cld(P._GEMM_MT_WORK, k * k))
         # LIVENESS, read from the pool's own publish counter rather than from a buffer. `gen` is
@@ -320,8 +326,12 @@ end
         #
         # It is still guarded on whether the entry ARMS, using the entry's own worker function: a
         # host whose floor declines this shape would otherwise fail for threading correctly.
+        # ARMED MEANS THE ENTRY'S WHOLE CONDITION, not just the worker count. The route also requires
+        # k to be inside the band, and asking only `_trsm_workers` is how this item first failed on a
+        # host whose band does not reach the k it had chosen: the workers said yes, the entry said no,
+        # and the witness then asserted that a job it had declined to publish had been published.
         P.set_num_threads(max(2, nthreads()))
-        armed = P._trsm_workers(k, n) > 1
+        armed = lo <= hi && k > P._TRMM_BASE_R && k <= P._TRMM_PACK_MIN && P._trsm_workers(k, n) > 1
         A = triu(randn(k, k)) + k * I
         B0 = randn(k, n)
         P.set_num_threads(1)
