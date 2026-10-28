@@ -302,31 +302,50 @@ end
         # concurrency reaches it: with one caller the claim always succeeds, and every
         # single-threaded test passed over it.
         #
-        # The operand is built to make that failure loud. The unreferenced triangle holds a large
-        # sentinel so a full product cannot agree by luck, and `diag = 'U'` is exercised because a
-        # gemm cannot honour an implicit unit diagonal at all. Verified to discriminate: 4 of 8
-        # assertions fail with the lost-claim branch removed.
+        # The operand is built to make that failure loud, and the sentinel states the invariant it
+        # tests rather than asserting a magnitude. `uplo='L'` means the STRICTLY UPPER triangle is
+        # never referenced, so filling it with NaN makes any read of it poison the result: a full
+        # product returns NaN and no tolerance can admit it. A finite sentinel would instead be a
+        # claim that it is large enough to escape `rtol`, which is a second thing to get right.
+        #
+        # THE REFERENCE IS BUILT FROM THE CLEAN MATRIX, which is what lets the sentinel be NaN. Timed
+        # against the sentinel matrix instead, this item would be asserting that OpenBLAS also never
+        # touches the unreferenced triangle — true by the spec, but an implementation that packs a
+        # full block and masks it would poison the reference too and fail for the wrong reason.
+        #
+        # `diag = 'U'` is exercised because a gemm cannot honour an implicit unit diagonal at all.
+        # With the lost-claim branch removed, every caller that loses the claim fails; how many that
+        # is varies with the race, so the count is not asserted.
         nt = min(4, Threads.nthreads())
         P.set_num_threads(nt)
         k = clamp(4 * P._TRMM_BASE_R, P._TRMM_BASE_R + 1, P._TRMM_PACK_MIN)
         n = max(2 * P._NR, 2 * cld(P._GEMM_MT_WORK, k * k))
-        A = tril(randn(k, k)) + k * I
+        Aref = tril(randn(k, k)) + k * I          # referenced half only; the other half is zero
+        A = copy(Aref)
         for c in 1:k, r in 1:(c - 1)
-            A[r, c] = 1.0e6                       # strictly upper: never referenced for uplo='L'
+            A[r, c] = NaN                         # strictly upper: never referenced for uplo='L'
         end
         B0 = randn(k, n)
+        # A length-k dot product carries a relative error of order k·eps, and this is PureBLAS against
+        # OpenBLAS summing in a different order — so the band is derived from k and moves with it. The
+        # sibling thread-invariance item compares bit patterns instead, because there both sides are
+        # PureBLAS and any difference at all is the defect.
+        rtol = 8 * k * eps(Float64)
+        # alpha is not a power of two: scaling by ±2^j is exact and would hide a misplaced alpha.
+        alpha = 3.7
         for dg in ('N', 'U')
             ref = copy(B0)
-            BLAS.trmm!('L', 'L', 'N', dg, 3.7, A, ref)
+            BLAS.trmm!('L', 'L', 'N', dg, alpha, Aref, ref)
+            @test all(isfinite, ref)              # the sentinel can only fire on a read of A's upper half
             outs = [copy(B0) for _ in 1:nt]
             Threads.@threads :static for t in 1:nt
                 for _ in 1:2
                     copyto!(outs[t], B0)
-                    P.trmm!(outs[t], A; side = 'L', uplo = 'L', transA = 'N', diag = dg, alpha = 3.7)
+                    P.trmm!(outs[t], A; side = 'L', uplo = 'L', transA = 'N', diag = dg, alpha = alpha)
                 end
             end
             for t in 1:nt
-                @test outs[t] ≈ ref rtol = 1.0e-12
+                @test isapprox(outs[t], ref; rtol)
             end
         end
         P.set_num_threads(1)
