@@ -423,20 +423,20 @@ end
 # Blocked compact-WY QR. Reduce each nb-panel (qr_unblocked!), build V (unit-lower-trapezoid) + the
 # compact-WY T (dlarft), then apply Qᵀ to the trailing block: C −= V·(Tᵀ·(Vᵀ·C)) — the two big gemms via
 # PureBLAS's cache-blocked gemm! (VᵀV and the trailing get gemm; Y=TᵀW is tiny → scalar).
-# Cached blocked-QR workspace (V m×nb, Tm/G nb×nb, Wb/Yb nb×n) — a fresh 5-matrix alloc per call
+# Cached blocked-QR workspace (V m×nb, Tm/G nb×nb, Wb nb×n) — a fresh per-call alloc of these
 # dominated geqrf at n=32–64. Regrown on demand; single-thread (like the other L3/LAPACK scratches).
-const _QR_WS = Base.OncePerTask{Base.RefValue{NTuple{5, Matrix{Float64}}}}(
-    () -> Ref{NTuple{5, Matrix{Float64}}}(ntuple(_ -> Matrix{Float64}(undef, 0, 0), 5))
+const _QR_WS = Base.OncePerTask{Base.RefValue{NTuple{4, Matrix{Float64}}}}(
+    () -> Ref{NTuple{4, Matrix{Float64}}}(ntuple(_ -> Matrix{Float64}(undef, 0, 0), 4))
 )
 @inline function _qr_ws(m::Int, n::Int, nb::Int)
     r = _QR_WS()
-    V, Tm, G, Wb, Vt = r[]                                   # 5th slot repurposed Yb→Vt (nb×m): the
-    if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n || size(Vt, 2) < m
-        V = Matrix{Float64}(undef, m, nb); Tm = Matrix{Float64}(undef, nb, nb)   # transposed V for the skinny
-        G = Matrix{Float64}(undef, nb, nb); Wb = Matrix{Float64}(undef, nb, n); Vt = Matrix{Float64}(undef, nb, m)
-        r[] = (V, Tm, G, Wb, Vt)                             # W=Vᵀ·C as an unpacked no-trans gemm
+    V, Tm, G, Wb = r[]
+    if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n
+        V = Matrix{Float64}(undef, m, nb); Tm = Matrix{Float64}(undef, nb, nb)
+        G = Matrix{Float64}(undef, nb, nb); Wb = Matrix{Float64}(undef, nb, n)
+        r[] = (V, Tm, G, Wb)
     end
-    return V, Tm, G, Wb, Vt
+    return V, Tm, G, Wb
 end
 @inline _qr_ws(::Type{Float64}, m::Int, n::Int, nb::Int) = _qr_ws(m, n, nb)
 # Any other real T (Float32, Dual, BigFloat, …) has no owned pool — the GKH pool is one Ref per CONCRETE type
@@ -478,8 +478,8 @@ function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <:
     return A
 end
 
-# ONE blocked driver for every `T<:Real` (req#3). Float64 gets the SIMD rank-2 panel + the owned workspace +
-# the unpacked skinny W; any other real gets the generic panel above and a per-call workspace, and its
+# ONE blocked driver for every `T<:Real` (req#3). Float64 gets the SIMD rank-2 panel + the owned workspace;
+# any other real gets the generic panel above and a per-call workspace, and its
 # trailing update goes through `syrk!`/`trmm!`/`gemm!` — which on a `Dual` are the planar real-kernel
 # compositions of dual_l3.md, so a dual QR rides the same BLAS-3 amortisation as potrf/getrf.
 function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where {T <: Real}
@@ -493,27 +493,26 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
     end
     nb = clamp(nb > 0 ? nb : _qr_nb(T, m, n), 1, k)  # nb>0 = caller override (tuning); else derive
     if T === Float64                                  # the owned GKH pool — the shipped route, untouched
-        V, Tm, G, Wb, Vt = _qr_ws(m, n, nb)
-        _geqrf_wy!(A, tau, m, n, k, nb, V, Tm, G, Wb, Vt)
+        V, Tm, G, Wb = _qr_ws(m, n, nb)
+        _geqrf_wy!(A, tau, m, n, k, nb, V, Tm, G, Wb)
     else
         # Every other T BORROWS from the arena (arena.jl): a `!` routine must not allocate, and the per-call
         # `Matrix{T}` workspace this used to build measured 18 736 B per dual `geqrf!` at n=64
-        # (bench/probes/lapack_entry_alloc.jl) — the one LAPACK bang entry that was not clean. `Vt` exists
-        # only for the BlasReal skinny arm, so any other T borrows it 0×0 (zero bytes) and never reads it.
+        # (bench/probes/lapack_entry_alloc.jl) — the one LAPACK bang entry that was not clean.
         @scope arn begin
             V = borrow!(arn, T, m, nb); Tm = borrow!(arn, T, nb, nb); G = borrow!(arn, T, nb, nb)
-            Wb = borrow!(arn, T, nb, n); Vt = T <: BlasReal ? borrow!(arn, T, nb, m) : borrow!(arn, T, 0, 0)
-            _geqrf_wy!(A, tau, m, n, k, nb, V, Tm, G, Wb, Vt)
+            Wb = borrow!(arn, T, nb, n)
+            _geqrf_wy!(A, tau, m, n, k, nb, V, Tm, G, Wb)
         end
     end
     return A
 end
 
-# The blocked compact-WY loop over a supplied workspace: `V` m×nb, `Tm`/`G` nb×nb, `Wb` nb×n, `Vt` nb×m (or
-# 0×0 when `T` is not a BlasReal). `@inline` so the Float64 instantiation compiles to the same body it had
-# when this loop sat in `geqrf!` itself.
+# The blocked compact-WY loop over a supplied workspace: `V` m×nb, `Tm`/`G` nb×nb, `Wb` nb×n.
+# `@inline` so the Float64 instantiation compiles to the same body it had when this loop sat in
+# `geqrf!` itself.
 @inline function _geqrf_wy!(
-        A::AbstractMatrix{T}, tau::AbstractVector{T}, m::Int, n::Int, k::Int, nb::Int, V, Tm, G, Wb, Vt
+        A::AbstractMatrix{T}, tau::AbstractVector{T}, m::Int, n::Int, k::Int, nb::Int, V, Tm, G, Wb
     ) where {T <: Real}
     pc = 1
     @inbounds while pc <= k
@@ -522,32 +521,9 @@ end
         jt0 = pc + pb
         if jt0 <= n
             mp = m - pc + 1; nt = n - jt0 + 1
-            # `Vtv` ONLY WHEN THE SKINNY PATH WILL USE IT. `Vt` is borrowed 0×0 for any non-`BlasReal` T
-            # (see `geqrf!`), because only the skinny unpacked arm reads
-            # it and that arm is gated on `T <: BlasReal`. Building the view unconditionally therefore
-            # threw `BoundsError: attempt to access 0×0 Matrix{Dual} at index [1:16, 1:96]` on every
-            # blocked shape for Dual, Float16 and BigFloat — `view` bounds-checks at construction, so it
-            # tripped before `useskinny` was ever consulted.
             Vv = view(V, 1:mp, 1:pb)
-            # Skinny W=Vᵀ·C via the unpacked path — the crossover is a µARCH SPLIT (req#8; measured fleet):
-            #  • AVX2 (W=4): the packed transA skinny gemm is STABLE at large mp, so unpacked wins only while Vᵀ
-            #    (pb·mp·8 B) stays L2-resident (else it re-fetches Vᵀ per n-tile). Gate: Vᵀ≤½L2 ⇔ 16·pb·mp≤L2
-            #    (Zen3: unpacked +8-17% at mp≤1024/Vt≤256KB, -10-23% at mp≥1536).
-            #  • AVX-512 (W=8): the packed transA skinny gemm COLLAPSES at large mp (neuro/wm: packed 16-28 vs
-            #    unpacked ~30-42 GF for mp≥512), so unpacked wins for all non-tiny mp. Gate: mp>_GEMM_UNPACK_MAX.
-            #  The L2 gate is in BYTES: Vᵀ ≤ ½L2 ⇔ 2·pb·mp·sizeof(T) ≤ L2 (= 16·pb·mp for Float64). Only a
-            #  BlasReal has the unpacked kernel; every other T takes `gemm!` (on a Dual: the planar route).
-            useskinny = T <: BlasReal && (_CHOLW == 4 ? (2 * pb * mp * sizeof(T) <= _L2_BYTES) : (mp > _GEMM_UNPACK_MAX))
-            if useskinny
-                Vtv = view(Vt, 1:pb, 1:mp)                         # safe here: BlasReal ⇒ Vt is full-size
-                for c in 1:pb, i in 1:mp                           # V and its transpose Vᵀ from A in ONE pass
-                    val = i == c ? one(T) : (i > c ? A[pc + i - 1, pc + c - 1] : zero(T))
-                    Vv[i, c] = val; Vtv[c, i] = val
-                end
-            else
-                for c in 1:pb, i in 1:mp
-                    Vv[i, c] = i == c ? one(T) : (i > c ? A[pc + i - 1, pc + c - 1] : zero(T))
-                end
+            for c in 1:pb, i in 1:mp
+                Vv[i, c] = i == c ? one(T) : (i > c ? A[pc + i - 1, pc + c - 1] : zero(T))
             end
             Gv = view(G, 1:pb, 1:pb)
             syrk!(Gv, Vv; uplo = 'U', trans = 'T', alpha = true, beta = false)  # G = Vᵀ V (upper only — dlarft
@@ -565,12 +541,25 @@ end
                 end
             end
             C = view(A, pc:m, jt0:n)
-            Wv = view(Wb, 1:pb, 1:nt)                                     # W = Vᵀ·C: skinny m=pb. When Vᵀ is
-            if useskinny                                                  # L2-resident, the UNPACKED no-trans path
-                _gemm_unpacked!(Val(false), Val(true), pb, nt, mp, one(T), Vtv, C, zero(T), Wv)  # (Vᵀ prebuilt, streams
-            else                                                          # C in place) beats the packed transA gemm
-                gemm!(Wv, Vv, C; transA = 'T', alpha = true, beta = false)   # +8-17%; else packed kc-blocked wins.
-            end
+            Wv = view(Wb, 1:pb, 1:nt)
+            # W = Vᵀ·C THROUGH `gemm!`, UNCONDITIONALLY, AND IT IS THE DOMINANT PHASE. This used to
+            # route a prebuilt Vᵀ into `_gemm_unpacked!` for most shapes, on a measured µarch split:
+            # the packed transA skinny gemm was recorded collapsing at large mp (16-28 GF against
+            # unpacked 30-42). That gemm has since moved — it now measures 46-53 GF/s serially, which
+            # is 0.90-1.0x of unpacked — so the premise the split rested on no longer holds, while the
+            # cost of the split does: `_gemm_unpacked!` has NO pool path, and at six workers this phase
+            # was 82-86% of geqrf's threaded wall time and never threaded. Amdahl on a 0.78 serial
+            # fraction gives exactly the 1.6x self-speedup observed flat from n=512 to 4096.
+            #
+            # Measured, Zen4, six workers, controlled A/B in one process: 20.15 -> 9.60 ms at n=1024
+            # (2.10x), 156.6 -> 62.5 at 2048 (2.51x), 1267 -> 495 at 4096 (2.56x), self-speedup to
+            # 3.3-4.0x. Serial cost 1.00x at 1024 and 0.97x at 2048, against cached serial margins of
+            # 1.181 and 1.394, so no serial cell flips.
+            #
+            # UNCONDITIONAL IS A req#11 REQUIREMENT, not a simplification: routing by thread count
+            # would make a one-thread call and a six-thread call take different kernels, and they do
+            # not agree bit for bit. This way they take the same one.
+            gemm!(Wv, Vv, C; transA = 'T', alpha = true, beta = false)
             trmm!(Wv, Tv; side = 'L', uplo = 'U', transA = 'T')            # W := Tᵀ W (was a scalar latency-bound
             # triple loop — SIMD trmm instead)
             gemm!(C, Vv, Wv; alpha = -1, beta = true)                     # C −= V·(Tᵀ W)
