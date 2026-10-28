@@ -439,6 +439,24 @@ end
     end
 end
 
+# A side-R worker is handed a ROW BAND of B and routes from `nroute`, the whole problem's row count,
+# so it takes the algorithm the unsplit solve takes. Bands round to `_MR·W`, which is FINER than the
+# `_SME_MR` modulus the SME recursion asks for, so a band's own height can fail that modulus where
+# the unsplit height passes it — at m=2048 with three workers the bands are 680/684/684. A band
+# routing on its own height takes the fused leaf while the unsplit call recurses, and leaf and
+# recursion sum in a different order, so the result would depend on the worker count.
+#
+# THE WORKER COUNT, NOT A RAGGED `m`, IS WHAT REACHES THIS: every band is a whole `_MR·W` block, and
+# only some worker counts make them whole `_SME_MR` blocks as well. `k` must be at least 64, because
+# `_sme_tile_ok` needs `min(m, k÷2) ≥ 2·_SME_MR` before the recursion is eligible at all.
+#
+# WHAT THIS ITEM DOES NOT COVER, so that a green is not read as covering it. Two further hazards on
+# this path have items of their own below. One is a band whose OWN height falls under the
+# `2·_SME_MR` floor `_sme_tile_ok` opens with, which `m = 2048` here never approaches — its narrowest
+# band at twelve workers is 168 rows. The other is that same predicate answering differently for a
+# band than for the undivided height with BOTH operands above that floor, through its modulus clause
+# rather than its floor; `m = 2048` is a whole `_SME_MR` block and so are its bands at every count
+# here, so this shape cannot reach it.
 @testitem "trsm side-R: bit-identical at every thread count" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
@@ -450,7 +468,13 @@ end
         bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
         # Liveness first: the band split has to be armed at this shape or the comparison is vacuous.
         # Then the hazard itself — a worker count whose bands are NOT whole `_SME_MR` blocks while the
-        # unsplit height is. A box that cannot reach one says so rather than passing for free.
+        # unsplit height is.
+        #
+        # THE SKIP BELOW DOES NOT SHORT-CIRCUIT, deliberately: the comparison loop is a valid req#11
+        # check wherever it runs, so it runs even on a box that cannot reach the SME hazard. The cost
+        # is that a green alone does not say the SME route was exercised — on x86, where `_SME_F64` is
+        # false, this item records one skip AND a pass for every comparison. Read the skip, not the
+        # count.
         nws = map(2:nthreads()) do nt
             P.set_num_threads(nt)
             P._trsm_workers_r(k, m, Float64)
@@ -460,8 +484,9 @@ end
         @test maximum(nws) > 1
         @test m % P._SME_MR == 0
         if !(ragged && P._SME_F64)
-            @test_skip "no reachable worker count splits m=$m into a band that is not a whole \
-                _SME_MR block, or f64 SME is off (_SME_F64 = $(P._SME_F64))"
+            @test_skip "the SME band hazard is unreachable here, so the passes below do not cover \
+                it: no worker count splits m=$m into a band that is not a whole _SME_MR block, or \
+                f64 SME is off (_SME_F64 = $(P._SME_F64))"
         end
         for (up, tr) in (('L', 'N'), ('L', 'T'), ('U', 'N'), ('U', 'T'))
             G = randn(k, k)
@@ -473,6 +498,164 @@ end
                 P.set_num_threads(nt)
                 g = copy(B0); P.trsm!(g, A; side = 'R', uplo = up, transA = tr)
                 @test bitsame(g, r)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
+
+# THE SIDE-R WORKER CAP IS A SPEED MEASURE, NOT A REPRODUCIBILITY ONE, and this item is its contract
+# check. A band narrower than the kernel's tile still reaches the coprocessor — the macrokernel pads
+# rows to `cld(mce, MR) * MR` and takes a partial last tile — so a 4-row band does 16 rows of work,
+# and twelve such bands multiply that waste across one coprocessor. `_trsmr_sme_nw` caps the pool at
+# the largest count whose every band clears `2·_SME_MR`, and only when the sub-gemm would reach the
+# coprocessor at all — asked of `_sme_eligible` itself rather than restated, so the rule
+# `_trmmr_sme_owns` already follows.
+#
+# BIT-IDENTITY AT THESE SHAPES IS NOT THIS CAP'S DOING, and a green here must not be read as
+# establishing it. `_sme_tile_ok` is resolved from the route token on every axis, so a split cannot
+# change the tile decision whatever the cap does. A cap CANNOT deliver that invariant in any case:
+# bands of 36, 40 and 44 rows all clear `2·_SME_MR` and still answer differently from an undivided
+# height through the modulus clause, so a cap keyed on the floor admits exactly those splits. The
+# sweep below is a regression net; the witness for the invariant is the item after this one.
+#
+# WHAT THIS ITEM ALONE ESTABLISHES is the cap's own contract: that it BINDS at these row counts, and
+# that every band it admits clears the tile width. The uncapped count is asserted to exceed the
+# capped one, or the contract would be untested. Two workers cannot reach it at any of these row
+# counts, hence the three-thread floor: at m=64 two bands are 32 rows each, exactly the tile width.
+# `k = 512` so the predicate is satisfied at the undivided shape and at every recursion level above
+# the base.
+@testitem "trsm side-R: the worker cap keeps every band at the SME tile width" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    k = 512
+    if nthreads() < 3
+        @test_skip "needs >= 3 julia threads: at two workers every band here is already at or above \
+            2*_SME_MR, so the cap cannot bind and its contract would go untested"
+    elseif !P._SME_F64 || P._SME_ENTRY[] === C_NULL
+        @test_skip "f64 SME is off here (_SME_F64 = $(P._SME_F64)), so no band ever reaches the \
+            coprocessor, the cap has nothing to keep off it, and its contract would go untested"
+    else
+        bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        bound = Ref(false)
+        for m in (64, 128, 256)
+            B0 = randn(m, k)
+            for (up, tr) in (('L', 'N'), ('L', 'T'), ('U', 'N'), ('U', 'T'))
+                G = randn(k, k)
+                A = (up == 'U' ? triu(G) : tril(G)) + k * I
+                P.set_num_threads(nthreads())
+                nwun = P._trsm_workers_r(k, m, Float64)
+                nwcap = P._trsmr_sme_nw(Float64, nwun, k, m, A, B0, tr == 'C')
+                bound[] |= nwcap < nwun
+                @test all(P._trsm_rchunk(m, nwcap, i, Float64)[2] >= 2 * P._SME_MR for i in 1:nwcap)
+                P.set_num_threads(1)
+                r = copy(B0); P.trsm!(r, A; side = 'R', uplo = up, transA = tr)
+                for nt in 2:nthreads()
+                    P.set_num_threads(nt)
+                    g = copy(B0); P.trsm!(g, A; side = 'R', uplo = up, transA = tr)
+                    @test bitsame(g, r)
+                end
+            end
+        end
+        @test bound[]
+        # A CONJUGATED SIDE-R SOLVE MUST NOT BE CAPPED. `_sme_eligible` declines a conjugated
+        # operand, so the sub-gemm takes NEON at every band width, and spending worker counts there
+        # buys nothing. The entry admits `transA = 'C'` on a real B, so this state is reachable.
+        # Bit-identity across thread counts still has to hold on that route, which is why the sweep
+        # below runs as well; it is not compared against the `'T'` result, which may take the
+        # coprocessor and therefore different arithmetic.
+        for m in (64, 128, 256), up in ('L', 'U')
+            B0 = randn(m, k)
+            G = randn(k, k)
+            A = (up == 'U' ? triu(G) : tril(G)) + k * I
+            P.set_num_threads(nthreads())
+            nwun = P._trsm_workers_r(k, m, Float64)
+            @test P._trsmr_sme_nw(Float64, nwun, k, m, A, B0, true) == nwun
+            P.set_num_threads(1)
+            r = copy(B0); P.trsm!(r, A; side = 'R', uplo = up, transA = 'C')
+            for nt in 2:nthreads()
+                P.set_num_threads(nt)
+                g = copy(B0); P.trsm!(g, A; side = 'R', uplo = up, transA = 'C')
+                @test bitsame(g, r)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
+
+# THE TILE DECISION MUST NOT DEPEND ON THE ROW SPLIT, and `_sme_tile_ok` is the one route predicate
+# that can break that rule with no operand anywhere near its minimum. It opens on
+# `min(m, n) >= 2·_SME_MR`, then takes two moduli, then falls back on `max(m, n) >= _SME_MIN_EXACT` —
+# so a band whose height clears the floor can still answer differently from the undivided height
+# through the modulus clause alone. At `m = 80` with two workers the bands are 40 and 40:
+# `_sme_tile_ok(80, 32)` is true because both operands are whole `_SME_MR` blocks, while
+# `_sme_tile_ok(40, 32)` is false because 40 is not one and `max(40, 32)` is under `_SME_MIN_EXACT`.
+# The SME macrokernel preloads C into ZA and accumulates on top; the vector path sums from zero and
+# stores `fma(β, C, α·acc)`. The two cannot agree bitwise, so the decision has to be taken on the
+# undivided pair, which is what the route token's named slots are for: side R fills the `m` slot, so
+# `_rt_m` is the whole problem's row count and `_rt_n` is the off-diagonal product's own width.
+#
+# THE LIVENESS WITNESS DEMANDS BOTH `min` OPERANDS ABOVE THE FLOOR, and that is the point of it. A
+# witness that merely found a narrow band would also be satisfied by capping the worker count until
+# every band clears `2·_SME_MR` — and such a cap leaves exactly these shapes split, because 40 and 44
+# already clear it, so the divergence survives the cap. Requiring the answer-difference with `min`
+# satisfied on BOTH sides is what ties the item to the predicate's operands rather than to band size,
+# and what stops it going quiet if a cap is ever reintroduced.
+#
+# `k = 128` so the off-diagonal widths are 64 and 32: 32 is the narrow one that separates the two
+# answers, and it is reachable because it is `_trsplit` of a level still above `_trsm_base()`. Both
+# diagonals are swept — a non-unit diagonal reaches the fused leaf and a unit one must recurse, and
+# the band split is above both, so neither is a control here.
+@testitem "trsm side-R: the SME tile decision does not depend on the row split" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    k = 128
+    # Widths of the off-diagonal products one side-R solve issues: the recursion halves `k` and
+    # updates across the split until a level fits the base.
+    offwidths(kk) = (ws = Int[]; q = kk;
+        while q > P._trsm_base(); h = P._trsplit(q); push!(ws, h); q -= h; end; ws)
+    bandlens(m, nw) = (P._trsm_rchunk(m, nw, i, Float64)[2] for i in 1:nw)
+    if nthreads() < 2
+        @test_skip "needs >= 2 julia threads: with no pool the rows are never split, so the \
+            comparisons would prove nothing"
+    elseif !P._SME_F64 || P._SME_ENTRY[] === C_NULL
+        @test_skip "f64 SME is off here (_SME_F64 = $(P._SME_F64)), so no tile decision can differ \
+            between a band and the undivided height and the comparisons would prove nothing"
+    else
+        bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        ws = offwidths(k)
+        @test !isempty(ws)
+        # `_trsm_workers_r` reads the LIVE pool size, so a sweep that forgets to set it reports no
+        # split at every shape and the difference count comes back zero — which reads exactly like a
+        # proof that none exists. The arming counter is what separates the two.
+        armed, differing = Ref(0), Ref(0)
+        for m in (80, 128), nt in 2:nthreads()
+            P.set_num_threads(nt)
+            nw = P._trsm_workers_r(k, m, Float64)
+            nw > 1 || continue
+            armed[] += 1
+            for b in bandlens(m, nw), w in ws
+                P._sme_tile_ok(m, w) == P._sme_tile_ok(b, w) && continue
+                min(b, w) >= 2 * P._SME_MR && (differing[] += 1)
+            end
+        end
+        P.set_num_threads(1)
+        @test armed[] > 0
+        @test differing[] > 0
+        for m in (80, 128)
+            B0 = randn(m, k)
+            for (up, tr) in (('L', 'N'), ('L', 'T'), ('U', 'N'), ('U', 'T')), dg in ('N', 'U')
+                G = randn(k, k)
+                A = (up == 'U' ? triu(G) : tril(G)) + k * I
+                P.set_num_threads(1)
+                r = copy(B0); P.trsm!(r, A; side = 'R', uplo = up, transA = tr, diag = dg)
+                for nt in 2:nthreads()
+                    P.set_num_threads(nt)
+                    g = copy(B0); P.trsm!(g, A; side = 'R', uplo = up, transA = tr, diag = dg)
+                    @test bitsame(g, r)
+                end
             end
         end
         P.set_num_threads(1)

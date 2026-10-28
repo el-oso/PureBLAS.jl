@@ -635,19 +635,19 @@ which sits at njp 24, is untested — fixing either does nothing for the other.
 field as the COST IN `tune!()`, so `ger_panel_np` reads `22 s`. The orphans put something else there —
 `sme_inplace_njp` reads `_EXPINT[10]`, a probe sweep handle — and a reader sees a populated column and
 concludes a tuning path exists. `test/tuner_tests.jl:160` asserts only `KNOBS ⊆ _TUNABLE_KEYS`; the
-reverse direction is unchecked, which is how thirteen accumulated silently.
+reverse direction is unchecked, which is how the orphans accumulated silently.
 
-**Step 1 — make the registry honest (small, no measurement risk, fixes all 12).** Require `tune:` to
-hold either a calibrator cost or the literal `none`, with any sweep handle after it
+**Step 1 — make the registry honest (small, no measurement risk, fixes every orphan at once).** Require
+`tune:` to hold either a calibrator cost or the literal `none`, with any sweep handle after it
 (`tune: none — sweep via _EXPINT[10]`); report coverage in the tally line
-(`23 Measured (10 calibrated · 13 orphaned)`); and assert the reverse direction, so every Measured knob
+(`23 Measured (15 calibrated · 8 orphaned)`); and assert the reverse direction, so every Measured knob
 either appears in `KNOBS` or declares `tune: none`.
 
 **Step 2 — adopt the orphans.** ✅ `sme_inplace_njp` is adopted as `calibrate_sme_inplace_njp`
 (`bench/calibrate.jl`), declared in `_TUNABLE_KEYS`, and its marker now carries a real cost. It
 measures the crossover by an independent route and pins nothing here: `njp*` spans 13.2 to 23.0 over
 seventeen cold processes, and the grid is capped at the shipped value so every draw in that
-range rounds back onto 16. The design is the template for the remaining twelve:
+range rounds back onto 16. The design is the template for the remaining eight:
 
 - **Decomposition, not a search.** Time `P` (`_sme_pack_A!` alone), and the marginal cost of one column
   panel with packed strides `C` and with in-place strides `S`, each differenced between two `njp` values
@@ -786,7 +786,7 @@ whether adopting an orphan is `bench/` work or `src/` work.
   `gemm_mt_work` times the fork-join round trip and applies the shipped formula to it, and
   `sme_inplace_njp` times the pack against one column panel either way.
 
-**Eleven of the twelve orphans have NEITHER.** Only `strassen_base` carries a hook, and it is blocked
+**Seven of the eight orphans have NEITHER.** Only `strassen_base` carries a hook, and it is blocked
 for an unrelated reason its own marker states (the split-efficiency curve has no knee). So "adopt the
 orphans" is mostly a request to add override hooks to shipped code, one knob at a time, and writing
 calibrators first would be building on nothing.
@@ -801,9 +801,10 @@ group kernels, not a mutable cell.
 **The four that are adoptable without touching `src/`:** `sme_dot_min`, `sme_asum_min`, `sme_axpy_min`
 and `sme_scal_min` are crossovers between two code paths that are each separately callable, so the
 decomposition route applies — time both paths across candidate `n` and report where they cross, as
-the `sme_inplace_njp` calibrator does for the pack. **The decomposition is now written and run** (see
-below); what remains for these four is wiring it into `bench/calibrate.jl` as a calibrator, which is
-`bench/` work only.
+the `sme_inplace_njp` calibrator does for the pack. ✅ **ADOPTED** — the decomposition is written, run
+(see below) and wired into `bench/calibrate.jl` as `calibrate_sme_dot_min` and its three siblings, each
+declared in `_TUNABLE_KEYS`. They add no member to the Bonferroni family: a decomposition measures the
+physical crossing rather than dueling candidates, so `_TUNE_NKNOBS` stays 12.
 
 ### ✅ MEASURED — THE FOUR SME LEVEL-1 FLOORS ARE FOUR DIFFERENT CROSSINGS (2026-10-17)
 
@@ -822,9 +823,10 @@ axpy      0.43   0.60   0.75   0.93    1.67    2.50    1.90    1.58
 
 Defaults corrected to the measured crossings: `dot` 65536 (unchanged), `asum` **131072**, `axpy`
 **131072**, `scal` **262144**. At the old floor `asum` was taking a route **41% slower** than the one
-it displaced. The ordering tracks STREAM COUNT — the one-stream reduction turns earliest, the
-read-modify-write form last — which is why four constants and not one shared cut. Routing
-re-verified per operation against its own call counter.
+it displaced. ⛔ **THE ORDERING HAS NO KNOWN PREDICTOR, and stream count is NOT it** — `dot` and `scal`
+each move two streams and their floors sit four times apart, while `asum` at one stream and `axpy` at
+three land on the same 131072. Four constants rather than one shared cut is the measured fact; no
+model stands behind it. Routing re-verified per operation against its own call counter.
 
 ⚠ **A FLOOR-GATED MEASUREMENT COULD NOT HAVE FOUND THIS.** The previous probe timed the PUBLIC entry
 against the displaced kernel, and the entry takes ZA only at or above its floor, so every sub-floor
@@ -878,9 +880,10 @@ against SME-off. An A/B across a stash needs a session restart per arm and a re-
 
 ### ✅ SUPERSEDED — the pre-`:unresolved` reading of the two unstable calibrators (2026-10-17)
 
-The section above is the current one. This is kept for its two run tables; its conclusion that a
-tie-break among the survivors would settle `potrf_upper_direct_max` is the reading `:unresolved`
-replaced, and no statistic from that measurement can order the band.
+`✅ FIXED — TWO CALIBRATORS NAMED A DIFFERENT WINNER EACH PROCESS` is the current section; it is not
+the one directly above this line. This is kept for its two run tables; its conclusion that a tie-break
+among the survivors would settle `potrf_upper_direct_max` is the reading `:unresolved` replaced, and no
+statistic from that measurement can order the band.
 
 Two of the nine existing calibrators return a different verdict on consecutive runs of
 `tune!(dryrun = true)` on an idle box. Neither is a noise problem: both adjudicate a margin their own

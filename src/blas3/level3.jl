@@ -5112,6 +5112,55 @@ end
     return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(m, _MR * _vwidth(T))))
 end
 
+# A SIDE-R ROW BAND NARROWER THAN THE COPROCESSOR'S TILE WASTES MOST OF ITS WORK, so the pool is
+# capped at the largest count whose every band clears `2 * _SME_MR`. The SME macrokernel pads rows to
+# `cld(mce, _SME_MR) * _SME_MR` and takes a partial last tile, so a 4-row band does 16 rows of work,
+# and twelve such bands multiply that waste across one coprocessor. At k=512, Float64 and twelve
+# workers the narrowest bands at m=64, 128 and 256 are 4, 8 and 20 rows.
+#
+# WHICH ROW COUNTS IT BINDS ON FOLLOWS THE WORKER COUNT, not the shape alone. At k=512, Float64 it
+# caps m=64 to two workers from four, six or twelve; m=128 to four, from six or twelve but not from
+# four, which already leaves 32-row bands; and m=256 to eight from twelve only, because six workers
+# leave 40. From m=512 up it never binds — twelve workers leave 40 rows there and 168 at m=2048.
+#
+# THIS IS A THROUGHPUT MEASURE, NOT A REPRODUCIBILITY ONE, AND A CAP COULD NOT BE ONE. Bands of 36,
+# 40 and 44 rows all clear `2 * _SME_MR` and still make `_sme_tile_ok` answer differently from the
+# undivided height, through its modulus clause: `_sme_tile_ok(80, 32)` is true because both operands
+# are whole `_SME_MR` blocks, `_sme_tile_ok(40, 32)` is false because 40 is not one and `max(40, 32)`
+# is under `_SME_MIN_EXACT`. Bit-identity across worker counts comes from resolving that predicate on
+# the route token on every axis — `_gemm_core!` reduces over `(mrt, nrt, krt)` — and not from here.
+#
+# ASKED OF `_sme_eligible` RATHER THAN RESTATED, for the reason `_trmmr_sme_owns` gives: the cap
+# spends worker counts, so it must not fire on a call gemm would route to NEON regardless. The
+# sub-gemm is `_gemm_subR!(B2, B1, off, …)`, so its three operands are B, B and A, its `m` is B's
+# undivided row count, and the widest `n` any recursion level gives it is the top split's remainder
+# `cld(k, 2)`.
+#
+# `cj` IS FORWARDED BECAUSE `_gemm_subR!` CARRIES IT INTO THE `cB` SLOT and `_sme_eligible` declines
+# any conjugated operand. The side-R entry admits `transA == 'C'` on a real B — for a real triangle
+# it computes what `'T'` computes — so a conjugated call reaches here, takes the NEON route, and must
+# not be capped for a coprocessor it never enters. Passing a bare `false` costs that call its workers
+# and buys nothing. `tA` and `tB` stay `false` because `_sme_eligible` does not read them.
+#
+# Off SME `_SME_F64` is false, so this is identically the uncapped count and no other box's worker
+# count moves.
+# PDM: Derived — the sub-gemm's own eligibility, asked of `_sme_eligible` with that gemm's operands
+# and shape, and a band floor read from `_sme_tile_ok` itself. | tune: n/a, follows _sme_eligible
+@inline function _trsmr_sme_nw(::Type{T}, nwr::Int, k::Int, m::Int, A, B, cj::Bool) where {T}
+    nwr > 1 || return nwr
+    _sme_eligible(T, m, cld(k, 2), k, false, false, false, cj, B, B, A) || return nwr
+    while nwr > 1
+        short = false
+        for i in 1:nwr
+            short = _trsm_rchunk(m, nwr, i, T)[2] < 2 * _SME_MR
+            short && break
+        end
+        short || break
+        nwr -= 1
+    end
+    return nwr
+end
+
 @noinline function _trsmr_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
     i0, len = _trsm_rchunk(p.m, nw, i, T)
     len > 0 || return nothing
@@ -5493,7 +5542,8 @@ function trsm!(
     # alpha=1 both diverge bitwise at every worker count 2..6. Square power-of-two B does NOT — every
     # band is then a multiple of the 8-row granule — which is why a square-only check passes it.
     if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
-        nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
+        nwr = _trsmr_sme_nw(eltype(B), _trsm_workers_r(k, size(B, 1), eltype(B)), k,
+                            size(B, 1), A, B, transA == 'C')
         if nwr > 1
             rA = _root(A); rB = _root(B)
             GC.@preserve rA rB _gemm_threaded!(
