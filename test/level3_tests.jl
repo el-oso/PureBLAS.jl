@@ -462,7 +462,7 @@ end
                 A = (up == 'U' ? triu(G) : tril(G)) + k * I
                 P.set_num_threads(nthreads())
                 nwun = P._trsm_workers_r(k, m, Float64)
-                nwcap = P._trsmr_sme_nw(Float64, nwun, k, m, A, B0)
+                nwcap = P._trsmr_sme_nw(Float64, nwun, k, m, A, B0, tr == 'C')
                 bound[] |= nwcap < nwun
                 @test all(P._trsm_rchunk(m, nwcap, i, Float64)[2] >= 2 * P._SME_MR for i in 1:nwcap)
                 P.set_num_threads(1)
@@ -475,6 +475,27 @@ end
             end
         end
         @test bound[]
+        # A CONJUGATED SIDE-R SOLVE MUST NOT BE CAPPED. `_sme_eligible` declines a conjugated
+        # operand, so the sub-gemm takes NEON at every band width, and spending worker counts there
+        # buys nothing. The entry admits `transA = 'C'` on a real B, so this state is reachable.
+        # Bit-identity across thread counts still has to hold on that route, which is why the sweep
+        # below runs as well; it is not compared against the `'T'` result, which may take the
+        # coprocessor and therefore different arithmetic.
+        for m in (64, 128, 256), up in ('L', 'U')
+            B0 = randn(m, k)
+            G = randn(k, k)
+            A = (up == 'U' ? triu(G) : tril(G)) + k * I
+            P.set_num_threads(nthreads())
+            nwun = P._trsm_workers_r(k, m, Float64)
+            @test P._trsmr_sme_nw(Float64, nwun, k, m, A, B0, true) == nwun
+            P.set_num_threads(1)
+            r = copy(B0); P.trsm!(r, A; side = 'R', uplo = up, transA = 'C')
+            for nt in 2:nthreads()
+                P.set_num_threads(nt)
+                g = copy(B0); P.trsm!(g, A; side = 'R', uplo = up, transA = 'C')
+                @test bitsame(g, r)
+            end
+        end
         P.set_num_threads(1)
     end
 end

@@ -5093,13 +5093,21 @@ end
 # spends worker counts, so it must not fire on a call gemm would route to NEON regardless. The
 # sub-gemm is `_gemm_subR!(B2, B1, off, …)`, so its three operands are B, B and A, its `m` is B's
 # undivided row count, and the widest `n` any recursion level gives it is the top split's remainder
-# `cld(k, 2)`. Off SME `_SME_F64` is false, so this is identically the uncapped count and no other
-# box's worker count moves.
+# `cld(k, 2)`.
+#
+# `cj` IS FORWARDED BECAUSE `_gemm_subR!` CARRIES IT INTO THE `cB` SLOT and `_sme_eligible` declines
+# any conjugated operand. The side-R entry admits `transA == 'C'` on a real B — for a real triangle
+# it computes what `'T'` computes — so a conjugated call reaches here, takes the NEON route, and must
+# not be capped for a coprocessor it never enters. Passing a bare `false` costs that call its workers
+# and buys nothing. `tA` and `tB` stay `false` because `_sme_eligible` does not read them.
+#
+# Off SME `_SME_F64` is false, so this is identically the uncapped count and no other box's worker
+# count moves.
 # PDM: Derived — the sub-gemm's own eligibility, asked of `_sme_eligible` with that gemm's operands
 # and shape, and a band floor read from `_sme_tile_ok` itself. | tune: n/a, follows _sme_eligible
-@inline function _trsmr_sme_nw(::Type{T}, nwr::Int, k::Int, m::Int, A, B) where {T}
+@inline function _trsmr_sme_nw(::Type{T}, nwr::Int, k::Int, m::Int, A, B, cj::Bool) where {T}
     nwr > 1 || return nwr
-    _sme_eligible(T, m, cld(k, 2), k, false, false, false, false, B, B, A) || return nwr
+    _sme_eligible(T, m, cld(k, 2), k, false, false, false, cj, B, B, A) || return nwr
     while nwr > 1
         short = false
         for i in 1:nwr
@@ -5470,7 +5478,8 @@ function trsm!(
     # alpha=1 both diverge bitwise at every worker count 2..6. Square power-of-two B does NOT — every
     # band is then a multiple of the 8-row granule — which is why a square-only check passes it.
     if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
-        nwr = _trsmr_sme_nw(eltype(B), _trsm_workers_r(k, size(B, 1), eltype(B)), k, size(B, 1), A, B)
+        nwr = _trsmr_sme_nw(eltype(B), _trsm_workers_r(k, size(B, 1), eltype(B)), k,
+                            size(B, 1), A, B, transA == 'C')
         if nwr > 1
             rA = _root(A); rB = _root(B)
             GC.@preserve rA rB _gemm_threaded!(
