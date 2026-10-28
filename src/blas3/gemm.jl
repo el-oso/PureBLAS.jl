@@ -1346,9 +1346,13 @@ end
 #
 # THE ROW BLOCKS MUST NOT DISAGREE ON KERNEL, and that is a correctness constraint before it is a
 # performance one. A block's row count depends on the extent the CALLER holds, and the two carvings do
-# not nest: `_trsm_rchunk` bands side-R rows in `_MR·W` = 16 while this driver tiles in `_SMR·W` = 32,
-# so m=41 is 32+9 unsplit and 16, 25 banded, which places the same rows in an aligned block one way and
-# a ragged block the other. Every block therefore takes THIS one kernel with `_GEMM_SPLIT_S` chains,
+# not nest: `_trsm_rchunk` bands side-R rows in `_MR * W` while this driver tiles in `_SMR * W`, two
+# different multipliers, so a band boundary can fall inside one of this driver's tiles. Worked at
+# `_MR * W` = 16 and `_SMR * W` = 32: m=41 is 32+9 unsplit and 16, 25 banded, which places the same
+# rows in an aligned block one way and a ragged block the other. BOTH PRODUCTS ARE HARDWARE-DERIVED
+# and smaller on a narrower vector — at W = 2 they are 4 and 8 — so read them from the constants and
+# treat the arithmetic above as one instance rather than the figures.
+# Every block therefore takes THIS one kernel with `_GEMM_SPLIT_S` chains,
 # masked when ragged; a kernel chosen per block from its own width sums k in an order that follows the
 # worker count (req#11). No route token can reach that choice — the deciding extent is a block's own
 # width inside an already-entered kernel.
@@ -3671,8 +3675,6 @@ end
     # do not agree bit-for-bit in general (see the note above `_gemm_unpacked!`), so a band that takes
     # one arm where the whole takes the other returns different bits. Side R routes on rows and side L
     # on columns, and reducing over the resolved triple is what makes one body serve both.
-    #
-    # `_sme_eligible` is the ONE exception and takes the local `m`; its own note below says why.
     mrt = _rt_m(rt, m); nrt = _rt_n(rt, n); krt = _rt_k(rt, k)
     # α==0 (or k==0) ⇒ C := βC, with A and B NOT referenced — reference ?gemm guarantees this, so a
     # caller may legally pass A/B holding Inf/NaN or uninitialised memory. The blocked routes each
@@ -3698,16 +3700,44 @@ end
         # arrives here through `_gemm_run_chunk`. `_sme_owns` at the threaded entry is what keeps
         # a split call off the coprocessor, because by this point the split has already happened.
         #
-        # THE ROW EXTENT IS THE LOCAL `m`, NOT `mrt`, and that is the single departure from the
-        # route-token invariant stated at the top of this body. `_sme_tile_ok` is a FLOOR on the
-        # tile actually handed to the kernel (`min(m, n) >= 2*_SME_MR`), and the call below passes
-        # the local extents, so resolving it from the token would admit a band narrower than the
-        # kernel's minimum tile. The column extent is `nrt` for the opposite reason — it is what
-        # makes a column-split chunk route as its parent did — and the two readings are therefore
-        # not symmetric. Whether that asymmetry can produce a thread-count divergence is open: it
-        # needs a row- or column-splitting caller reaching this branch on Apple silicon, which is
-        # the only place `_SME_F64` is true, so it is not decidable on the x86 fleet.
-        if _sme_eligible(T, m, nrt, k, tA, tB, cA, cB, C, A, B)
+        # EVERY EXTENT IS ROUTED, and this is the one route predicate `max` absorption cannot
+        # protect: `_sme_tile_ok` is `min(m, n) >= 2*_SME_MR` plus two moduli, so a chunk reading its
+        # own extents judges the tile on different operands than the unsplit call and the two kernels
+        # do not agree bit for bit — the SME path preloads C into ZA and accumulates on top, the
+        # vector path sums from zero and stores `fma(beta, C, alpha*acc)`.
+        #
+        # The token says which dimension it repairs, which is what makes one reading correct on both
+        # sides: side L passes `(-1, nroute, -1)`, so `mrt` is the local row count and a column split
+        # leaves that equal to the undivided one; side R passes `(nroute, -1, -1)`, so `mrt` is the
+        # undivided row count and `nrt` is the local column count, which a row split leaves whole.
+        # `_sme_tile_ok(mrt, nrt)` is therefore the undivided pair either way.
+        #
+        # The predicate is a shape-and-crossover test, not a minimum a narrow band could violate: the
+        # kernel pads any row count (`mpad = cld(mce, MR) * MR` in `_sme_gemm!`) and takes a partial
+        # last tile. So reading the local row extent costs reproducibility and cannot buy correctness.
+        #
+        # IT DOES BUY SPEED, THOUGH, AND THAT COST LANDS ON THE WORKER COUNT. Routing the predicate
+        # ADMITS bands the local read refused — measured on an M6, side-R solve at k=512 and twelve
+        # workers, SME calls go from 0 to 180 at m=64, 128 and 256. Padding a 4-row band to `_SME_MR`
+        # discards three quarters of the work, twelve deep on one shared coprocessor, and the solve
+        # runs 2.18x slower at m=64, 1.39x at m=128, 1.17x at m=256. The remedy belongs in the
+        # admission decision, not here: capping workers so every band reaches the kernel's tile turns
+        # those three into 1.36x, 1.55x and 1.29x FASTER than an unrouted predicate manages.
+        #
+        # THE BASELINE FOR ALL SIX FIGURES IS THE UNROUTED PREDICATE. Against the ROUTED predicate
+        # with no cap the same measurements read 2.96x, 2.16x and 1.51x — the products — so a ratio
+        # quoted here without naming its baseline is ambiguous by about a factor of two.
+        #
+        # Those ratios are one SME implementation's, not a portable property: the padding waste follows
+        # from `_SME_MR`, and a part with a different tile width moves every figure above.
+        #
+        # A residual sits at m=512, where the cap does not bind and this reading measures 4-5% slower.
+        # THAT FIGURE IS NOT ADJUDICATED: the cross-tree timings behind it rest on one control shape at
+        # m=2048 agreeing to 0.2%, and one control cannot separate two windows that matched from two
+        # that both drifted. Settling it needs several controls straddling the routing change and
+        # per-sample spread. The large ratios above sit far outside that uncertainty and the call
+        # counts are not timings at all, so only this 4-5% is open.
+        if _sme_eligible(T, mrt, nrt, krt, tA, tB, cA, cB, C, A, B)
             return _gemm_sme!(C, A, B, Float64(alpha), Float64(beta), m, n, k, tA, tB)
         end
         if strassen != _STR_OFF && _STRASSEN && !tA && _strided1(A) && _strided1(B) &&

@@ -666,8 +666,8 @@ end
 # every call gets a freshly allocated operand touched once. Warm, a rep loop amortizes the prologue
 # over many passes and the crossing sits 16-64x lower, which is a different question.
 #
-# THE FOUR DO NOT SHARE A CROSSING — it tracks the operation's stream count, the one-stream reduction
-# turning earliest and the read-modify-write form last — so each is adjudicated separately and each
+# THE FOUR DO NOT SHARE A CROSSING, and nothing known predicts the ordering — `dot` and `scal` each
+# move two streams and their floors sit four times apart — so each is adjudicated separately and each
 # may pin, decline or tie on its own evidence.
 const SME_L1_MIN_GRID = (32768, 65536, 131072, 262144, 524288)
 

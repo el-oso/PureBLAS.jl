@@ -274,8 +274,8 @@ Every `@load_preference` key in `src/` — 173 of them.
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
-| `sme_asum_min` | literal | Measured | the same crossing for the one-stream form, which turns later because half the outstanding requests. | 4.2 s |
-| `sme_axpy_min` | literal | Measured | the same cold crossing for the three-stream form. | 4.2 s |
+| `sme_asum_min` | literal | Measured | this operation's own cold crossing, 131072 against dot's 65536; the four level-1 floors do not share one and no stream count predicts the ordering. | 4.2 s |
+| `sme_axpy_min` | literal | Measured | this operation's own cold crossing, 131072, half of scal's; the four level-1 floors do not share one and no stream count predicts the ordering. | 4.2 s |
 | `sme_dot_min` | literal | Measured | where a fixed ZA prologue disappears into the stream; a ratio between two kernels, not a residency criterion. | 4.2 s |
 | `sme_l1_groups` | literal | Measured | every fmla into one ZA slice is a serial chain, so this is dependency depth, not residency or width; the optimum inverts either side of two. | none — orphaned; candidates (1,2,4,8) |
 | `sme_rmw_groups` | literal | Measured | each group carries its own load and store, so this is stream count and dependency depth together, not residency or width. | none — orphaned; candidates (1,2,4,8) |

@@ -29,10 +29,13 @@
 # among them flag the ones that are not a `max` over the resolved values. A `max` form is reported only
 # if it reads a raw extent where a resolved one exists.
 #
-# Mark a deliberate local read with `# route-ok: <reason>` on the same line or the line above. There is
-# one legitimate reason and it should be stated: a FLOOR on the tile actually handed to a kernel must
-# read the local extent, because routing it from the undivided shape would admit a chunk below the
-# kernel's minimum and trade a reproducibility bug for a correctness one.
+# Mark a deliberate local read with `# route-ok: <reason>` on the same line or the line above. No site
+# in `src/` carries one, and the reason that would justify it is narrower than it reads: a FLOOR on the
+# tile actually handed to a kernel must read the local extent, because routing it from the undivided
+# shape would admit a chunk below the kernel's minimum. A ROUTE PREDICATE IS NOT SUCH A FLOOR even when
+# it is shaped like one — `_sme_tile_ok` opens on a `min` and is still not a minimum, because the
+# kernel pads any row count it is given. The baseline file settles that case arithmetically; read it
+# before marking a new site rather than reasoning from the shape of the comparison.
 const _RT_SRC = normpath(joinpath(@__DIR__, "..", "src"))
 const _RT_BASELINE = joinpath(@__DIR__, "routetoken_lint_baseline.txt")
 
