@@ -289,6 +289,50 @@ end
 # THE WORKER COUNT, NOT A RAGGED `m`, IS WHAT REACHES THIS: every band is a whole `_MR·W` block, and
 # only some worker counts make them whole `_SME_MR` blocks as well. `k` must be at least 64, because
 # `_sme_tile_ok` needs `min(m, k÷2) ≥ 2·_SME_MR` before the recursion is eligible at all.
+@testitem "trmm side-L: a concurrent caller that loses the claim still multiplies a TRIANGLE" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Base.Threads
+    P = PureBLAS
+    if Threads.nthreads() < 2
+        @test_skip Threads.nthreads() >= 2
+    else
+        # WHAT THIS CATCHES, and it caught it: the side-L column route had no lost-claim branch, so a
+        # loser fell through to the pool's generic `_gemm_core!` fallback — a FULL matrix product. It
+        # read A's unreferenced triangle as data and could not honour an implicit unit diagonal, so a
+        # caller that merely lost the claim got a wrong answer rather than a slow one. Only
+        # concurrency reaches it: with one caller the claim always succeeds, and every
+        # single-threaded test passed over it.
+        #
+        # The operand is built to make that failure loud. The unreferenced triangle holds a large
+        # sentinel so a full product cannot agree by luck, and `diag = 'U'` is exercised because a
+        # gemm cannot honour an implicit unit diagonal at all. Verified to discriminate: 4 of 8
+        # assertions fail with the lost-claim branch removed.
+        nt = min(4, Threads.nthreads())
+        P.set_num_threads(nt)
+        k = clamp(4 * P._TRMM_BASE_R, P._TRMM_BASE_R + 1, P._TRMM_PACK_MIN)
+        n = max(2 * P._NR, 2 * cld(P._GEMM_MT_WORK, k * k))
+        A = tril(randn(k, k)) + k * I
+        for c in 1:k, r in 1:(c - 1)
+            A[r, c] = 1.0e6                       # strictly upper: never referenced for uplo='L'
+        end
+        B0 = randn(k, n)
+        for dg in ('N', 'U')
+            ref = copy(B0)
+            BLAS.trmm!('L', 'L', 'N', dg, 3.7, A, ref)
+            outs = [copy(B0) for _ in 1:nt]
+            Threads.@threads :static for t in 1:nt
+                for _ in 1:2
+                    copyto!(outs[t], B0)
+                    P.trmm!(outs[t], A; side = 'L', uplo = 'L', transA = 'N', diag = dg, alpha = 3.7)
+                end
+            end
+            for t in 1:nt
+                @test outs[t] ≈ ref rtol = 1.0e-12
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
+
 @testitem "trmm side-L: bit-identical at every thread count" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
