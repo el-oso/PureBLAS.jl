@@ -4334,6 +4334,16 @@ const _MT_KIND_GBMVN = 18
 # req8-ok: enum discriminant, host-invariant by construction — see the two lines above
 const _MT_KIND_ELEM = 19
 
+# Side-L trmm: a COLUMN band of B against the whole of A, run by `_trmm_left!`. Distinct from
+# `_MT_KIND_TRMMR`, which splits ROWS for side R and packs op(A) per band.
+# An enum discriminant, host-invariant by construction: nothing about the machine can make 20 a better
+# tag than 21, so there is no residency or latency criterion to derive it from and no candidate set to
+# measure. Same category as `_MT_KIND_ELEM` above.
+# PDM: Exempt — job-kind tag, not hardware tuning. Nothing a machine reports could place it, and a
+# Preference over it would be meaningless; same class as a sentinel.
+# req8-ok: enum discriminant, host-invariant by construction — see the two lines above
+const _MT_KIND_TRMM = 20
+
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
 @inline _is_reduction(kind::Int) =
@@ -4533,6 +4543,7 @@ end
     p.kind == _MT_KIND_LUAHEAD && return _luahead_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRSMR && return _trsmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMMR && return _trmmr_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_TRMM && return _trmm_run_chunk(p, nw, i)
     p.kind == _MT_KIND_AXPY && return _axpy_run_chunk(p, nw, i)
     p.kind == _MT_KIND_DOT && return _dot_run_chunk(p, nw, i)
     p.kind == _MT_KIND_ASUM && return _asum_run_chunk(p, nw, i)
@@ -5539,6 +5550,9 @@ end
         # job, and the driver and idle workers are then in spin/wait loops with nowhere for a GC to
         # progress from. That failed as a swallowed worker exception or a silent hang, by interleaving.
         kind == _MT_KIND_TRMMR && _trmmr_prefit!(T, A.n, nw)
+        # NOTE no prefit for `_MT_KIND_TRMM`. Side L splits COLUMNS and each band runs the same
+        # `_trmm_left!` recursion the unsplit call runs, whose bases borrow from the arena rather
+        # than from a pre-sized pool — the shape `_MT_KIND_TRSM` already has.
         p.Cp = C.ptr; p.ldc = C.ld
         p.Ap = A.ptr; p.lda = A.ld
         p.Bp = B.ptr; p.ldb = B.ld
