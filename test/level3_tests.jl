@@ -1,14 +1,20 @@
-# The α every trmm threading item scales by, in one place because it is a REQUIREMENT and not a
-# preference, and three copies of a requirement is three chances to weaken one of them.
+# α is `trmm`'s own scalar: the operation is `B := α·op(A)·B`, so α multiplies the whole product.
+# The trmm threading items all pass this one, and they pass something other than 1 on purpose.
 #
-# WHAT IT HAS TO BE: a factor whose application ROUNDS. Scaling by ±2^j is exact, so the same α
-# applied at a different point in the sum order returns the same bits — and "α placed differently"
-# is precisely the defect these items hunt, so a power-of-two α would let every one of them pass
-# over it. Nothing else is required: the value is otherwise arbitrary.
+# WHY NOT 1. An implementation CHOOSES when to apply α, and the choices differ in their last bits.
+# Side L's column route scales after the product (`_trmm_run_chunk` calls `_scal_all!` on its band),
+# while `_gemm_core!` folds α into `_pack_A!` and so multiplies it into A's entries BEFORE any
+# product: `α·(Σ aᵢbᵢ)` against `Σ (α·aᵢ)·bᵢ`. Equal in exact arithmetic, different once rounded.
+# At α = 1 there is nothing to misplace and that whole class of defect is invisible.
 #
-# The property is CHECKED HERE, at setup, rather than described in each item. An α edited into a
-# power of two fails the whole group before a single assertion runs, instead of quietly turning
-# three bit-identity gates into tautologies — which is the failure a comment cannot prevent.
+# WHY NOT A POWER OF TWO. Multiplying by ±2^j only shifts the exponent, so it is EXACT — both
+# orderings above would then return bit-identical results, every item below would pass, and a
+# misplaced α would still be there. A power-of-two α turns a bit-identity gate into a tautology.
+#
+# The value is otherwise arbitrary: anything that is not ±2^j does the job equally well. So the
+# PROPERTY is what is checked, here at setup rather than described in each item — an α edited into a
+# power of two fails the whole group before a single assertion runs, which is the failure a comment
+# cannot prevent. One binding, because seven copies of a requirement are seven chances to weaken it.
 @testmodule L3Alpha begin
     const ALPHA = 3.7
     isinteger(log2(ALPHA)) && error(
