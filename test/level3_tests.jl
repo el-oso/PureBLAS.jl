@@ -11,19 +11,43 @@
 # orderings above would then return bit-identical results, every item below would pass, and a
 # misplaced α would still be there. A power-of-two α turns a bit-identity gate into a tautology.
 #
-# WHICH VALUE: no value is special, and there is nothing to derive — the requirement is a PROPERTY,
-# not an optimum, so every α outside ±2^j serves identically and a formula cannot single one out.
-# `1/3` is therefore written as a quotient rather than as a decimal: a third is the simplest number
-# binary cannot represent, so the expression itself shows why multiplying by it rounds. An arbitrary
-# decimal would satisfy the property equally well and say nothing about where it came from, leaving a
-# reader unable to tell a considered value from a typo.
+# WHICH VALUE, and it is measured rather than chosen. The one thing these items need from α is
+# PLACEMENT SENSITIVITY: the probability that moving α's application changes the bits. Measured on
+# both shapes the code actually produces — `(α·a)·b` vs `α·(a·b)` elementwise, and
+# `Σ(α·aᵢ)·bᵢ` vs `α·Σ(aᵢ·bᵢ)` over a length-512 chain — with 2e6 and 4000 samples (SE ≈ 0.35pp on
+# the chain figure):
 #
-# The property is also CHECKED, at setup rather than described in each item, because the magnitude is
-# free but the exactness is not: an α edited to a power of two fails the whole group before a single
-# assertion runs, instead of leaving three bit-identity gates green and vacuous. One binding, because
-# seven copies of a requirement are seven chances to weaken one of them.
+#   α                 elem    chain    mantissa bits   exact·{2,3,5,6,7,9,10}
+#   π                34.7%   95.3%        22/52          0 of 7
+#   0.7              35.2%   95.0%        26/52          1 of 7
+#   1/3              34.7%   94.8%        26/52          3 of 7
+#   3.7              34.7%   94.4%        27/52          1 of 7
+#   prevfloat(1.0)   23.6%   89.8%        52/52          0 of 7
+#   nextfloat(1.0)   32.2%   89.3%         1/52          0 of 7
+#   prevfloat(2.0)   23.7%   88.9%        52/52          0 of 7
+#
+# TWO RESULTS, and the first is the one that would be guessed wrong. A full mantissa is NOT what
+# makes a good multiplier: `prevfloat(2.0)` has every bit set and is the WEAKEST of the set, because
+# sitting next to a power of two makes multiplication by it nearly an exponent shift. The whole
+# near-1 and near-2 family loses 5-6 points and must be avoided.
+#
+# Second, among generic values the criterion does NOT single one out — π, 0.7, 1/3 and 3.7 span
+# 94.4-95.3%, inside a couple of standard errors. So sensitivity settles the FAMILY, not the member,
+# and the tiebreak is the remaining measurable defect: arithmetic coincidences with small integers,
+# where `1/3` scores 3 of 7 (`(1/3)*3 == 1.0` exactly) against π's 0.
+#
+# π therefore: top of the sensitivity group, no coincidences, and a NAMED constant, so there is no
+# provenance left to ask after — which a bare decimal can never offer however well commented.
+#
+# The property is still checked here rather than described in each item, because a future edit is
+# what this guards: an α moved into the powers of two fails the whole group before a single assertion
+# runs, instead of leaving three bit-identity gates green and vacuous.
+#
+# To re-measure: for each candidate, count how often `(α*a)*b !== α*(a*b)` over random pairs, and how
+# often a length-512 `muladd` chain disagrees with the same chain scaled afterwards. Both shapes are
+# three lines and need no harness, which is why the numbers above are stated rather than cited.
 @testmodule L3Alpha begin
-    const ALPHA = 1 / 3
+    const ALPHA = Float64(π)
     isinteger(log2(ALPHA)) && error(
         "L3Alpha.ALPHA = $ALPHA is a power of two. Scaling by ±2^j is exact, so the trmm " *
         "thread-invariance and lost-claim items would stop being able to see a misplaced alpha."
