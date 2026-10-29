@@ -11,12 +11,19 @@
 # orderings above would then return bit-identical results, every item below would pass, and a
 # misplaced α would still be there. A power-of-two α turns a bit-identity gate into a tautology.
 #
-# The value is otherwise arbitrary: anything that is not ±2^j does the job equally well. So the
-# PROPERTY is what is checked, here at setup rather than described in each item — an α edited into a
-# power of two fails the whole group before a single assertion runs, which is the failure a comment
-# cannot prevent. One binding, because seven copies of a requirement are seven chances to weaken it.
+# WHICH VALUE: no value is special, and there is nothing to derive — the requirement is a PROPERTY,
+# not an optimum, so every α outside ±2^j serves identically and a formula cannot single one out.
+# `1/3` is therefore written as a quotient rather than as a decimal: a third is the simplest number
+# binary cannot represent, so the expression itself shows why multiplying by it rounds. An arbitrary
+# decimal would satisfy the property equally well and say nothing about where it came from, leaving a
+# reader unable to tell a considered value from a typo.
+#
+# The property is also CHECKED, at setup rather than described in each item, because the magnitude is
+# free but the exactness is not: an α edited to a power of two fails the whole group before a single
+# assertion runs, instead of leaving three bit-identity gates green and vacuous. One binding, because
+# seven copies of a requirement are seven chances to weaken one of them.
 @testmodule L3Alpha begin
-    const ALPHA = 3.7
+    const ALPHA = 1 / 3
     isinteger(log2(ALPHA)) && error(
         "L3Alpha.ALPHA = $ALPHA is a power of two. Scaling by ±2^j is exact, so the trmm " *
         "thread-invariance and lost-claim items would stop being able to see a misplaced alpha."
