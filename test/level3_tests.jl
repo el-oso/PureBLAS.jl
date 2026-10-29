@@ -1,3 +1,22 @@
+# The α every trmm threading item scales by, in one place because it is a REQUIREMENT and not a
+# preference, and three copies of a requirement is three chances to weaken one of them.
+#
+# WHAT IT HAS TO BE: a factor whose application ROUNDS. Scaling by ±2^j is exact, so the same α
+# applied at a different point in the sum order returns the same bits — and "α placed differently"
+# is precisely the defect these items hunt, so a power-of-two α would let every one of them pass
+# over it. Nothing else is required: the value is otherwise arbitrary.
+#
+# The property is CHECKED HERE, at setup, rather than described in each item. An α edited into a
+# power of two fails the whole group before a single assertion runs, instead of quietly turning
+# three bit-identity gates into tautologies — which is the failure a comment cannot prevent.
+@testmodule L3Alpha begin
+    const ALPHA = 3.7
+    isinteger(log2(ALPHA)) && error(
+        "L3Alpha.ALPHA = $ALPHA is a power of two. Scaling by ±2^j is exact, so the trmm " *
+        "thread-invariance and lost-claim items would stop being able to see a misplaced alpha."
+    )
+end
+
 @testitem "trmm vs OpenBLAS (all side/uplo/trans/diag)" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B
@@ -289,7 +308,7 @@ end
 # THE WORKER COUNT, NOT A RAGGED `m`, IS WHAT REACHES THIS: every band is a whole `_MR·W` block, and
 # only some worker counts make them whole `_SME_MR` blocks as well. `k` must be at least 64, because
 # `_sme_tile_ok` needs `min(m, k÷2) ≥ 2·_SME_MR` before the recursion is eligible at all.
-@testitem "trmm side-L: a concurrent caller that loses the claim still multiplies a TRIANGLE" tags = [:checks] begin
+@testitem "trmm side-L: a concurrent caller that loses the claim still multiplies a TRIANGLE" tags = [:checks] setup = [L3Alpha] begin
     using PureBLAS, LinearAlgebra, Base.Threads
     P = PureBLAS
     if Threads.nthreads() < 2
@@ -344,13 +363,7 @@ end
         # sibling thread-invariance item compares bit patterns instead, because there both sides are
         # PureBLAS and any difference at all is the defect.
         rtol = 8 * k * eps(Float64)
-        # alpha has to ROUND when it is applied, or a misplaced alpha is invisible: scaling by ±2^j
-        # is exact, so the same factor applied at a different point in the sum order would return the
-        # same bits. The value itself carries no other requirement, so the PROPERTY is asserted here
-        # rather than argued in a comment -- any alpha that passes this line does the job, and one
-        # edited into a power of two fails immediately instead of quietly weakening the item.
-        alpha = 3.7
-        @test !isinteger(log2(alpha))
+        alpha = L3Alpha.ALPHA
         for dg in ('N', 'U')
             ref = copy(B0)
             BLAS.trmm!('L', 'L', 'N', dg, alpha, Aref, ref)
@@ -376,7 +389,7 @@ end
     end
 end
 
-@testitem "trmm side-L: bit-identical at every thread count" tags = [:checks] begin
+@testitem "trmm side-L: bit-identical at every thread count" tags = [:checks] setup = [L3Alpha] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
     const P = PureBLAS
@@ -422,27 +435,28 @@ end
         A = triu(randn(k, k)) + k * I
         B0 = randn(k, n)
         P.set_num_threads(1)
-        r = copy(B0); P.trmm!(r, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = 3.7)
+        r = copy(B0); P.trmm!(r, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = L3Alpha.ALPHA)
         if armed
             pool = P._gemm_pool(Float64)
             P.set_num_threads(max(2, nthreads()))
             g0 = @atomic pool.gen
-            Bw = copy(B0); P.trmm!(Bw, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = 3.7)
+            Bw = copy(B0); P.trmm!(Bw, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = L3Alpha.ALPHA)
             g1 = @atomic pool.gen
             @test g1 != g0                               # a job was published
             @test P._mt_gen_nw(g1) > 1                   # and with more than one worker
         else
             @test_skip "the amortisation floor declines this shape on this host"
         end
-        # alpha is not a power of two: scaling by ±2^j is exact and would hide a misplaced alpha.
+        # `L3Alpha.ALPHA` rather than 1: the scaling has to ROUND or a misplaced alpha returns the
+        # same bits and this item cannot see it. That requirement is enforced in `L3Alpha`.
         for up in ('L', 'U'), tr in ('N', 'T'), dg in ('N', 'U')
             G = up == 'U' ? triu(randn(k, k)) + k * I : tril(randn(k, k)) + k * I
             X0 = randn(k, n)
             P.set_num_threads(1)
-            ref = copy(X0); P.trmm!(ref, G; side = 'L', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+            ref = copy(X0); P.trmm!(ref, G; side = 'L', uplo = up, transA = tr, diag = dg, alpha = L3Alpha.ALPHA)
             for nt in 2:nthreads()
                 P.set_num_threads(nt)
-                g = copy(X0); P.trmm!(g, G; side = 'L', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+                g = copy(X0); P.trmm!(g, G; side = 'L', uplo = up, transA = tr, diag = dg, alpha = L3Alpha.ALPHA)
                 @test bitsame(g, ref)
             end
         end
@@ -450,7 +464,7 @@ end
     end
 end
 
-@testitem "trmm side-R: bit-identical at every thread count" tags = [:checks] begin
+@testitem "trmm side-R: bit-identical at every thread count" tags = [:checks] setup = [L3Alpha] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
     const P = PureBLAS
@@ -509,16 +523,17 @@ end
         else
             @test length(P._gpack_shared_pool(Float64)) > serial_slots
         end
-        # alpha is not a power of two: scaling by ±2^j is exact and would hide a misplaced alpha.
+        # `L3Alpha.ALPHA` rather than 1: the scaling has to ROUND or a misplaced alpha returns the
+        # same bits and this item cannot see it. That requirement is enforced in `L3Alpha`.
         for up in ('L', 'U'), tr in ('N', 'T'), dg in ('N', 'U')
             G = randn(k, k)
             A = (up == 'U' ? triu(G) : tril(G)) + k * I
             B0 = randn(m, k)
             P.set_num_threads(1)
-            r = copy(B0); P.trmm!(r, A; side = 'R', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+            r = copy(B0); P.trmm!(r, A; side = 'R', uplo = up, transA = tr, diag = dg, alpha = L3Alpha.ALPHA)
             for nt in 2:nthreads()
                 P.set_num_threads(nt)
-                g = copy(B0); P.trmm!(g, A; side = 'R', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+                g = copy(B0); P.trmm!(g, A; side = 'R', uplo = up, transA = tr, diag = dg, alpha = L3Alpha.ALPHA)
                 @test bitsame(g, r)
             end
         end
