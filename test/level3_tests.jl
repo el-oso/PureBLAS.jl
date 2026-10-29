@@ -1,56 +1,27 @@
-# α is `trmm`'s own scalar: the operation is `B := α·op(A)·B`, so α multiplies the whole product.
-# The trmm threading items all pass this one, and they pass something other than 1 on purpose.
+# α for the trmm threading items. `trmm!` computes `B := α·op(A)·B`, and the serial entry and the
+# threaded bands both apply α AFTER the product, elementwise (`_scal_all!`), so they agree bit for
+# bit at any α. The items pass an α that is not ±2^j so that they would still see a path applying α
+# BEFORE the product, as `_gemm_core!` does by folding it into `_pack_A!`: `Σ (α·aᵢ)·bᵢ` and
+# `α·Σ (aᵢ·bᵢ)` differ in the last bit unless α is a power of two, where the multiplication is exact
+# and the two are identical. α = 1 would also skip every `isone(alpha) || _scal_all!` line, so a
+# loser branch that dropped its scale would pass.
 #
-# WHY NOT 1. An implementation CHOOSES when to apply α, and the choices differ in their last bits.
-# Side L's column route scales after the product (`_trmm_run_chunk` calls `_scal_all!` on its band),
-# while `_gemm_core!` folds α into `_pack_A!` and so multiplies it into A's entries BEFORE any
-# product: `α·(Σ aᵢbᵢ)` against `Σ (α·aᵢ)·bᵢ`. Equal in exact arithmetic, different once rounded.
-# At α = 1 there is nothing to misplace and that whole class of defect is invisible.
+# THE VALUE IS IMMATERIAL BEYOND THAT PROPERTY, and the guard is the whole specification — there is
+# no better admissible α to find, because the criterion is saturated rather than under-determined. A
+# misplaced α moves an affected entry's bits with probability above 0.2 for every non-power-of-two α
+# (measured 0.24-0.35 per product and 0.89-0.95 per length-512 dot, values adjacent to a power of two
+# sitting at the low end), while each item compares hundreds to hundreds of thousands of entries and
+# a misplaced α touches every entry of the affected band. The chance of the defect hiding is then
+# below 0.76^500 ≈ 1e-59 for ANY admissible value, so no admissible value is better than another and
+# the spread between them decides nothing.
 #
-# WHY NOT A POWER OF TWO. Multiplying by ±2^j only shifts the exponent, so it is EXACT — both
-# orderings above would then return bit-identical results, every item below would pass, and a
-# misplaced α would still be there. A power-of-two α turns a bit-identity gate into a tautology.
-#
-# WHICH VALUE, and it is measured rather than chosen. The one thing these items need from α is
-# PLACEMENT SENSITIVITY: the probability that moving α's application changes the bits. Measured on
-# both shapes the code actually produces — `(α·a)·b` vs `α·(a·b)` elementwise, and
-# `Σ(α·aᵢ)·bᵢ` vs `α·Σ(aᵢ·bᵢ)` over a length-512 chain — with 2e6 and 4000 samples (SE ≈ 0.35pp on
-# the chain figure):
-#
-#   α                 elem    chain    mantissa bits   exact·{2,3,5,6,7,9,10}
-#   π                34.7%   95.3%        22/52          0 of 7
-#   0.7              35.2%   95.0%        26/52          1 of 7
-#   1/3              34.7%   94.8%        26/52          3 of 7
-#   3.7              34.7%   94.4%        27/52          1 of 7
-#   prevfloat(1.0)   23.6%   89.8%        52/52          0 of 7
-#   nextfloat(1.0)   32.2%   89.3%         1/52          0 of 7
-#   prevfloat(2.0)   23.7%   88.9%        52/52          0 of 7
-#
-# TWO RESULTS, and the first is the one that would be guessed wrong. A full mantissa is NOT what
-# makes a good multiplier: `prevfloat(2.0)` has every bit set and is the WEAKEST of the set, because
-# sitting next to a power of two makes multiplication by it nearly an exponent shift. The whole
-# near-1 and near-2 family loses 5-6 points and must be avoided.
-#
-# Second, among generic values the criterion does NOT single one out — π, 0.7, 1/3 and 3.7 span
-# 94.4-95.3%, inside a couple of standard errors. So sensitivity settles the FAMILY, not the member,
-# and the tiebreak is the remaining measurable defect: arithmetic coincidences with small integers,
-# where `1/3` scores 3 of 7 (`(1/3)*3 == 1.0` exactly) against π's 0.
-#
-# π therefore: top of the sensitivity group, no coincidences, and a NAMED constant, so there is no
-# provenance left to ask after — which a bare decimal can never offer however well commented.
-#
-# The property is still checked here rather than described in each item, because a future edit is
-# what this guards: an α moved into the powers of two fails the whole group before a single assertion
-# runs, instead of leaving three bit-identity gates green and vacuous.
-#
-# To re-measure: for each candidate, count how often `(α*a)*b !== α*(a*b)` over random pairs, and how
-# often a length-512 `muladd` chain disagrees with the same chain scaled afterwards. Both shapes are
-# three lines and need no harness, which is why the numbers above are stated rather than cited.
+# `significand` is taken in absolute value on purpose: it carries the sign, so `significand(-4.0)` is
+# -1.0 and an unsigned comparison would admit the negative powers of two.
 @testmodule L3Alpha begin
-    const ALPHA = Float64(π)
-    isinteger(log2(ALPHA)) && error(
-        "L3Alpha.ALPHA = $ALPHA is a power of two. Scaling by ±2^j is exact, so the trmm " *
-        "thread-invariance and lost-claim items would stop being able to see a misplaced alpha."
+    const ALPHA = 3.7
+    (isfinite(ALPHA) && !iszero(ALPHA) && abs(significand(ALPHA)) != 1) || error(
+        "L3Alpha.ALPHA = $ALPHA is zero, non-finite, or ±2^j: scaling by it is exact, so a " *
+        "misplaced alpha returns the same bits and the trmm threading items cannot see it"
     )
 end
 
@@ -400,6 +371,11 @@ end
         # sibling thread-invariance item compares bit patterns instead, because there both sides are
         # PureBLAS and any difference at all is the defect.
         rtol = 8 * k * eps(Float64)
+        # `L3Alpha.ALPHA` rather than 1, and for a DIFFERENT reason than the bit-identical items
+        # have: at α = 1 the loser branch's `isone(alpha) || _scal_all!` never runs, so a loser that
+        # dropped its scale entirely would still pass here. α PLACEMENT is invisible to this item —
+        # it compares against OpenBLAS at `rtol` and a placement difference is O(eps) — so only the
+        # bit-identical items below can see that half.
         alpha = L3Alpha.ALPHA
         for dg in ('N', 'U')
             ref = copy(B0)
