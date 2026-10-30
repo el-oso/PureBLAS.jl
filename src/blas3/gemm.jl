@@ -893,6 +893,23 @@ function _gemm_blocked!(
     ldc = stride(C, 2); ldb = stride(B, 2); sz = sizeof(T)
     GC.@preserve C Ap Bp B begin
         Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp); Bp0 = db ? pointer(B) : Bpp
+        # GC-SAFE REGION (_EXP20). Everything below this point works on raw pointers into memory the
+        # `GC.@preserve` above roots, allocates nothing, and writes no pointers — so a collection may
+        # proceed while it runs. Declaring that is what stops ANOTHER thread's collection from parking
+        # this one at a safepoint for the length of a mark-and-sweep; `_gemm_scratch` is called before
+        # the region precisely because it is the one thing here that can allocate.
+        #
+        # ⚠ `nw == 1` IS A CORRECTNESS CONDITION, NOT A SCOPE CHOICE. Above it the sweep below reaches
+        # `_pool_barrier`, and a join is free to yield; a task switch out of a GC-safe region leaves
+        # the thread's state lying about what it is doing, which corrupts collection rather than
+        # slowing it. The threaded path needs the region around chunk BODIES instead, never a join.
+        #
+        # `try`/`finally` is not optional either: an exception escaping with the state still SAFE
+        # leaves a thread that collection will not wait for while it goes on to allocate.
+        safe = nw == 1 && @inbounds(_EXPFLAG[_EXP20])
+        ptls = safe ? ccall(:jl_get_ptls_states, Ptr{Nothing}, ()) : Ptr{Nothing}(0)
+        gcst = safe ? ccall(:jl_gc_safe_enter, Int8, (Ptr{Nothing},), ptls) : Int8(0)
+        try
         jc = 0
         while jc < n
             nce = min(nc, n - jc)
@@ -929,6 +946,9 @@ function _gemm_blocked!(
                 pc += kc
             end
             jc += nc
+        end
+        finally
+            safe && ccall(:jl_gc_safe_leave, Nothing, (Ptr{Nothing}, Int8), ptls, gcst)
         end
     end
     return C

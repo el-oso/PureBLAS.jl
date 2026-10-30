@@ -3627,7 +3627,7 @@ end
 # removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
 # read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
 const _EXPINT = fill(0, 11)
-const _EXPFLAG = fill(false, 19)
+const _EXPFLAG = fill(false, 20)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
 # Adding a named const per knob DEFEATS the table and costs a full restart each time: Revise declares a
@@ -3636,7 +3636,7 @@ const _EXPFLAG = fill(false, 19)
 # recompilation lands inside timed rounds (measured A/A sigma 0.008 -> 0.139). Do not add names below.
 const _EXP1, _EXP2, _EXP3, _EXP4, _EXP5, _EXP6, _EXP7, _EXP8 = 1, 2, 3, 4, 5, 6, 7, 8
 const _EXP9, _EXP10, _EXP11, _EXP12, _EXP13, _EXP14, _EXP15, _EXP16 = 9, 10, 11, 12, 13, 14, 15, 16
-const _EXP17, _EXP18, _EXP19 = 17, 18, 19
+const _EXP17, _EXP18, _EXP19, _EXP20 = 17, 18, 19, 20
 # REGISTRY — update these COMMENTS, never the const list above:
 #   _EXP1  tiny-k stripe NR=2W instead of NRV*W          FALSIFIED (loses up to 11%)
 #   _EXP2  tiny-k cold-operand prefetch                  FALSIFIED (3.2% slower, destabilises the cell)
@@ -3743,6 +3743,16 @@ const _EXP17, _EXP18, _EXP19 = 17, 18, 19
 #   _EXP19 INVERTED: set true to DISABLE the SME gemv-T route (`_sme_gemvt_eligible`) so the kernel
 #          and the SIMD path it displaces can be compared in ONE process. SHIPS ON above
 #          `_SME_GEMVT_MINM`.
+#   _EXP20 set true to wrap the serial blocked gemm's pointer loops in a GC-SAFE REGION, so that a
+#          collection started by ANOTHER thread does not stop this one at a safepoint. Measured on a
+#          minimal allocation-free kernel against a thread allocating 1.1M vectors/s: the tail goes
+#          from 11.8 ms against a 0.57 ms median (3 of 3000 calls past 2x median) to a 0.80 ms
+#          maximum and 0 of 3000, at no cost when nothing else allocates (0.5428 vs 0.5403 ms) and
+#          with the allocating thread's own throughput and RSS unchanged. `GC.enable(false)` buys the
+#          same tail but costs that thread 79% of its throughput and 4.8x the RSS, which is the
+#          reason this route is worth a private symbol at all.
+#          ⚠ SERIAL ONLY while it is a flag: above `nw == 1` the sweep reaches `_pool_barrier`, and a
+#          join may yield, which a GC-safe region forbids.
 #   _EXP16 INVERTED: set true to restore the UNFUSED `_ctrgemm_3m!` (three n×n P arrays + `_split3!`).
 #          The FUSED driver ships. Kept A/B-able because Zen5 is unmeasured; fused uses the same kernels
 #          with strictly less traffic, so it cannot lose (measured fused/unfused 0.83-1.00, both boxes).
