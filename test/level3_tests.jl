@@ -1,22 +1,12 @@
-# α for the trmm threading items. `trmm!` computes `B := α·op(A)·B`, and the serial entry and the
-# threaded bands both apply α AFTER the product, elementwise (`_scal_all!`), so they agree bit for
-# bit at any α. The items pass an α that is not ±2^j so that they would still see a path applying α
-# BEFORE the product, as `_gemm_core!` does by folding it into `_pack_A!`: `Σ (α·aᵢ)·bᵢ` and
-# `α·Σ (aᵢ·bᵢ)` differ in the last bit unless α is a power of two, where the multiplication is exact
-# and the two are identical. α = 1 would also skip every `isone(alpha) || _scal_all!` line, so a
-# loser branch that dropped its scale would pass.
+# α for the trmm threading items: `trmm!` computes `B := α·op(A)·B`.
 #
-# THE VALUE IS IMMATERIAL BEYOND THAT PROPERTY, and the guard is the whole specification — there is
-# no better admissible α to find, because the criterion is saturated rather than under-determined. A
-# misplaced α moves an affected entry's bits with probability above 0.2 for every non-power-of-two α
-# (measured 0.24-0.35 per product and 0.89-0.95 per length-512 dot, values adjacent to a power of two
-# sitting at the low end), while each item compares hundreds to hundreds of thousands of entries and
-# a misplaced α touches every entry of the affected band. The chance of the defect hiding is then
-# below 0.76^500 ≈ 1e-59 for ANY admissible value, so no admissible value is better than another and
-# the spread between them decides nothing.
+# It must not be 1 or ±2^j. A path applying α before the product — `_gemm_core!` folds it into
+# `_pack_A!` — computes `Σ (α·aᵢ)·bᵢ` where the shipping paths compute `α·Σ (aᵢ·bᵢ)`; those differ in
+# the last bit except at a power of two, where scaling is exact and the items could not tell them
+# apart. At α = 1 the `isone(alpha) || _scal_all!` lines are skipped entirely, so a path that dropped
+# its scale would also pass. The value is arbitrary beyond that: the guard is the requirement.
 #
-# `significand` is taken in absolute value on purpose: it carries the sign, so `significand(-4.0)` is
-# -1.0 and an unsigned comparison would admit the negative powers of two.
+# `abs`, because `significand` carries the sign and `significand(-4.0)` is -1.0.
 @testmodule L3Alpha begin
     const ALPHA = 3.7
     (isfinite(ALPHA) && !iszero(ALPHA) && abs(significand(ALPHA)) != 1) || error(
@@ -322,39 +312,21 @@ end
     if Threads.nthreads() < 2
         @test_skip Threads.nthreads() >= 2
     else
-        # WHAT THIS CATCHES, and it caught it: the side-L column route had no lost-claim branch, so a
-        # loser fell through to the pool's generic `_gemm_core!` fallback — a FULL matrix product. It
-        # read A's unreferenced triangle as data and could not honour an implicit unit diagonal, so a
-        # caller that merely lost the claim got a wrong answer rather than a slow one. Only
-        # concurrency reaches it: with one caller the claim always succeeds, and every
-        # single-threaded test passed over it.
+        # A caller that loses the pool claim runs the fallback, and without a `_MT_KIND_TRMM` branch
+        # that fallback is `_gemm_core!` — a FULL product, which reads A's unreferenced triangle and
+        # cannot honour an implicit unit diagonal. Only concurrency reaches it: a lone caller always
+        # wins the claim, so every single-threaded test passes over it.
         #
-        # The operand is built to make that failure loud. `uplo='L'` never references the STRICTLY
-        # UPPER triangle, so it carries a sentinel: a full product reads it as data and lands far
-        # outside the tolerance band.
+        # `uplo='L'` never references the strictly upper triangle, so it carries a sentinel a full
+        # product would read. NOT NaN, although NaN would also catch a kernel that packs the full
+        # tile and masks it: the pack buffers and the arena are shared across calls, so a NaN
+        # reaching one surfaces in an unrelated item with nothing pointing back here. The sentinel's
+        # margin over `rtol` is demonstrated by the positive control below, not argued.
         #
-        # SENTINEL PROVENANCE. A wrong full product adds a spurious `_SENTINEL * B[j,c]` to an entry
-        # whose true value is O(k·|B|), so it is detected once `_SENTINEL / k > rtol`; with the
-        # `rtol` below that is `_SENTINEL > 8·k²·eps`, about 5e-10 at k = 512. The value is round and
-        # far above that bound rather than tight to it, so the margin survives a change to `rtol`, to
-        # `k`, or to `B`'s scale — and the POSITIVE CONTROL below computes the wrong answer and
-        # asserts it is rejected, so the margin is demonstrated per run instead of derived once here.
+        # The reference comes from the CLEAN matrix. Built from the sentinel matrix it would instead
+        # be asserting that OpenBLAS never reads the unreferenced triangle either.
         #
-        # ⚠ NOT NaN, deliberately. A NaN sentinel would also catch an implementation that packs the
-        # full tile and masks the unreferenced part (`NaN·0` poisons, `_SENTINEL·0` does not), which
-        # is a real spec violation. It is rejected anyway: the pack buffers and the arena are shared
-        # and reused across calls, so a NaN that reached one could surface in an unrelated item with
-        # nothing pointing back here. A masked read is left to the guard-page checks that already
-        # cover it.
-        #
-        # THE REFERENCE IS BUILT FROM THE CLEAN MATRIX. Taken from the sentinel matrix instead, this
-        # item would be asserting that OpenBLAS also never touches the unreferenced triangle — true
-        # by the spec, but an implementation that packs a full block and masks it would move the
-        # reference too and the item would fail for the wrong reason.
-        #
-        # `diag = 'U'` is exercised because a gemm cannot honour an implicit unit diagonal at all.
-        # With the lost-claim branch removed, every caller that loses the claim fails; how many that
-        # is varies with the race, so the count is not asserted.
+        # `diag = 'U'` is covered because a gemm cannot honour an implicit unit diagonal at all.
         _SENTINEL = 1.0e6
         nt = min(4, Threads.nthreads())
         P.set_num_threads(nt)
@@ -366,24 +338,19 @@ end
             A[r, c] = _SENTINEL                   # strictly upper: never referenced for uplo='L'
         end
         B0 = randn(k, n)
-        # A length-k dot product carries a relative error of order k·eps, and this is PureBLAS against
-        # OpenBLAS summing in a different order — so the band is derived from k and moves with it. The
-        # sibling thread-invariance item compares bit patterns instead, because there both sides are
-        # PureBLAS and any difference at all is the defect.
+        # PureBLAS against OpenBLAS, summing in a different order: a length-k dot product's error is
+        # of order k·eps, so the band tracks k. (The sibling items compare bit patterns, both sides
+        # being PureBLAS.)
         rtol = 8 * k * eps(Float64)
-        # `L3Alpha.ALPHA` rather than 1, and for a DIFFERENT reason than the bit-identical items
-        # have: at α = 1 the loser branch's `isone(alpha) || _scal_all!` never runs, so a loser that
-        # dropped its scale entirely would still pass here. α PLACEMENT is invisible to this item —
-        # it compares against OpenBLAS at `rtol` and a placement difference is O(eps) — so only the
-        # bit-identical items below can see that half.
+        # α ≠ 1 here catches a loser that skipped its scale, not a misplaced one: at `rtol` a
+        # placement difference is O(eps) and invisible. Only the bit-identical items see that half.
         alpha = L3Alpha.ALPHA
         for dg in ('N', 'U')
             ref = copy(B0)
             BLAS.trmm!('L', 'L', 'N', dg, alpha, Aref, ref)
             @test all(isfinite, ref)              # the sentinel can only fire on a read of A's upper half
-            # POSITIVE CONTROL: the full product is what the missing branch fell through to, so
-            # computing it here proves the operand and the band can tell the two apart. Without this
-            # the item could pass by being blind rather than by being right.
+            # POSITIVE CONTROL: the full product the missing branch fell through to, so the item
+            # proves per run that its operand and band can tell the two apart.
             bad = similar(ref)
             BLAS.gemm!('N', 'N', alpha, A, B0, 0.0, bad)
             @test !isapprox(bad, ref; rtol)
