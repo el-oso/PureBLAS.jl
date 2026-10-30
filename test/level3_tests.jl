@@ -1,3 +1,15 @@
+# α for the trmm threading items (`trmm!` computes `B := α·op(A)·B`). Not 1, or the
+# `isone(alpha) || _scal_all!` lines never run; not ±2^j, or `Σ (α·aᵢ)·bᵢ` — what `_gemm_core!`
+# computes, folding α into `_pack_A!` — matches the shipping `α·Σ (aᵢ·bᵢ)` bit for bit. Otherwise
+# arbitrary: the guard is the requirement. `abs` because `significand(-4.0)` is -1.0.
+@testmodule L3Alpha begin
+    const ALPHA = 3.7
+    (isfinite(ALPHA) && !iszero(ALPHA) && abs(significand(ALPHA)) != 1) || error(
+        "L3Alpha.ALPHA = $ALPHA is zero, non-finite, or ±2^j: scaling by it is exact, so a " *
+        "misplaced alpha returns the same bits and the trmm threading items cannot see it"
+    )
+end
+
 @testitem "trmm vs OpenBLAS (all side/uplo/trans/diag)" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B
@@ -289,7 +301,60 @@ end
 # THE WORKER COUNT, NOT A RAGGED `m`, IS WHAT REACHES THIS: every band is a whole `_MR·W` block, and
 # only some worker counts make them whole `_SME_MR` blocks as well. `k` must be at least 64, because
 # `_sme_tile_ok` needs `min(m, k÷2) ≥ 2·_SME_MR` before the recursion is eligible at all.
-@testitem "trmm side-L: bit-identical at every thread count" tags = [:checks] begin
+@testitem "trmm side-L: a concurrent caller that loses the claim still multiplies a TRIANGLE" tags = [:checks] setup = [L3Alpha] begin
+    using PureBLAS, LinearAlgebra, Base.Threads
+    P = PureBLAS
+    if Threads.nthreads() < 2
+        @test_skip Threads.nthreads() >= 2
+    else
+        # Without a `_MT_KIND_TRMM` branch a claim-loser falls through to `_gemm_core!` — a full
+        # product, reading A's unreferenced triangle and ignoring an implicit unit diagonal. A lone
+        # caller always wins the claim, so only concurrency reaches it.
+        #
+        # The strictly upper triangle is unreferenced at `uplo='L'`, so it carries a sentinel a full
+        # product would read; the positive control below shows it clears `rtol`. Not NaN: the pack
+        # buffers and arena are shared, so a NaN reaching one fails an unrelated item instead.
+        # The reference uses the CLEAN matrix, or it would also be asserting that OpenBLAS never
+        # reads that triangle. `diag='U'` is covered because a gemm cannot honour a unit diagonal.
+        _SENTINEL = 1.0e6
+        nt = min(4, Threads.nthreads())
+        P.set_num_threads(nt)
+        k = clamp(4 * P._TRMM_BASE_R, P._TRMM_BASE_R + 1, P._TRMM_PACK_MIN)
+        n = max(2 * P._NR, 2 * cld(P._GEMM_MT_WORK, k * k))
+        Aref = tril(randn(k, k)) + k * I          # referenced half only; the other half is zero
+        A = copy(Aref)
+        for c in 1:k, r in 1:(c - 1)
+            A[r, c] = _SENTINEL                   # strictly upper: never referenced for uplo='L'
+        end
+        B0 = randn(k, n)
+        # vs OpenBLAS, which sums in a different order: a length-k dot errs by order k·eps.
+        rtol = 8 * k * eps(Float64)
+        # α ≠ 1 catches a loser that skipped its scale; placement is O(eps), invisible at rtol.
+        alpha = L3Alpha.ALPHA
+        for dg in ('N', 'U')
+            ref = copy(B0)
+            BLAS.trmm!('L', 'L', 'N', dg, alpha, Aref, ref)
+            @test all(isfinite, ref)              # the sentinel can only fire on a read of A's upper half
+            # POSITIVE CONTROL: the wrong answer the missing branch produced, shown rejected.
+            bad = similar(ref)
+            BLAS.gemm!('N', 'N', alpha, A, B0, 0.0, bad)
+            @test !isapprox(bad, ref; rtol)
+            outs = [copy(B0) for _ in 1:nt]
+            Threads.@threads :static for t in 1:nt
+                for _ in 1:2
+                    copyto!(outs[t], B0)
+                    P.trmm!(outs[t], A; side = 'L', uplo = 'L', transA = 'N', diag = dg, alpha = alpha)
+                end
+            end
+            for t in 1:nt
+                @test isapprox(outs[t], ref; rtol)
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
+
+@testitem "trmm side-L: bit-identical at every thread count" tags = [:checks] setup = [L3Alpha] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
     const P = PureBLAS
@@ -335,27 +400,26 @@ end
         A = triu(randn(k, k)) + k * I
         B0 = randn(k, n)
         P.set_num_threads(1)
-        r = copy(B0); P.trmm!(r, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = 3.7)
+        r = copy(B0); P.trmm!(r, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = L3Alpha.ALPHA)
         if armed
             pool = P._gemm_pool(Float64)
             P.set_num_threads(max(2, nthreads()))
             g0 = @atomic pool.gen
-            Bw = copy(B0); P.trmm!(Bw, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = 3.7)
+            Bw = copy(B0); P.trmm!(Bw, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = L3Alpha.ALPHA)
             g1 = @atomic pool.gen
             @test g1 != g0                               # a job was published
             @test P._mt_gen_nw(g1) > 1                   # and with more than one worker
         else
             @test_skip "the amortisation floor declines this shape on this host"
         end
-        # alpha is not a power of two: scaling by ±2^j is exact and would hide a misplaced alpha.
         for up in ('L', 'U'), tr in ('N', 'T'), dg in ('N', 'U')
             G = up == 'U' ? triu(randn(k, k)) + k * I : tril(randn(k, k)) + k * I
             X0 = randn(k, n)
             P.set_num_threads(1)
-            ref = copy(X0); P.trmm!(ref, G; side = 'L', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+            ref = copy(X0); P.trmm!(ref, G; side = 'L', uplo = up, transA = tr, diag = dg, alpha = L3Alpha.ALPHA)
             for nt in 2:nthreads()
                 P.set_num_threads(nt)
-                g = copy(X0); P.trmm!(g, G; side = 'L', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+                g = copy(X0); P.trmm!(g, G; side = 'L', uplo = up, transA = tr, diag = dg, alpha = L3Alpha.ALPHA)
                 @test bitsame(g, ref)
             end
         end
@@ -363,7 +427,7 @@ end
     end
 end
 
-@testitem "trmm side-R: bit-identical at every thread count" tags = [:checks] begin
+@testitem "trmm side-R: bit-identical at every thread count" tags = [:checks] setup = [L3Alpha] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
     const P = PureBLAS
@@ -422,16 +486,15 @@ end
         else
             @test length(P._gpack_shared_pool(Float64)) > serial_slots
         end
-        # alpha is not a power of two: scaling by ±2^j is exact and would hide a misplaced alpha.
         for up in ('L', 'U'), tr in ('N', 'T'), dg in ('N', 'U')
             G = randn(k, k)
             A = (up == 'U' ? triu(G) : tril(G)) + k * I
             B0 = randn(m, k)
             P.set_num_threads(1)
-            r = copy(B0); P.trmm!(r, A; side = 'R', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+            r = copy(B0); P.trmm!(r, A; side = 'R', uplo = up, transA = tr, diag = dg, alpha = L3Alpha.ALPHA)
             for nt in 2:nthreads()
                 P.set_num_threads(nt)
-                g = copy(B0); P.trmm!(g, A; side = 'R', uplo = up, transA = tr, diag = dg, alpha = 3.7)
+                g = copy(B0); P.trmm!(g, A; side = 'R', uplo = up, transA = tr, diag = dg, alpha = L3Alpha.ALPHA)
                 @test bitsame(g, r)
             end
         end
