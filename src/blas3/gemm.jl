@@ -5438,6 +5438,18 @@ end
             # after the product, as `trmm!` applies it.
             _trmm_right!(up, tA, cA, unit, A, C)
             isone(alpha) || _scal_all!(C, alpha)
+        elseif kind == _MT_KIND_TRMM
+            # SIDE L, AND THIS BRANCH IS NOT OPTIONAL. Without it the kind falls through to the
+            # `_gemm_core!` at the bottom, which is a FULL matrix product: it reads A's unreferenced
+            # triangle as data and cannot honour an implicit unit diagonal. A caller that merely lost
+            # the claim would then get a WRONG ANSWER rather than a slow one, and only concurrency
+            # reaches it — with one caller the claim always succeeds.
+            #
+            # `_trmm_left!` routes on `size(A, 1)`, which a COLUMN split leaves alone, so the default
+            # `nroute = -1` — this loser's own `n`, the whole of B — reaches the arm the winner's
+            # bands reach. α after the product, as `trmm!` applies it.
+            _trmm_left!(up, tA, cA, unit, A, C)
+            isone(alpha) || _scal_all!(C, alpha)
         else
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
             _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
