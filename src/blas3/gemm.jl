@@ -893,11 +893,16 @@ function _gemm_blocked!(
     ldc = stride(C, 2); ldb = stride(B, 2); sz = sizeof(T)
     GC.@preserve C Ap Bp B begin
         Cp0 = pointer(C); App = pointer(Ap); Bpp = pointer(Bp); Bp0 = db ? pointer(B) : Bpp
-        # GC-SAFE REGION (_EXP20). Everything below this point works on raw pointers into memory the
-        # `GC.@preserve` above roots, allocates nothing, and writes no pointers — so a collection may
-        # proceed while it runs. Declaring that is what stops ANOTHER thread's collection from parking
-        # this one at a safepoint for the length of a mark-and-sweep; `_gemm_scratch` is called before
-        # the region precisely because it is the one thing here that can allocate.
+        # GC-SAFE REGION (_EXP20), AND IT IS A MEASURED DEAD END — see the registry entry. Everything
+        # below works on raw pointers into memory the `GC.@preserve` above roots, allocates nothing
+        # and writes no pointers, so the state is honestly declarable; `_gemm_scratch` is called
+        # before the region because it is the one thing here that can allocate.
+        #
+        # WHAT IT DOES NOT DO is spare this thread the wait. `JL_GC_STATE_UNSAFE` is 0, the normal
+        # state of a thread running Julia code, and `jl_gc_state_set` polls `jl_gc_safepoint_`
+        # whenever either side of the transition is UNSAFE — so entry and exit BOTH poll, and that
+        # poll is where a thread blocks during a collection. The region concentrates the wait at the
+        # two boundaries; what it removes is the COLLECTOR's wait for this thread.
         #
         # ⚠ `nw == 1` IS A CORRECTNESS CONDITION, NOT A SCOPE CHOICE. Above it the sweep below reaches
         # `_pool_barrier`, and a join is free to yield; a task switch out of a GC-safe region leaves

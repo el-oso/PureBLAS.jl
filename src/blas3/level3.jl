@@ -3743,16 +3743,23 @@ const _EXP17, _EXP18, _EXP19, _EXP20 = 17, 18, 19, 20
 #   _EXP19 INVERTED: set true to DISABLE the SME gemv-T route (`_sme_gemvt_eligible`) so the kernel
 #          and the SIMD path it displaces can be compared in ONE process. SHIPS ON above
 #          `_SME_GEMVT_MINM`.
-#   _EXP20 set true to wrap the serial blocked gemm's pointer loops in a GC-SAFE REGION, so that a
-#          collection started by ANOTHER thread does not stop this one at a safepoint. Measured on a
-#          minimal allocation-free kernel against a thread allocating 1.1M vectors/s: the tail goes
-#          from 11.8 ms against a 0.57 ms median (3 of 3000 calls past 2x median) to a 0.80 ms
-#          maximum and 0 of 3000, at no cost when nothing else allocates (0.5428 vs 0.5403 ms) and
-#          with the allocating thread's own throughput and RSS unchanged. `GC.enable(false)` buys the
-#          same tail but costs that thread 79% of its throughput and 4.8x the RSS, which is the
-#          reason this route is worth a private symbol at all.
-#          ⚠ SERIAL ONLY while it is a flag: above `nw == 1` the sweep reaches `_pool_barrier`, and a
-#          join may yield, which a GC-safe region forbids.
+#   _EXP20 wraps the serial blocked gemm's pointer loops in a GC-SAFE REGION. ⛔ A MEASURED DEAD END,
+#          kept only so the arms can be reproduced; do not revive it without reading the kb finding
+#          `gc-safe-region-is-a-negative-on-x86`.
+#          The region does NOT spare the kernel a collection's wait: `JL_GC_STATE_UNSAFE` is 0, the
+#          state of a thread running Julia code, and `jl_gc_state_set` polls `jl_gc_safepoint_`
+#          whenever either side of the transition is UNSAFE — so entry and exit both poll, and the
+#          wait is concentrated at the boundaries rather than removed. It is the COLLECTOR that stops
+#          waiting for this thread.
+#          Measured on Zen4 accordingly: median ratio 1.000 quiet and under an allocating thread;
+#          max never past 1.30x median over ten arms sweeping GC from 1.3% to 56% of wall clock;
+#          three large spikes all campaign, one with it off and TWO with it on. One run also wedged
+#          with no error, no stack and an empty log, and did not reproduce in four more — an
+#          unexplained intermittent hang is on its own reason enough not to ship this.
+#          `jl_gc_safe_enter`/`_leave` are `libjulia-internal` only, on the hottest path, inside the
+#          trimmed `.so`, `--trim` unverified.
+#          ⚠ SERIAL ONLY: above `nw == 1` the sweep reaches `_pool_barrier`, and a join may yield,
+#          which a GC-safe region forbids.
 #   _EXP16 INVERTED: set true to restore the UNFUSED `_ctrgemm_3m!` (three n×n P arrays + `_split3!`).
 #          The FUSED driver ships. Kept A/B-able because Zen5 is unmeasured; fused uses the same kernels
 #          with strictly less traffic, so it cannot lose (measured fused/unfused 0.83-1.00, both boxes).
