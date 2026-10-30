@@ -2071,8 +2071,11 @@ function _gemv!(
             # scatters never call it.
             nw = _gemvt_workers(Int(m), Int(n), eltype(A))
             if nw > 1
+                # `blk` decided ONCE here and carried, so the chunks, a lost claim and the serial arm
+                # below cannot disagree. Same value this entry has always used.
                 GC.@preserve A x y _gemvt_threaded!(
-                    Int(m), Int(n), αT, pointer(A), stride(A, 2), _ptr(x), _ptr(y), βT, iszero(β), nw
+                    Int(m), Int(n), αT, pointer(A), stride(A, 2), _ptr(x), _ptr(y), βT, iszero(β), nw,
+                    !_gemvt_perscan(Int(m), Int(n), eltype(A))
                 )
                 return y
             end
