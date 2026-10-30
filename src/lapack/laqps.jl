@@ -97,7 +97,24 @@ end
     xv = _qp_colv(X, xr, xr + nr - 1, xc)
     yv = view(y, 1:nc)
     if T <: BlasReal && _l2_simd_ok(Av, xv, yv, 1, 1)
-        _gemv_t_simd!(nr, nc, T(α), Av, xv, zero(T), yv, Val(true), true)
+        # THIS IS geqp3's DOMINANT BLAS-2 TERM — the trailing block swept against one panel column,
+        # once per column of the panel — and it ran serial because the gemv-T threading seam lives in
+        # `_gemv!`, which this fast path skips to avoid that entry's per-call dispatch. Routing
+        # through `_gemv!` instead was measured and rejected: it costs 32% of serial geqp3, because
+        # the call happens thousands of times at n = 2048.
+        #
+        # `blk = true` is the force the header above records, and it is PASSED into the job rather
+        # than left for the bands to re-derive. A band that blocked differently from this serial arm
+        # would fold each `y[j]` by different arithmetic, which geqp3 amplifies into a different
+        # PIVOT — correct against LAPACK either way, but not reproducible across thread counts.
+        nw = _gemvt_workers(nr, nc, T)
+        if nw > 1
+            GC.@preserve Av xv yv _gemvt_threaded!(
+                nr, nc, T(α), pointer(Av), stride(Av, 2), _ptr(xv), _ptr(yv), zero(T), true, nw, true
+            )
+        else
+            _gemv_t_simd!(nr, nc, T(α), Av, xv, zero(T), yv, Val(true), true)
+        end
     else
         _gemv!(true, false, nr, nc, T(α), Av, xv, 1, zero(T), yv, 1)
     end
