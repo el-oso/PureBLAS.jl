@@ -1,12 +1,7 @@
-# α for the trmm threading items: `trmm!` computes `B := α·op(A)·B`.
-#
-# It must not be 1 or ±2^j. A path applying α before the product — `_gemm_core!` folds it into
-# `_pack_A!` — computes `Σ (α·aᵢ)·bᵢ` where the shipping paths compute `α·Σ (aᵢ·bᵢ)`; those differ in
-# the last bit except at a power of two, where scaling is exact and the items could not tell them
-# apart. At α = 1 the `isone(alpha) || _scal_all!` lines are skipped entirely, so a path that dropped
-# its scale would also pass. The value is arbitrary beyond that: the guard is the requirement.
-#
-# `abs`, because `significand` carries the sign and `significand(-4.0)` is -1.0.
+# α for the trmm threading items (`trmm!` computes `B := α·op(A)·B`). Not 1, or the
+# `isone(alpha) || _scal_all!` lines never run; not ±2^j, or `Σ (α·aᵢ)·bᵢ` — what `_gemm_core!`
+# computes, folding α into `_pack_A!` — matches the shipping `α·Σ (aᵢ·bᵢ)` bit for bit. Otherwise
+# arbitrary: the guard is the requirement. `abs` because `significand(-4.0)` is -1.0.
 @testmodule L3Alpha begin
     const ALPHA = 3.7
     (isfinite(ALPHA) && !iszero(ALPHA) && abs(significand(ALPHA)) != 1) || error(
@@ -312,21 +307,15 @@ end
     if Threads.nthreads() < 2
         @test_skip Threads.nthreads() >= 2
     else
-        # A caller that loses the pool claim runs the fallback, and without a `_MT_KIND_TRMM` branch
-        # that fallback is `_gemm_core!` — a FULL product, which reads A's unreferenced triangle and
-        # cannot honour an implicit unit diagonal. Only concurrency reaches it: a lone caller always
-        # wins the claim, so every single-threaded test passes over it.
+        # Without a `_MT_KIND_TRMM` branch a claim-loser falls through to `_gemm_core!` — a full
+        # product, reading A's unreferenced triangle and ignoring an implicit unit diagonal. A lone
+        # caller always wins the claim, so only concurrency reaches it.
         #
-        # `uplo='L'` never references the strictly upper triangle, so it carries a sentinel a full
-        # product would read. NOT NaN, although NaN would also catch a kernel that packs the full
-        # tile and masks it: the pack buffers and the arena are shared across calls, so a NaN
-        # reaching one surfaces in an unrelated item with nothing pointing back here. The sentinel's
-        # margin over `rtol` is demonstrated by the positive control below, not argued.
-        #
-        # The reference comes from the CLEAN matrix. Built from the sentinel matrix it would instead
-        # be asserting that OpenBLAS never reads the unreferenced triangle either.
-        #
-        # `diag = 'U'` is covered because a gemm cannot honour an implicit unit diagonal at all.
+        # The strictly upper triangle is unreferenced at `uplo='L'`, so it carries a sentinel a full
+        # product would read; the positive control below shows it clears `rtol`. Not NaN: the pack
+        # buffers and arena are shared, so a NaN reaching one fails an unrelated item instead.
+        # The reference uses the CLEAN matrix, or it would also be asserting that OpenBLAS never
+        # reads that triangle. `diag='U'` is covered because a gemm cannot honour a unit diagonal.
         _SENTINEL = 1.0e6
         nt = min(4, Threads.nthreads())
         P.set_num_threads(nt)
@@ -338,19 +327,15 @@ end
             A[r, c] = _SENTINEL                   # strictly upper: never referenced for uplo='L'
         end
         B0 = randn(k, n)
-        # PureBLAS against OpenBLAS, summing in a different order: a length-k dot product's error is
-        # of order k·eps, so the band tracks k. (The sibling items compare bit patterns, both sides
-        # being PureBLAS.)
+        # vs OpenBLAS, which sums in a different order: a length-k dot errs by order k·eps.
         rtol = 8 * k * eps(Float64)
-        # α ≠ 1 here catches a loser that skipped its scale, not a misplaced one: at `rtol` a
-        # placement difference is O(eps) and invisible. Only the bit-identical items see that half.
+        # α ≠ 1 catches a loser that skipped its scale; placement is O(eps), invisible at rtol.
         alpha = L3Alpha.ALPHA
         for dg in ('N', 'U')
             ref = copy(B0)
             BLAS.trmm!('L', 'L', 'N', dg, alpha, Aref, ref)
             @test all(isfinite, ref)              # the sentinel can only fire on a read of A's upper half
-            # POSITIVE CONTROL: the full product the missing branch fell through to, so the item
-            # proves per run that its operand and band can tell the two apart.
+            # POSITIVE CONTROL: the wrong answer the missing branch produced, shown rejected.
             bad = similar(ref)
             BLAS.gemm!('N', 'N', alpha, A, B0, 0.0, bad)
             @test !isapprox(bad, ref; rtol)
@@ -427,8 +412,6 @@ end
         else
             @test_skip "the amortisation floor declines this shape on this host"
         end
-        # `L3Alpha.ALPHA` rather than 1: the scaling has to ROUND or a misplaced alpha returns the
-        # same bits and this item cannot see it. That requirement is enforced in `L3Alpha`.
         for up in ('L', 'U'), tr in ('N', 'T'), dg in ('N', 'U')
             G = up == 'U' ? triu(randn(k, k)) + k * I : tril(randn(k, k)) + k * I
             X0 = randn(k, n)
@@ -503,8 +486,6 @@ end
         else
             @test length(P._gpack_shared_pool(Float64)) > serial_slots
         end
-        # `L3Alpha.ALPHA` rather than 1: the scaling has to ROUND or a misplaced alpha returns the
-        # same bits and this item cannot see it. That requirement is enforced in `L3Alpha`.
         for up in ('L', 'U'), tr in ('N', 'T'), dg in ('N', 'U')
             G = randn(k, k)
             A = (up == 'U' ? triu(G) : tril(G)) + k * I
