@@ -63,7 +63,8 @@ end
 # PureBLAS's geqrf! stores the SAME reflector vectors v as reference LAPACK, but τ in the faer convention
 # (τ_stored = 1/τ_LAPACK). We CONVERT τ back to the LAPACK convention at the C-ABI boundary so this symbol
 # is a true drop-in (faer never crosses the ABI): a caller feeding this τ to reference/OpenBLAS orgqr/ormqr
-# now gets a correct Q. (Complex zgeqrf! already returns LAPACK-convention τ — no conversion there.)
+# gets a correct Q. Real paths only — complex `geqrf!` already returns LAPACK τ, so the complex shims
+# below convert nothing.
 Base.@ccallable function dgeqrf_64_(
         m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{Float64}, lda::Ptr{Int64},
         tau::Ptr{Float64}, work::Ptr{Float64}, lwork::Ptr{Int64}, info::Ptr{Int64}
@@ -82,7 +83,11 @@ Base.@ccallable function dgeqrf_64_(
     return
 end
 
-# cgeqrf/zgeqrf: native complex geqrf! (BlasComplex). Same faer-τ→LAPACK convert as dgeqrf (v is standard).
+# cgeqrf/zgeqrf: native complex geqrf! (BlasComplex). NO τ conversion — complex `qr_unblocked!` stores
+# what `_zqr_reflect!` returns, which is already LAPACK's τ (zlarfg: H = I − τ·v·vᴴ, 0 ⇒ identity).
+# Only the real paths store faer's 1/τ. Converting here emitted 1/τ_LAPACK from this symbol, so a caller
+# feeding it to reference zungqr/zunmqr got a wrong Q; verified by reconstruction (LAPACK convention
+# 1.5e-15, faer convention 2.4).
 for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
     @eval Base.@ccallable function $(Symbol(p, "geqrf_64_"))(
             m::Ptr{Int64}, n::Ptr{Int64}, A::Ptr{$T},
@@ -93,10 +98,6 @@ for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
         end
         M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); k = min(M, N)
         geqrf!(PtrMatrix(A, M, N, ld), PtrVector(tau, k))
-        tv = PtrVector(tau, k)
-        @inbounds for i in 1:k
-            t = tv[i]; tv[i] = (isfinite(t) && t != zero($T)) ? one($T) / t : zero($T)
-        end
         unsafe_store!(info, Int64(0)); return
     end
 end
