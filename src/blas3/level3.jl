@@ -906,9 +906,12 @@ end
 # `Float64` and `_strided1` are the column route's own requirements, not extra caution: the chunk
 # body reconstructs its band as a `PtrMatrix`, which needs a unit-stride first dimension, and the
 # F32 widening is a separate change with its own bit-identity run.
+#
+# No lower bound on `k`: columns of B are independent whether a recursion or a base kernel runs on
+# them, and whether a join is worth paying is `_trsm_workers`'s question at the call site.
 @inline _trmm_left_owns(A, B, transA::Char, sl::Bool, k::Int) =
     sl && eltype(B) === Float64 && transA != 'C' &&
-        _strided1(A) && _strided1(B) && size(B, 1) == k && k > _TRMM_BASE_R
+        _strided1(A) && _strided1(B) && size(B, 1) == k
 
 # `nroute` is the UNDIVIDED column count of B, or -1 for an unsplit call. Every predicate in this
 # function and in its bases keys on `k`, the triangular dimension, which a COLUMN split leaves whole

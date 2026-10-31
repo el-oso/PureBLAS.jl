@@ -381,7 +381,9 @@ end
         # would leave the whole large-k half of the route — the half where the recursion replaces the
         # packed Strassen driver — covered by nothing.
         lo = P._TRMM_BASE_R + 1
-        ks = (max(lo, 4 * P._TRMM_BASE_R), 2 * P._TRMM_PACK_MIN)
+        # One k per region the route serves. Below `_TRMM_BASE_R` a band is a column slice of a BASE
+        # kernel while the serial call takes `trmm!`'s tiny path — a different pair to hold equal.
+        ks = (P._TRMM_BASE_R ÷ 2, max(lo, 4 * P._TRMM_BASE_R), 2 * P._TRMM_PACK_MIN)
         for k in ks
         # the narrowest B that clears the flop floor, doubled so the floor is not the thing under test
         n = max(2 * P._NR, 2 * cld(P._GEMM_MT_WORK, k * k))
