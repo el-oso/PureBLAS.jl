@@ -4145,17 +4145,9 @@ end
     # above already ends it, which is why the gate never sees this at all.)
     flops = 2 * m * n * k
     (flops < _GEMM_MT_WORK || n < _NR) && return 1
-    # `_GEMM_MT_WORK` GATES, IT DOES NOT RATION. The line above is the amortisation criterion and it
-    # answers the only question the join cost poses: is this call long enough that waking workers is
-    # worth it. How MANY to wake once the answer is yes is a different question, and the join does not
-    # speak to it — so `flops ÷ _GEMM_MT_WORK` is not a term here. Measured on Zen4 at six threads,
-    # timing `_gemm_threaded!` directly at a forced `nw`, the full pool is fastest at every size the
-    # gate admits: n=100 runs 4.01x serial at nw=6 against 1.83x at the rationed nw=2, and n=128
-    # 4.99x against 3.87x at nw=4. Cold, the ration is worse than not threading — nw=2 at n=100
-    # reads 0.80x against serial while nw=6 reads 1.98x.
-    #
-    # The remaining bound is the work actually available to split: `cld(n, _NR)` column blocks, since
-    # a worker with no block of its own only adds a join.
+    # `_GEMM_MT_WORK` gates above; it must not also ration. The join decides WHETHER to thread, never
+    # how many to wake — the bound is the splittable work, since a worker without a block of its own
+    # only adds a join. The full pool is fastest at every size the gate admits.
     return max(1, min(nt, cld(n, _NR)))
 end
 
