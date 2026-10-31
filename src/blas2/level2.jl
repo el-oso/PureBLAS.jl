@@ -4157,7 +4157,7 @@ end
 #     not get unrolled, so the broadcasts must be written out explicitly.
 # Numerics: reassociated vs the per-column sweep; residual-checked, not bitwise.
 
-# ── fully-unrolled REGISTER-RESIDENT tiny-n triangular solve (N forms) ────────────────────────────
+# ── fully-unrolled REGISTER-RESIDENT tiny-n triangular solve (N and T forms) ──────────────────────
 # WHY THIS SHAPE. A tiny trsv is LATENCY-bound and serial: the chain is x₁→x₂→…→x_n, one dependent op
 # per column. Measured cost breakdown of `_trsv_simd!` (Zen4, floor-subtracted, 3-term fit
 # t = c + a·n + b·n²): c=2.11 ns, a=9.33 ns/COLUMN (~37 cycles), b=0.0675 ns/n² — at n=8 that is
@@ -4176,7 +4176,7 @@ end
 # 1.10. `Expr(:meta, :inline)` is emitted into the body because `@inline` does NOT propagate into a
 # `@generated` CodeInfo on Julia 1.12+ (recorded hazard: without it, args pass BY POINTER and the
 # caller's accumulators get stack-demoted).
-@generated function _trsv_reg!(::Val{N}, ::Val{UP}, ::Val{UNIT}, A, x) where {N, UP, UNIT}
+@generated function _trsv_reg!(::Val{N}, ::Val{UP}, ::Val{TR}, ::Val{UNIT}, A, x) where {N, UP, TR, UNIT}
     T = eltype(A)
     sz = sizeof(T)
     xs = [Symbol(:xv_, i) for i in 1:N]
@@ -4195,12 +4195,18 @@ end
             push!(body.args, :($(rs[j]) = inv(unsafe_load($(cs[j]), $j))))
         end
     end
-    order = UP ? (N:-1:1) : (1:N)
+    # Transposing solves the opposite triangle, so the sweep direction keys on `eup` rather than `UP`,
+    # and the off-diagonal element is `A[j, i]` — column `i` at offset `j`, so both forms read a
+    # column and neither needs a strided load. The diagonal is `A[j, j]` either way, hence the
+    # reciprocals above are shared.
+    eup = TR ? !UP : UP
+    order = eup ? (N:-1:1) : (1:N)
     for j in order
         UNIT || push!(body.args, :($(xs[j]) = $(xs[j]) * $(rs[j])))
-        rows = UP ? (1:(j - 1)) : ((j + 1):N)
+        rows = eup ? (1:(j - 1)) : ((j + 1):N)
         for i in rows                              # independent of each other ⇒ pipeline under the chain
-            push!(body.args, :($(xs[i]) = $(xs[i]) - $(xs[j]) * unsafe_load($(cs[j]), $i)))
+            aji = TR ? :(unsafe_load($(cs[i]), $j)) : :(unsafe_load($(cs[j]), $i))
+            push!(body.args, :($(xs[i]) = $(xs[i]) - $(xs[j]) * $aji))
         end
     end
     for i in 1:N                                   # store once
@@ -4244,10 +4250,10 @@ const _TRSV_REG_MAX = @load_preference("trsv_reg_max", _SCALAR_FPREGS - 4)::Int
 
 # Runtime n → `Val(n)` ladder, emitted from `_TRSV_REG_MAX` so the generated set tracks the bound and
 # no size is hand-listed. Falls through to `_trsv_simd!` above the unrolled set.
-@generated function _trsv_reg_val!(::Val{UP}, ::Val{UNIT}, n::Int, A, x) where {UP, UNIT}
-    body = :(_trsv_simd!($UP, false, $UNIT, n, A, x))
+@generated function _trsv_reg_val!(::Val{UP}, ::Val{TR}, ::Val{UNIT}, n::Int, A, x) where {UP, TR, UNIT}
+    body = :(_trsv_simd!($UP, $TR, $UNIT, n, A, x))
     for N in _TRSV_REG_MAX:-1:1
-        body = Expr(:if, :(n == $N), :(_trsv_reg!(Val($N), Val($UP), Val($UNIT), A, x)), body)
+        body = Expr(:if, :(n == $N), :(_trsv_reg!(Val($N), Val($UP), Val($TR), Val($UNIT), A, x)), body)
     end
     return quote
         $(Expr(:meta, :inline))
@@ -4255,14 +4261,21 @@ const _TRSV_REG_MAX = @load_preference("trsv_reg_max", _SCALAR_FPREGS - 4)::Int
     end
 end
 
-@inline function _trsv_reg_n!(up::Bool, unit::Bool, n::Int, A, x)
+# `up`/`tr`/`unit` reach the generated kernel as type parameters, so each is peeled by an explicit
+# branch: `Val(up)` on a runtime `Bool` would be a dynamic dispatch.
+@inline function _trsv_reg_n!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     return if up
-        unit ? _trsv_reg_val!(Val(true), Val(true), n, A, x) :
-            _trsv_reg_val!(Val(true), Val(false), n, A, x)
+        tr ? _trsv_reg_unit!(Val(true), Val(true), unit, n, A, x) :
+            _trsv_reg_unit!(Val(true), Val(false), unit, n, A, x)
     else
-        unit ? _trsv_reg_val!(Val(false), Val(true), n, A, x) :
-            _trsv_reg_val!(Val(false), Val(false), n, A, x)
+        tr ? _trsv_reg_unit!(Val(false), Val(true), unit, n, A, x) :
+            _trsv_reg_unit!(Val(false), Val(false), unit, n, A, x)
     end
+end
+
+@inline function _trsv_reg_unit!(::Val{UP}, ::Val{TR}, unit::Bool, n::Int, A, x) where {UP, TR}
+    return unit ? _trsv_reg_val!(Val(UP), Val(TR), Val(true), n, A, x) :
+        _trsv_reg_val!(Val(UP), Val(TR), Val(false), n, A, x)
 end
 
 # ── FUSED F=8 PANEL SWEEP FOR THE **T** FORMS ────────────────────────────────────────────────────
@@ -4529,16 +4542,19 @@ end
     # 5.3% arithmetic, and still 81% per-column at n=32. The cause is the `_axpy_simd!` call per column
     # with lengths n-1..0, every one below the vector width, so each pays a call and a regime ladder to
     # move at most W-1 scalars. Two replacements, measured (worst shape of the four, vs `_trsv_simd!`):
-    #   n ≤ _TRSV_REG_MAX → `_trsv_reg!`  x1.38-2.55, and it wins on ALL FOUR (uplo × diag) shapes.
+    #   n ≤ _TRSV_REG_MAX → `_trsv_reg!`, and it wins on ALL EIGHT (uplo × trans × diag) shapes.
+    # The T forms route here too, and they are the same code: transposing flips which triangle is
+    # swept and swaps the off-diagonal load's indices, nothing else. Measured against `_trsv_simd!`
+    # (Zen4, n=8/11/12, median of Chairmarks samples): worst cell 1.26 at U/T/unit n=8, best 5.01,
+    # and every one of the 24 cells is above 1.
     # ONLY the register kernel is routed here. Sending 12 < n ≤ NB to `_trsv_fused8!` was tried and
     # REVERTED: fused8 is shape-DEPENDENT at those sizes — it wins L/unit (1.35 at n=32) but LOSES
     # U/non-unit (0.887 at n=32, 0.945 at 48, 0.984 at 64), and getrs issues exactly one of each, so the
     # average looked positive while the gate went DOWN on all three boxes at n=32 (1.080→1.025 Zen4,
     # 1.408→1.351 Zen3, 1.091→0.969 Zen5). A per-shape table beats an end-to-end average when the caller
     # uses more than one shape.
-    if !tr && eltype(A) <: BlasReal && n <= _TRSV_REG_MAX && _strided1(A) &&
-            _dense1(x)
-        return _trsv_reg_n!(up, unit, n, A, x)
+    if eltype(A) <: BlasReal && n <= _TRSV_REG_MAX && _strided1(A) && _dense1(x)
+        return _trsv_reg_n!(up, tr, unit, n, A, x)
     end
     # T FORMS: the fused F=8 panel sweep (`_trsv_fused8_t!`) is the transpose of what the N forms have
     # had all along — 8 independent dot accumulators over the already-solved region instead of 8 fused
