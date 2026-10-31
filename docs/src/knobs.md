@@ -67,7 +67,7 @@ Every `@load_preference` key in `src/` — 173 of them.
 | `trmv_fused_min` | delegates | Literal | the L2-residency crossover was tried and falsified; fused8 wins at every n, all 3 boxes. | candidate |
 | `trmv_sme_min` | sibling | Derived | the first n whose two-sweep cover carries a block worth an SME entry, 4*_TRI_NB, with four diagonal blocks beneath it; the arm above is `_trmv_split!`. Inert (typemax) without SME. | sweep n, upper/N |
 | `trmv_split_recmax` | formula | Derived | formula over detected consts: `2 * _L2_BYTES` | — |
-| `trsv_reg_max` | formula | Derived | formula over detected consts: `_SCALAR_FPREGS - 4` | — |
+| `trsv_reg_max` | formula | Derived | formula over detected consts: `_SCALAR_FPREGS` | — |
 | `zhemv_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
 | `zhemv_pf_tiles` | literal | Literal | prefetch depth in tiles for the Hermitian mat-vec. | candidate |
 

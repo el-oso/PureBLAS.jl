@@ -4223,30 +4223,33 @@ end
 
 # Largest n solved by the fully-unrolled register-resident kernel.
 # PDM: P = `@load_preference`; D = DERIVED from the SCALAR FP REGISTER FILE.
-# Criterion: the kernel's whole working set is x (n scalar registers) plus a small fixed number of
-# temps (column pointer, reciprocal, the multiplier in flight, an address temp ⇒ ~4). It wins while
-# that fits, and degrades once the unrolled body spills. The governing count is the **x86-64 scalar FP
-# register file = 16 xmm**, which is UNIFORM across the whole fleet (Zen3/Zen4/Zen5) — deliberately NOT
-# `_NVREG` (=32 under AVX-512 here): this kernel is scalar and LLVM allocates it in xmm0-15, so the
+# Criterion: x must be REGISTER-RESIDENT, so n cannot exceed the architectural scalar FP register
+# file — 16 xmm on x86-64, UNIFORM across the whole fleet (Zen3/Zen4/Zen5). Deliberately NOT `_NVREG`
+# (=32 under AVX-512 here): this kernel is scalar and LLVM allocates it in xmm0-15, so the
 # vector-register count is the wrong resource. Being W-independent is the point — Zen3 (AVX2, W=4) is
 # the worst getrs@8 cell and no AVX-512-width trick could close it.
-#   _TRSV_REG_MAX = _SCALAR_FPREGS - 4 = 12
-# VALIDATED against the measured knee (Zen4, all four shapes, worst-shape speedup vs `_trsv_simd!`):
-#   n     8      11     12     13     16
-#   min  2.03   2.55   2.47   1.73   1.75
-# i.e. the drop lands exactly between 12 and 13, as the residency model predicts. The kernel still WINS
-# at every n ≤ 16, so this bound is chosen for where the win is best-and-still-growing, not to avoid a
-# regression; raising it is safe on speed and costs only generated code (bodies are O(n²) statements).
+#   _TRSV_REG_MAX = _SCALAR_FPREGS = 16
+# The bound is the register file itself, not a no-spill margin below it. Past about 12 the unrolled
+# body does spill temps and its cost grows faster — but the fallback it replaces issues ONE CALL PER
+# COLUMN and grows faster still, so the kernel keeps winning to the end of the file. Measured Zen4
+# against `_trsv_simd!`, all eight uplo × trans × diag shapes, Chairmarks median, worst cell per n:
+#   n      12     13     14     15     16
+#   worst 2.18   2.39   2.42   2.32   2.21
+# 40 cells, none below 2.2. Measure this with a LITERAL `Val(n)` in its own branch: a `Val(n)` built
+# from a runtime variable is a dynamic dispatch, and reads as a flat ~270 ns for every n regardless of
+# the kernel — an n-independent plateau is the tell that the harness is timing itself.
 # PDM: Derived — architectural scalar FP register file: 16 (x86-64 xmm0-15) vs 32 (AArch64 v0-31). Same ISA fact as _NVREG, which was already derived; this one was hardcoded. | tune: n/a
 # DERIVED 2026-08-21, repaying debt. This was `= 16` with the comment "x86-64 xmm0-15; architectural"
 # sitting beside it — the derivation was written in prose and not in code, which is the exact shape
 # req#8 exists to forbid. BEHAVIOUR-NEUTRAL ON THIS FLEET by construction: all three boxes are x86-64,
-# so it still reads 16 and `_TRSV_REG_MAX = _SCALAR_FPREGS - 4 = 12` is unchanged. What it buys is the
-# ARM case, where 32 architectural FP registers are available and a hardcoded 16 would have silently
-# halved the trsv register budget on the M-series box in the roadmap.
+# so it reads 16 on every box here. What it buys is the ARM case, where 32 architectural FP registers
+# are available and a hardcoded 16 would silently halve the trsv register budget on an M-series part.
+# ⚠ That extrapolation is UNMEASURED: on AArch64 the bound reads 32, which generates unrolled bodies
+# up to n=32 (O(n²) statements each, eight shapes) and has never been timed or compile-cost-checked
+# on that hardware. Validate there before trusting it.
 const _SCALAR_FPREGS = Sys.ARCH === :x86_64 ? 16 : 32
-# PDM: Derived — formula over detected consts: `_SCALAR_FPREGS - 4`
-const _TRSV_REG_MAX = @load_preference("trsv_reg_max", _SCALAR_FPREGS - 4)::Int
+# PDM: Derived — formula over detected consts: `_SCALAR_FPREGS`
+const _TRSV_REG_MAX = @load_preference("trsv_reg_max", _SCALAR_FPREGS)::Int
 
 # Runtime n → `Val(n)` ladder, emitted from `_TRSV_REG_MAX` so the generated set tracks the bound and
 # no size is hand-listed. Falls through to `_trsv_simd!` above the unrolled set.
