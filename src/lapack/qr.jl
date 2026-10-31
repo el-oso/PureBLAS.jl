@@ -576,6 +576,22 @@ function geqrf!(A::AbstractMatrix{T}) where {T <: Real}
     return A, tau
 end
 
+"""
+    geqrf_tau_lapack!(tau) -> tau
+
+Convert real `geqrf!`'s τ in place from the faer convention (`H = I − v·vᵀ/τ`, `Inf` ⇒ identity) to
+LAPACK's (`H = I − τ·v·vᵀ`, `0` ⇒ identity), which is what [`orgqr!`] and [`ormqr!`] take. The two
+are reciprocals. A no-op on complex τ, which `geqrf!` already stores in LAPACK form.
+"""
+function geqrf_tau_lapack!(tau::AbstractVector{T}) where {T <: Real}
+    @inbounds for i in eachindex(tau)
+        t = tau[i]
+        tau[i] = (isfinite(t) && !iszero(t)) ? one(T) / t : zero(T)
+    end
+    return tau
+end
+geqrf_tau_lapack!(tau::AbstractVector{<:Complex}) = tau
+
 # ── orgqr / ungqr — form Q from geqrf reflectors (LAPACK dorg2r/zung2r, unblocked) ─────────────────────
 # A (m×n, m≥n on entry) holds the geqrf reflectors (standard LAPACK τ — the C-ABI dgeqrf_64_ shim already
 # converts faer's stored 1/τ back to this convention). `k` reflectors H(1)…H(k) are used (k≤n≤m); on exit
@@ -587,10 +603,19 @@ end
 
 Form `Q` (LAPACK dorgqr/zungqr, unblocked dorg2r/zung2r) from the `k` geqrf reflectors stored in `A`
 (standard LAPACK τ convention). Overwrites `A`'s leading `n` columns with `Q`'s leading `n` columns.
+
+⚠ REAL `geqrf!` DOES NOT RETURN THIS τ. It stores faer's `1/τ`; pass it through [`geqrf_tau_lapack!`]
+first. Complex `geqrf!` already returns LAPACK τ and needs no conversion.
 """
 function orgqr!(A::AbstractMatrix{T}, tau::AbstractVector{T}, k::Int = length(tau)) where {T}
     m, n = size(A)
     (0 <= k <= n <= m) || throw(DimensionMismatch("orgqr!: requires k ≤ n ≤ m"))
+    # Fail fast on faer's τ rather than returning a NaN Q: LAPACK τ is always finite (0 ⇒ identity),
+    # while faer marks an identity reflector with Inf.
+    all(isfinite, tau) || throw(ArgumentError(
+        "orgqr!: τ contains a non-finite entry. Real `geqrf!` stores faer τ (1/τ_LAPACK, Inf ⇒ " *
+        "identity); convert it with `geqrf_tau_lapack!(tau)` before calling."
+    ))
     @inbounds begin
         for j in (k + 1):n
             for l in 1:m

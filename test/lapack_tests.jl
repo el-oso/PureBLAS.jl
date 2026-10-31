@@ -1858,6 +1858,25 @@ end
     end
 end
 
+@testitem "geqrf! → orgqr!: the native pair needs τ converted, and nothing else does it" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(20261031)
+    # `geqrf!` stores faer τ; `orgqr!` takes LAPACK τ. The C-ABI shim converts, so Mode 1 is a true
+    # drop-in — but a Mode 2 caller composing the two public functions gets a NaN Q, which is how this
+    # was found. The conversion is `τ_L = 1/τ_f` with `Inf ⇒ 0`, and this item is the only place that
+    # says so executably.
+    @testset "$(m)x$(n)" for (m, n) in ((8, 8), (33, 20), (96, 64))
+        A = randn(m, n); k = min(m, n)
+        F = copy(A); tau = zeros(Float64, k)
+        PureBLAS.geqrf!(F, tau)
+        tl = [isfinite(t) && !iszero(t) ? inv(t) : 0.0 for t in tau]
+        Q = PureBLAS.orgqr!(copy(F), tl)
+        @test all(isfinite, Q)
+        @test maximum(abs, Q' * Q - I) < 1.0e-11                          # orthonormal
+        @test maximum(abs, Q * triu(F)[1:n, 1:n] - A) < 1.0e-10           # Q·R = A
+    end
+end
+
 @testitem "geqrf! — generic T<:Real: A = QR under the faer tau convention" begin
     using PureBLAS, LinearAlgebra, Random
     Random.seed!(31415)

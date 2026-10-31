@@ -155,6 +155,13 @@ end
         # geqrf τ-conversion: geqrf!+OpenBLAS orgqr now gives a valid Q (faer never crosses the ABI).
         A2 = copy(A); _, tau = LA.geqrf!(A2); Qo = LA.orgqr!(copy(A2), tau)
         @test maximum(abs, Qo'Qo - I) < 1.0e-9
+        # THE SAME ROUND TRIP IN COMPLEX, because only the real one was covered and the two shims do
+        # NOT agree: `_zqr_reflect!` returns LAPACK τ and complex `qr_unblocked!` stores it unchanged,
+        # so a `1/τ` at the ABI would emit faer τ from a path that never produced it.
+        Az2 = copy(Az)
+        _, tauz = LA.geqrf!(Az2); Qz = LA.orgqr!(copy(Az2), tauz)   # orgqr! dispatches to zungqr_
+        @test maximum(abs, Qz' * Qz - I) < 1.0e-9
+        @test maximum(abs, Qz * triu(Az2) - Az) < 1.0e-9            # Q·R reconstructs A
 
         # Symmetric eigensolver routes: eigen(Symmetric)/eigvals(Symmetric) → dsyevr_ (Julia's default).
         @test fwd("dsyevr_") != syevr_before                              # actually forwarded
