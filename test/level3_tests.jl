@@ -370,17 +370,19 @@ end
         #
         # liveness-ok: this route's admission is decided by `_trsm_workers` against `_GEMM_MT_WORK`,
         # not by `_L1_MT_MIN` (a BLAS-1 byte floor) and not by an SME predicate (side L has none).
-        # The item asks `_trsm_workers` DIRECTLY below and skips when it declines, so the gate is
-        # consulted rather than guessed — which is what the lint is for. The sizes are derived from
-        # the two thresholds that bound the route, not chosen.
-        # THE BAND IS NOT THE SAME WIDTH ON EVERY µARCH and it can be narrow: `_TRMM_PACK_MIN` is
-        # `(5 * _GEMM_UNPACK_MAX) ÷ 2`, which is 1120 where `_GEMM_UNPACK_MAX` is 448 and 240 where it
-        # is 96. A k derived from `_TRMM_BASE_R` alone overshoots the top on the narrow hosts — this
-        # item asserted itself into that and failed on AVX2 — so k is clamped INTO the band and the
-        # band being empty is a skip rather than a false assertion.
+        # The item asks the entry's OWN predicates below — `_trmm_left_owns` and `_trsm_workers` —
+        # and skips when they decline, so the gate is consulted rather than guessed.
+        #
+        # TWO k's, AND THE SECOND ONE IS THE POINT. `_trmm_left_owns` has no upper bound, so the
+        # column route serves every k above `_TRMM_BASE_R`. `_TRMM_PACK_MIN` still bounds the packed
+        # driver that F32 and non-strided operands take, and it varies by µarch
+        # (`(5 * _GEMM_UNPACK_MAX) ÷ 2`: 1120 where `_GEMM_UNPACK_MAX` is 448, 240 where it is 96),
+        # so a k derived from it is the only way to land ABOVE it on every host. A single small k
+        # would leave the whole large-k half of the route — the half where the recursion replaces the
+        # packed Strassen driver — covered by nothing.
         lo = P._TRMM_BASE_R + 1
-        hi = P._TRMM_PACK_MIN
-        k = clamp(4 * P._TRMM_BASE_R, lo, hi)
+        ks = (max(lo, 4 * P._TRMM_BASE_R), 2 * P._TRMM_PACK_MIN)
+        for k in ks
         # the narrowest B that clears the flop floor, doubled so the floor is not the thing under test
         n = max(2 * P._NR, 2 * cld(P._GEMM_MT_WORK, k * k))
         # LIVENESS, read from the pool's own publish counter rather than from a buffer. `gen` is
@@ -391,14 +393,15 @@ end
         #
         # It is still guarded on whether the entry ARMS, using the entry's own worker function: a
         # host whose floor declines this shape would otherwise fail for threading correctly.
-        # ARMED MEANS THE ENTRY'S WHOLE CONDITION, not just the worker count. The route also requires
-        # k to be inside the band, and asking only `_trsm_workers` is how this item first failed on a
-        # host whose band does not reach the k it had chosen: the workers said yes, the entry said no,
-        # and the witness then asserted that a job it had declined to publish had been published.
-        P.set_num_threads(max(2, nthreads()))
-        armed = lo <= hi && k > P._TRMM_BASE_R && k <= P._TRMM_PACK_MIN && P._trsm_workers(k, n) > 1
+        # ARMED MEANS THE ENTRY'S WHOLE CONDITION, not just the worker count. Asking only
+        # `_trsm_workers` is how this item once failed on a host that declined the k it had chosen:
+        # the workers said yes, the entry said no, and the witness then asserted that a job the entry
+        # had declined to publish had been published. `_trmm_left_owns` IS that condition, so the
+        # item and the entry cannot drift apart.
         A = triu(randn(k, k)) + k * I
         B0 = randn(k, n)
+        P.set_num_threads(max(2, nthreads()))
+        armed = P._trmm_left_owns(A, B0, 'N', true, k) && P._trsm_workers(k, n) > 1
         P.set_num_threads(1)
         r = copy(B0); P.trmm!(r, A; side = 'L', uplo = 'U', transA = 'N', diag = 'N', alpha = L3Alpha.ALPHA)
         if armed
@@ -423,6 +426,7 @@ end
                 @test bitsame(g, ref)
             end
         end
+        end     # for k in ks
         P.set_num_threads(1)
     end
 end
