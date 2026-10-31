@@ -207,8 +207,9 @@ end
     @testset "$T $ul$tr$dg n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64),
             ul in ('U', 'L'), tr in ('N', 'T', 'C'), dg in ('N', 'U'),
             # The two n straddling `_TRSV_REG_MAX` are read from the constant, so they keep testing
-            # the register kernel's boundary — on both sides of it — if that bound moves.
-            n in (1, 5, PureBLAS._TRSV_REG_MAX, PureBLAS._TRSV_REG_MAX + 1, 16, 17, 40)
+            # the register kernel's boundary — on both sides of it — if that bound moves. `unique`
+            # because the bound currently coincides with a size already in the ladder.
+            n in unique((1, 5, PureBLAS._TRSV_REG_MAX, PureBLAS._TRSV_REG_MAX + 1, 16, 17, 40))
 
         A = randn(T, n, n) ./ T(2n)                       # well-conditioned: near-identity triangle
         for i in 1:n
