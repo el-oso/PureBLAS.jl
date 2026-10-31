@@ -895,6 +895,21 @@ function _trmm_cmplx_packed_R!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     return B
 end
 
+# Does `_trmm_left!` own this side-L call? Asked by BOTH sites that could serve it — the column-split
+# arm in `trmm!` and the `_trmm_split_L!` arm beside it — so neither spells the conditions itself.
+# That is the whole point: the two sites are reached at different worker counts (the split arm runs
+# when the pool declines the claim), and a condition written twice is how the same call comes to run
+# `_trmm_left!` on six workers and the packed Strassen driver on one. Those two return different
+# bits, so disagreement here is a req#11 break, not a performance wobble. Same role `_strassen_owns`
+# plays for the column-split sites above `_gemm_core!`.
+#
+# `Float64` and `_strided1` are the column route's own requirements, not extra caution: the chunk
+# body reconstructs its band as a `PtrMatrix`, which needs a unit-stride first dimension, and the
+# F32 widening is a separate change with its own bit-identity run.
+@inline _trmm_left_owns(A, B, transA::Char, sl::Bool, k::Int) =
+    sl && eltype(B) === Float64 && transA != 'C' &&
+        _strided1(A) && _strided1(B) && size(B, 1) == k && k > _TRMM_BASE_R
+
 # `nroute` is the UNDIVIDED column count of B, or -1 for an unsplit call. Every predicate in this
 # function and in its bases keys on `k`, the triangular dimension, which a COLUMN split leaves whole
 # — so the token is needed for one thing only: the off-diagonal `_gemm_acc!`, whose kernel choice
@@ -1542,21 +1557,25 @@ function trmm!(
     # takes the same flat loop and the same token, so it is admissible on the same argument. Widening
     # it is a separate change with its own bit-identity run, not a free rider on this one.
     # ── SIDE L: a COLUMN split of B ────────────────────────────────────────────────────────────────
-    # Columns of B are independent under `B := op(A)·B`, so the bands share nothing. Armed only where
-    # `_trmm_left!` owns the call — above `_TRMM_PACK_MIN` the split driver owns it instead and threads
-    # its own off-diagonal updates, and a column split layered on that would contend for the one pool
-    # claim. Below `_TRMM_BASE_R` the base kernels run without a recursion and there is nothing to
-    # amortise a join with.
+    # Columns of B are independent under `B := op(A)·B`, so the bands share nothing. `_trmm_left_owns`
+    # draws the boundary, and it has no upper bound: a Float64 strided side-L call takes this route at
+    # every `k` above `_TRMM_BASE_R`, where the base kernels run without a recursion and there is
+    # nothing to amortise a join with.
+    #
+    # THE RECURSION, NOT THE PACKED DRIVER, IS THE THREADED SIDE-L ROUTE, and the reason is scaling
+    # rather than serial speed. `_trmm_split_L!` cannot be column-split at all: it asks for Strassen,
+    # whose quadrant boundary moves with `n`, so a band would compute `C[i,j]` by a different formula
+    # than the unsplit call. It therefore has to thread from the inside, through its off-diagonal
+    # updates, and that caps it — the updates' own products reach 5.5x of six workers but the
+    # Winograd combine passes between them are at the streaming roof (measured 65 GB/s against an
+    # `axpy` roof of 57), so the driver tops out near 2.8x. `_trmm_left!` column-splits to 5.2-5.5x
+    # across every uplo/trans at k = 1200..4096. Serially the two are within a few percent of each
+    # other and the recursion is AHEAD below 2048, so the threaded margin is not bought with a
+    # serial loss except at the top of the range (+4.7% at 4096).
     #
     # `_trsm_workers` decides, on the solve's own `k²·n`: side-L trmm has the same operand shape and
     # the same flop count, so the amortisation floor transfers exactly rather than by analogy.
-    #
-    # `Float64` STAYS, on the same argument as the side-R block below: F32 takes the identical
-    # recursion and the identical token, so it is admissible, but widening it earns its own
-    # bit-identity run rather than riding on this one.
-    if sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
-            _strided1(A) && _strided1(B) && size(B, 1) == k &&
-            k > _TRMM_BASE_R && k <= _TRMM_PACK_MIN + _EXPINT[2]
+    if !iszero(alpha) && _trmm_left_owns(A, B, transA, sl, k)
         nwl = _trsm_workers(k, size(B, 2))
         if nwl > 1
             rA = _root(A); rB = _root(B)
@@ -1605,20 +1624,24 @@ function trmm!(
                 _trmm_cmplx_small_R!(up_, tr_, cj_, unit_, k, A, B)
         end
         isone(alpha) || _scal_all!(B, convert(eltype(B), alpha))
-        # side-L real large → K-range-trimmed single-pass packed (the straddling tile contracts only its
-        # nonzero p-band, not the full kc zero-band — that band was the ~kc/k waste that capped the naive
-        # packed trmm). Else (side R, complex/AD, small) → recursion-over-gemm! (no regression).
-        # OPEN HYPOTHESIS (task #134), recorded not wired: `_GEMM_UNPACK_MAX` is gemm's UNPACKED-vs-BLOCKED
-        # crossover, derived as 2·(nvreg−4)·W = 448 on both AVX-512 boxes and 96 on AVX2. Here it decides
-        # something else — recursion-over-gemm vs single-pass packed trmm, a different kernel PAIR on a
-        # different shape family, never measured at its own boundary. The gate loses 9-13% in
-        # 448 < n <= 480 on exactly the two boxes where this const is 448, and nowhere on the box where it
-        # is 96. Corroborating: the side-R analog `_TRMM_RPACK` WAS measured directly and found packed
-        # decisive only from n>=1536, direct winning the small/mid band. If confirmed the fix is a trmm-owned
-        # Measure-tier crossover (candidates bounded to [_GEMM_UNPACK_MAX, 4·_GEMM_UNPACK_MAX], default =
-        # today's value so migration is zero-risk), NOT a change to gemm's constant.
+        # Large side-L real that `_trmm_left!` does NOT own — Float32, or an operand whose first
+        # dimension is not unit-stride — takes the K-range-trimmed single-pass packed driver (the
+        # straddling tile contracts only its nonzero p-band, not the full kc zero-band; that band was
+        # the ~kc/k waste capping a naive packed trmm). Side R, complex and AD go to
+        # recursion-over-gemm! below.
+        #
+        # `_TRMM_PACK_MIN` decides recursion-over-gemm vs single-pass packed, and it is
+        # `(5·_GEMM_UNPACK_MAX)/2` — a constant derived for gemm's UNPACKED-vs-BLOCKED crossover
+        # (2·(nvreg−4)·W: 448 on AVX-512, 96 on AVX2), i.e. a different kernel pair on a different
+        # shape family, never measured at its own boundary. The gate loses 9-13% in
+        # 448 < n <= 480 on exactly the two boxes where that const is 448 and nowhere on the box where
+        # it is 96; the side-R analog `_TRMM_RPACK` WAS measured directly and puts the packed win only
+        # from n >= 1536. A trmm-owned Measure-tier crossover is the fix if that is confirmed
+        # (candidates bounded to [_GEMM_UNPACK_MAX, 4·_GEMM_UNPACK_MAX]), NOT a change to gemm's
+        # constant. Float64 no longer reaches this cut at all, so what remains exposed is F32 and the
+        # non-strided shapes.
     elseif sl && eltype(B) <: BlasReal && transA != 'C' && k > _TRMM_PACK_MIN + _EXPINT[2] &&
-            !_EXPFLAG[_EXP9]
+            !_trmm_left_owns(A, B, transA, sl, k) && !_EXPFLAG[_EXP9]
         # 8×8 tile (Val(1), unified W==_NR): finer K-trim staircase + smaller within-tile zero triangle;
         # the proven-fastest, most consistent path across sizes. (A 16×8 bulk helped N-cases at large k
         # but regressed k=768 and the public po2 A-pad path — non-robust, not worth the split.)

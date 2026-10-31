@@ -28,14 +28,17 @@
         [T(sinpi((i + 3j) / 97) + 2) for i in 1:r, j in 1:c]
     m = 24
     ks = sort(unique([8, lo, lo + 1, (lo + hi) ÷ 2, hi - 1, hi, hi + 1, 2hi]))
-    # THE BAND HAS AN UPPER BOUND ON SIDE L, AND IT IS NOT `_TRMM_BASE`. Above `_TRMM_PACK_MIN` a real
-    # non-conj side-L call is routed to `_trmm_split_L!`, which packs and contracts in a different
-    # order from the recursion; both are accurate and their bits differ by design, so bit equality is
-    # not the invariant there. That cut is `(5 * _GEMM_UNPACK_MAX) ÷ 2`, which is 240 on AVX2, 1120 on
-    # AVX-512 and 280 on NEON — so whether a k is inside the band is a property of the MACHINE, and
-    # a fixed k list silently tests a non-invariant on some of them.
+    # THE BAND HAS AN UPPER BOUND ON SIDE L FOR Float32 ONLY. `_trmm_left_owns` claims every strided
+    # non-conj Float64 side-L call at any k, so Float64 mirrors `_trmm_left!` the whole way up and is
+    # not filtered — the large-k half of that route is the part this item exists to watch. An F32
+    # call above `_TRMM_PACK_MIN` still goes to `_trmm_split_L!`, which packs and contracts in a
+    # different order from the recursion; both are accurate and their bits differ by design, so bit
+    # equality is not the invariant there. That cut is `(5 * _GEMM_UNPACK_MAX) ÷ 2`, which is 240 on
+    # AVX2, 1120 on AVX-512 and 280 on NEON — so whether a k is inside it is a property of the
+    # MACHINE, and a fixed k list silently tests a non-invariant on some of them.
     packmin = P._TRMM_PACK_MIN + P._EXPINT[2]
-    ks_for(side, T) = side == 'R' || !(T <: PureBLAS.BlasReal) ? ks : filter(<=(packmin), ks)
+    ks_for(side, T) = side == 'R' || !(T <: PureBLAS.BlasReal) || T === Float64 ?
+        ks : filter(<=(packmin), ks)
     diverged = Tuple{DataType, Int, Char, String}[]
     for T in (Float64, Float32, ComplexF64), side in ('L', 'R'), k in ks_for(side, T),
             up in ('U', 'L'), ta in ('N', 'T'), dg in ('N', 'U')
