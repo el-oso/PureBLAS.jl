@@ -5104,7 +5104,8 @@ end
     nt > 1 || return 1
     flops = k * k * n
     (flops < _GEMM_MT_WORK || n < _NR) && return 1
-    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
+    # Gate, not ration — the argument is at `_gemm_workers`.
+    return max(1, min(nt, cld(n, _NR)))
 end
 
 # One worker's column band. Called from `_gemm_run_chunk` (gemm.jl) on the pool's `_MT_KIND_TRSM` job,
@@ -5132,7 +5133,8 @@ end
     nt > 1 || return 1
     flops = k * k * m
     (flops < _GEMM_MT_WORK || m < _MR * _vwidth(T)) && return 1
-    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(m, _MR * _vwidth(T))))
+    # Gate, not ration — the argument is at `_gemm_workers`.
+    return max(1, min(nt, cld(m, _MR * _vwidth(T))))
 end
 
 # A SIDE-R ROW BAND NARROWER THAN THE COPROCESSOR'S TILE WASTES MOST OF ITS WORK, so the pool is

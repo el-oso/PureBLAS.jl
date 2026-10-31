@@ -4145,7 +4145,10 @@ end
     # above already ends it, which is why the gate never sees this at all.)
     flops = 2 * m * n * k
     (flops < _GEMM_MT_WORK || n < _NR) && return 1
-    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
+    # `_GEMM_MT_WORK` gates above; it must not also ration. The join decides WHETHER to thread, never
+    # how many to wake — the bound is the splittable work, since a worker without a block of its own
+    # only adds a join. The full pool is fastest at every size the gate admits.
+    return max(1, min(nt, cld(n, _NR)))
 end
 
 # The job is a set of ISBITS fields on a pre-existing mutable struct, not a closure and not a tuple of
@@ -4381,7 +4384,8 @@ the cap would trade a rare idle worker for narrower chunks everywhere.
     nt > 1 || return 1
     flops = n * (n + 1) * k
     (flops < _GEMM_MT_WORK || n < _NR) && return 1
-    return max(1, min(nt, flops ÷ _GEMM_MT_WORK, cld(n, _NR)))
+    # Gate, not ration — the argument is at `_gemm_workers`.
+    return max(1, min(nt, cld(n, _NR)))
 end
 
 """
