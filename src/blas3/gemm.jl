@@ -4937,28 +4937,45 @@ end
 # The zeroing lives HERE and not in the driver on purpose: it is per-block over exactly the rows
 # `_symv_rows` allows, which is what makes this identical to `_symv_blocked!`'s serial loop. Doing it
 # in the driver would sweep all of `n` per block and cost more than the fold.
+@inline function _symv_run_block!(p::GemmPool{T}, b::Int, nblk::Int, n::Int, NB::Int,
+        part, npad::Int, Am)::Nothing where {T}
+    j0, j1 = _symv_cols(b, nblk, n, NB)
+    j1 > j0 || return nothing
+    if isone(b)
+        _symv_simd_cols!(p.up, n, p.alpha, Am, p.Ap, p.Bp, j0, j1)
+    else
+        zp = pointer(part, (b - 1) * npad + 1)
+        lo, hi = _symv_rows(p.up, n, j0, j1)
+        @inbounds for k in lo:hi
+            unsafe_store!(zp, zero(T), k)
+        end
+        _symv_simd_cols!(p.up, n, p.alpha, Am, p.Ap, zp, j0, j1)
+    end
+    return nothing
+end
+
 @noinline function _symv_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
     n = p.m
     nblk = _symv_nblk(n, T)
     NB = min(_SYMV_NB, _vwidth(T))
-    b0, cnt = _red_chunk(nblk, nw, i)
-    cnt > 0 || return nothing
     part = _red_partials(T)
     npad = _symv_npad(n, T)
     Am = PtrMatrix{T}(p.Cp, n, n, p.ldc)
-    for b in b0:(b0 + cnt - 1)
-        j0, j1 = _symv_cols(b, nblk, n, NB)
-        j1 > j0 || continue
-        if isone(b)
-            _symv_simd_cols!(p.up, n, p.alpha, Am, p.Ap, p.Bp, j0, j1)
-        else
-            zp = pointer(part, (b - 1) * npad + 1)
-            lo, hi = _symv_rows(p.up, n, j0, j1)
-            @inbounds for k in lo:hi
-                unsafe_store!(zp, zero(T), k)
-            end
-            _symv_simd_cols!(p.up, n, p.alpha, Am, p.Ap, zp, j0, j1)
-        end
+    # MIRRORED PAIRS, not `_red_chunk`'s contiguous run. A column block's work tapers across the
+    # triangle, so a contiguous share concentrates it on one worker. The pair `{l, nblk+1-l}` spans
+    # the same total for every `l`, so the shares are equal by construction and not by tuning.
+    # Measured self-speedup at six threads, n=512/1024/2048: 1.76/2.09/2.52 contiguous against
+    # 2.80/3.04/3.82 paired, with the serial arm unchanged within 2%. `nblk` of 8 yields only four
+    # pairs, so four workers is the ceiling here whatever the thread count — 3.82 is 95% of it, and
+    # raising `_SYMV_NBLK` is what would use more.
+    # `_red_chunk` is left alone for `dot`/`asum`/`scal`/`iamax`, whose blocks carry equal work and
+    # whose comment makes contiguity deliberate. Which block a worker holds is all that moves: the
+    # driver folds in block order either way, so req#11 is untouched.
+    half = cld(nblk, 2)
+    for l in i:nw:half
+        _symv_run_block!(p, l, nblk, n, NB, part, npad, Am)
+        hi = nblk + 1 - l
+        hi > l && _symv_run_block!(p, hi, nblk, n, NB, part, npad, Am)
     end
     return nothing
 end
