@@ -74,17 +74,38 @@ end
 #
 # Trim-safe: the `ccall` runs at precompile time inside a `const` initializer and folds to a literal,
 # exactly as the `CpuId` cpuid calls do — no runtime syscall on any code path (req#4).
-function _sysctl_int(name::String)
-    Sys.isapple() || return 0
+function _sysctl_probe(name::String)
+    Sys.isapple() || return (false, 0)
     return try
         out = Ref{Int64}(0)
         sz = Ref{Csize_t}(sizeof(Int64))
         rc = ccall(:sysctlbyname, Cint, (Cstring, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
                    name, out, sz, C_NULL, 0)
-        rc == 0 ? Int(out[]) : 0
+        rc == 0 ? (true, Int(out[])) : (false, 0)
     catch
-        0
+        (false, 0)
     end
+end
+
+# A missing key and a key reading 0 are the same answer for a cache size — both mean "fall back" —
+# so this discards the distinction that `_sysctl_probe` keeps.
+_sysctl_int(name::String) = _sysctl_probe(name)[2]
+
+# A FEATURE BIT MUST BE PRESENT AND SET, and the difference matters in a way it does not for a
+# cache size. `_sysctl_int` answers 0 both for "this key reads zero" and for "this key does not
+# exist", so a gate built on it treats a renamed or mistyped oid as "the hardware lacks the
+# feature": the route goes dead on every machine, no error is raised, and the symptom presents as
+# a kernel that never helps rather than as a detection fault.
+#
+# DARWIN NAMES THE SME ELEMENT-TYPE CAPABILITIES IN TWO STYLES AND THE SPLIT IS NOT COSMETIC. The
+# 32-bit outer products are unprefixed, being base SME — `SME_F32F32`, `SME_F16F32`, `SME_I8I32`,
+# `SME_B16F32`, `SME_BI32I32`, `SME_I16I32` — while the 64-bit and 16-bit EXTENSIONS carry `FEAT_`:
+# `FEAT_SME_F64F64`, `FEAT_SME_I16I64`, `FEAT_SME_F16F16`, `FEAT_SME_B16B16`. So
+# `hw.optional.arm.FEAT_SME_F32F32` exists on no machine, and a gate written by analogy with
+# `_SME_F64`'s key is permanently false everywhere. `test/cpuinfo_tests.jl` asserts that a bogus
+# oid and a real one give DIFFERENT answers, so a probe that cannot fail cannot pass for a gate.
+_sysctl_feature(name::String) = let (found, v) = _sysctl_probe(name)
+    found && v == 1
 end
 
 # L1 data-cache size in bytes (folded to a const; fallback if a level reports 0). Unused by the
@@ -235,6 +256,55 @@ const _SME_LANES = @load_preference(
     "sme_lanes",
     let b = _sysctl_int("hw.optional.arm.sme_max_svl_b")
         b > 0 ? b ÷ sizeof(Float64) : 0
+    end
+)::Int
+
+# `_SME_F32` gates the Float32 gemm path. It differs from `_SME_F64` in two ways, both of which
+# were established by executing the instruction rather than by reading the feature table:
+#
+#   * THE GATE IS WIDER, because the 32-bit outer product is base SME rather than an extension.
+#     An `fmopa za.s` assembles and runs with `+sme,+sme2` alone — `+sme-f64f64` is absent from the
+#     target features and is not needed. `_SME_F64` is a strictly narrower condition.
+#   * THE KEY IS UNPREFIXED: `hw.optional.arm.SME_F32F32`. See `_sysctl_feature` for why Darwin
+#     splits the names that way and what a gate written by analogy with `_SME_F64`'s key costs.
+#
+# FEAT_SME2 is CONJOINED rather than relied on to imply the 32-bit capability. No part is available
+# on which the two bits disagree, so "SME2 implies the 32-bit outer product" cannot be checked;
+# a conjunction fails safe where an assumed implication does not.
+# PDM: Exempt — the detected FEAT_SME2 + SME_F32F32 pair itself; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+const _SME_F32 = Sys.ARCH === :aarch64 && @load_preference(
+    "sme_f32",
+    _sysctl_feature("hw.optional.arm.FEAT_SME2") &&
+        _sysctl_feature("hw.optional.arm.SME_F32F32")
+)::Bool
+
+# A machine that advertises SME2 but publishes NO 32-bit capability key is the one state that must
+# not pass quietly: either the key has been renamed, or this is the first part with SME2 and no
+# 32-bit outer product. Both deserve a look. Neither is a correctness hazard — the Float32 route
+# just stays on NEON — which is why `_sme_init!` warns here and errors for a failed self-test: a
+# geometry assumption that does not hold produces wrong numbers, this produces slower ones.
+const _SME_F32_KEY_ABSENT = Sys.ARCH === :aarch64 &&
+    _sysctl_feature("hw.optional.arm.FEAT_SME2") &&
+    !_sysctl_probe("hw.optional.arm.SME_F32F32")[1]
+
+# FP32 lanes per streaming vector, and so the dimension of a 32-bit ZA tile.
+#
+# ZA IS `svl` x `svl` BYTES, so the tile count equals the element size in bytes while the tile
+# dimension equals the lane count: at svl = 64 that is 8 tiles of 8x8 for Float64 against 4 tiles
+# of 16x16 for Float32. One `fmopa za.s` is therefore 256 FMAs where `fmopa za.d` is 64 — four
+# times the work per instruction, because the outer product is a square and only its side scales
+# with the lane count. Measured 3.94x on an M6 against that 4.00x structural prediction.
+#
+# THE TILE BUDGET IS TIGHTER AND STILL SUFFICIENT. Float64 uses 4 of its 8 tiles for a 2x2 register
+# tile; the same arrangement in Float32 uses 4 of 4. That leaves nothing spare only if two users
+# needed tiles at once, and none do: every ZA user is its own `llvmcall` that enables ZA on entry
+# and disables it on exit, and the driver calls them strictly in sequence — pack B, pack A, then the
+# macrokernel. So the transpose packer and the register tile can both own tile 0.
+# PDM: Exempt — the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+const _SME_LANES_F32 = @load_preference(
+    "sme_lanes_f32",
+    let b = _sysctl_int("hw.optional.arm.sme_max_svl_b")
+        b > 0 ? b ÷ sizeof(Float32) : 0
     end
 )::Int
 

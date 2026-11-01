@@ -97,8 +97,27 @@ end
         # the SIMD path rather than produce a wrong answer.
         @test !elig(false, false, true, false)
         @test !elig(false, false, false, true)
-        @test !P._sme_eligible(Float32, n, n, n, false, false, false, false,
-                               zeros(Float32, n, n), rand(Float32, n, n), rand(Float32, n, n))
+        # FLOAT32 HAS ITS OWN ROUTE, with its own feature gate, its own tile floor and its own entry
+        # pointer, so the predicate admits it on its own terms instead of falling through. `n` here
+        # is a multiple of both register tiles and above both floors.
+        f32(cA, cB, nn) = P._sme_eligible(Float32, nn, nn, nn, false, false, cA, cB,
+            zeros(Float32, nn, nn), rand(Float32, nn, nn), rand(Float32, nn, nn))
+        if P._SME_F32 && P._SME_ENTRY32[] !== C_NULL
+            @test f32(false, false, n)
+            # Conjugation is declined at BOTH precisions: these kernels are real.
+            @test !f32(true, false, n)
+            @test !f32(false, true, n)
+            # THE TWO FLOORS ARE NOT THE SAME FLOOR. A 32-bit register tile is twice as wide, so half
+            # the extents that divide the 64-bit tile leave the 32-bit one ragged -- and a ragged
+            # Float32 shape must clear a higher floor. At `_SME_MR32 + _SME_MR` the Float64 predicate
+            # takes its tile-exact path while Float32 declines, which is what makes borrowing either
+            # precision's guard for the other a wrong answer.
+            sq = P._SME_MR32 + P._SME_MR
+            @test P._sme_tile_ok(sq, sq)
+            @test !f32(false, false, sq)
+        else
+            @test !f32(false, false, n)
+        end
         # Below the crossover the packed panels do not pay for themselves. The crossover is
         # `_SME_MIN_EXACT` for EVERY operand, ragged or not: a ragged block is one macrokernel call
         # whose edge tiles are predicated, so it no longer pays a prologue per edge tile and no
@@ -311,5 +330,157 @@ end
         # And the witness agrees with the predicate rather than being a second opinion.
         @test P._sme_gemv_eligible(Float64, n, n, false, false, A, x, y, 1, 1, 0.0)
         @test !P._sme_gemv_eligible(Float64, n, n, true, false, At, x, y, 1, 1, 0.0)
+    end
+end
+
+# ── Float32 route ──────────────────────────────────────────────────────────────────────────────
+@testitem "SME Float32 geometry follows the detected lane count" begin
+    using PureBLAS
+    const P = PureBLAS
+    # ZA is `svl` x `svl` BYTES, so a 32-bit tile is twice the dimension of a 64-bit one on the
+    # same hardware and the register tile is twice as wide in each direction.
+    @test P._SME_MR32 == 2 * P._SME_L32
+    @test P._SME_NR32 == 2 * P._SME_L32
+    if P._SME_F32
+        @test P._SME_LANES_F32 > 0
+        @test P._SME_LANES_F32 == 2 * P._SME_LANES
+        @test P._SME_L32 == 2 * P._SME_L
+        # The floor is a multiple of the register tile, not a Float32 literal, so it tracks it.
+        @test P._SME_MIN_EXACT32 == 3 * P._SME_MR32
+    else
+        # Geometry stays well formed off the feature so the IR strings still build.
+        @test P._SME_L32 == 16
+    end
+end
+
+@testitem "SME Float32 block sizes obey the same derivation" begin
+    using PureBLAS
+    const P = PureBLAS
+    # The SAME formulas as the Float64 case, with `sizeof(T)` and the register tile substituted —
+    # which is the point: one derivation serves both precisions, so neither carries a literal.
+    for (m, n, k) in ((2048, 2048, 2048), (512, 512, 512), (100, 37, 53), (4096, 4096, 4096))
+        MC, NC, KC = P._sme_blocks(Float32, m, n, k)
+        @test 0 < MC <= max(m, P._SME_MR32)
+        @test 0 < KC <= k
+        # Tile-aligned ONLY when the block is a genuine split; a single block takes the true extent
+        # and the kernel predicates its last tile. m=100 and k=53 are the cases that must not round.
+        @test MC == m || MC % P._SME_MR32 == 0
+        @test KC == k || KC % P._SME_L32 == 0
+        @test NC >= n
+        @test KC * NC * sizeof(Float32) <= P._SME_PANEL_BUDGET + KC * P._SME_NR32 * sizeof(Float32)
+    end
+end
+
+@testitem "SME Float32 tile floor admits one whole tile and declines below it" begin
+    using PureBLAS
+    const P = PureBLAS
+    MR = P._SME_MR32
+    # ONE whole register tile each way is the admission criterion for a tile-exact shape, measured
+    # at k = 10, 64 and 256 (the table on `_sme_tile_ok32`): one tile wins at every depth and
+    # nothing below it does. This is where the Float32 floor parts company with the Float64 one,
+    # which needs two tiles -- so it is asserted rather than assumed to follow.
+    @test P._sme_tile_ok32(MR, MR)
+    @test P._sme_tile_ok32(2 * MR, 2 * MR)
+    @test !P._sme_tile_ok32(MR - 1, 4096)
+    # A RAGGED shape has to clear the higher floor instead, because its predicated edge tile can
+    # cost more than the tile earns at small k -- 1.25 and 1.5 tiles measure 0.34x and 0.48x there.
+    @test !P._sme_tile_ok32(MR + 8, MR + 8)
+    @test !P._sme_tile_ok32(2 * MR + 1, 2 * MR + 1)
+    @test P._sme_tile_ok32(MR + 8, P._SME_MIN_EXACT32)
+    # THE TWO FLOORS DIVERGE, and the clearest witness is an extent that is tile-exact for Float64
+    # and ragged for Float32 -- a 32-bit tile is twice as wide, so half the extents that divide the
+    # 64-bit tile do not divide it. At `_SME_MR32 + _SME_MR` the Float64 predicate takes its exact
+    # path and the Float32 one falls to its ragged floor and declines.
+    @test P._sme_tile_ok(P._SME_MR32 + P._SME_MR, P._SME_MR32 + P._SME_MR)
+    @test !P._sme_tile_ok32(P._SME_MR32 + P._SME_MR, P._SME_MR32 + P._SME_MR)
+end
+
+@testitem "SME Float32 gemm! matches the oracle on ragged shapes" begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    if !P._SME_F32 || P._SME_ENTRY32[] === C_NULL
+        @test_skip "no SME Float32 route on this machine"
+    else
+        # The reference accumulates in Float64, so this compares against the EXACT product rather
+        # than against another Float32 summation order — a kernel that merely reorders the sum
+        # would otherwise pass. The tolerance is a Float32 one, scaled by depth.
+        MR = P._SME_MR32
+        @testset "m=$m n=$n k=$k tA=$tA alpha=$al beta=$be" for (m, n, k) in (
+                    (2MR, 2MR, P._SME_L32), (2MR + 1, 2MR + 3, P._SME_L32 + 1),
+                    (3MR, 2MR, 10), (2MR, 3MR + 5, 64), (2MR + 7, 2MR + 11, 17),
+                ),
+                tA in (false, true),
+                (al, be) in ((1.0f0, 0.0f0), (1.5f0, 0.5f0), (0.0f0, 1.0f0))
+            A = tA ? rand(Float32, k, m) : rand(Float32, m, k)
+            B = rand(Float32, k, n)
+            C = rand(Float32, m, n)
+            got = copy(C)
+            P.gemm!(got, A, B; alpha = al, beta = be, transA = tA ? 'T' : 'N', transB = 'N')
+            opA = tA ? transpose(Float64.(A)) : Float64.(A)
+            want = Float64(al) .* (opA * Float64.(B)) .+ Float64(be) .* Float64.(C)
+            den = maximum(abs, want)
+            @test maximum(abs.(Float64.(got) .- want)) <= 1.0e-5 * max(den, 1.0)
+        end
+    end
+end
+
+@testitem "SME Float32 eligible calls decline the worker pool" begin
+    using PureBLAS
+    const P = PureBLAS
+    if !P._SME_F32 || P._SME_ENTRY32[] === C_NULL
+        @test_skip "no SME Float32 route on this machine"
+    else
+        # The matrix unit is shared by the cluster, so splitting an SME call across workers queues
+        # them behind one unit instead of dividing the work. `_sme_owns` at the threaded entry is
+        # the only place that can be decided — a guard inside the chunk body runs after the split.
+        MR = P._SME_MR32
+        C = zeros(Float32, 4MR, 4MR); A = rand(Float32, 4MR, 64); B = rand(Float32, 64, 4MR)
+        @test P._sme_owns(Float32, 4MR, 4MR, 64, false, false, false, false, C, A, B)
+        # One whole tile each way is ON the floor, so the route owns it and the pool stays out.
+        @test P._sme_owns(Float32, MR, MR, 64, false, false, false, false, C, A, B)
+        # Below the floor the route declines and the pool is free to split as usual.
+        @test !P._sme_owns(Float32, MR - 1, MR - 1, 64, false, false, false, false, C, A, B)
+        # A conjugated operand is not this kernel's shape at either precision.
+        @test !P._sme_owns(Float32, 4MR, 4MR, 64, false, false, true, false, C, A, B)
+        # THE GUARD REACHES BEYOND gemm, AND THAT IS THE POINT RATHER THAN A SIDE EFFECT. `symm`
+        # asks the same predicate before sizing its pool, and its own test already admits Float32,
+        # so a Float32 symm whose sub-gemm the route owns declines the split for the same reason:
+        # otherwise each worker chunk reaches the route separately and contends for one shared unit.
+        Cs = zeros(Float32, 4MR, 4MR); Bs = rand(Float32, 4MR, 4MR)
+        @test P._symm_sme_owns(Float32, 4MR, 4MR, 4MR, Cs, Bs)
+        @test !P._symm_sme_owns(Float32, MR - 1, MR - 1, MR - 1,
+                                zeros(Float32, MR - 1, MR - 1), rand(Float32, MR - 1, MR - 1))
+    end
+end
+
+@testitem "SME Float32 results are identical across worker counts" begin
+    using PureBLAS
+    const P = PureBLAS
+    if !P._SME_F32 || P._SME_ENTRY32[] === C_NULL
+        @test_skip "no SME Float32 route on this machine"
+    else
+        # req#11: the result may not depend on how many workers ran it. Adding a route is exactly
+        # the change that breaks this, by keying a predicate on a chunk's own extent instead of on
+        # the route token — so both a shape the route OWNS and one just under its floor are checked,
+        # because the second is the one that actually gets split.
+        MR = P._SME_MR32
+        using Base.Threads: nthreads
+        if nthreads() < 2
+            @test_skip "needs >= 2 julia threads to split anything"
+        else
+            for (m, n, k) in ((4MR, 4MR, 64), (2MR - 1, 4MR, 64))
+                A = rand(Float32, m, k); B = rand(Float32, k, n)
+                P.set_num_threads(1)
+                base = zeros(Float32, m, n)
+                P.gemm!(base, A, B)
+                for nt in 2:min(4, nthreads())
+                    P.set_num_threads(nt)
+                    got = zeros(Float32, m, n)
+                    P.gemm!(got, A, B)
+                    @test got == base
+                end
+            end
+            P.set_num_threads(1)
+        end
     end
 end
