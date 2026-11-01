@@ -3738,6 +3738,14 @@ end
         # per-sample spread. The large ratios above sit far outside that uncertainty and the call
         # counts are not timings at all, so only this 4-5% is open.
         if _sme_eligible(T, mrt, nrt, krt, tA, tB, cA, cB, C, A, B)
+            # ONE PREDICATE, TWO KERNELS. `_sme_eligible` has already decided which precision had
+            # its feature gate, its tile floor and its published entry pointer satisfied, so all
+            # that is left here is the compile-time type test that selects the matching driver.
+            # Without it a Float32 call that passed the predicate would reach the Float64 kernel
+            # and reinterpret its operands.
+            if T === Float32
+                return _gemm_sme_f32!(C, A, B, Float32(alpha), Float32(beta), m, n, k, tA, tB)
+            end
             return _gemm_sme!(C, A, B, Float64(alpha), Float64(beta), m, n, k, tA, tB)
         end
         if strassen != _STR_OFF && _STRASSEN && !tA && _strided1(A) && _strided1(B) &&
