@@ -4,7 +4,15 @@
 # it. See test/routetoken_lint.jl for the rule.
 #
 # CORRECT AND DELIBERATE. `_sme_tile_ok` is a `min` plus two moduli, so `max` absorption cannot reach
-# it and the predicate must read the token on every axis — which this site does. Baselined rather than
+# it and the predicate must read the token on every axis — which this site does.
+#
+# THIS ONE SITE COVERS TWO PREDICATES. `_sme_eligible` dispatches on the element type and asks
+# `_sme_tile_ok` for Float64 or `_sme_tile_ok32` for Float32; both are a `min` plus two moduli, over
+# register tiles that differ by a factor of two. The protection is identical and comes from HERE
+# rather than from either predicate: the token values are what the call hands them, so neither can
+# read a chunk extent whatever its own floors are. The Float32 floors differ from the Float64 ones
+# (one register tile rather than two on the first clause, measured across k), which changes WHICH
+# shapes route and not whether the routing is worker-invariant. Baselined rather than
 # marked in source so the lint keeps reporting the class: a `min` predicate is the shape that has
 # broken req#11 repeatedly, and each new one must come here and be argued.
 #

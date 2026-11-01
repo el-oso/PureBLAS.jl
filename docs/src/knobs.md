@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 173 of them.
+Every `@load_preference` key in `src/` — 176 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -15,8 +15,8 @@ Every `@load_preference` key in `src/` — 173 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 80 Derived · 23 Measured (15 calibrated · 8 orphaned) · 52 Literal · 18 Exempt.
-**Default form** (mechanical): 69 formula · 22 delegates · 8 sibling · 64 literal · 5 flag · 5 other.
+**Tier:** 80 Derived · 24 Measured (15 calibrated · 9 orphaned) · 52 Literal · 20 Exempt.
+**Default form** (mechanical): 70 formula · 22 delegates · 8 sibling · 65 literal · 5 flag · 6 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -146,8 +146,10 @@ Every `@load_preference` key in `src/` — 173 of them.
 | `l3_bytes` | formula | Exempt | the detected L3 size itself (floored at L2 where no L3/SLC is queryable, see above); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `madvise_hugepages` | flag | Exempt | a capability switch, not hardware tuning. Set `madvise_hugepages = false` to disable. | — |
 | `simd_bytes` | delegates | Exempt | the detected SIMD width itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `sme_f32` | other | Exempt | the detected FEAT_SME2 + SME_F32F32 pair itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `sme_f64` | other | Exempt | the detected FEAT_SME2 + FEAT_SME_F64F64 pair itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `sme_lanes` | formula | Exempt | the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `sme_lanes_f32` | formula | Exempt | the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | n/a |
 
 ## LAPACK · banded_chol
 
@@ -268,6 +270,7 @@ Every `@load_preference` key in `src/` — 173 of them.
 | `sme_inplace_njp` | literal | Measured | the column-panel re-read count at which packing A starts to pay, for a stride whose columns spread over two or more L1 sets; neither block size nor page geometry places it, and the value is bounded above by the gate cells that lose when the cut admits their own panel count. `_sme_inplace_njp` halves it for a one-set stride, which it identifies from the detected `_L1_WAY_BYTES`. | 2 s; _EXPINT[10] sweeps it by hand |
 | `sme_min` | literal | Measured | tile-occupancy crossover, not a residency formula: the general cut is where the worst remainder (1) starts paying, and exact multiples of MR are admitted earlier because they pack no remainder panel at all. | none — orphaned; sweep |
 | `sme_min_exact` | literal | Measured | the same occupancy crossover for shapes that pack no remainder panel at all; one full row panel already pays, per the table above. | none — orphaned; sweep |
+| `sme_min_exact32` | literal | Measured | the occupancy crossover for ragged Float32 shapes, selected from the candidate set "multiples of `_SME_MR32`" by sweeping DEPTH as well as extent: at k = 64 and 256 the 1.25-tile and 1.5-tile shapes win 1.12-1.74, and at k = 10 they lose 0.34 and 0.48, so the multiplier that agrees with the Float64 one is a result here rather than an inheritance. | none — orphaned; sweep |
 | `sme_panel_bytes` | literal | Measured | a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | none — orphaned; sweep |
 
 ## sme_l1
@@ -294,7 +297,7 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Orphaned Measured knobs
 
-8 of the 23 Measured knobs have no entry in
+9 of the 24 Measured knobs have no entry in
 `bench/calibrate.jl`, so `tune!()` cannot set them however many times it runs. The tier is
 still correct — the value was reached by measurement — but the pin it asks for is
 unreachable until a calibrator exists. Each row's `tune!()` cell reads `none`, and the
@@ -307,6 +310,7 @@ handle after it is what a person would sweep by hand meanwhile.
 | `sme_ger_groups` | candidates (1,2,4,8) |
 | `sme_min` | sweep |
 | `sme_min_exact` | sweep |
+| `sme_min_exact32` | sweep |
 | `sme_panel_bytes` | sweep |
 | `sme_l1_groups` | candidates (1,2,4,8) |
 | `sme_rmw_groups` | candidates (1,2,4,8) |

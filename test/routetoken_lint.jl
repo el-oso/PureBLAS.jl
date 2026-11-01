@@ -23,7 +23,10 @@
 # `max(m, nrt, k) <= C` test reads the serial value even though `m` is the band height — `max` absorbs
 # it. So those predicates are safe without being touched. A predicate built from a `min`, a modulus or
 # a bare one-sided bound gets no such protection: `_sme_tile_ok` is `min(m,n) >= 2*_SME_MR` plus two
-# moduli, and it is the only route predicate in the tree that the `max` trick does not cover.
+# moduli, and its Float32 twin `_sme_tile_ok32` has the same shape with the Float32 register tile.
+# They are the only route predicates in the tree that the `max` trick does not cover, so BOTH names
+# are in the patterns below — a sibling the scanner does not know about is an unguarded site that
+# looks guarded.
 #
 # So the lint has two halves. Find the size-keyed predicates in a function that HAS a route token, then
 # among them flag the ones that are not a `max` over the resolved values. A `max` form is reported only
@@ -51,9 +54,9 @@ const _RT_HAS_TOKEN = r"(rt::NTuple\{3,\s*Int\}|nroute::Int|\b(mrt|nrt|krt)\s*=)
 const _RT_RESOLVED = r"\b(mrt|nrt|krt)\b"
 const _RT_RAW = r"(\bsize\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*[12]\s*\)|\bm\b|\bn\b)"
 # A size-keyed predicate: compared against a tuning const or handed to a tile predicate.
-const _RT_PRED = r"(<=|>=|<|>)\s*_[A-Za-z_]|_sme_tile_ok\(|_sme_eligible\(|_sme_owns\("
+const _RT_PRED = r"(<=|>=|<|>)\s*_[A-Za-z_]|_sme_tile_ok(32)?\(|_sme_eligible\(|_sme_owns\("
 # Forms the n-slot token cannot repair.
-const _RT_UNPROTECTED = r"(\bmin\(|%\s*_|\brem\(|_sme_tile_ok\(|_sme_eligible\(|_sme_owns\()"
+const _RT_UNPROTECTED = r"(\bmin\(|%\s*_|\brem\(|_sme_tile_ok(32)?\(|_sme_eligible\(|_sme_owns\()"
 # A ONE-SIDED BOUND ON A RAW EXTENT, and this one must fire even when resolved names appear elsewhere
 # on the same line. The most dangerous shape in this whole class is the HALF-PROTECTED predicate: the
 # original defect read `m >= _SMR * _vwidth(T) && max(mrt, nrt, krt) <= _gemm_split_max()`, where the

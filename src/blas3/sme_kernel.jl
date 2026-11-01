@@ -60,12 +60,66 @@ const _SME_L = (_SME_F64 && _SME_LANES > 0) ? _SME_LANES : 8
 const _SME_MR = 2 * _SME_L
 const _SME_NR = 2 * _SME_L
 
-# (ZA tile, slice, C column, C row offset) for each of the 32 vertical slices of the C tile.
-# VERTICAL slices, not horizontal: a vertical slice is one column over all 8 rows, which is
-# exactly the contiguous run a column-major C holds.
-function _sme_c_slots()
+# Float32 register-tile geometry, from the same 2x2 arrangement of ZA tiles. A 32-bit tile is
+# `svl/4` square where a 64-bit tile is `svl/8`, so MR and NR are TWICE the Float64 values on the
+# same hardware and one register tile covers four times the area.
+#
+# The fallback mirrors `_SME_L`'s and exists for the same reason: off SME these bodies still build,
+# and are never executed because every entry point is gated on `_SME_F32`.
+const _SME_L32 = (_SME_F32 && _SME_LANES_F32 > 0) ? _SME_LANES_F32 : 16
+const _SME_MR32 = 2 * _SME_L32
+const _SME_NR32 = 2 * _SME_L32
+
+# Register-tile geometry by element type. Every branch is a compile-time constant, so a
+# `T`-dispatched read const-folds and the packers below carry no runtime geometry lookup.
+@inline _sme_mr(::Type{Float64}) = _SME_MR
+@inline _sme_nr(::Type{Float64}) = _SME_NR
+@inline _sme_lanes_of(::Type{Float64}) = _SME_L
+@inline _sme_mr(::Type{Float32}) = _SME_MR32
+@inline _sme_nr(::Type{Float32}) = _SME_NR32
+@inline _sme_lanes_of(::Type{Float32}) = _SME_L32
+
+# ── Element descriptor for the IR generators ───────────────────────────────────────────────────
+# ONE EMITTER SERVES BOTH PRECISIONS, because the macrokernel's shape carries measured properties
+# that must not drift between them: the edge-tile bodies deliberately share no common tail, and an
+# optimizer that merges them into one block of predicate phis costs 5x on EVERY tile. A second copy
+# of the emitter would let that property hold on one precision and lapse on the other.
+#
+# `v` IS NOT THE LANE COUNT. It is LLVM's `nxv<v>` minimum element count — the element count of a
+# 128-bit vector, so 2 for `double` and 4 for `float` — and it is fixed by the type. The LANE COUNT
+# is `svl / sizeof(T)`, it comes from the hardware, and it is what sets the ZA tile dimension.
+# Substituting one for the other emits IR that fails to legalize ("do not know how to split this
+# operator's operand").
+#
+# ZA is `svl` x `svl` BYTES, so Float32 gets FOUR tiles of 16x16 where Float64 gets eight of 8x8 at
+# svl = 64: one `fmopa za.s` is 256 FMAs against `fmopa za.d`'s 64. Four times the work per
+# instruction, not two, because the outer product is a square and lanes scale only its side.
+function _sme_eltype(::Type{T}, L::Int) where {T}
+    sz = sizeof(T)
+    v = 16 ÷ sz
+    ty = T === Float64 ? "double" : "float"
+    nx = "nxv$(v)f$(8 * sz)"
+    # The ZA load/store width letter: `ld1d`/`st1d` move 64-bit elements, `ld1w`/`st1w` 32-bit.
+    sfx = T === Float64 ? "d" : "w"
+    # `+sme-f64f64` is the Float64 EXTENSION and must NOT appear for Float32, whose outer product is
+    # base SME. `+sve` is absent from both deliberately: with it LLVM uses SVE for ordinary work
+    # OUTSIDE streaming mode, and this hardware has no non-streaming SVE.
+    feats = T === Float64 ? "+sme,+sme2,+sme-f64f64" : "+sme,+sme2"
+    return (
+        ty = ty, v = v, nx = nx, sfx = sfx, bytes = sz, feats = feats,
+        L = L, MR = 2L, NR = 2L,
+        pred = "<vscale x $v x i1>", vec = "<vscale x $v x $ty>",
+        wl = "llvm.aarch64.sve.whilelt.nxv$(v)i1.i64",
+        ld1 = "llvm.aarch64.sve.ld1.$nx",
+    )
+end
+
+# (ZA tile, slice, C column, C row offset) for each vertical slice of the C register tile.
+# VERTICAL slices, not horizontal: a vertical slice is one column over all `L` rows, which is
+# exactly the contiguous run a column-major C holds. The 2x2 tile arrangement puts columns below
+# `L` in tiles 0/2 and the rest in 1/3, rows below `L` in 0/1 and the rest in 2/3.
+function _sme_c_slots(L::Int)
     slots = Tuple{Int, Int, Int, Int}[]
-    L = _SME_L
     for jj in 0:(L - 1)
         push!(slots, (0, jj, jj, 0))
         push!(slots, (2, jj, jj, L))
@@ -75,23 +129,28 @@ function _sme_c_slots()
     return slots
 end
 
-const _SME_ATTRS = """
+_sme_attrs(T) = """
 attributes #0 = { noinline "aarch64_inout_za" "aarch64_pstate_sm_body"
-  "target-features"="+sme,+sme2,+sme-f64f64" }
+  "target-features"="$(T.feats)" }
 """
 
-const _SME_DECLS = """
+_sme_decls(T) = """
 declare void @llvm.aarch64.sme.zero(i32)
 declare void @llvm.aarch64.sme.za.enable()
 declare void @llvm.aarch64.sme.za.disable()
-declare void @llvm.aarch64.sme.mopa.nxv2f64(i32, <vscale x 2 x i1>, <vscale x 2 x i1>, <vscale x 2 x double>, <vscale x 2 x double>)
-declare void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1>, ptr, i32, i32)
-declare void @llvm.aarch64.sme.st1d.vert(<vscale x 2 x i1>, ptr, i32, i32)
-declare void @llvm.aarch64.sme.ld1d.horiz(<vscale x 2 x i1>, ptr, i32, i32)
-declare void @llvm.aarch64.sme.st1d.horiz(<vscale x 2 x i1>, ptr, i32, i32)
-declare <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64, i64)
-declare <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1>, ptr)
+declare void @llvm.aarch64.sme.mopa.$(T.nx)(i32, $(T.pred), $(T.pred), $(T.vec), $(T.vec))
+declare void @llvm.aarch64.sme.ld1$(T.sfx).vert($(T.pred), ptr, i32, i32)
+declare void @llvm.aarch64.sme.st1$(T.sfx).vert($(T.pred), ptr, i32, i32)
+declare void @llvm.aarch64.sme.ld1$(T.sfx).horiz($(T.pred), ptr, i32, i32)
+declare void @llvm.aarch64.sme.st1$(T.sfx).horiz($(T.pred), ptr, i32, i32)
+declare $(T.pred) @$(T.wl)(i64, i64)
+declare $(T.vec) @$(T.ld1)($(T.pred), ptr)
 """
+
+const _SME_T64 = _sme_eltype(Float64, _SME_L)
+const _SME_T32 = _sme_eltype(Float32, _SME_L32)
+const _SME_ATTRS = _sme_attrs(_SME_T64)
+const _SME_DECLS = _sme_decls(_SME_T64)
 
 # ── Macrokernel ────────────────────────────────────────────────────────────────────────────────
 # The panel loops live INSIDE the streaming region, so streaming mode is entered once per
@@ -113,11 +172,11 @@ declare <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1>, p
 # whatever the padded panel holds — zeros or stale values — and are never stored, so the panel
 # padding needs to be readable, not zero. B is read with whole-vector loads and must therefore
 # extend to a whole column tile; a packed panel does, and `_sme_inplace_b` requires it.
-function _sme_macro_ir(overwrite::Bool)
-    slots = _sme_c_slots()
-    L = _SME_L
+function _sme_macro_ir(overwrite::Bool, T)
+    slots = _sme_c_slots(T.L)
+    L = T.L
     io = IOBuffer()
-    print(io, _SME_DECLS)
+    print(io, _sme_decls(T))
     # The four operand strides are RUNTIME arguments, which is what lets the kernel read an operand
     # IN PLACE instead of from a packed panel — a packed panel and a column-major operand differ in
     # nothing else (see `_sme_pack_A!`'s layout and `_sme_unpacked_a`). Making them dynamic costs
@@ -125,16 +184,16 @@ function _sme_macro_ir(overwrite::Bool)
     # against the constant-stride form at n=64..1024 with bit-identical output.
     args = "ptr %c, i64 %ldc, ptr %ap, ptr %bp, i64 %nip, i64 %njp, i64 %kce, " *
         "i64 %aip, i64 %aks, i64 %bjp, i64 %bks, i64 %mrem, i64 %nrem"
-    mopa(t, a, b, s) = "  call void @llvm.aarch64.sme.mopa.nxv2f64(i32 $t, <vscale x 2 x i1> splat (i1 true), " *
-        "<vscale x 2 x i1> splat (i1 true), <vscale x 2 x double> %va$a$s, <vscale x 2 x double> %vb$b$s)"
+    mopa(t, a, b, s) = "  call void @llvm.aarch64.sme.mopa.$(T.nx)(i32 $t, $(T.pred) splat (i1 true), " *
+        "$(T.pred) splat (i1 true), $(T.vec) %va$a$s, $(T.vec) %vb$b$s)"
     # Every C slice of a whole tile, unrolled under the constant all-true predicate.
     whole = function (op, s)
-        tag = op == "ld1d" ? "l" : "s"
+        tag = op == "ld1$(T.sfx)" ? "l" : "s"
         for (n, (tile, sl, col, row)) in enumerate(slots)
             println(io, "  %$(tag)o$s$n = mul nsw i64 %ldc, $col")
-            println(io, "  %$(tag)p$s$n = getelementptr inbounds double, ptr %ci, i64 %$(tag)o$s$n")
-            println(io, "  %$(tag)q$s$n = getelementptr inbounds double, ptr %$(tag)p$s$n, i64 $row")
-            println(io, "  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> splat (i1 true), ptr %$(tag)q$s$n, i32 $tile, i32 $sl)")
+            println(io, "  %$(tag)p$s$n = getelementptr inbounds $(T.ty), ptr %ci, i64 %$(tag)o$s$n")
+            println(io, "  %$(tag)q$s$n = getelementptr inbounds $(T.ty), ptr %$(tag)p$s$n, i64 $row")
+            println(io, "  call void @llvm.aarch64.sme.$op.vert($(T.pred) splat (i1 true), ptr %$(tag)q$s$n, i32 $tile, i32 $sl)")
         end
     end
     # The live C slices of an edge tile: a loop over the live columns with a register slice index,
@@ -149,11 +208,11 @@ function _sme_macro_ir(overwrite::Bool)
 $(t)lo:
   %j$(t)lo = phi i64 [ 0, %$pre ], [ %j$(t)lon, %$(t)lo ]
   %o$(t)lo = mul nsw i64 %j$(t)lo, %ldc
-  %p$(t)lo = getelementptr inbounds double, ptr %ci, i64 %o$(t)lo
-  %q$(t)lo = getelementptr inbounds double, ptr %p$(t)lo, i64 $L
+  %p$(t)lo = getelementptr inbounds $(T.ty), ptr %ci, i64 %o$(t)lo
+  %q$(t)lo = getelementptr inbounds $(T.ty), ptr %p$(t)lo, i64 $L
   %s$(t)lo = trunc i64 %j$(t)lo to i32
-  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> %prlo, ptr %p$(t)lo, i32 0, i32 %s$(t)lo)
-  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> %prhi, ptr %q$(t)lo, i32 2, i32 %s$(t)lo)
+  call void @llvm.aarch64.sme.$op.vert($(T.pred) %prlo, ptr %p$(t)lo, i32 0, i32 %s$(t)lo)
+  call void @llvm.aarch64.sme.$op.vert($(T.pred) %prhi, ptr %q$(t)lo, i32 2, i32 %s$(t)lo)
   %j$(t)lon = add nuw nsw i64 %j$(t)lo, 1
   %d$(t)lo = icmp slt i64 %j$(t)lon, %clo$t
   br i1 %d$(t)lo, label %$(t)lo, label %$(t)mid
@@ -165,12 +224,12 @@ $(t)mid:
 $(t)hi:
   %j$(t)hi = phi i64 [ $L, %$(t)mid ], [ %j$(t)hin, %$(t)hi ]
   %o$(t)hi = mul nsw i64 %j$(t)hi, %ldc
-  %p$(t)hi = getelementptr inbounds double, ptr %ci, i64 %o$(t)hi
-  %q$(t)hi = getelementptr inbounds double, ptr %p$(t)hi, i64 $L
+  %p$(t)hi = getelementptr inbounds $(T.ty), ptr %ci, i64 %o$(t)hi
+  %q$(t)hi = getelementptr inbounds $(T.ty), ptr %p$(t)hi, i64 $L
   %r$(t)hi = sub nsw i64 %j$(t)hi, $L
   %s$(t)hi = trunc i64 %r$(t)hi to i32
-  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> %prlo, ptr %p$(t)hi, i32 1, i32 %s$(t)hi)
-  call void @llvm.aarch64.sme.$op.vert(<vscale x 2 x i1> %prhi, ptr %q$(t)hi, i32 3, i32 %s$(t)hi)
+  call void @llvm.aarch64.sme.$op.vert($(T.pred) %prlo, ptr %p$(t)hi, i32 1, i32 %s$(t)hi)
+  call void @llvm.aarch64.sme.$op.vert($(T.pred) %prhi, ptr %q$(t)hi, i32 3, i32 %s$(t)hi)
   %j$(t)hin = add nuw nsw i64 %j$(t)hi, 1
   %d$(t)hi = icmp slt i64 %j$(t)hin, %cols
   br i1 %d$(t)hi, label %$(t)hi, label %$next
@@ -187,20 +246,20 @@ kloop_$s:
   %kk$s = phi i64 [ 0, %$from ], [ %kkn$s, %kloop_$s ]
   %aoff$s = mul nsw i64 %kk$s, %aks
   %boff$s = mul nsw i64 %kk$s, %bks
-  %pa0$s = getelementptr inbounds double, ptr %api, i64 %aoff$s
-  %pa1$s = getelementptr inbounds double, ptr %pa0$s, i64 $L
-  %pb0$s = getelementptr inbounds double, ptr %bpj, i64 %boff$s
-  %pb1$s = getelementptr inbounds double, ptr %pb0$s, i64 $L
+  %pa0$s = getelementptr inbounds $(T.ty), ptr %api, i64 %aoff$s
+  %pa1$s = getelementptr inbounds $(T.ty), ptr %pa0$s, i64 $L
+  %pb0$s = getelementptr inbounds $(T.ty), ptr %bpj, i64 %boff$s
+  %pb1$s = getelementptr inbounds $(T.ty), ptr %pb0$s, i64 $L
 """)
         if pred
-            println(io, "  %va0$s = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %prlo, ptr %pa0$s)")
-            println(io, "  %va1$s = call <vscale x 2 x double> @llvm.aarch64.sve.ld1.nxv2f64(<vscale x 2 x i1> %prhi, ptr %pa1$s)")
+            println(io, "  %va0$s = call $(T.vec) @$(T.ld1)($(T.pred) %prlo, ptr %pa0$s)")
+            println(io, "  %va1$s = call $(T.vec) @$(T.ld1)($(T.pred) %prhi, ptr %pa1$s)")
         else
-            println(io, "  %va0$s = load <vscale x 2 x double>, ptr %pa0$s, align 8")
-            println(io, "  %va1$s = load <vscale x 2 x double>, ptr %pa1$s, align 8")
+            println(io, "  %va0$s = load $(T.vec), ptr %pa0$s, align $(T.bytes)")
+            println(io, "  %va1$s = load $(T.vec), ptr %pa1$s, align $(T.bytes)")
         end
-        println(io, "  %vb0$s = load <vscale x 2 x double>, ptr %pb0$s, align 8")
-        println(io, "  %vb1$s = load <vscale x 2 x double>, ptr %pb1$s, align 8")
+        println(io, "  %vb0$s = load $(T.vec), ptr %pb0$s, align $(T.bytes)")
+        println(io, "  %vb1$s = load $(T.vec), ptr %pb1$s, align $(T.bytes)")
         println(io, mopa(0, 0, 0, s))
         println(io, mopa(1, 0, 1, s))
         println(io, mopa(2, 1, 0, s))
@@ -222,7 +281,7 @@ define void @entry($args) {
 define internal void @macro($args) #0 {
 entry:
   call void @llvm.aarch64.sme.za.enable()
-  %ldcnr = mul nsw i64 %ldc, $(_SME_NR)
+  %ldcnr = mul nsw i64 %ldc, $(T.NR)
   %anyi = icmp sgt i64 %nip, 0
   %anyj = icmp sgt i64 %njp, 0
   %go = and i1 %anyi, %anyj
@@ -232,25 +291,25 @@ jploop:
   %jp = phi i64 [ 0, %entry ], [ %jpn, %jpend ]
   %jpn = add nuw nsw i64 %jp, 1
   %lastj = icmp eq i64 %jpn, %njp
-  %cols = select i1 %lastj, i64 %nrem, i64 $(_SME_NR)
-  %jrag = icmp ne i64 %cols, $(_SME_NR)
+  %cols = select i1 %lastj, i64 %nrem, i64 $(T.NR)
+  %jrag = icmp ne i64 %cols, $(T.NR)
   %bo = mul nsw i64 %jp, %bjp
-  %bpj = getelementptr inbounds double, ptr %bp, i64 %bo
+  %bpj = getelementptr inbounds $(T.ty), ptr %bp, i64 %bo
   %co = mul nsw i64 %jp, %ldcnr
-  %cj = getelementptr inbounds double, ptr %c, i64 %co
+  %cj = getelementptr inbounds $(T.ty), ptr %c, i64 %co
   br label %iploop
 
 iploop:
   %ip = phi i64 [ 0, %jploop ], [ %ipn, %ipend ]
   %ipn = add nuw nsw i64 %ip, 1
   %lasti = icmp eq i64 %ipn, %nip
-  %rows = select i1 %lasti, i64 %mrem, i64 $(_SME_MR)
-  %irag = icmp ne i64 %rows, $(_SME_MR)
+  %rows = select i1 %lasti, i64 %mrem, i64 $(T.MR)
+  %irag = icmp ne i64 %rows, $(T.MR)
   %edge = or i1 %irag, %jrag
   %ao = mul nsw i64 %ip, %aip
-  %api = getelementptr inbounds double, ptr %ap, i64 %ao
-  %cio = mul nsw i64 %ip, $(_SME_MR)
-  %ci = getelementptr inbounds double, ptr %cj, i64 %cio
+  %api = getelementptr inbounds $(T.ty), ptr %ap, i64 %ao
+  %cio = mul nsw i64 %ip, $(T.MR)
+  %ci = getelementptr inbounds $(T.ty), ptr %cj, i64 %cio
   br i1 %edge, label %tile_e, label %tile_f
 
 tile_f:
@@ -259,27 +318,27 @@ tile_f:
     if overwrite
         println(io, "  call void @llvm.aarch64.sme.zero(i32 255)")
     else
-        whole("ld1d", "f")
+        whole("ld1$(T.sfx)", "f")
     end
     kloop("f", false, "tile_f")
-    whole("st1d", "f")
+    whole("st1$(T.sfx)", "f")
     println(io, "  br label %ipend\n")
     # An EDGE tile. Only `%prlo`/`%prhi` are live across its k-loop; the live-column loops keep
     # the predicate count at two, so nothing spills, and give the two bodies no common tail for
     # the optimizer to merge into one block of predicate phis — which is what a shared epilogue
     # with one predicate per slice does, and it costs 5x on EVERY tile.
     println(io, "tile_e:")
-    println(io, "  %prlo = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 0, i64 %rows)")
-    println(io, "  %prhi = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 $L, i64 %rows)")
+    println(io, "  %prlo = call $(T.pred) @$(T.wl)(i64 0, i64 %rows)")
+    println(io, "  %prhi = call $(T.pred) @$(T.wl)(i64 $L, i64 %rows)")
     println(io, "  call void @llvm.aarch64.sme.zero(i32 255)")
     if overwrite
         println(io, "  br label %kdis_e\n")
     else
-        live("ld1d", "pl", "tile_e", "kdis_e")
+        live("ld1$(T.sfx)", "pl", "tile_e", "kdis_e")
     end
     println(io, "kdis_e:")
     kloop("e", true, "kdis_e")
-    live("st1d", "st", "tstore_e", "ipend")
+    live("st1$(T.sfx)", "st", "tstore_e", "ipend")
     print(io, """
 ipend:
   br i1 %lasti, label %jpend, label %iploop
@@ -292,12 +351,14 @@ done:
   ret void
 }
 """)
-    print(io, _SME_ATTRS)
+    print(io, _sme_attrs(T))
     return String(take!(io))
 end
 
-const _SME_MACRO_ACC = _sme_macro_ir(false)
-const _SME_MACRO_OVER = _sme_macro_ir(true)
+const _SME_MACRO_ACC = _sme_macro_ir(false, _SME_T64)
+const _SME_MACRO_OVER = _sme_macro_ir(true, _SME_T64)
+const _SME_MACRO32_ACC = _sme_macro_ir(false, _SME_T32)
+const _SME_MACRO32_OVER = _sme_macro_ir(true, _SME_T32)
 
 # `aip`/`bjp` step one panel-row / panel-column block; `aks`/`bks` step one depth position. A PACKED
 # panel and an operand read IN PLACE differ only in these four numbers — see `_sme_panel_strides`.
@@ -327,6 +388,33 @@ const _SME_MACRO_OVER = _sme_macro_ir(true)
     return nothing
 end
 
+# The Float32 macrokernel. Same arguments and same meaning as `_sme_macro!`, over a register tile
+# twice as wide in each direction because a 32-bit ZA tile is twice the dimension of a 64-bit one.
+@inline function _sme_macro32!(
+        C::Ptr{Float32}, ldc::Int, Ap::Ptr{Float32}, Bp::Ptr{Float32},
+        nip::Int, njp::Int, kce::Int, aip::Int, aks::Int, bjp::Int, bks::Int,
+        mrem::Int, nrem::Int, overwrite::Bool
+    )
+    T = Tuple{
+        Ptr{Float32}, Int64, Ptr{Float32}, Ptr{Float32}, Int64, Int64, Int64,
+        Int64, Int64, Int64, Int64, Int64, Int64,
+    }
+    if overwrite
+        Base.llvmcall(
+            (_SME_MACRO32_OVER, "entry"), Cvoid, T,
+            C, Int64(ldc), Ap, Bp, Int64(nip), Int64(njp), Int64(kce),
+            Int64(aip), Int64(aks), Int64(bjp), Int64(bks), Int64(mrem), Int64(nrem)
+        )
+    else
+        Base.llvmcall(
+            (_SME_MACRO32_ACC, "entry"), Cvoid, T,
+            C, Int64(ldc), Ap, Bp, Int64(nip), Int64(njp), Int64(kce),
+            Int64(aip), Int64(aks), Int64(bjp), Int64(bks), Int64(mrem), Int64(nrem)
+        )
+    end
+    return nothing
+end
+
 # Strides for a PACKED panel of `kpad` depth positions: a row block is `kpad*MR` apart, a depth
 # position `MR` apart. The unpacked forms are in `_sme_panel_strides`.
 @inline _sme_packed_a_strides(kpad::Int) = (kpad * _SME_MR, _SME_MR)
@@ -347,10 +435,10 @@ end
 # `kce` loads under a `whilelt` lane predicate and a column past `nce` under an all-false one, so
 # no load touches memory outside the operand and the dead lanes land in ZA as zeros. The stores
 # then write whole horizontal slices as usual, so the panel's padding is zero-filled.
-function _sme_packb_ir()
-    L = _SME_L
+function _sme_packb_ir(T)
+    L = T.L
     io = IOBuffer()
-    print(io, _SME_DECLS)
+    print(io, _sme_decls(T))
     args = "ptr %bp, ptr %b, i64 %ldb, i64 %kpad, i64 %kce, i64 %nce, i64 %ncb"
     print(io, """
 define void @entry($args) {
@@ -372,7 +460,7 @@ cbloop:
   %jp = lshr i64 %cb, 1
   %jblk = and i64 %cb, 1
   %jpoff = mul nsw i64 %jp, %kpad
-  %jpoffn = mul nsw i64 %jpoff, $(_SME_NR)
+  %jpoffn = mul nsw i64 %jpoff, $(T.NR)
   %jbo = mul nsw i64 %jblk, $L
   %dstbase = add nsw i64 %jpoffn, %jbo
   %colbase = mul nsw i64 %cb, $L
@@ -381,24 +469,24 @@ cbloop:
 pbloop:
   %pb = phi i64 [ 0, %cbloop ], [ %pbnext, %pbloop ]
   %p0 = mul nsw i64 %pb, $L
-  %pk = call <vscale x 2 x i1> @llvm.aarch64.sve.whilelt.nxv2i1.i64(i64 %p0, i64 %kce)
+  %pk = call $(T.pred) @$(T.wl)(i64 %p0, i64 %kce)
 """)
     for jj in 0:(L - 1)
         println(io, "  %c$jj = add nsw i64 %colbase, $jj")
         println(io, "  %ck$jj = icmp slt i64 %c$jj, %nce")
-        println(io, "  %pg$jj = select i1 %ck$jj, <vscale x 2 x i1> %pk, <vscale x 2 x i1> zeroinitializer")
+        println(io, "  %pg$jj = select i1 %ck$jj, $(T.pred) %pk, $(T.pred) zeroinitializer")
         println(io, "  %cs$jj = mul nsw i64 %c$jj, %ldb")
         println(io, "  %so$jj = add nsw i64 %p0, %cs$jj")
         # Not `inbounds`: a dead column's address lies outside the operand and is never dereferenced.
-        println(io, "  %sp$jj = getelementptr double, ptr %b, i64 %so$jj")
-        println(io, "  call void @llvm.aarch64.sme.ld1d.vert(<vscale x 2 x i1> %pg$jj, ptr %sp$jj, i32 0, i32 $jj)")
+        println(io, "  %sp$jj = getelementptr $(T.ty), ptr %b, i64 %so$jj")
+        println(io, "  call void @llvm.aarch64.sme.ld1$(T.sfx).vert($(T.pred) %pg$jj, ptr %sp$jj, i32 0, i32 $jj)")
     end
     for i in 0:(L - 1)
         println(io, "  %r$i = add nsw i64 %p0, $i")
-        println(io, "  %rn$i = mul nsw i64 %r$i, $(_SME_NR)")
+        println(io, "  %rn$i = mul nsw i64 %r$i, $(T.NR)")
         println(io, "  %do$i = add nsw i64 %dstbase, %rn$i")
-        println(io, "  %dp$i = getelementptr inbounds double, ptr %bp, i64 %do$i")
-        println(io, "  call void @llvm.aarch64.sme.st1d.horiz(<vscale x 2 x i1> splat (i1 true), ptr %dp$i, i32 0, i32 $i)")
+        println(io, "  %dp$i = getelementptr inbounds $(T.ty), ptr %bp, i64 %do$i")
+        println(io, "  call void @llvm.aarch64.sme.st1$(T.sfx).horiz($(T.pred) splat (i1 true), ptr %dp$i, i32 0, i32 $i)")
     end
     print(io, """
   %pbnext = add nuw nsw i64 %pb, 1
@@ -415,11 +503,12 @@ done:
   ret void
 }
 """)
-    print(io, _SME_ATTRS)
+    print(io, _sme_attrs(T))
     return String(take!(io))
 end
 
-const _SME_PACKB = _sme_packb_ir()
+const _SME_PACKB = _sme_packb_ir(_SME_T64)
+const _SME_PACKB32 = _sme_packb_ir(_SME_T32)
 
 # `kpad` is the panel's depth (a whole number of L), `kce`/`nce` the operand's live depth and
 # width, `ncb` the number of L-wide column blocks the panel holds.
@@ -429,6 +518,17 @@ const _SME_PACKB = _sme_packb_ir()
     Base.llvmcall(
         (_SME_PACKB, "entry"), Cvoid,
         Tuple{Ptr{Float64}, Ptr{Float64}, Int64, Int64, Int64, Int64, Int64},
+        bp, b, Int64(ldb), Int64(kpad), Int64(kce), Int64(nce), Int64(ncb)
+    )
+    return nothing
+end
+
+@inline function _sme_packb32!(
+        bp::Ptr{Float32}, b::Ptr{Float32}, ldb::Int, kpad::Int, kce::Int, nce::Int, ncb::Int
+    )
+    Base.llvmcall(
+        (_SME_PACKB32, "entry"), Cvoid,
+        Tuple{Ptr{Float32}, Ptr{Float32}, Int64, Int64, Int64, Int64, Int64},
         bp, b, Int64(ldb), Int64(kpad), Int64(kce), Int64(nce), Int64(ncb)
     )
     return nothing
@@ -447,33 +547,34 @@ end
 # is much WORSE — 0.24x at n=4096 — because the panel is re-read once per column panel and the
 # packed copy is what keeps it cache- and TLB-resident.
 function _sme_pack_A!(
-        Ap::Ptr{Float64}, A::Ptr{Float64}, lda::Int,
-        ic::Int, pc::Int, mce::Int, kce::Int, kpad::Int, alpha::Float64
-    )
-    MR = _SME_MR
+        Ap::Ptr{T}, A::Ptr{T}, lda::Int,
+        ic::Int, pc::Int, mce::Int, kce::Int, kpad::Int, alpha::T
+    ) where {T}
+    MR = _sme_mr(T)
+    sz = sizeof(T)
     np = cld(mce, MR)
-    one_alpha = alpha == 1.0
+    one_alpha = alpha == one(T)
     let pa = Ap
         @inbounds for ip in 0:(np - 1)
             base = ip * kpad * MR
             i0 = ip * MR
             full_rows = (i0 + MR) <= mce
             for p in 0:(kpad - 1)
-                d = pa + (base + p * MR) * 8
+                d = pa + (base + p * MR) * sz
                 if p >= kce
                     for i in 0:(MR - 1)
-                        unsafe_store!(d + i * 8, 0.0)
+                        unsafe_store!(d + i * sz, zero(T))
                     end
                 elseif full_rows && one_alpha
-                    s = A + (ic + i0 + (pc + p) * lda) * 8
+                    s = A + (ic + i0 + (pc + p) * lda) * sz
                     for i in 0:(MR - 1)
-                        unsafe_store!(d + i * 8, unsafe_load(s + i * 8))
+                        unsafe_store!(d + i * sz, unsafe_load(s + i * sz))
                     end
                 else
-                    s = A + (ic + i0 + (pc + p) * lda) * 8
+                    s = A + (ic + i0 + (pc + p) * lda) * sz
                     for i in 0:(MR - 1)
-                        v = (i0 + i) < mce ? alpha * unsafe_load(s + i * 8) : 0.0
-                        unsafe_store!(d + i * 8, v)
+                        v = (i0 + i) < mce ? alpha * unsafe_load(s + i * sz) : zero(T)
+                        unsafe_store!(d + i * sz, v)
                     end
                 end
             end
@@ -671,9 +772,10 @@ end
 
 # Scales a packed panel in place. Needed only when alpha must ride a panel built by the ZA
 # transpose, which has no scaling form; the panel is cache-resident at this point.
-function _sme_scale_panel!(P::Ptr{Float64}, len::Int, s::Float64)
+function _sme_scale_panel!(P::Ptr{T}, len::Int, s::T) where {T}
+    sz = sizeof(T)
     for i in 0:(len - 1)
-        q = P + i * 8
+        q = P + i * sz
         unsafe_store!(q, s * unsafe_load(q))
     end
     return nothing
@@ -693,12 +795,13 @@ end
 # PDM: Measured — a packing-memory ceiling, not a residency criterion: KC is grown to minimize C passes, and where a larger panel stops paying depends on packing throughput against kernel throughput. | tune: none — orphaned; sweep
 const _SME_PANEL_BUDGET = @load_preference("sme_panel_bytes", 64 * 1024 * 1024)::Int
 
-@inline function _sme_blocks(m::Int, n::Int, k::Int)
-    NC = max(_SME_NR, n)
+@inline function _sme_blocks(::Type{T}, m::Int, n::Int, k::Int) where {T}
+    MR = _sme_mr(T); NR = _sme_nr(T); L = _sme_lanes_of(T)
+    NC = max(NR, n)
     # Depth block: as deep as the budget allows, so C is re-streamed as few times as possible.
-    kb = max(_SME_L, (_SME_PANEL_BUDGET ÷ sizeof(Float64)) ÷ max(NC, 1))
+    kb = max(L, (_SME_PANEL_BUDGET ÷ sizeof(T)) ÷ max(NC, 1))
     KC = min(k, kb)
-    # ROUND ONLY A KC THAT IS ACTUALLY A SPLIT. Rounding down to a whole `_SME_L` keeps a depth
+    # ROUND ONLY A KC THAT IS ACTUALLY A SPLIT. Rounding down to a whole `L` keeps a depth
     # block's pack aligned, but applying it when `KC == k` turns any k not divisible by the lane
     # count into TWO blocks — 96 + 4 at k=100 — and the tail block pays a second pack, a second
     # full pass over C, and every ragged edge tile again. The pack already zero-fills `kce` up to
@@ -707,24 +810,28 @@ const _SME_PANEL_BUDGET = @load_preference("sme_panel_bytes", 64 * 1024 * 1024):
     # Measured on an M6, driver KC against KC = k, output bitwise identical:
     #   n,k = 100,100 -> 1.31x   128,100 -> 1.20x   256,250 -> 1.10x
     #         500,500 -> 1.07x  2100,2100 -> 1.04x
-    # It costs every SME caller at every `k % _SME_L != 0`, and n=100 is a gate cell.
+    # It costs every SME caller at every `k % L != 0`, and n=100 is a gate cell.
     if KC < k
-        KC -= KC % _SME_L
-        KC = max(KC, _SME_L)
+        KC -= KC % L
+        KC = max(KC, L)
     end
     # Row block: the A panel (MC x KC) is the operand re-read per column panel, so hold it to a
     # share of L2 the way the SIMD path holds its own A block.
     # The same rule as KC: round only a block that is actually a split. A single block takes the
     # true m — the kernel predicates its last row tile — where rounding it would carve m = 50 into
     # 48 + 2 and run the two rows as a second block with its own pack and its own macrokernel call.
-    mb = max(_SME_MR, ((_L2_BYTES * 3) ÷ 10) ÷ (KC * sizeof(Float64)))
+    mb = max(MR, ((_L2_BYTES * 3) ÷ 10) ÷ (KC * sizeof(T)))
     MC = min(m, mb)
     if MC < m
-        MC -= MC % _SME_MR
-        MC = max(MC, _SME_MR)
+        MC -= MC % MR
+        MC = max(MC, MR)
     end
     return MC, NC, KC
 end
+
+# The Float64 geometry is the default for every existing caller; the type-dispatched form above is
+# what lets the Float32 route share one derivation instead of carrying a second set of literals.
+@inline _sme_blocks(m::Int, n::Int, k::Int) = _sme_blocks(Float64, m, n, k)
 
 # ── Driver ─────────────────────────────────────────────────────────────────────────────────────
 # C = beta*C + alpha*op(A)*op(B), column-major, Float64, on the SME path. alpha rides in the A
@@ -835,14 +942,106 @@ function _sme_gemm!(
     return nothing
 end
 
+# ── Float32 driver ─────────────────────────────────────────────────────────────────────────────
+# The `jc -> pc -> ic` loop order and every block size come from `_sme_blocks(Float32, ...)`, which
+# is the same derivation the Float64 path uses with `sizeof(T)` and the register tile substituted —
+# so a machine with a different streaming vector length gets different blocking rather than wrong
+# results, and no Float32 literal is written down.
+#
+# BOTH OPERANDS ARE ALWAYS PACKED HERE, where `_sme_gemm!` can read either in place. That is a
+# deliberate omission, not an oversight: reading A in place needs `op(A) = A` and reading B in place
+# needs `op(B) = B'`, and the shapes this path exists for issue `op(A) = A'` with `op(B) = B`, which
+# qualifies for neither. Adding it would mean re-deriving the residency caps those predicates read,
+# for no effect on the calls that reach here.
+function _sme_gemm_f32!(
+        C::Ptr{Float32}, ldc::Int, A::Ptr{Float32}, lda::Int, B::Ptr{Float32}, ldb::Int,
+        m::Int, n::Int, k::Int, alpha::Float32, beta::Float32, tA::Bool, tB::Bool,
+        Ap::Ptr{Float32}, Bp::Ptr{Float32}, MC::Int, NC::Int, KC::Int
+    )
+    MR = _SME_MR32
+    NR = _SME_NR32
+    L = _SME_L32
+    # beta == 0 is handled by ZEROING ZA on the first depth block rather than zeroing C here: C
+    # traffic dominates once compute is this much faster, so an extra full pass over C is real.
+    # Any other beta needs one scaling pass, after which every block accumulates.
+    if beta != 0.0f0 && beta != 1.0f0
+        @inbounds for j in 0:(n - 1), i in 0:(m - 1)
+            p = C + (i + j * ldc) * 4
+            unsafe_store!(p, beta * unsafe_load(p))
+        end
+    end
+    # alpha folds into whichever panel the scaling (contiguous) packer builds. The ZA transpose has
+    # no scaling form, so when A is transposed alpha rides B — which is packed once per (jc, pc)
+    # rather than once per (jc, pc, ic), the cheaper side in any case.
+    bscale = tA ? alpha : 1.0f0
+    if m == 0 || n == 0 || k == 0 || alpha == 0.0f0
+        # No product to add. C still needs beta applied, including the beta == 0 case the block
+        # loop would otherwise have covered.
+        if beta == 0.0f0
+            @inbounds for j in 0:(n - 1), i in 0:(m - 1)
+                unsafe_store!(C + (i + j * ldc) * 4, 0.0f0)
+            end
+        end
+        return nothing
+    end
+    overwrite_first = beta == 0.0f0
+
+    jc = 0
+    while jc < n
+        nce = min(NC, n - jc)
+        npad = cld(nce, NR) * NR
+        pc = 0
+        while pc < k
+            kce = min(KC, k - pc)
+            kpad = cld(kce, L) * L
+            # Which side needs transposing follows from the storage, not from preference:
+            #   op(A)=A  -- A is m x k, so MR rows of a column are already contiguous
+            #   op(A)=A' -- A is k x m, so that run is strided and needs a transpose
+            #   op(B)=B  -- B is k x n, so the run is strided and needs a transpose
+            #   op(B)=B' -- B is n x k, so the run is contiguous
+            if tB
+                _sme_pack_A!(Bp, B, ldb, jc, pc, nce, kce, kpad, bscale)
+            else
+                _sme_packb32!(Bp, B + (pc + jc * ldb) * 4, ldb, kpad, kce, nce, npad ÷ L)
+                bscale == 1.0f0 || _sme_scale_panel!(Bp, npad * kpad, bscale)
+            end
+            njp = npad ÷ NR
+            nrem = nce - (njp - 1) * NR
+            ic = 0
+            while ic < m
+                mce = min(MC, m - ic)
+                mpad = cld(mce, MR) * MR
+                if !tA
+                    _sme_pack_A!(Ap, A, lda, ic, pc, mce, kce, kpad, alpha)
+                else
+                    _sme_packb32!(Ap, A + (pc + ic * lda) * 4, lda, kpad, kce, mce, mpad ÷ L)
+                end
+                nip = mpad ÷ MR
+                _sme_macro32!(
+                    C + (ic + jc * ldc) * 4, ldc, Ap, Bp, nip, njp, kce,
+                    kpad * MR, MR, kpad * NR, NR,
+                    mce - (nip - 1) * MR, nrem, overwrite_first && pc == 0
+                )
+                ic += MC
+            end
+            pc += KC
+        end
+        jc += NC
+    end
+    return nothing
+end
+
 # Packed-panel sizes for a given problem, so callers can size workspace without replaying the loop.
-@inline function _sme_scratch_sizes(m::Int, n::Int, k::Int)
-    MC, NC, KC = _sme_blocks(m, n, k)
-    kpad = cld(min(KC, k), _SME_L) * _SME_L
-    apad = cld(min(MC, m), _SME_MR) * _SME_MR
-    bpad = cld(min(NC, n), _SME_NR) * _SME_NR
+@inline function _sme_scratch_sizes(::Type{T}, m::Int, n::Int, k::Int) where {T}
+    MC, NC, KC = _sme_blocks(T, m, n, k)
+    L = _sme_lanes_of(T)
+    kpad = cld(min(KC, k), L) * L
+    apad = cld(min(MC, m), _sme_mr(T)) * _sme_mr(T)
+    bpad = cld(min(NC, n), _sme_nr(T)) * _sme_nr(T)
     return (apad * kpad, bpad * kpad, MC, NC, KC)
 end
+
+@inline _sme_scratch_sizes(m::Int, n::Int, k::Int) = _sme_scratch_sizes(Float64, m, n, k)
 
 # ── Entry point from `_gemm_core!` ─────────────────────────────────────────────────────────────
 # Float64, op(A)=A, op(B)=B, unit row stride on all three. Scratch comes from the shared Level-3
@@ -885,6 +1084,8 @@ const _SME_MIN_EXACT = @load_preference("sme_min_exact", 3 * _SME_MR)::Int
 # concrete argument types so nothing is boxed and nothing is allocated.
 const _SME_TRAMPOLINE = Ref{Any}(nothing)      # roots the closure against collection
 const _SME_ENTRY = Ref{Ptr{Cvoid}}(C_NULL)
+const _SME_TRAMPOLINE32 = Ref{Any}(nothing)    # roots the Float32 closure against collection
+const _SME_ENTRY32 = Ref{Ptr{Cvoid}}(C_NULL)
 
 function _sme_entry_cabi(
         C::Ptr{Float64}, ldc::Int, A::Ptr{Float64}, lda::Int, B::Ptr{Float64}, ldb::Int,
@@ -893,6 +1094,16 @@ function _sme_entry_cabi(
     )
     _sme_gemm!(C, ldc, A, lda, B, ldb, m, n, k, alpha, beta, tA != 0, tB != 0,
                Ap, Bp, MC, NC, KC)
+    return nothing
+end
+
+function _sme_entry32_cabi(
+        C::Ptr{Float32}, ldc::Int, A::Ptr{Float32}, lda::Int, B::Ptr{Float32}, ldb::Int,
+        m::Int, n::Int, k::Int, alpha::Float32, beta::Float32, tA::Int, tB::Int,
+        Ap::Ptr{Float32}, Bp::Ptr{Float32}, MC::Int, NC::Int, KC::Int
+    )
+    _sme_gemm_f32!(C, ldc, A, lda, B, ldb, m, n, k, alpha, beta, tA != 0, tB != 0,
+                   Ap, Bp, MC, NC, KC)
     return nothing
 end
 
@@ -977,21 +1188,59 @@ function _sme_selftest()
     return worst
 end
 
+# The Float32 route answers the same known question before its pointer is published, and for the
+# same reason: a kernel that builds is not a kernel that is correct, and a geometry assumption that
+# is wrong for this streaming vector length produces wrong numbers with no symptom. The reference
+# accumulates in Float64 so the check is against the exact product rather than another Float32
+# summation order; the tolerance is a Float32 one because the kernel's result is Float32.
+#
+# Shapes reach the edge paths: one whole register tile pair, then a ragged m, n and k together,
+# which exercises the predicated edge tiles and the predicated ZA transpose.
+function _sme_selftest32()
+    L = _SME_L32
+    gen(m, n) = Float32[i + 1000.0f0 * j for i in 1:m, j in 1:n]
+    worst = 0.0
+    for (m, n, k) in ((2 * _SME_MR32, 2 * _SME_NR32, L), (2 * _SME_MR32 + 1, 2 * _SME_NR32 + 3, L + 1))
+        A = gen(m, k); B = gen(k, n)
+        for a in (1.5f0,), b in (0.0f0, 0.5f0)
+            C = gen(m, n)
+            want = Float64(a) .* (Float64.(A) * Float64.(B)) .+ Float64(b) .* Float64.(C)
+            got = copy(C)
+            _gemm_sme_f32!(got, A, B, a, b, m, n, k, false, false)
+            worst = max(worst, maximum(abs, Float64.(got) .- want) / maximum(abs, want))
+        end
+    end
+    return worst
+end
+
 
 function _sme_init!()
-    _SME_F64 || return nothing
+    # The disjunction, for the reason the trampoline-builder guard gives: the Float32 gate is wider
+    # than the Float64 one, so either feature alone is enough to have work to do here.
+    (_SME_F64 || _SME_F32) || return nothing
     # `__init__` also runs inside the PRECOMPILE process, whose codegen targets the generic image
     # CPU. Building the trampoline there compiles the kernel into the image and fails on `rdsvl`.
     ccall(:jl_generating_output, Cint, ()) == 0 || return nothing
     # Both trampolines come from the builders at the end of this file, which carry the barrier or
     # drop it according to the compiling process's own target — see the block comment there.
-    try
-        cf = _sme_entry_cf()
-        _SME_TRAMPOLINE[] = cf
-        _SME_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, cf)
-    catch
-        # A machine that advertises the feature but cannot build the kernel keeps the SIMD path.
-        _SME_ENTRY[] = C_NULL
+    if _SME_F64
+        try
+            cf = _sme_entry_cf()
+            _SME_TRAMPOLINE[] = cf
+            _SME_ENTRY[] = Base.unsafe_convert(Ptr{Cvoid}, cf)
+        catch
+            # A machine that advertises the feature but cannot build the kernel keeps the SIMD path.
+            _SME_ENTRY[] = C_NULL
+        end
+    end
+    if _SME_F32
+        try
+            cf32 = _sme_entry32_cf()
+            _SME_TRAMPOLINE32[] = cf32
+            _SME_ENTRY32[] = Base.unsafe_convert(Ptr{Cvoid}, cf32)
+        catch
+            _SME_ENTRY32[] = C_NULL
+        end
     end
     try
         gf = _sme_gemv_cf()
@@ -1062,6 +1311,22 @@ function _sme_init!()
             error(_SME_SELFTEST_MSG)
         end
     end
+    # The Float32 route is checked SEPARATELY and fails separately: it has its own feature gate, its
+    # own kernels and its own entry pointer, so a Float32 geometry fault must not take the Float64
+    # path down with it, nor the reverse. The tolerance is a Float32 one -- about 8 ulp at these
+    # depths -- where the Float64 check uses 1e-12.
+    if _SME_ENTRY32[] !== C_NULL
+        err32 = try
+            _sme_selftest32()
+        catch e
+            _SME_ENTRY32[] = C_NULL
+            rethrow(e)
+        end
+        if !(err32 < 1e-6)
+            _SME_ENTRY32[] = C_NULL
+            error(_SME_SELFTEST32_MSG)
+        end
+    end
     return nothing
 end
 
@@ -1115,10 +1380,55 @@ end
     return max(m, n) >= _SME_MIN_EXACT
 end
 
+# Float32 size floors, as multiples of the Float32 register tile so no precision-specific literal
+# is written down. There is ONE floor here against the Float64 path's two: `_SME_MIN` has no reader
+# outside comments, and a preference that silently does nothing is the same hazard as a feature gate
+# that silently reads false, so the Float32 side carries only the cut its predicate consults.
+#
+# The multiplier matches the Float64 one for a MEASURED reason rather than by inheritance — see the
+# k = 10 row of the table on `_sme_tile_ok32`, where ragged shapes at 1.25 and 1.5 tiles lose 0.34x
+# and 0.48x.
+#
+# PDM: Measured — the occupancy crossover for ragged Float32 shapes, selected from the candidate set "multiples of `_SME_MR32`" by sweeping DEPTH as well as extent: at k = 64 and 256 the 1.25-tile and 1.5-tile shapes win 1.12-1.74, and at k = 10 they lose 0.34 and 0.48, so the multiplier that agrees with the Float64 one is a result here rather than an inheritance. | tune: none — orphaned; sweep
+const _SME_MIN_EXACT32 = @load_preference("sme_min_exact32", 3 * _SME_MR32)::Int
+
+# The Float32 twin of `_sme_tile_ok`, admitting ONE whole register tile each way where the Float64
+# path requires two. The candidate set is multiples of `_SME_MR32`; WHICH multiple is a MEASURED
+# selection, because the assumption that the occupancy crossover scales with the register tile does
+# not survive contact with the hardware.
+#
+# Square Float32, this route against the SIMD path it displaces, median of interleaved runs:
+#
+#     m = n        24     32     40     48
+#     k = 10     0.77   1.78   0.34   0.48
+#     k = 64     0.61   1.15   1.12   1.38
+#     k = 256    0.91   2.24   1.47   1.74
+#
+# ONE WHOLE TILE PAYS AT EVERY DEPTH and nothing below it does, so the first clause is one tile.
+# The thin shapes say it more loudly: at n = 4096, k = 64, m = 32 reaches 7.8x and m = 48 reaches
+# 8.5x, both of which a two-tile floor declines.
+#
+# THE RAGGED ARM STAYS AT `_SME_MIN_EXACT32`, and the k = 10 row is why, rather than inheritance:
+# 40 and 48 carry one predicated edge tile, and at that depth the edge costs more than the tile
+# earns — 0.34 and 0.48, a worse loss than anything this floor refuses elsewhere. Both win at k = 64
+# and k = 256, so the floor gives up a 1.1x–1.7x gain to refuse a 3x loss. That is the right
+# direction for a floor that cannot see k.
+@inline function _sme_tile_ok32(m, n)
+    min(m, n) >= _SME_MR32 || return false
+    (m % _SME_MR32 == 0 && n % _SME_MR32 == 0) && return true
+    return max(m, n) >= _SME_MIN_EXACT32
+end
+
+# Both precisions, each gated on its OWN feature constant, its OWN tile floor and its OWN
+# published entry pointer. The Float32 gate is the wider of the two -- the 32-bit outer product is
+# base SME where the 64-bit one is an extension -- so neither implies the other and neither arm may
+# borrow the other's guard. `T === Float64` and `T === Float32` are compile-time tests, so a call
+# site of either precision keeps exactly one branch and no runtime type check.
 @inline _sme_eligible(::Type{T}, m, n, k, tA, tB, cA, cB, C, A, B) where {T} =
-    T === Float64 && _SME_F64 && !cA && !cB &&
-        _strided1(C) && _strided1(A) && _strided1(B) &&
-        _sme_tile_ok(m, n) && _SME_ENTRY[] !== C_NULL
+    !cA && !cB && _strided1(C) && _strided1(A) && _strided1(B) && (
+        (T === Float64 && _SME_F64 && _sme_tile_ok(m, n) && _SME_ENTRY[] !== C_NULL) ||
+            (T === Float32 && _SME_F32 && _sme_tile_ok32(m, n) && _SME_ENTRY32[] !== C_NULL)
+    )
 
 # AN SME-ELIGIBLE CALL IS NOT COLUMN-SPLIT, for the same reason a Strassen call is not: splitting it
 # does not divide the work between units, it queues the workers behind one of them. The coprocessor
@@ -2861,6 +3171,29 @@ end
     return C
 end
 
+# The Float32 twin of `_gemm_sme!`. Same shape, same scratch source, same reason for the `ccall`
+# through a published pointer rather than a direct call: the barrier is what keeps the streaming
+# kernel out of the package image on a build whose target does not name `+sme`.
+@noinline function _gemm_sme_f32!(C, A, B, alpha::Float32, beta::Float32, m::Int, n::Int, k::Int,
+                                  tA::Bool, tB::Bool)
+    Threads.atomic_add!(_SME_CALLS, 1)
+    asz, bsz, MC, NC, KC = _sme_scratch_sizes(Float32, m, n, k)
+    Ap, Bp = _gemm_scratch(Float32, asz, bsz)
+    ldc = stride(C, 2); lda = stride(A, 2); ldb = stride(B, 2)
+    GC.@preserve C A B Ap Bp begin
+        ccall(
+            _SME_ENTRY32[], Cvoid,
+            (Ptr{Float32}, Int, Ptr{Float32}, Int, Ptr{Float32}, Int,
+             Int, Int, Int, Float32, Float32, Int, Int,
+             Ptr{Float32}, Ptr{Float32}, Int, Int, Int),
+            pointer(C), ldc, pointer(A), lda, pointer(B), ldb,
+            m, n, k, alpha, beta, tA ? 1 : 0, tB ? 1 : 0,
+            pointer(Ap), pointer(Bp), MC, NC, KC
+        )
+    end
+    return C
+end
+
 # The self-test's failure text, built at PRECOMPILE from consts rather than interpolated where it is
 # thrown. Every value in it is a compile-time constant, so there is nothing to defer; and `__init__`
 # is in the trim graph, where an interpolated `error("...$x...")` lowers to `print_to_string` over a
@@ -2874,6 +3207,16 @@ const _SME_SELFTEST_MSG = """
     does not hold on this machine -- lanes=$(_SME_LANES), L=$(_SME_L), MR=$(_SME_MR), NR=$(_SME_NR), gemv blocks up
     to $(_SME_GEMV_BLK * _SME_GEMV_NGMAX) rows. Please report it.
     Set `sme_f64 = false` in LocalPreferences.toml to keep the SIMD path meanwhile."""
+
+# The Float32 route's failure text, built at PRECOMPILE from consts for the same reasons as the
+# Float64 one above: `__init__` is in the trim graph, where an interpolated `error` lowers to
+# `print_to_string` over a `Vararg{Any}` tuple and `--trim=safe` rejects it.
+const _SME_SELFTEST32_MSG = """
+    SME Float32 self-test failed against an exact reference. Call
+    `PureBLAS._sme_selftest32()` for the measured relative error. The kernels built and ran, so
+    this is a geometry assumption that does not hold on this machine -- lanes=$(_SME_LANES_F32),
+    L=$(_SME_L32), MR=$(_SME_MR32), NR=$(_SME_NR32). Please report it.
+    Set `sme_f32 = false` in LocalPreferences.toml to keep the SIMD path meanwhile."""
 
 # ⛔ THE BARRIER COSTS ~50 ns PER CALL AND CANNOT BE SKIPPED BY TESTING THE `-C` TARGET.
 #
@@ -2916,7 +3259,11 @@ const _SME_STATIC = _SME_F64 && let p = Base.JLOptions().cpu_target   # C_NULL /
     p != C_NULL && occursin("+sme", unsafe_string(p))
 end
 
-@static if !_SME_F64
+# THE GUARD IS THE DISJUNCTION, not `_SME_F64` alone: the Float32 gate is the wider one, so a part
+# with SME2 and no `FEAT_SME_F64F64` has a usable Float32 route and must still get its trampoline.
+# The property this branch exists to protect is unchanged, because off SME -- x86 included -- BOTH
+# constants are false and nothing below is defined.
+@static if !_SME_F64 && !_SME_F32
     # OFF SME HARDWARE THESE MUST NOT EXIST IN ANY FORM. `_sme_init!` returns at its first line
     # there, so they are unreachable — but a top-level definition is still INFERRED, and inferring
     # `inferencebarrier(_sme_entry_cabi)` + `@cfunction` drags the cabi entry and `_gemm_core!`
@@ -2924,14 +3271,25 @@ end
     # they had been compiled away, is what made two StrictMode dogfood items report
     # `OptimizationFailureReport in PureBLAS._gemm_core!` on x86.
     _sme_entry_cf() = throw(AssertionError("SME trampoline requested without SME"))
+    _sme_entry32_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_gemv_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_gemvt_cf() = throw(AssertionError("SME trampoline requested without SME"))
     _sme_ger_cf() = throw(AssertionError("SME trampoline requested without SME"))
 elseif _SME_STATIC
+    # THE FLOAT32 TRAMPOLINE RIDES THE SAME TEST, which is about the TARGET and not the feature:
+    # `+sme` in `-C` is what decides whether the barrier is needed, and it is named for both
+    # precisions at once or for neither. A part with the Float32 capability and not the Float64 one
+    # falls to the branch below and keeps the barrier — correct, just not barrier-free — where
+    # splitting this block per precision would compile the Float64 constant form there and drag the
+    # Float64 kernel in by inference, which is the hazard the first branch exists to prevent.
     _sme_entry_cf() = @cfunction(_sme_entry_cabi, Cvoid,
         (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
          Int, Int, Int, Float64, Float64, Int, Int,
          Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
+    _sme_entry32_cf() = @cfunction(_sme_entry32_cabi, Cvoid,
+        (Ptr{Float32}, Int, Ptr{Float32}, Int, Ptr{Float32}, Int,
+         Int, Int, Int, Float32, Float32, Int, Int,
+         Ptr{Float32}, Ptr{Float32}, Int, Int, Int))
     _sme_gemv_cf() = @cfunction(_sme_gemv_cabi, Cvoid,
         (Ptr{Float64}, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Float64, Int))
     _sme_gemvt_cf() = @cfunction(_sme_gemvt_cabi, Cvoid,
@@ -2948,6 +3306,13 @@ else
             (Ptr{Float64}, Int, Ptr{Float64}, Int, Ptr{Float64}, Int,
              Int, Int, Int, Float64, Float64, Int, Int,
              Ptr{Float64}, Ptr{Float64}, Int, Int, Int))
+    end
+    function _sme_entry32_cf()
+        f32 = Base.inferencebarrier(_sme_entry32_cabi)
+        return @cfunction($f32, Cvoid,
+            (Ptr{Float32}, Int, Ptr{Float32}, Int, Ptr{Float32}, Int,
+             Int, Int, Int, Float32, Float32, Int, Int,
+             Ptr{Float32}, Ptr{Float32}, Int, Int, Int))
     end
     function _sme_gemv_cf()
         g = Base.inferencebarrier(_sme_gemv_cabi)
