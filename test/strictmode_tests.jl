@@ -874,3 +874,72 @@ end
         end
     end
 end
+
+# ── COMPILED-SPECIALIZATION BUDGET AND GROWTH ─────────────────────────────────────────────────────
+# WHY THIS ITEM EXISTS, and it is a defect this suite could not catch. Two PRs widened `_trsv_reg!`'s
+# `@generated` ladder from 4 shape combinations x 12 sizes to 8 x 16, which with the array-type pairs
+# reaching it took the method from roughly 576 to 1536 compiled specializations. Lints were clean, the
+# full suite was green, and both merged. The cost surfaced only when another session measured the
+# package image on a different platform and found it 383 MiB larger — the `.ji` is indifferent (it
+# varied by 42 bytes across an 8x range of the bound), because the expansion happens in codegen.
+#
+# THE GATE IS A BUDGET, NOT A GROWTH COMPARISON, and that is a constraint rather than a preference.
+# `specialization_report` judges TWO limits, so `max_type_depth` is pinned at `typemax(Int)` — left at
+# its default of 4 the item fails on depth and reads as a budget failure, which is a different bug
+# than the one it is here to catch.
+#
+# ⚠ A GROWTH GATE CANNOT LIVE IN A TESTITEM. `StrictModeTest.test_specializations(mod; baseline,
+# workload)` counts the specializations compiled in the CURRENT PROCESS, so its stored baseline is
+# only valid against an identical process history. Testitems share a process, so by the time this one
+# runs the items before it have already compiled gesvd, getrf, gebrd and the rest: a baseline recorded
+# by running this item alone then reads `gemm!` at 325 against 67 and throws. Suite order and CI
+# sharding both change that population, so no tolerance makes it reproducible — it is not noise, it is
+# a different measurement. A budget is immune in the one direction that matters: extra process history
+# can only raise a count, so it can report a false FAILURE but never a false pass.
+#
+# ⚠ `findings_diff`/`audit_changed` cannot substitute, confirmed in StrictMode's source by its author:
+# `:specialization` findings are `:info`, `nfailures` counts only `status === :fail`, so an `:info`
+# count change is invisible to the diff. Do not reach for it here either.
+@testitem "StrictMode dogfood: compiled-specialization budget" tags = [:checks] begin
+    using PureBLAS, StrictMode
+    using LinearAlgebra
+    P = PureBLAS
+
+    # A workload, not a sweep: a method carries no specializations until something has called it, so
+    # the budget below means nothing unless the kernels it judges have been exercised in this process.
+    function spec_workload()
+        for T in (Float64, Float32)
+            A = Matrix{T}(I, 24, 24) .+ T(0.5); B = copy(A); C = zeros(T, 24, 24)
+            P.gemm!(C, A, B)
+            x = ones(T, 24)
+            for ul in ('U', 'L'), tr in ('N', 'T'), dg in ('N', 'U')
+                P.trsv!(P.SIMDBackend(), A, copy(x); uplo = ul, trans = tr, diag = dg)
+            end
+            P.symm!(P.SIMDBackend(), C, A, B; side = 'L', uplo = 'U', alpha = one(T), beta = zero(T))
+        end
+        return nothing
+    end
+    spec_workload()
+
+    # BUDGET. The limit is REASONED FROM THE TWO METHODS THAT EXCEED IT, which are different problems:
+    #
+    #   * `_trsv_reg!` — 1792, and REDUCIBLE. Its 128 `Val` combinations (8 shapes x 16 sizes) are
+    #     irreducible, but the ~14 `(A, x)` array-type pairs multiplying them are not: every one
+    #     immediately takes `pointer(A)` and `stride(A, 2)`, so normalising at the ladder boundary
+    #     collapses them to the 2 element types, 128 x 2 = 256.
+    #   * `_uker_cmplx!` — 800, and NOT reducible the same way. It already takes `Ptr{T}`, so there is
+    #     no array-type multiplier to remove; the 800 is ~400 `Val` combinations x 2 element types, and
+    #     those combinations ARE the generated tile shape space.
+    #
+    # So the budget cannot be 256: that is below an irreducible count, and a gate below what the design
+    # requires is a marker that fails forever rather than a target. 1024 sits above `_uker_cmplx!`'s
+    # irreducible space and below `_trsv_reg!`'s reducible one, so it FAILS today at 1792 and PASSES
+    # once the ladder is normalised — it can come out both ways, which is the whole requirement. A
+    # `@test_broken` that starts passing errors as "Unexpectedly Passed", so the flip is not silent.
+    #
+    # ⚠ RAISING THIS TO SILENCE A FAILURE DEFEATS IT. If a third method appears above 1024, the
+    # question is whether its `Val` space is irreducible like `_uker_cmplx!`'s or carries a removable
+    # type multiplier like `_trsv_reg!`'s — not what number makes the line green.
+    @test_broken isempty(specialization_report(PureBLAS;
+        max_specializations = 1024, max_type_depth = typemax(Int)))
+end
