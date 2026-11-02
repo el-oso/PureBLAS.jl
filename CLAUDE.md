@@ -357,7 +357,7 @@ Both modes share ONE set of low-level kernels. Source map:
 - Correctness oracle = OpenBLAS via `LinearAlgebra.BLAS.*` over s/d/c/z, many `n`, strides, edges.
   Note: single-vector ops (nrm2/asum/iamax/scal) are spec'd `incx ≥ 1` (reference returns 0 for
   `incx<1`); only two-vector ops (axpy/dot) take negative/mismatched increments.
-- StrictMode dogfood (`@assert_typestable/@assert_noalloc/@assert_trim_safe`) on hot paths, gated by
+- StrictMode dogfood (`@assert_typestable/@assert_noalloc/@assert_trim_compatible`) on hot paths, gated by
   `StrictMode.checks_enabled()`. AD smoke test via ForwardDiff (proves Mode 2).
 
 ## Benchmarking (reuse PureFFT methodology)
@@ -538,7 +538,9 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
   | arithmetic intensity / shuffle-port bound? | `kernel_report` |
   | is this call actually inlined? | `@assert_inlined`, `inline_suggestions` |
   | boxing / instability / allocation on a hot path | `@assert_noboxing`, `@assert_typestable`, `@assert_noalloc` |
-  | trim/.so safety | `@assert_trim_safe`, `explain_trim` |
+  | trim/.so safety | `@assert_trim_compatible`, `explain_trim` |
+  | a method compiled N times over (image size, precompile time) | `specialization_report` |
+  | a Float32 kernel doing Float64 arithmetic (half the SIMD width) | `conversion_report` |
 
   **Why this is a rule:** on 2026-08-25/26 three separate investigations were run by edit-measure-revert
   that a static check answers in seconds — eleven "SIMD body + scalar tail" kernels found one at a time
