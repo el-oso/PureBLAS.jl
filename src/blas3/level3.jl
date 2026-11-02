@@ -735,7 +735,7 @@ function _trmm_cmplx_packed_L!(up::Bool, tr::Bool, cj::Bool, unit::Bool, k::Int,
     Tc = eltype(B); T = real(Tc); n = size(B, 2)
     upM = (up != tr)
     W = _vwidth(T); mr = _CMR * W; nr = _CNR; sz = sizeof(T)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, mr * k, cld(nc, nr) * nr * k)
     ldb = stride(B, 2); alr = one(T); ali = zero(T)         # α==1 (folded outside)
     # ESCAPE AUDIT (@scope arn): `M`/`Mv` do not leave this block. They reach `_mat_tri!`, the conj
@@ -1387,7 +1387,7 @@ function _trmm_packed!(up::Bool, tr::Bool, unit::Bool, α::T, A, B, ::Val{MRV} =
     ov > 0 && (kc = min(max(ov, W), m))
     @inbounds _EXPINT[6] = kc                    # witness: the kc this call actually ran with
     mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     nblk = cld(m, kc); bpf_blk = cld(nc, nr) * nr * kc          # one packed pc-block slot (padded to kc)
     Ap, _ = _gemm_scratch(T, cld(mc, mr) * mr * kc, 1)
     Bpf = _trmm_bpf(T, nblk * bpf_blk)
@@ -5999,7 +5999,7 @@ function _trgemm_packed!(
     ) where {T <: BlasReal, MR, NR, OV}
     n = size(C, 1); W = _vwidth(T); mr = MR * W; nr = NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C Ap Bp begin
@@ -6051,7 +6051,7 @@ function _trgemm_cmplx_packed!(
     n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = NR
     kc = min(_CKC, k)
     mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     ldc = stride(C, 2); sz = sizeof(T)                 # ldc in COMPLEX elements (kernel does the ×2)
     GC.@preserve C ApR ApI BpR BpI begin
@@ -6127,7 +6127,7 @@ function _trgemm_cmplx_packed_u!(
     n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = W          # unified requires nr == mr (CMR=1)
     kc = min(_CKC, k)
     mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     plen = cld(n, mr) * mr * kc
     onepack = X === Y && tXp == !tYp                               # herk/zsyrk: B-pack == A-pack
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, plen, plen)
@@ -6201,7 +6201,7 @@ function _trgemm_cmplx_packed2_u!(
     n = size(C, 1); W = _vwidth(T); mr = _CMR * W; nr = W
     kc = min(_CKC, k)
     mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     plen = cld(n, mr) * mr * kc
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, plen, plen)
     sr = alr; si = SA == -1 ? -ali : ali                         # s = SA==-1 ? conj(α) : α (into X-pack)
@@ -6508,7 +6508,7 @@ function _ctrgemm_3m_fused!(
     ) where {Tc, MR, NR}
     Tr = real(Tc); n = size(C, 1); W = _vwidth(Tr); mr = MR * W; nr = NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, Tr, kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     lenA = cld(mc, mr) * mr * kc; lenB = cld(nc, nr) * nr * kc
     t = _gemm_3m_scratch(Tr, lenA, lenB, mr * nr)   # 1-3 A panels, 4-6 B panels, 7-9 tile scratch
     ldc = stride(C, 2); sz = sizeof(Tr); ar = real(α); ai = imag(α)
@@ -6667,7 +6667,7 @@ function _trgemm_packed2!(
     ) where {T <: BlasReal, MRV, NRV, OV}
     n = size(C, 1); W = _vwidth(T); mr = MRV * W; nr = NRV
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     Ap1, Bp1, Ap2, Bp2 = _syr2k_scratch(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     ldc = stride(C, 2); sz = sizeof(T)
     GC.@preserve C Ap1 Bp1 Ap2 Bp2 begin
@@ -6801,7 +6801,7 @@ function _trgemm_packed_u!(
     ) where {T <: BlasReal}
     n = size(C, 1); W = _vwidth(T); mr = W; nr = _NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     plen = cld(n, mr) * mr * kc
     pk = _syr2k_scratch(T, plen, plen); packA = pk[1]
     ldc = stride(C, 2); sz = sizeof(T)
@@ -6842,7 +6842,7 @@ function _trgemm_packed2_u!(
     ) where {T <: BlasReal}
     n = size(C, 1); W = _vwidth(T); mr = W; nr = _NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     plen = cld(n, mr) * mr * kc
     pk = _syr2k_scratch(T, plen, plen); packA = pk[1]; packB = pk[2]
     ldc = stride(C, 2); sz = sizeof(T)
@@ -7673,7 +7673,7 @@ function _hemm_packed_L!(up::Bool, α, β, A, B, C, ::Val{HERM} = Val(true)) whe
     Tc = eltype(C); T = real(Tc); n = size(C, 1); m = size(C, 2); W = _vwidth(T); mr = _CMR * W; nr = _CNR
     kc = min(_CKC, n)
     mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(n, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(m, nr) * nr)
+    nc = _gemm_nc(m, nr)                  # `m` is this driver's COLUMN count — the `jc` loop runs to it
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     # β=0 ⇒ the first kc-block OVERWRITES C (Val{B0}), so the n² pre-scaling pass is dead work. Skipping
     # it is also what makes β=0 correct on a C holding NaN/Inf: overwrite, never 0·C. Mirrors the gemm
