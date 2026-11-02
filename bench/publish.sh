@@ -48,7 +48,18 @@ echo "══ 1b  pb arm vs its reference arms: same clock?"
 # 2026-08-18 Zen5's refresh was 100% current AND 100% invalid, because the box boosted to
 # 4.7 GHz for the whole sweep against references cached at 2.0 GHz, inflating every Zen5 ratio ~2.3x.
 # `freqgate.jl` structurally cannot see that (its reference is the header, which floated too).
-if ! bench/check_arm_clocks.sh; then
+# GATE ON THE CACHES THIS CHAIN ACTUALLY PUBLISHES FROM, WHICH IS `plots_data_*` ONLY. Called with no
+# arguments the check audits `mt_data_*` too, and a threaded cache cannot answer this question: its
+# `pb_mt` arm carries an `mtanchor` figure, which is `base * min(1.0, ref/now)` — a TIME RATIO wearing
+# MHz units, not a clock — while the threaded VENDOR arms are sampled on the calling thread, which
+# OpenBLAS and AOCL leave blocked while their own workers run. So those cells read mismatched whatever
+# the clock did, and the refusal they produced here blocked a SERIAL publish on evidence about a
+# threaded cache this chain never reads. Measured 2026-11-01: all three `plots_data_*` caches clean at
+# 0.1%/0.8%/0.9% worst while `mt_data_*` reported 8 and 11 "mismatched" cells, every one reference-side.
+# The mt caches are NOT exempt from auditing — `bench/audit_mt.sh` owns that, with a check that can
+# actually see a threaded window. Tolerance is passed explicitly because the first argument IS the
+# tolerance and a path there is silently reinterpreted as one.
+if ! bench/check_arm_clocks.sh 3 bench/plots_data_*.txt; then
     if [ -n "$FORCE" ]; then
         echo "(--force given: publishing over clock-mismatched cells)"
     else
