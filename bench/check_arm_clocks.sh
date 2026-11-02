@@ -35,6 +35,22 @@
 set -u
 cd "$(dirname "$0")/.." || exit 2
 tol=${1:-3}
+# THE FIRST ARGUMENT IS THE TOLERANCE, AND A NON-NUMERIC ONE MUST NOT BE ACCEPTED. `tol` reaches awk
+# through `-v TOL`, where a non-numeric value turns every `> TOL` into a STRING comparison — so the
+# audit still runs, still counts, still prints a worst-case figure, and reports a PASS regardless of
+# it. Observed: `check_arm_clocks.sh bench/mt_data_avx512_wintermute.txt` printed
+# "cross-arm: all 951 cells within bench/mt_data_avx512_wintermute.txt% (worst 10.0%)" — a pass and a
+# 10% worst case on one line — and, because the path was also shifted away as the tolerance, audited
+# every cache instead of the one named. A check that cannot fail is worse than no check, so refuse.
+case $tol in
+    *[!0-9.]* | '' | *.*.*)
+        echo "check_arm_clocks.sh: first argument is the TOLERANCE IN PERCENT, not a cache path." >&2
+        echo "  got: '$tol'" >&2
+        echo "  usage: bench/check_arm_clocks.sh [tol_pct] [cache.txt ...]     # tol_pct defaults to 3" >&2
+        echo "  to audit one cache at the default tolerance: bench/check_arm_clocks.sh 3 '$tol'" >&2
+        exit 2
+        ;;
+esac
 shift 2>/dev/null || true
 # Explicit caches may follow the tolerance. With none, BOTH tiers are audited — unlike the other
 # checks, this one has always scanned `mt_data_*` too, because the cross-arm comparison is the only
