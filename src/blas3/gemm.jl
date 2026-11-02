@@ -34,6 +34,31 @@ const _NR = @load_preference("gemm_nr", _at_gemm_nr(_HW))::Int
 const _NC = @load_preference("gemm_nc", _at_gemm_nc(_HW))::Int   # B col block ≤ ¼·L3, po2-dodged
 # PDM: Derived — formula over detected consts: `_at_gemm_kc(_HW)`
 const _KC = @load_preference("gemm_kc", _at_gemm_kc(_HW))::Int   # B micropanel kc·_NR·8 ≤ ½·L1 (BLIS)
+
+# The `jc` blocks are BALANCED across `n`, not greedily filled to the cap. `_NC` is po2-dodged, so
+# filling greedily leaves a remainder block of whatever happens to be left: 8 columns at n = 2048,
+# 16 at n = 4096. A narrow `jc` block costs a full pass — it re-packs the whole of A and runs the
+# entire k-loop — for a fraction of a percent of the output, and its A-panel reuse is `nce/nr` = 1
+# instead of `nc/nr`.
+#
+# Measured on Zen4 (3468 MHz, 16 flops/cycle peak), classical real gemm as a fraction of peak: 93.0%
+# at n = 2032 and 92.7% at n = 2040, both a single block, against 90.2% at n = 2048 and 89.7% at
+# n = 4096, recovering to 91.9% once the remainder reaches 32 columns. The single-block figure equals
+# OpenBLAS's rate at the same size, so the remainder is the whole of the gap — and it falls on exactly
+# the power-of-two sizes, which is where `_NC`'s po2 dodge puts it.
+#
+# `nb` is the block count the cap implies, and `cld(cld(n, nb), nr) * nr` is the narrowest equal width
+# in whole `nr` groups that still covers `n` in `nb` blocks. `min` with the cap preserves the L3
+# residency bound `_NC` encodes, and `nb` itself never changes, so no additional A-pack pass appears.
+#
+# Bit-identity across thread counts is unaffected (req #11): `jc` splits COLUMNS, so every element of
+# C lies in exactly one block and accumulates its whole k chain in the order `kc = min(_KC, k)` fixes
+# — a function of the problem, never of the blocking or the worker count.
+@inline function _gemm_nc(n::Int, nr::Int)
+    cap = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nb = cld(n, cap)
+    return min(cap, cld(cld(n, nb), nr) * nr)
+end
 # Short-k split-reduction tile (cpuinfo.jl `_at_gemm_split_*`): tall _SMR·W×_SNR tile, S-way k-split, for the
 # small-n window where the wide tile under-fills. _SPLIT_OK const-folds the whole path off on AVX2 (already ≥1.0
 # there via _GEMM_MR1_MAX; would spill). req#8; measured n=32 0.85→1.07× OB (Zen4).
@@ -888,7 +913,7 @@ function _gemm_blocked!(
     # Cap block sizes by the actual problem so small GEMMs don't allocate/pack huge panels.
     kc = min(_KC, k)
     mc = _at_mc_kc(_HW, T, kc, mr, cld(m, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     Ap, Bp = _gemm_scratch(T, cld(mc, mr) * mr * kc, db ? 0 : cld(nc, nr) * nr * kc)
     ldc = stride(C, 2); ldb = stride(B, 2); sz = sizeof(T)
     GC.@preserve C Ap Bp B begin
@@ -2275,7 +2300,7 @@ function _gemm_cmplx_impl!(
     W = _vwidth(T); mr = _CMR * W; nr = NR
     kc = min(_CKC, k)
     mc = _at_mc_kc(_HW, eltype(C), kc, mr, cld(m, mr) * mr)
-    nc = min(max(nr, (_NC ÷ nr) * nr), cld(n, nr) * nr)
+    nc = _gemm_nc(n, nr)
     ApR, ApI, BpR, BpI = _gemm_scratch_cmplx(T, cld(mc, mr) * mr * kc, cld(nc, nr) * nr * kc)
     a = convert(Tc, alpha); alr = real(a); ali = imag(a)
     ldc = stride(C, 2); sz = sizeof(T)
