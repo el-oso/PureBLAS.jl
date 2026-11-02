@@ -921,12 +921,25 @@ end
     end
     spec_workload()
 
-    # BUDGET. 256 is chosen, not observed: `_trsv_reg!`'s 128 `Val` combinations (8 shapes x 16 sizes)
-    # are irreducible, and the ~12 `(A, x)` array-type pairs multiplying them are NOT — every one of
-    # them immediately takes `pointer(A)` and `stride(A, 2)`, so normalising to a pointer form at the
-    # ladder boundary collapses them to the 2 element types. 128 x 2 = 256 is the state this project
-    # intends to reach, so the gate FAILS until that work lands. A budget that passes on the day it is
-    # written records nothing.
+    # BUDGET. The limit is REASONED FROM THE TWO METHODS THAT EXCEED IT, which are different problems:
+    #
+    #   * `_trsv_reg!` — 1792, and REDUCIBLE. Its 128 `Val` combinations (8 shapes x 16 sizes) are
+    #     irreducible, but the ~14 `(A, x)` array-type pairs multiplying them are not: every one
+    #     immediately takes `pointer(A)` and `stride(A, 2)`, so normalising at the ladder boundary
+    #     collapses them to the 2 element types, 128 x 2 = 256.
+    #   * `_uker_cmplx!` — 800, and NOT reducible the same way. It already takes `Ptr{T}`, so there is
+    #     no array-type multiplier to remove; the 800 is ~400 `Val` combinations x 2 element types, and
+    #     those combinations ARE the generated tile shape space.
+    #
+    # So the budget cannot be 256: that is below an irreducible count, and a gate below what the design
+    # requires is a marker that fails forever rather than a target. 1024 sits above `_uker_cmplx!`'s
+    # irreducible space and below `_trsv_reg!`'s reducible one, so it FAILS today at 1792 and PASSES
+    # once the ladder is normalised — it can come out both ways, which is the whole requirement. A
+    # `@test_broken` that starts passing errors as "Unexpectedly Passed", so the flip is not silent.
+    #
+    # ⚠ RAISING THIS TO SILENCE A FAILURE DEFEATS IT. If a third method appears above 1024, the
+    # question is whether its `Val` space is irreducible like `_uker_cmplx!`'s or carries a removable
+    # type multiplier like `_trsv_reg!`'s — not what number makes the line green.
     @test_broken isempty(specialization_report(PureBLAS;
-        max_specializations = 256, max_type_depth = typemax(Int)))
+        max_specializations = 1024, max_type_depth = typemax(Int)))
 end
