@@ -404,6 +404,39 @@ Zen5 native-AVX512 / future M5 ARM — the 1.0× gate is evaluated per machine).
 
 ## Standing rules
 
+- **A PR THAT CHANGES A MEASURED NUMBER SHIPS THE REBUILT PLOTS AND TABLES FOR WHAT IT TOUCHED.**
+  req#9 says a change with no ratio is not done; this is its other half — a ratio nobody can see is
+  not published. The figures are what gets read, so a PR whose panels still show the old library has
+  not reported its result, whatever its description claims.
+
+  **Rebuild through the chain that owns the artifact, never by hand or per-op.** Serial figures and
+  tables: `bench/publish.sh`. Threaded page and panels: `bench/publish_mt.sh`. Apple: the reproduce
+  block in `docs/src/performance_apple.md`, rendered in ONE invocation. Each rebuilds its whole set
+  from the caches and byte-compares against a fresh regenerate, so a build that is not a pure
+  function of the caches fails instead of committing. A per-op render writes a table from one fresh
+  row against every other row's older data.
+
+  **Before opening the PR, run the currency check for each set it touches** — serial
+  `bench/check_artifacts_current.sh`, threaded `bench/check_mt_artifacts_current.sh`. Both render
+  from the caches into a temp directory and byte-compare against the working tree, rebuilding
+  nothing: a check that regenerates first can only compare two fresh renders and passes by
+  construction. Neither is in `test/lints.sh` — each costs two julia starts, against that file's ~9 s
+  budget — so they are a deliberate pre-PR step.
+
+  **Check the artifact against the cache, not that the page builds.** A stale figure renders
+  perfectly. Measured 2026-11-05: the threaded panels sat at their 2026-10-05 render while
+  `publish_mt.sh` refused for a month and the mt caches were rewritten three times. The page looked
+  healthy throughout, and a reader comparing potrf at n=4096 saw ~0.6x of AOCL where the cache held
+  1.07x. The giveaway was in the figure itself — its y-axis topped out at 1.0x, so it could not have
+  drawn a passing cell at all. The threaded set had no currency check at the time; the serial set
+  had one, and stayed current.
+
+  Three sections must agree and all three are read: **single-threaded**, **threaded**, **Apple
+  silicon**. Apple carries no frequency lock (`fleet_freqlock.sh` is `amd_pstate` sysfs only), so its
+  numbers are directional rather than gate verdicts — say so where they are shown, and keep
+  `assets/apple/provenance.md` stamped with the commit and time actually measured, since that line is
+  how a reader dates the page.
+
 - **NEVER PUT A FLEET MACHINE NAME IN THIS REPOSITORY. It is PUBLIC, the names are the operator's, and
   they have now been removed by hand twice** — the second time 162 occurrences across 49 files. Name
   the **microarchitecture** instead (Zen3, Zen4, Zen5, arm64): that is what a sentence citing a box is
