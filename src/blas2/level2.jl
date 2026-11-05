@@ -57,44 +57,83 @@ end
 const _GEMV_MR_PREF = @load_preference("gemv_mr", nothing)
 const _GEMV_MR = something(_GEMV_MR_PREF, 8)::Int
 
-# ── ROW-BLOCK HEIGHT: DERIVED FROM THE CALL, NOT FROM THE µARCH (2026-09-10) ────────────────────────
+# ── ROW-BLOCK HEIGHT: DERIVED FROM THE CALL, NOT FROM THE µARCH ─────────────────────────────────────
 # The row-block driver blocks m rows `mr = MR*W` at a time:
 #     while i0 + mr <= m ... end;  mre = m - i0  -> masked remainder
 # so the cost of a given MR is set by TWO facts about the CALL, both known at run time:
 #   1. `MR*W > m` is DEGENERATE — the loop never executes, the whole call falls into the masked
 #      branch, and (mr-m)/mr of every lane is wasted. At W=8 that is every m < 64 under MR=8.
-#   2. otherwise the masked tail costs `m mod MR*W` rows, so a height that divides m is free and one
-#      that leaves a large remainder pays for it once per call.
-# Neither fact mentions the microarchitecture, which is why this is a Derive and not the Measure-tier
-# literal it used to be: `_GEMV_MR` was a fleet-minimax constant that every untuned box got wrong at
-# some m, and pinning it per host cannot fix machines nobody has benchmarked (req#7/#8).
+#   2. otherwise the final block runs its full `h` lanes whatever it uses, and WHAT THAT COSTS DEPENDS
+#      ON WHERE op(A) SITS. The two regimes want opposite things, and both are measured below:
+#        * op(A) fits L1 — the wasted lanes are arithmetic on resident data and are nearly free, so
+#          what matters is getting as much of the work as possible into FULL blocks rather than into
+#          the masked one. Minimising `m mod h` does exactly that: it is the count of rows stranded in
+#          the final block, and the tie-to-taller then takes the tallest height that strands as few.
+#        * op(A) spills L1 — the wasted lanes are wasted memory traffic, so what matters is the
+#          lane-rows the call computes, `cld(m, h) * h`. Minimising the waste `(h - m mod h) mod h` is
+#          the same ordering.
+# The split is `m * n * sizeof(T)` against the DETECTED L1 size, so this stays a Derive over detected
+# constants rather than a Measure-tier literal: a fleet-minimax constant gets some m wrong on every
+# box, and pinning it per host cannot fix machines nobody has benchmarked (req#7/#8).
 #
-# Ties prefer the LARGER height, because more accumulators hide more FMA latency when the tail cost
-# is equal — that is the one µarch-flavoured term, and it only breaks ties.
+# ⚠ `m mod h` IS THE WRONG METRIC ONCE op(A) SPILLS, and the difference is not cosmetic. It is bounded
+# by h, so comparing it structurally prefers SHORT heights whenever nothing divides m, and lands on the
+# right answer only when a tall height divides m exactly — which every power-of-two m does, so a
+# square power-of-two ladder cannot expose it. At m = 505, W = 8 it reads 9 for h = 16 against 57 for
+# h = 64 and picks MR=2, although both compute 512 lane-rows, and MR=2 then measures 18% slower on
+# Zen4 and 32% slower on Zen5.
 #
-# FLEET TABLE, gate-exact regime, in-process A/B of the SHIPPED kernel, non-overlapping CIs.
-# "law" = the height this function returns; ✓ = it is the measured winner.
-#   Zen3 W=4:  m=32 ->8 ✓(1.87)  m=50 ->6 ✓(1.49)  m=64 ->8 ✓(2.03)                     3/3
-#   neuro  Zen5 W=8:  32 ->4 ✓(1.23)  50 ->6 ✓(1.14)  64 ->8 ✓(1.42)  100 ->6 ✓(1.04)
-#                     128 ->8 ✓(1.02)  256 ->8 ✓(1.40)  448 ->8 ✓(1.11)                        7/7
-#   winter Zen4 W=8:  32 ->4 ✓(1.11)  50 ->6 ✓(1.15)  64 ->8 ✓(1.32)  100 ->6 ✗(MR=2 wins)
-#                     128 ->8 ✓(1.03)  256 ->8 ✓(1.74)  448 ->8 ✓(1.14)                        6/7
-# 16/17. The one miss (Zen4 m=100) costs 5.8% against MR=2 there; against the SHIPPED MR=8 the
-# rule still wins by 24% on Zen5 and 38% at m=32, so its bounded regret is far smaller than the
-# constant's. Ratios are vs MR=2 within each row, so read them across a row, never down a column.
+# Ties prefer the LARGER height, because more accumulators hide more FMA latency when the metric is
+# equal — that is the one µarch-flavoured term, and it only breaks ties.
+#
+# FLEET TABLE — the (m, n) shapes this path actually receives at the gate, which is what it is
+# validated against: the square `gemvN` cells, where m == n, and the rectangular cells, where m is
+# fixed at 505 and n sweeps. Medians of 9 rounds with the arm order rotated, in-process A/B of the
+# shipped kernel at each `Val(MR)`; round-to-round spread 0.1-0.6% on the AVX-512 boxes.
+#
+# `rb` BOUNDS THE DOMAIN PER BOX, and that is why AVX2 appears in only two rows: `_gemvn_rb()` is 448
+# where W=8 and 64 where W=4, so on AVX2 every shape with n > 64 takes the PANEL path and never reaches
+# this function. A regression here is invisible on AVX2 except at the two smallest shapes — and those
+# two are where it bites hardest.
+#
+#   (m, n)      op(A)     regime     law   Zen4     Zen5     Zen3
+#   (50, 50)     19 KiB   in L1       6    6 ✓      6 ✓      6 ✓
+#   (64, 64)     32 KiB   in L1       8    8 ✓      8 ✓      8 ✓
+#   (100, 100)   78 KiB   spilled     2    2 ✓      6 ✗      panel
+#   (128, 128)  128 KiB   spilled     8    8 ✓      8 ✓      panel
+#   (256, 256)  512 KiB   spilled     8    8 ✓      8 ✓      panel
+#   (505, 131)  516 KiB   spilled     8    8 ✓      4 ✗      panel
+#   (505, 256) 1010 KiB   spilled     8    8 ✓      8 ✓      panel
+#   (505, 384) 1515 KiB   spilled     8    8 ✓      8 ✓      panel
+#   (505, 448) 1767 KiB   spilled     8    8 ✓      8 ✓      panel
+# Zen4 9/9, Zen5 8/9, Zen3 2/2 over the shapes it governs there; the two misses cost 2.8% and 2.2%.
+#
+# WHY NOT ONE METRIC FOR BOTH REGIMES — each single-metric rule was measured and each has a wide miss:
+#   * `m mod h` everywhere      — 18% at (505,448) on Zen4, 32% on Zen5
+#   * waste everywhere          — 72% at (50,50) on Zen3, where it picks MR=2 (0.564 vs 0.327 µs)
+#   * tallest non-degenerate    — 26-32% at (100,100), one full block beside a 36/64-masked one
+#   * fewest blocks             — the same as tallest, same miss
+#
+# ONE SHAPE NEEDS A TERM THIS SIGNATURE DOES NOT CARRY: at (100, 100) Zen4 wants MR=2 and Zen5 wants
+# MR=6 — same width, same shape, opposite answers — so no function of the call can satisfy both. It
+# costs 2.8% on Zen5, and (505, 131) costs 2.2% there for the same reason.
 #
 # The PANEL path (n > `_gemvn_rb()`) is deliberately NOT covered: there the winner does not track the
-# remainder (measured: Zen3 wants 8 almost everywhere, Zen4 and Zen5 disagree size by
-# size) and the whole spread is 0.90-1.19 because the kernel is bandwidth-bound. It keeps `_GEMV_MR`.
-@inline function _gemvn_rowblock_mr(m::Int, W::Int)
+# waste (measured: Zen3 wants 8 almost everywhere, Zen4 and Zen5 disagree size by size) and the whole
+# spread is 0.90-1.19 because the kernel is bandwidth-bound. It keeps `_GEMV_MR`.
+@inline function _gemvn_rowblock_mr(m::Int, n::Int, W::Int, ::Type{T}) where {T}
+    resident = m * n * sizeof(T) <= _L1_BYTES
     best = 2
-    bestrem = typemax(Int)
+    bestcost = typemax(Int)
     for mr in (2, 4, 6, 8)          # ascending + `<=` below ⇒ ties resolve to the LARGER height
         h = mr * W
         h > m && continue           # degenerate: no full block would run at all
-        r = m % h
-        if r <= bestrem
-            bestrem = r
+        # Resident: rows stranded in the masked block, so the full blocks carry as much as possible.
+        # Spilled: lanes the masked block computes and discards, which is wasted traffic. Both are 0
+        # when h divides m, which is why a power-of-two m cannot tell the two metrics apart.
+        cost = resident ? m % h : (h - m % h) % h
+        if cost <= bestcost
+            bestcost = cost
             best = mr
         end
     end
@@ -580,23 +619,24 @@ end
         m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}, mroute::Int
     ) where {T <: BlasReal, B0}
     if n <= _gemvn_rb()
-        # Per-call row-block height (see `_gemvn_rowblock_mr`). A pin disables the derivation, and
-        # `isnothing(_GEMV_MR_PREF)` is a load-time const so the pinned build folds this away and
-        # emits ONE specialization, exactly as before. Unpinned, the branch runs once per gemv! call
-        # against a driver that then loops over m — not in any inner loop.
-        @static if isnothing(_GEMV_MR_PREF)
-            mr = _gemvn_rowblock_mr(m, _vwidth(T))
-            if mr == 8
-                _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(8))
-            elseif mr == 6
-                _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(6))
-            elseif mr == 4
-                _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(4))
-            else
-                _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(2))
-            end
+        # Per-call row-block height, always derived (see `_gemvn_rowblock_mr`). The branch runs once
+        # per gemv! call against a driver that then loops over m — not in any inner loop.
+        #
+        # ⚠ `_GEMV_MR` DOES NOT REACH HERE, AND THAT SEPARATION IS THE POINT. It is the PANEL path's
+        # height and stays Measure tier there, because no detected constant separates the boxes for
+        # that path. Letting the same preference also select here made one key govern two paths with
+        # different winners: a `gemv_mr` pin — which the panel path needs — compiled this derivation
+        # out, so on a tuned box the row-block height was whatever the panel wanted, and the law's
+        # own correctness went unmeasured on exactly the hosts that decide the gate.
+        mr = _gemvn_rowblock_mr(m, n, _vwidth(T), T)
+        if mr == 8
+            _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(8))
+        elseif mr == 6
+            _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(6))
+        elseif mr == 4
+            _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(4))
         else
-            _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(_GEMV_MR))
+            _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(2))
         end
     # `mroute`, NOT `m`: this predicate selects between two drivers whose n-chunking differs — minner
     # uses `_gemvn_minner_np` columns per panel, the old path a flat `_GEMV_NP` — so a row band that

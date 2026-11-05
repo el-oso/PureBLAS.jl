@@ -29,7 +29,12 @@ shift
 
 PUBLISH=1
 PARALLEL=0
-ARMS=""          # empty = every arm (pb + both references) in one window
+# NAMED EXPLICITLY, NEVER LEFT EMPTY. Omitting `arms=` once meant "measure every arm"; plots.jl's
+# default is PB-ONLY (`_REF_ARMS = isnothing(_ARMS_SEL) ? String[] : …`), so an empty string measures
+# PureBLAS and divides it by whatever vendor times the cache already holds — the exact machine-state
+# mismatch a targeted sweep exists to remove, and silently, in PureBLAS's favour. `fleet_refresh.sh`'s
+# `full` branch carries the same correction and the record of what the empty form cost.
+ARMS="pb,openblas,aocl"
 BOXES=()
 for a in "$@"; do
     case "$a" in
@@ -42,7 +47,18 @@ for a in "$@"; do
 done
 ARMSARG=""
 [ -n "$ARMS" ] && ARMSARG="arms=$ARMS"
-[ ${#BOXES[@]} -gt 0 ] || BOXES=(Zen3 Zen4 Zen5)
+# THE DEFAULT IS SSH ALIASES, NOT µARCH LABELS. `run_on` hands its argument straight to `ssh`, and the
+# µarch names this file reports in are not resolvable hosts, so a label default makes the documented
+# no-argument form fail at the first box. `PB_BOXES` is the remote list from `bench/fleet.local.sh`
+# (gitignored, so no machine name enters the repository — the same source `fleet_sync.sh` reads), and
+# `hostname` is the dev box, which `run_on` already special-cases to run locally.
+if [ ${#BOXES[@]} -eq 0 ]; then
+    _FL="$(dirname "$0")/fleet.local.sh"
+    [ -f "$_FL" ] && . "$_FL"
+    # shellcheck disable=SC2206,SC2128  # PB_BOXES is a space-separated list, splitting is intended
+    BOXES=($(hostname) ${PB_BOXES:-})
+    [ ${#BOXES[@]} -gt 0 ] || { echo "no boxes: pass them, or set PB_BOXES in bench/fleet.local.sh"; exit 2; }
+fi
 
 SHA="$(git rev-parse HEAD)"
 SHORT="$(git rev-parse --short HEAD)"
@@ -124,7 +140,12 @@ echo "══ 3  measure op=$OP ${ARMSARG:+($ARMSARG)}${PARALLEL:+ }$([ "$PARALLE
 LOGDIR="$(mktemp -d)"
 measure_box() {
     local b="$1"
-    run_on "$b" "JULIA_NUM_PRECOMPILE_TASKS=1 taskset -c 8 julia --project=bench bench/plots.jl bench op=$OP $ARMSARG" \
+    # `nodraw`: MEASURE AND CACHE ONLY. Without it plots.jl re-renders the SVGs and tables, which are
+    # TRACKED, so one op dirties the tree and the dirty-tree guard above refuses every op after it —
+    # a sweep of several ops measured only its first. Rendering belongs to `bench/publish.sh`, which
+    # builds the whole artifact set from the caches in one pass; a per-op render would also write a
+    # table from one freshly-swept row against every other row's older data.
+    run_on "$b" "JULIA_NUM_PRECOMPILE_TASKS=1 taskset -c 8 julia --project=bench bench/plots.jl bench op=$OP $ARMSARG nodraw" \
         > "$LOGDIR/$b.log" 2>&1 || echo "  $b  MEASURE FAILED (see $LOGDIR/$b.log)"
 }
 if [ "$PARALLEL" -eq 1 ]; then
