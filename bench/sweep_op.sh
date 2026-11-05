@@ -140,7 +140,12 @@ echo "══ 3  measure op=$OP ${ARMSARG:+($ARMSARG)}${PARALLEL:+ }$([ "$PARALLE
 LOGDIR="$(mktemp -d)"
 measure_box() {
     local b="$1"
-    run_on "$b" "JULIA_NUM_PRECOMPILE_TASKS=1 taskset -c 8 julia --project=bench bench/plots.jl bench op=$OP $ARMSARG" \
+    # `nodraw`: MEASURE AND CACHE ONLY. Without it plots.jl re-renders the SVGs and tables, which are
+    # TRACKED, so one op dirties the tree and the dirty-tree guard above refuses every op after it —
+    # a sweep of several ops measured only its first. Rendering belongs to `bench/publish.sh`, which
+    # builds the whole artifact set from the caches in one pass; a per-op render would also write a
+    # table from one freshly-swept row against every other row's older data.
+    run_on "$b" "JULIA_NUM_PRECOMPILE_TASKS=1 taskset -c 8 julia --project=bench bench/plots.jl bench op=$OP $ARMSARG nodraw" \
         > "$LOGDIR/$b.log" 2>&1 || echo "  $b  MEASURE FAILED (see $LOGDIR/$b.log)"
 }
 if [ "$PARALLEL" -eq 1 ]; then
