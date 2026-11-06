@@ -1103,6 +1103,14 @@ _reps_quadratic(s) = clamp(20_000_000 ÷ (s * s), 1, 512)
 # ⚠ STILL REQUIRES CPU BOOST DISABLED (`echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost`,
 # performance governor) so the fixed clock keeps OB vs PB comparable. See memory dev-fleet.
                                        # `refs` mirrors `sweep`'s override, for DL3 — see the note there.
+# A context is either one array (`getrf`, `potrf`) or a tuple of them (everything else), so cloning and
+# restoring dispatch on that. Only these two shapes occur; a `Vector` here would be a context LIST and is
+# walked by the caller, never passed in.
+_ctx_clone(x::AbstractArray) = copy(x)
+_ctx_clone(x::Tuple) = map(_ctx_clone, x)
+_ctx_restore!(w::AbstractArray, m::AbstractArray) = (copyto!(w, m); w)
+_ctx_restore!(w::Tuple, m::Tuple) = (foreach(_ctx_restore!, w, m); w)
+
 function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = _reps_cubic, refs = nothing)
     # Both PB arms belong in an explicit list — see the note in `sweep`.
     armlist = isnothing(refs) ? nothing :
@@ -1111,13 +1119,33 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
     out = Tuple{Int, CellData}[]
     for s in sizes
         !isnothing(_SELSIZE) && s != _SELSIZE && continue     # `size=` selects ONE cell
-        # reps fresh contexts per sample: setup (EXCLUDED from timing) pre-generates them, the core runs the
-        # destructive op on each. reps→1 at large n; large at tiny n so a ~50 ns n=8 op isn't measured as a
-        # single sub-timer-resolution call (which fabricated n=8 "fails" — evals=1 alone can't amortize it).
+        # reps contexts per sample, RESTORED rather than reallocated: setup (EXCLUDED from timing)
+        # `copyto!`s each working context back from a pristine master, so the destructive op still gets
+        # untouched input on every sample while nothing is allocated or freed in the loop.
+        #
+        # ALLOCATING THEM PER SAMPLE MEASURED THE ALLOCATOR, NOT THE LIBRARY, and unevenly across the
+        # fleet. At n=1024 a square gemm context is 25 MB; churning that per sample cost the THREADED arm
+        # 37% on the 12-core chiplet box (self-speedup 3.56x against 5.65x) and ~1% on the two monolithic
+        # ones, while leaving the SERIAL arm unchanged on all three. Cache residency is not the mechanism:
+        # cycling through pre-allocated contexts — same residency, no churn — reads 5.65x, and `mk` writes
+        # every byte in setup anyway. Nor is it collection inside the window: Chairmarks reports 0% GC and
+        # 0 bytes for the timed core. What remains is the kernel work the churn creates around the call,
+        # which six worker threads absorb six times over against the serial arm's once.
+        #
+        # RESTORING, NOT CYCLING: a cycled context would hand a destructive op its own previous output.
+        # `trsm!` overwrites B and `getrf!` overwrites its argument, so the input has to be put back.
+        #
+        # reps→1 at large n; large at tiny n so a ~50 ns n=8 op isn't measured as a single
+        # sub-timer-resolution call (which fabricated n=8 "fails" — evals=1 alone can't amortize it).
         # `repsof` is overridable because the default assumes the swept size IS the problem dimension and
         # the op is O(s³); rows that sweep some other axis (pbtrf sweeps the BANDWIDTH at fixed n, cost
-        # O(n·kd²)) would otherwise be handed hundreds of full-size contexts to allocate.
+        # O(n·kd²)) would otherwise be handed hundreds of full-size contexts.
         reps = repsof(s)
+        masters = [mk(s) for _ in 1:reps]
+        works = [_ctx_clone(c) for c in masters]
+        restore_all!() = (for i in 1:reps
+                _ctx_restore!(works[i], masters[i])
+            end; works)
         rounds = _rounds_heavy(s)
         secs = s >= 1024 ? 2.0 : seconds   # large-n windows are seconds-bound; 2.0 is plenty and ~halves cost
         acc = ArmData(); rmeds = Float64[]
@@ -1133,7 +1161,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
                 # single number that was never true. Two /sys reads per arm-round against a ≥0.5 s
                 # window is unmeasurable overhead.
                 _khz_sample!(a)
-                b = @be [mk(s) for _ in 1:reps] (
+                b = @be restore_all!() (
                     cs -> (
                         v = 0.0; for c in cs
                             v += f(c)
