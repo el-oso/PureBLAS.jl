@@ -468,10 +468,15 @@ end
             P._trsm_workers_r(k, m, Float64)
         end
         @test maximum(nws) > 1
-        # LIVENESS, and it reads the driver rather than the admission predicate. `_trmmr_prefit!` grows
-        # one `_gpack_shared_pool` slot per worker, from the driver, inside the claim — so a grown slot
-        # count means a job was published. Without this, "every thread count agrees" would be satisfied
-        # by a build where nothing threaded at all, which is how this class of item goes quiet.
+        # LIVENESS, and it reads the driver rather than the admission predicate. Without it, "every
+        # thread count agrees" would be satisfied by a build where nothing threaded at all, which is how
+        # this class of item goes quiet.
+        #
+        # THE WITNESS IS `p.gen`, NOT THE SHARED-POOL SLOT COUNT. `_gpack_shared_pool` only ever grows
+        # and is process-wide, so "it grew across this call" holds only while nothing earlier in the
+        # process has already grown it to the worker count — it is a statement about test order, not
+        # about this call. `p.gen` is bumped once per dispatched job by the driver and is monotonic per
+        # call, so it answers the same question from any starting state.
         #
         # THE POOL IS ONLY THE THREADED PATH WHERE THE PACK DRIVER OWNS THE CALL. A host whose matrix
         # coprocessor takes this shape never reaches `_trmmr_prefit!`, so the slot count stays at zero
@@ -481,16 +486,16 @@ end
         # itself consults, rather than a proxy for it: a guard that is not the code's own question can
         # disagree with the code. The bit-identity assertions below are NOT guarded — they must hold on
         # every route, which is the invariant req#11 actually asks for.
-        P.set_num_threads(1)
         Aw = triu(randn(k, k)) + k * I
-        Bw = randn(m, k); P.trmm!(Bw, Aw; side = 'R', uplo = 'U')
-        serial_slots = length(P._gpack_shared_pool(Float64))
         P.set_num_threads(maximum(2:nthreads()))
-        Bw2 = randn(m, k); P.trmm!(Bw2, Aw; side = 'R', uplo = 'U')
+        Bw2 = randn(m, k)
+        gen0 = @atomic P._gemm_pool(Float64).gen
+        P.trmm!(Bw2, Aw; side = 'R', uplo = 'U')
+        gen1 = @atomic P._gemm_pool(Float64).gen
         if P._trmmr_sme_owns(Float64, k, m, Aw, Bw2)
             @test_skip "coprocessor owns this shape — the pack driver is not the threaded path here"
         else
-            @test length(P._gpack_shared_pool(Float64)) > serial_slots
+            @test gen1 != gen0
         end
         for up in ('L', 'U'), tr in ('N', 'T'), dg in ('N', 'U')
             G = randn(k, k)
