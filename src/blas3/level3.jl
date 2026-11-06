@@ -1266,6 +1266,56 @@ end
     end
 end
 
+# Pack a SYMMETRIC A panel straight from its stored triangle, with no dense intermediate.
+#
+# WHY THIS EXISTS. `symm` used to expand A into a full n×n scratch and then run an ordinary product on
+# it. The expansion is O(n²) against an O(n³) product, which looks free, and in isolation it nearly is —
+# but the product reads back what the expansion just wrote, and that turnaround is not free at all.
+# Measured on Zen4 at n=100, six workers: the expansion alone is 4.2 us and the product alone 9.7 us,
+# while the two in sequence are 26.8 — the steps cost 1.9x their own sum. Packing from the triangle
+# deletes the write, and with it the read that misses.
+#
+# NO NEW MICROKERNEL IS NEEDED for the bulk of the work, because a packed panel of a symmetric matrix is
+# one of three cases and two of them already exist:
+#   * wholly inside the stored triangle  → every element is `A[i,j]`  → `_pack_A_simd!`
+#   * wholly inside the mirrored half    → every element is `A[j,i]`  → `_pack_A_simd_T!`
+#   * straddling the diagonal            → mixed, and there are only O(n/mr) such panels
+# The diagonal is identical either way, so a panel touching it exactly at its edge still takes a fast
+# path; only a panel that spans the diagonal strictly needs the scalar body below.
+#
+# `up` is A's stored triangle. α rides into the pack exactly as it does for `_pack_A!`.
+function _pack_A_sym!(
+        Ap::AbstractVector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int,
+        up::Bool, alpha::T, mr::Int
+    ) where {T}
+    rlo = ic; rhi = ic + mce - 1                   # 0-based global row span of this panel
+    clo = pc; chi = pc + kce - 1                   # 0-based global column span
+    if _strided1(A) && T <: BlasReal
+        # `_symstored` is 1-based; the spans here are 0-based, so compare the same way it would.
+        if up ? (rhi <= clo) : (rlo >= chi)
+            return _pack_A_simd!(Ap, A, ic, pc, mce, kce, alpha, mr)      # all stored: read A[i,j]
+        elseif up ? (rlo >= chi) : (rhi <= clo)
+            return _pack_A_simd_T!(Ap, A, ic, pc, mce, kce, alpha, mr)    # all mirrored: read A[j,i]
+        end
+    end
+    np = cld(mce, mr)
+    @inbounds for pi in 0:(np - 1)
+        base = pi * mr * kce
+        for p in 0:(kce - 1)
+            for r in 0:(mr - 1)
+                lr = pi * mr + r
+                Ap[base + p * mr + r + 1] = if lr < mce
+                    gi = ic + lr + 1; gp = pc + p + 1                     # 1-based, as `_symstored` wants
+                    alpha * (_symstored(up, gi, gp) ? A[gi, gp] : A[gp, gi])
+                else
+                    zero(T)
+                end
+            end
+        end
+    end
+    return
+end
+
 # Pack a triangular op(A) panel: zero the non-stored half, write the diagonal (unit ⇒ 1). packed_upper
 # = the packed op(A) is upper-triangular (zero where gi>gp). Used only for diagonal-straddling A-panels
 # (off-diagonal panels are fully stored → plain _pack_A!, fully-zero panels are skipped by the driver).
