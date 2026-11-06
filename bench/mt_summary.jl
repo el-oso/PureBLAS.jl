@@ -37,10 +37,15 @@ function roundratios(qpb, qmt)
     return [med([qpb[(r - 1) * QN + i] / qmt[(r - 1) * QN + i] for i in 1:QN]) for r in 1:n]
 end
 
+# Arms removed by the clock-band filter in `cells`, per call. A module-level counter rather than an
+# extra return value, because `cells` has callers that destructure its two results.
+const _THROTTLED_ARMS = Ref(0)
+
 function cells(path)
     out = []
     ref = 0
     offlock = 0
+    _THROTTLED_ARMS[] = 0
     for ln in eachline(path)
         startswith(ln, "#pbbench") && ((ref, _) = _freq_ref(ln); continue)
         (isempty(strip(ln)) || startswith(ln, "#")) && continue
@@ -64,10 +69,11 @@ function cells(path)
         # rows would lose cells the panels keep.
         if _freq_window_mismatch(wins)
             ceil_khz = maximum(hi for (_, hi) in wins; init = 0)
-            for (i, f) in enumerate(p[4:end])
+            for f in p[4:end]
                 _p = split(f, "|"); lo = _window_of(_p)[1]
                 if lo > 0 && ceil_khz > 0 && (ceil_khz - lo) / ceil_khz > 0.03
                     delete!(d, String(_p[1]))
+                    _THROTTLED_ARMS[] += 1
                 end
             end
         end
@@ -112,7 +118,10 @@ function mt_rows(path; flat_band = FLAT)
         push!(movers, (s, spread, lvl, op, sz))
     end
     sort!(movers; by = first, rev = true)
-    return movers, (cells = length(rows), offlock = offlock, no_mt = no_mt, flat = flat)
+    return movers, (
+        cells = length(rows), offlock = offlock, no_mt = no_mt, flat = flat,
+        throttled_arms = _THROTTLED_ARMS[],
+    )
 end
 
 function main(paths, show_all)
