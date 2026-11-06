@@ -3646,13 +3646,19 @@ end
 #   _EXPINT[10] SME in-place-A column-panel cut (0 = `_SME_INPLACE_NJP`, negative = residency only) --
 #               see `_sme_inplace_njp`
 #   _EXPINT[11] witness: the widest column-panel count the cut above admitted (proves the arm was live)
+#   _EXPINT[12] 1 = disable the COOPERATIVE A-pack (A/B arm; 0 ships: deal the `ic` blocks across the
+#               workers into one shared buffer and meet at a barrier). With 1, every worker packs every
+#               block into its own scratch, which is the redundant form the cooperative pack replaced --
+#               more traffic, no barrier. Tests whether the barrier or the traffic dominates when the
+#               operands come from DRAM rather than L3.
+#   _EXPINT[13] witness: 1 = the cooperative branch ran, 2 = the private branch ran
 #
 # ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
 # OUT-OF-BOUNDS READ that no test will catch — `@inbounds` deletes the check, and a stale heap value
 # that happens to be 0 looks exactly like "knob off". That is not hypothetical: on 2026-08-18 a revert
 # removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
 # read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
-const _EXPINT = fill(0, 11)
+const _EXPINT = fill(0, 13)
 const _EXPFLAG = fill(false, 19)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
