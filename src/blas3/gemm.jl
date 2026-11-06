@@ -779,7 +779,11 @@ function _blocked_pc_sweep!(
     # out of bounds in an exactly-sized view, which is why only `tA=T` failed. Matches `_gpack_prefit!`.
     blk = cld(mc, mr) * mr * max(kcmax, kce)
     nblk = cld(m, mc)
-    coop = nw > 1
+    # `_EXPINT[12]` is the A/B arm: 1 sends every worker down the private per-worker pack instead, which
+    # `Ap` is already sized for (one `mc`x`kc` block, independent of `nw`). `_EXPINT[13]` witnesses which
+    # branch ran, because an A/B whose arm was never in the call graph produces a believable null.
+    coop = nw > 1 && iszero(@inbounds _EXPINT[12])
+    @inbounds _EXPINT[13] = coop ? 1 : 2
     shp = App
     if coop
         sh = _gpack_shared(T, nblk, blk)
