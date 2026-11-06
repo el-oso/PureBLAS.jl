@@ -1626,10 +1626,22 @@ function trmm!(
     # other and the recursion is AHEAD below 2048, so the threaded margin is not bought with a
     # serial loss except at the top of the range (+4.7% at 4096).
     #
-    # `_trsm_workers` decides, on the solve's own `k²·n`: side-L trmm has the same operand shape and
-    # the same flop count, so the amortisation floor transfers exactly rather than by analogy.
+    # THE FLOOR DOES NOT TRANSFER FROM trsm, THOUGH THE FLOP COUNT DOES. Both are `k²·n` on the same
+    # operand shape, which is why this site used `_trsm_workers`, but a solve and a product amortise the
+    # pool differently: trsm's columns carry a sequential substitution, trmm's are a product. Forcing the
+    # pool at six workers, bit-identical to the serial result, gain by flop count (Zen4/Zen3/Zen5):
+    #
+    #       32768   0.79 / 0.95 / 0.93      <- loses
+    #       64000   1.11 / 1.32 / 1.31
+    #      125000   1.58 / 1.64 / 1.86
+    #      262144   1.87 / 2.22 / 2.06
+    #
+    # trsm at the same 125000 flops LOSES, at 0.89x on Zen4 — so one floor cannot serve both, and
+    # `_GEMM_MT_WORK`'s 220416 refused a size at which trmm returns 1.6-1.9x on every box. Halving it
+    # admits 125000 and still refuses 64000, whose 1.11x on the weakest box is not worth six workers.
+    # That is the same standard the shared floor is set to: the worst admitted cell returns about 1.8x.
     if !iszero(alpha) && _trmm_left_owns(A, B, transA, sl, k)
-        nwl = _trsm_workers(k, size(B, 2))
+        nwl = _trmm_workers_l(k, size(B, 2))
         if nwl > 1
             rA = _root(A); rB = _root(B)
             GC.@preserve rA rB _gemm_threaded!(
@@ -5163,6 +5175,25 @@ end
     nt > 1 || return 1
     flops = k * k * n
     (flops < _GEMM_MT_WORK || n < _NR) && return 1
+    # Gate, not ration — the argument is at `_gemm_workers`.
+    return max(1, min(nt, cld(n, _NR)))
+end
+
+# side-L trmm's worker count. Identical to `_trsm_workers` but for the floor: the two ops share the
+# `k²·n` flop count and the operand shape, and they do NOT share an amortisation point, because a
+# product's columns parallelise where a substitution's do not. Measured at 125000 flops, six workers,
+# bit-identical to serial: trmm returns 1.58/1.64/1.86 on Zen4/Zen3/Zen5 while trsm LOSES at 0.89x on
+# Zen4. The derivation and the full gain-by-flops table are at the call site in `trmm!`.
+#
+# HALF, not a separate literal: the number this divides is the measured fork-join amortised at the
+# detected FMA rate, and nothing about trmm changes either of those — what changes is how much of the
+# call the pool can overlap, and one factor of two is what the measurements support. A third knob here
+# would be a tuning parameter with no derivation behind it.
+@inline function _trmm_workers_l(k::Int, n::Int)
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    flops = k * k * n
+    (flops < _GEMM_MT_WORK ÷ 2 || n < _NR) && return 1
     # Gate, not ration — the argument is at `_gemm_workers`.
     return max(1, min(nt, cld(n, _NR)))
 end
