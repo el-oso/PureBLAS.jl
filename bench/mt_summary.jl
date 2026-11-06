@@ -47,11 +47,18 @@ function cells(path)
         p = split(ln, "\t"); length(p) >= 4 || continue
         d = Dict{String, Vector{Float64}}()
         drift = false
+        wins = Tuple{Int, Int}[]
         for f in p[4:end]
             _p = split(f, "|"); a, csv = _p[1], _p[end]
             _freq_offlock(_freq_of(_p), ref) && (drift = true)
+            push!(wins, _window_of(_p))
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
+        # A cell whose arms did not share a clock BAND is excluded for the same reason an off-lock arm
+        # is: the ratio compares two machine states. The pin alone cannot see this — a threaded vendor
+        # arm can hold its pin and still spend part of its own window far below it, which is what
+        # `_freq_window_mismatch` reads off `flo|fhi`.
+        _freq_window_mismatch(wins) && (drift = true)
         # An off-lock arm corrupts a ratio exactly as much here as in the gate: a floating clock between
         # the two windows IS the thing being measured otherwise. Count them, never average them in.
         drift && (offlock += 1; continue)
