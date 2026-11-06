@@ -59,6 +59,20 @@ function box_section(io, path)
     println(io)
     @printf(io, "%d cells measured, %d off-lock. Listed below: the threadable ops whose best cell moves further than the %.1f%% noise floor.\n",
         st.cells, st.offlock, 100 * NOISE_P99)
+    # A removed arm must be stated, or a smaller and cleaner-looking gate reads as a better library.
+    if st.throttled_arms > 0
+        println(io)
+        @printf(io, """
+        %d reference arm(s) in this cache are EXCLUDED from the gate: they did not hold the clock band
+        their sibling arms held in the same cell. A threaded vendor arm can keep its pin on paper and
+        still spend part of its own window far below it, because six cores of a vendor BLAS on a
+        power-limited part pull the package clock down where one core never does. A ratio against such an
+        arm compares two machine states, and the error runs in PureBLAS's FAVOUR — a throttled reference
+        is a slower reference — so those arms are dropped rather than drawn. The `pb` and `pb_mt` arms of
+        the same cells shared one window and held the clock, so the self-speedup figures below are
+        unaffected; it is the gate panels that lose cells.
+        """, st.throttled_arms)
+    end
     println(io)
 
     rows = [r for r in rows if _threadable(r[3])]        # drop what cannot thread — see NOISE_P99
@@ -275,15 +289,19 @@ for BLAS-2 and for the complex groups.
 A cell with no threaded reference arm is DROPPED rather than compared against a serial one — a
 threaded PureBLAS arm over a single-thread vendor is not the gate and must not be drawn as if it were.
 
-!!! warning "The Zen4 curve is not yet adjudicable"
-    That box is a laptop mainboard with no battery, and it was running on a supply that could not hold
-    its pin once every core was busy: one core held 2795 MHz indefinitely while six oscillated
-    2332–2804 MHz, at 52–58 °C, far below any thermal limit. 1208 of its cached arms are stamped
-    below the pin and 413 cells compare two power states rather than two libraries. The error runs in
-    PureBLAS's favour, because a throttled reference is a slower reference. A larger supply has since
-    moved its sustainable pin to 3501 MHz and `fleet_freqlock.sh verify-mt` confirms six cores hold
-    it, so those cells are being re-measured with both arms in one machine state; until then read the
-    Zen3 and Zen5 curves, whose cross-arm clocks agree on 929 of 937 and 951 of 951 cells.
+!!! warning "A reference arm that throttled is dropped, and the coverage per box differs a lot"
+    A threaded vendor arm can keep its pin on paper and still spend part of its own window far below
+    it: six cores of a vendor BLAS on a power-limited part pull the package clock down where one core
+    never does. A ratio against such an arm compares two power states rather than two libraries, and
+    the error runs in PureBLAS's FAVOUR, because a throttled reference is a slower reference. Those
+    arms are therefore dropped from the gate rather than drawn, and a cell left with no threaded
+    reference disappears from these panels.
+
+    How many arms that removes is a property of the BOX, not of the library, and it is stated per box
+    in the sections below — a laptop part on a shared power budget loses far more than a desktop one.
+    Read the per-box exclusion count before comparing two curves here: a curve drawn from fewer cells
+    is not a better result. The self-speedup panels further down are unaffected, since both of their
+    arms share one window.
 
 ![BLAS-1 — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_l1.svg)
 ![BLAS-2 — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_l2.svg)
