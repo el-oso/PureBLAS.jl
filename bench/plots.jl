@@ -18,6 +18,7 @@
 using PureBLAS, LinearAlgebra, Statistics, Printf
 using ForwardDiff              # DL1: the only group whose reference is a Julia implementation, not a BLAS
 include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
+include(joinpath(@__DIR__, "freqgate.jl"))   # _window_of / _freq_window_mismatch — clock adjudicability
 include(joinpath(@__DIR__, "freqlock.jl")); using .FreqLock   # THE frequency-lock criterion
 using TOML                    # _active_prefs: enumerate pins so a silent one cannot ride along
 using Chairmarks: @be   # robust per-side timing (auto sample-sizing + warmup); replaces hand-rolled time_ns
@@ -2985,7 +2986,15 @@ function save_cache(path, groups)
 end
 # Returns (groups, meta::NamedTuple). meta carries version/slug/isa/host from the header (µarch identity
 # for the multi-host overlay). Refuses a cache from an older methodology version (forces re-measure).
+# Set per `load_cache` call: only a threaded cache can contain an arm that loaded every core, so only
+# there does the cross-arm clock-band filter below apply. The counter is reported by the caller, because
+# a filter that drops cells silently reads exactly like a cache that never had them.
+const _IS_MT_CACHE = Ref(false)
+const _MT_WINDOW_DROPPED = Ref(0)
+
 function load_cache(path)
+    _IS_MT_CACHE[] = occursin("mt_data_", basename(path))
+    _MT_WINDOW_DROPPED[] = 0
     g = Dict{String, Vector{OpData}}()
     meta = (version = 1, slug = "?", uarch = "?", isa = "?", host = "?", cpu = "?", commit = "?", time = "?")  # legacy ⇒ v1
     for ln in eachline(path)
@@ -3043,6 +3052,30 @@ function load_cache(path)
                 parse.(Float64, split(csv, ","))
             )
         end
+        # THREADED CACHES ONLY: drop an ARM that did not hold the clock band its siblings held. A
+        # threaded reference arm can hold its pin and still spend part of its own window far below it —
+        # six cores of a vendor BLAS on a power-limited part pull the package clock down where one core
+        # never does — and a ratio against it compares two machine states in PureBLAS's FAVOUR, because
+        # a throttled reference is a slower reference.
+        #
+        # THE ARM, NOT THE CELL. Dropping the cell would also strip it from the "what threading bought"
+        # panels, where `pb` and `pb_mt` shared one window and both held the clock — valid data thrown
+        # away because a vendor arm misbehaved. Removing just the offending arm leaves each view to do
+        # what it already does: the gate view falls back to the other reference, or drops the cell when
+        # no threaded reference survives, and the self-speedup view is untouched.
+        #
+        # Gated to `mt_data_` because only a threaded arm can load every core. The serial caches have
+        # their own anchor and clock questions, and silently reshaping the published serial panels is not
+        # this filter's job.
+        if _IS_MT_CACHE[] && _freq_window_mismatch([(r.flo, r.fhi) for r in values(cell)])
+            ceil_khz = maximum(r.fhi for r in values(cell); init = 0)
+            for (a, r) in collect(cell)
+                if r.flo > 0 && ceil_khz > 0 && (ceil_khz - r.flo) / ceil_khz > 0.03
+                    delete!(cell, a)
+                    _MT_WINDOW_DROPPED[] += 1
+                end
+            end
+        end
         ops = get!(g, lvl, OpData[])
         i = findfirst(p -> p.first == nm, ops)
         isnothing(i) ? push!(ops, nm => [(ssz, cell)]) : push!(ops[i].second, (ssz, cell))
@@ -3052,6 +3085,14 @@ function load_cache(path)
             "per-arm provenance). v2 stored only the quotient, so it cannot be converted — the arm times " *
             "were never written. Re-measure with `bench`."
     )
+    # SAY SO. A cell dropped quietly is indistinguishable from a cell the sweep never measured, which is
+    # how a page ends up reporting a smaller, cleaner-looking set without stating what left it.
+    if _MT_WINDOW_DROPPED[] > 0
+        @printf(
+            "  %s: %d arm(s) EXCLUDED — did not hold the clock band their siblings held (throttled)\n",
+            basename(path), _MT_WINDOW_DROPPED[]
+        )
+    end
     return g, meta
 end
 
