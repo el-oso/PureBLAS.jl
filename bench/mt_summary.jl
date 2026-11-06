@@ -54,11 +54,23 @@ function cells(path)
             push!(wins, _window_of(_p))
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
-        # A cell whose arms did not share a clock BAND is excluded for the same reason an off-lock arm
-        # is: the ratio compares two machine states. The pin alone cannot see this — a threaded vendor
-        # arm can hold its pin and still spend part of its own window far below it, which is what
-        # `_freq_window_mismatch` reads off `flo|fhi`.
-        _freq_window_mismatch(wins) && (drift = true)
+        # An ARM that did not hold the clock band its siblings held is removed, for the same reason an
+        # off-lock arm is: a ratio against it compares two machine states. The pin alone cannot see this
+        # — a threaded vendor arm can hold its pin and still spend part of its own window far below it,
+        # which is what `_freq_window_mismatch` reads off `flo|fhi`.
+        #
+        # THE ARM, NOT THE CELL, matching `load_cache` in plots.jl: dropping the cell would also discard
+        # the `pb`/`pb_mt` pair, which shared one window and both held the clock, so the self-speedup
+        # rows would lose cells the panels keep.
+        if _freq_window_mismatch(wins)
+            ceil_khz = maximum(hi for (_, hi) in wins; init = 0)
+            for (i, f) in enumerate(p[4:end])
+                _p = split(f, "|"); lo = _window_of(_p)[1]
+                if lo > 0 && ceil_khz > 0 && (ceil_khz - lo) / ceil_khz > 0.03
+                    delete!(d, String(_p[1]))
+                end
+            end
+        end
         # An off-lock arm corrupts a ratio exactly as much here as in the gate: a floating clock between
         # the two windows IS the thing being measured otherwise. Count them, never average them in.
         drift && (offlock += 1; continue)
