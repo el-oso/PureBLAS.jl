@@ -1103,13 +1103,20 @@ _reps_quadratic(s) = clamp(20_000_000 ÷ (s * s), 1, 512)
 # ⚠ STILL REQUIRES CPU BOOST DISABLED (`echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost`,
 # performance governor) so the fixed clock keeps OB vs PB comparable. See memory dev-fleet.
                                        # `refs` mirrors `sweep`'s override, for DL3 — see the note there.
-# A context is either one array (`getrf`, `potrf`) or a tuple of them (everything else), so cloning and
-# restoring dispatch on that. Only these two shapes occur; a `Vector` here would be a context LIST and is
-# walked by the caller, never passed in.
+# A context is one array (`getrf`, `potrf`), a tuple of arrays (most cells), or a tuple mixing arrays
+# with immutable parameters — `gbtrf`'s is `(kl, ku, AB)`, two bandwidths and the band storage. Cloning
+# and restoring dispatch on that. A `Vector` here would be a context LIST, which the caller walks and
+# never passes in.
+#
+# THERE IS NO CATCH-ALL: a type that is neither an array, a tuple, nor one of the immutables below
+# raises instead of being passed through, because passing an unrecognised MUTABLE component through
+# would silently skip its restore and hand a destructive op its own previous output.
 _ctx_clone(x::AbstractArray) = copy(x)
 _ctx_clone(x::Tuple) = map(_ctx_clone, x)
+_ctx_clone(x::Union{Number, AbstractChar, Symbol}) = x
 _ctx_restore!(w::AbstractArray, m::AbstractArray) = (copyto!(w, m); w)
 _ctx_restore!(w::Tuple, m::Tuple) = (foreach(_ctx_restore!, w, m); w)
+_ctx_restore!(w::Union{Number, AbstractChar, Symbol}, ::Union{Number, AbstractChar, Symbol}) = w
 
 function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = _reps_cubic, refs = nothing)
     # Both PB arms belong in an explicit list — see the note in `sweep`.
