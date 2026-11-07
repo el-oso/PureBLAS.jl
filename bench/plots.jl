@@ -18,6 +18,7 @@
 using PureBLAS, LinearAlgebra, Statistics, Printf
 using ForwardDiff              # DL1: the only group whose reference is a Julia implementation, not a BLAS
 include(joinpath(@__DIR__, "gatecrit.jl"))   # gate_pass / GATE_MIN — THE gate criterion
+include(joinpath(@__DIR__, "freqgate.jl"))   # _window_of / _freq_window_mismatch — clock adjudicability
 include(joinpath(@__DIR__, "freqlock.jl")); using .FreqLock   # THE frequency-lock criterion
 using TOML                    # _active_prefs: enumerate pins so a silent one cannot ride along
 using Chairmarks: @be   # robust per-side timing (auto sample-sizing + warmup); replaces hand-rolled time_ns
@@ -1103,6 +1104,21 @@ _reps_quadratic(s) = clamp(20_000_000 ÷ (s * s), 1, 512)
 # ⚠ STILL REQUIRES CPU BOOST DISABLED (`echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost`,
 # performance governor) so the fixed clock keeps OB vs PB comparable. See memory dev-fleet.
                                        # `refs` mirrors `sweep`'s override, for DL3 — see the note there.
+# A context is one array (`getrf`, `potrf`), a tuple of arrays (most cells), or a tuple mixing arrays
+# with immutable parameters — `gbtrf`'s is `(kl, ku, AB)`, two bandwidths and the band storage. Cloning
+# and restoring dispatch on that. A `Vector` here would be a context LIST, which the caller walks and
+# never passes in.
+#
+# THERE IS NO CATCH-ALL: a type that is neither an array, a tuple, nor one of the immutables below
+# raises instead of being passed through, because passing an unrecognised MUTABLE component through
+# would silently skip its restore and hand a destructive op its own previous output.
+_ctx_clone(x::AbstractArray) = copy(x)
+_ctx_clone(x::Tuple) = map(_ctx_clone, x)
+_ctx_clone(x::Union{Number, AbstractChar, Symbol}) = x
+_ctx_restore!(w::AbstractArray, m::AbstractArray) = (copyto!(w, m); w)
+_ctx_restore!(w::Tuple, m::Tuple) = (foreach(_ctx_restore!, w, m); w)
+_ctx_restore!(w::Union{Number, AbstractChar, Symbol}, ::Union{Number, AbstractChar, Symbol}) = w
+
 function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = _reps_cubic, refs = nothing)
     # Both PB arms belong in an explicit list — see the note in `sweep`.
     armlist = isnothing(refs) ? nothing :
@@ -1111,13 +1127,33 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
     out = Tuple{Int, CellData}[]
     for s in sizes
         !isnothing(_SELSIZE) && s != _SELSIZE && continue     # `size=` selects ONE cell
-        # reps fresh contexts per sample: setup (EXCLUDED from timing) pre-generates them, the core runs the
-        # destructive op on each. reps→1 at large n; large at tiny n so a ~50 ns n=8 op isn't measured as a
-        # single sub-timer-resolution call (which fabricated n=8 "fails" — evals=1 alone can't amortize it).
+        # reps contexts per sample, RESTORED rather than reallocated: setup (EXCLUDED from timing)
+        # `copyto!`s each working context back from a pristine master, so the destructive op still gets
+        # untouched input on every sample while nothing is allocated or freed in the loop.
+        #
+        # ALLOCATING THEM PER SAMPLE MEASURED THE ALLOCATOR, NOT THE LIBRARY, and unevenly across the
+        # fleet. At n=1024 a square gemm context is 25 MB; churning that per sample cost the THREADED arm
+        # 37% on the 12-core chiplet box (self-speedup 3.56x against 5.65x) and ~1% on the two monolithic
+        # ones, while leaving the SERIAL arm unchanged on all three. Cache residency is not the mechanism:
+        # cycling through pre-allocated contexts — same residency, no churn — reads 5.65x, and `mk` writes
+        # every byte in setup anyway. Nor is it collection inside the window: Chairmarks reports 0% GC and
+        # 0 bytes for the timed core. What remains is the kernel work the churn creates around the call,
+        # which six worker threads absorb six times over against the serial arm's once.
+        #
+        # RESTORING, NOT CYCLING: a cycled context would hand a destructive op its own previous output.
+        # `trsm!` overwrites B and `getrf!` overwrites its argument, so the input has to be put back.
+        #
+        # reps→1 at large n; large at tiny n so a ~50 ns n=8 op isn't measured as a single
+        # sub-timer-resolution call (which fabricated n=8 "fails" — evals=1 alone can't amortize it).
         # `repsof` is overridable because the default assumes the swept size IS the problem dimension and
         # the op is O(s³); rows that sweep some other axis (pbtrf sweeps the BANDWIDTH at fixed n, cost
-        # O(n·kd²)) would otherwise be handed hundreds of full-size contexts to allocate.
+        # O(n·kd²)) would otherwise be handed hundreds of full-size contexts.
         reps = repsof(s)
+        masters = [mk(s) for _ in 1:reps]
+        works = [_ctx_clone(c) for c in masters]
+        restore_all!() = (for i in 1:reps
+                _ctx_restore!(works[i], masters[i])
+            end; works)
         rounds = _rounds_heavy(s)
         secs = s >= 1024 ? 2.0 : seconds   # large-n windows are seconds-bound; 2.0 is plenty and ~halves cost
         acc = ArmData(); rmeds = Float64[]
@@ -1133,7 +1169,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
                 # single number that was never true. Two /sys reads per arm-round against a ≥0.5 s
                 # window is unmeasurable overhead.
                 _khz_sample!(a)
-                b = @be [mk(s) for _ in 1:reps] (
+                b = @be restore_all!() (
                     cs -> (
                         v = 0.0; for c in cs
                             v += f(c)
@@ -2950,7 +2986,22 @@ function save_cache(path, groups)
 end
 # Returns (groups, meta::NamedTuple). meta carries version/slug/isa/host from the header (µarch identity
 # for the multi-host overlay). Refuses a cache from an older methodology version (forces re-measure).
-function load_cache(path)
+# Set per `load_cache` call: only a threaded cache can contain an arm that loaded every core, so only
+# there does the cross-arm clock-band filter below apply. The counter is reported by the caller, because
+# a filter that drops cells silently reads exactly like a cache that never had them.
+const _IS_MT_CACHE = Ref(false)
+const _MT_WINDOW_DROPPED = Ref(0)
+
+# `drop_throttled` MUST stay false on the MERGE path, and that is not a preference.
+#
+# The merge loads the cache, folds the freshly measured arms in, and writes the whole thing back. A
+# filter applied during that load therefore does not hide an arm from a view — it DELETES it from the
+# file. Shipped true-by-default for one run and it destroyed 1224 cached reference arms across 632
+# cells (Zen4 26, Zen3 235, Zen5 963), which is hours of vendor measurement that only existed on disk.
+# Only the RENDER and REPORT paths pass true.
+function load_cache(path; drop_throttled::Bool = false)
+    _IS_MT_CACHE[] = drop_throttled && occursin("mt_data_", basename(path))
+    _MT_WINDOW_DROPPED[] = 0
     g = Dict{String, Vector{OpData}}()
     meta = (version = 1, slug = "?", uarch = "?", isa = "?", host = "?", cpu = "?", commit = "?", time = "?")  # legacy ⇒ v1
     for ln in eachline(path)
@@ -3008,6 +3059,30 @@ function load_cache(path)
                 parse.(Float64, split(csv, ","))
             )
         end
+        # THREADED CACHES ONLY: drop an ARM that did not hold the clock band its siblings held. A
+        # threaded reference arm can hold its pin and still spend part of its own window far below it —
+        # six cores of a vendor BLAS on a power-limited part pull the package clock down where one core
+        # never does — and a ratio against it compares two machine states in PureBLAS's FAVOUR, because
+        # a throttled reference is a slower reference.
+        #
+        # THE ARM, NOT THE CELL. Dropping the cell would also strip it from the "what threading bought"
+        # panels, where `pb` and `pb_mt` shared one window and both held the clock — valid data thrown
+        # away because a vendor arm misbehaved. Removing just the offending arm leaves each view to do
+        # what it already does: the gate view falls back to the other reference, or drops the cell when
+        # no threaded reference survives, and the self-speedup view is untouched.
+        #
+        # Gated to `mt_data_` because only a threaded arm can load every core. The serial caches have
+        # their own anchor and clock questions, and silently reshaping the published serial panels is not
+        # this filter's job.
+        if _IS_MT_CACHE[] && _freq_window_mismatch([(r.flo, r.fhi) for r in values(cell)])
+            ceil_khz = maximum(r.fhi for r in values(cell); init = 0)
+            for (a, r) in collect(cell)
+                if r.flo > 0 && ceil_khz > 0 && (ceil_khz - r.flo) / ceil_khz > 0.03
+                    delete!(cell, a)
+                    _MT_WINDOW_DROPPED[] += 1
+                end
+            end
+        end
         ops = get!(g, lvl, OpData[])
         i = findfirst(p -> p.first == nm, ops)
         isnothing(i) ? push!(ops, nm => [(ssz, cell)]) : push!(ops[i].second, (ssz, cell))
@@ -3017,6 +3092,14 @@ function load_cache(path)
             "per-arm provenance). v2 stored only the quotient, so it cannot be converted — the arm times " *
             "were never written. Re-measure with `bench`."
     )
+    # SAY SO. A cell dropped quietly is indistinguishable from a cell the sweep never measured, which is
+    # how a page ends up reporting a smaller, cleaner-looking set without stating what left it.
+    if _MT_WINDOW_DROPPED[] > 0
+        @printf(
+            "  %s: %d arm(s) EXCLUDED — did not hold the clock band their siblings held (throttled)\n",
+            basename(path), _MT_WINDOW_DROPPED[]
+        )
+    end
     return g, meta
 end
 
@@ -3054,7 +3137,9 @@ function load_fleet(prefix::AbstractString = "plots_data_")
         (occursin("_aocl", f) || occursin("_mkl", f)) && continue   # skip leftover v2 split caches
         occursin("_lite", f) == _LITE || continue
         try                                                    # a stale/foreign/half-written cache must NOT
-            g, meta = load_cache(joinpath(@__DIR__, f))        # abort the whole fleet render — skip it loudly
+            # RENDER path: a throttled arm must not be drawn, so it is filtered out of the view here.
+            # Nothing on this path writes the cache back, which is what makes the filter safe to apply.
+            g, meta = load_cache(joinpath(@__DIR__, f); drop_throttled = true)   # a stale/foreign/half-written cache must NOT
             push!(fleet, (meta, g))
         catch e
             @warn "skipping cache $f (stale version or unreadable)" exception = (e, catch_backtrace())
@@ -3253,9 +3338,10 @@ end
 # ── measure (and cache) or load from cache, then draw ────────────────────────────────────────────
 if "plot" in ARGS
     isfile(CACHE) || error("no cache at $CACHE — run without `plot` first to measure")
-    g, _meta = load_cache(CACHE); println("loaded cached data ← $CACHE")
+    # Both of these are PLOT-ONLY paths — no `bench`, so nothing is written back and the filter is safe.
+    g, _meta = load_cache(CACHE; drop_throttled = true); println("loaded cached data ← $CACHE")
 elseif !("bench" in ARGS) && isfile(CACHE)
-    g, _meta = load_cache(CACHE); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
+    g, _meta = load_cache(CACHE; drop_throttled = true); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
 else
     _require_lock()        # an off-lock run is INVALID, not merely noisy — refuse at second zero
     _MEASURED_ANYTHING[] = true
