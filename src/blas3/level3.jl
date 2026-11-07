@@ -3718,13 +3718,17 @@ end
 #               0 ships: column-group-outer, see `_PACK_CG`). With 1, a pass reads one line from each
 #               of `kce` columns at stride `lda`, which folds into one L1 set whenever the byte stride
 #               is a multiple of `_L1_WAY_BYTES`. Tests the traversal against the fold directly.
+#   _EXPINT[15] 1 = restore the FULL-HEIGHT `ic` loop in `_trgemm_packed!` (A/B arm; 0 ships: pack
+#               only the rows the column block can reach). The surviving tiles are the same either
+#               way, so this arm changes work done and not results — it prices the discarded copying,
+#               which is nearly free on one thread and 7-19% of runtime on six.
 #
 # ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
 # OUT-OF-BOUNDS READ that no test will catch — `@inbounds` deletes the check, and a stale heap value
 # that happens to be 0 looks exactly like "knob off". That is not hypothetical: on 2026-08-18 a revert
 # removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
 # read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
-const _EXPINT = fill(0, 14)
+const _EXPINT = fill(0, 15)
 const _EXPFLAG = fill(false, 19)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
@@ -6161,8 +6165,23 @@ function _trgemm_packed!(
                 kce = min(kc, k - pc)
                 b0 = OV && pc == 0             # overwrite C on the FIRST k-block (β=0 fast path), else add
                 _pack_B!(Bp, Y, pc, jc, kce, nce, tYp, nr)
-                ic = 0
-                while ic < n
+                # PACK ONLY THE ROWS THIS COLUMN BLOCK CAN REACH. `_trgemm_tiles!` already drops the
+                # tiles outside the stored triangle, but the pack above it ran the full height of A for
+                # every block, so those rows were copied to be discarded. Upper storage holds `i <= j`,
+                # so a block whose last column is `jc + nce - 1` cannot reach a row past it; lower holds
+                # `i >= j`, so it cannot reach a row before `jc`. The surviving tiles, and therefore the
+                # result, are identical — only the copying stops.
+                #
+                # It is worth the two tokens because the pack is nearly free on one thread and is not on
+                # six: each worker repacks A for its own blocks, so the redundancy scales with the worker
+                # count. Measured on Zen4 by stubbing `_pack_A!` out of this kernel entirely, 6 workers
+                # against 1, syrk at n=1024/2048/4096: the pack is 7.7%/7.1%/19.0% of threaded runtime
+                # and 0.4%/-0.4%/0.9% of serial.
+                # `_EXPINT[15]` is the A/B arm: 1 restores the full-height loop.
+                full = !iszero(@inbounds _EXPINT[15])
+                ic = (up || full) ? 0 : (jc ÷ mc) * mc
+                ilim = (up && !full) ? min(n, jc + nce) : n
+                while ic < ilim
                     mce = min(mc, n - ic)
                     # PACK UNSCALED, APPLY α AT THE STORE, matching `_trgemm_packed_u!`. Folding α
                     # into the pack computes Σ(α·a)·b where the store form computes Σ α·(a·b); the
