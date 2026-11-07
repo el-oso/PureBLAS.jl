@@ -110,9 +110,17 @@ _use_pb!(a::AbstractString) = (BLAS.set_num_threads(1); PureBLAS.set_num_threads
 const _ARMS_SEL = let i = findfirst(a -> startswith(a, "arms="), ARGS)   # `let` — see _SELOP
     isnothing(i) ? nothing : split(ARGS[i][6:end], ",")
 end
-# One cell, not a whole op: `op=trmv size=512`. Sizes are matched exactly against the op's own list.
+# One cell, or a chosen few: `op=trmv size=512` or `op=trmv size=512,1024,2048`. Sizes are matched
+# exactly against the op's own list.
+#
+# A COMMA LIST EXISTS BECAUSE STARTUP DOMINATES A SINGLE-CELL RUN. Loading this file pulls in PureBLAS,
+# AOCL and OpenBLAS and then runs the contention and lock checks, which is about half of a 63 s
+# single-cell invocation on Zen3. Repairing a scattered set of cells one `size=` at a time therefore
+# pays that fixed cost per cell, while `op=` amortises it and then measures every size of the routine —
+# roughly ten times the work when two or three cells need fixing. The list gives one process per op and
+# only the cells that need it.
 const _SELSIZE = let i = findfirst(a -> startswith(a, "size="), ARGS)   # `let` — see _SELOP below
-    isnothing(i) ? nothing : parse(Int, ARGS[i][6:end])
+    isnothing(i) ? nothing : Set(parse(Int, s) for s in split(ARGS[i][6:end], ",") if !isempty(s))
 end
 # AOCL = AMD's Zen-tuned AOCL-BLIS + AOCL-libFLAME, shipped as the `AOCL_jll` artifact (AMD's own release,
 # NOT generic blis_jll/libflame_jll). We LBT-forward its artifact .so paths directly (BLAS→libblis-mt,
@@ -1010,7 +1018,7 @@ function sweep(mk, sizes, work_ob, work_pb, repfn; samples = 400, seconds = 0.15
         vcat(_DO_PB ? [_ARM_PB] : String[], _DO_PB_MT ? [_ARM_PB_MT] : String[],
             [a for a in refs if isnothing(_ARMS_SEL) || a in _ARMS_SEL])
     for s in sizes
-        !isnothing(_SELSIZE) && s != _SELSIZE && continue     # `size=` selects ONE cell
+        !isnothing(_SELSIZE) && s ∉ _SELSIZE && continue     # `size=` selects the listed cells
         reps = repfn(s)
         rounds = _rounds_light(s); rmeds = Float64[]
         # Accumulate per arm. Every arm is measured inside the SAME round, so the quantile vectors that
@@ -1126,7 +1134,7 @@ function sweep_heavy(mk, ob1, pb1, sizes; samples = 64, seconds = 4.0, repsof = 
             [a for a in refs if isnothing(_ARMS_SEL) || a in _ARMS_SEL])
     out = Tuple{Int, CellData}[]
     for s in sizes
-        !isnothing(_SELSIZE) && s != _SELSIZE && continue     # `size=` selects ONE cell
+        !isnothing(_SELSIZE) && s ∉ _SELSIZE && continue     # `size=` selects the listed cells
         # reps contexts per sample, RESTORED rather than reallocated: setup (EXCLUDED from timing)
         # `copyto!`s each working context back from a pristine master, so the destructive op still gets
         # untouched input on every sample while nothing is allocated or freed in the loop.
@@ -2991,6 +2999,9 @@ end
 # a filter that drops cells silently reads exactly like a cache that never had them.
 const _IS_MT_CACHE = Ref(false)
 const _MT_WINDOW_DROPPED = Ref(0)
+# Per-box tally of arms the filter removed, keyed by µarch slug, so the legend of a threaded GATE panel
+# can state it beside the curve it shortened.
+const _THROTTLED_BY_SLUG = Dict{String, Int}()
 
 # `drop_throttled` MUST stay false on the MERGE path, and that is not a preference.
 #
@@ -3140,6 +3151,12 @@ function load_fleet(prefix::AbstractString = "plots_data_")
             # RENDER path: a throttled arm must not be drawn, so it is filtered out of the view here.
             # Nothing on this path writes the cache back, which is what makes the filter safe to apply.
             g, meta = load_cache(joinpath(@__DIR__, f); drop_throttled = true)   # a stale/foreign/half-written cache must NOT
+            # REMEMBER HOW MANY ARMS THAT REMOVED, PER BOX, so the legend can say why a curve stops.
+            # Without it a reader sees a short curve and concludes the box was not measured or the
+            # library does not run there, when in fact every size WAS measured and the box's threaded
+            # REFERENCE could not hold its clock. A filter that shortens a published curve has to say so
+            # in the figure, not only in the page around it.
+            _THROTTLED_BY_SLUG[meta.slug] = _MT_WINDOW_DROPPED[]
             push!(fleet, (meta, g))
         catch e
             @warn "skipping cache $f (stale version or unreadable)" exception = (e, catch_backtrace())
@@ -3260,6 +3277,11 @@ function svg_panels(path, title, fleet, gk, ref::AbstractString = REFBK; only = 
     lx = ml
     for (meta, _) in fleet   # legend
         col = _ucolor(meta.slug); lab = _ulabel(meta)
+        # A curve that stops early because its REFERENCE throttled must say so here. The count is the
+        # arms this box lost to the clock-band filter; a cell left with no threaded reference cannot be
+        # drawn at all, which is what shortens the line.
+        nd = get(_THROTTLED_BY_SLUG, meta.slug, 0)
+        nd > 0 && (lab = "$lab — $nd ref arms throttled")
         println(io, """<line x1="$lx" y1="42" x2="$(lx + 22)" y2="42" stroke="$col" stroke-width="3"/>""")
         println(io, """<text x="$(lx + 27)" y="46" font-size="12">$lab</text>""")
         lx += 27 + 7 * length(lab) + 26
