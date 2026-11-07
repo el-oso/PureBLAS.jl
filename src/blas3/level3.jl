@@ -1655,7 +1655,7 @@ function trmm!(
     if !sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
             _strided1(A) && _strided1(B) && size(B, 2) == k &&
             !_trmmr_sme_owns(Float64, k, size(B, 1), A, B)
-        nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
+        nwr = _trmm_workers_r(k, size(B, 1), eltype(B))
         if nwr > 1
             rA = _root(A); rB = _root(B)
             GC.@preserve rA rB _gemm_threaded!(
@@ -5223,6 +5223,27 @@ end
     nt > 1 || return 1
     flops = k * k * m
     (flops < _GEMM_MT_WORK || m < _MR * _vwidth(T)) && return 1
+    # Gate, not ration — the argument is at `_gemm_workers`.
+    return max(1, min(nt, cld(m, _MR * _vwidth(T))))
+end
+
+# side-R trmm's worker count: `_trsm_workers_r` with the same halved floor side L takes, and for the
+# same reason. The row split is the mirror of side L's column split and amortises the same way, which
+# the measurement bears out — forcing the pool at six workers, bit-identical to serial, gain by flop
+# count on Zen4/Zen3:
+#
+#       32768   0.77 / 0.69      <- loses
+#       64000   1.11 / 1.18
+#      125000   1.57 / 1.24
+#      262144   1.72 / 1.85
+#
+# The side-R SOLVE at 125000 flops is what the shared floor is set for; the side-R PRODUCT pays there
+# on both boxes. Half admits 125000 and still refuses 64000.
+@inline function _trmm_workers_r(k::Int, m::Int, ::Type{T}) where {T}
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    flops = k * k * m
+    (flops < _GEMM_MT_WORK ÷ 2 || m < _MR * _vwidth(T)) && return 1
     # Gate, not ration — the argument is at `_gemm_workers`.
     return max(1, min(nt, cld(m, _MR * _vwidth(T))))
 end
