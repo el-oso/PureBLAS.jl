@@ -179,14 +179,14 @@ Best speedup per operation, six threads against one, on each box.
 | L1 `swap` | 4.26× @100000 | 6.40× @1000000 | 6.70× @300000 |
 | L2 `gemvTrect` | 5.38× @758 | 5.79× @2880 | 6.69× @758 |
 | L1 `asum` | 4.01× @300000 | 4.56× @1000000 | 6.30× @300000 |
-| L1 `nrm2` | 3.70× @100000 | 4.65× @1000000 | 6.27× @300000 |
+| L1 `nrm2` | 3.90× @300000 | 4.65× @1000000 | 6.27× @300000 |
 | L2 `gemvNrect` | 3.18× @384 | 4.78× @448 | 6.03× @758 |
 | L1 `dot` | 3.86× @100000 | 5.58× @1000000 | 6.00× @300000 |
 | L3 `trsm` | 5.67× @1000 | 5.77× @1000 | 5.93× @2100 |
 | L3 `trmm` | 5.74× @1000 | 5.72× @1000 | 5.92× @2100 |
 | L1 `scal` | 4.60× @100000 | 4.31× @300000 | 5.86× @1000000 |
 | L3 `trsmRrect` | 5.86× @2880 | 5.82× @2880 | 5.86× @2880 |
-| L3 `gemm` | 5.80× @1000 | 5.71× @1000 | 5.76× @1000 |
+| L3 `gemm` | 5.80× @1000 | 5.71× @1000 | 5.74× @1000 |
 | L3 `trmmR` | 5.76× @1000 | 5.60× @1000 | 5.69× @1024 |
 | L2 `gemvT` | 5.15× @512 | 5.00× @1024 | 5.74× @1024 |
 | L1 `iamax` | 4.46× @300000 | 4.36× @1000000 | 5.67× @1000000 |
@@ -225,11 +225,11 @@ Best speedup per operation, six threads against one, on each box.
 
 ### Zen3 · AVX2
 
-Measured 2026-11-07T07:10 at commit `39d36ab3`, AMD Ryzen 9 5900X 12-Core Processor, pinned at 3701 MHz with boost off.
+Measured 2026-11-07T10:25 at commit `32999407`, AMD Ryzen 9 5900X 12-Core Processor, pinned at 3701 MHz with boost off.
 
 1142 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
-245 reference arm(s) in this cache are EXCLUDED from the gate: they did not hold the clock band
+1 reference arm(s) in this cache are EXCLUDED from the gate: they did not hold the clock band
 their sibling arms held in the same cell. A threaded vendor arm can keep its pin on paper and
 still spend part of its own window far below it, because six cores of a vendor BLAS on a
 power-limited part pull the package clock down where one core never does. A ratio against such an
@@ -269,8 +269,8 @@ unaffected; it is the gate panels that lose cells.
 | L1 `asum` | **4.01×** | 300000 | 21% |
 | L2 `gbmvN` | **3.98×** | 4096 | 1% |
 | LP `getrf` | **3.93×** | 4096 | 0% |
+| L1 `nrm2` | **3.90×** | 300000 | 30% |
 | L1 `dot` | **3.86×** | 100000 | 2% |
-| L1 `nrm2` | **3.70×** | 100000 | 2% |
 | LP `geqp3` | **3.50×** | 2048 | 0% |
 | LP `gels` | **3.45×** | 1024 | 1% |
 | LP `pptrfL` | **3.43×** | 1024 | 0% |
@@ -308,15 +308,6 @@ unaffected; it is the gate panels that lose cells.
 Measured 2026-11-07T02:58 at commit `801db45f`, AMD Ryzen 5 7640U w/ Radeon 760M Graphics, pinned at 3501 MHz with boost off.
 
 1142 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
-
-26 reference arm(s) in this cache are EXCLUDED from the gate: they did not hold the clock band
-their sibling arms held in the same cell. A threaded vendor arm can keep its pin on paper and
-still spend part of its own window far below it, because six cores of a vendor BLAS on a
-power-limited part pull the package clock down where one core never does. A ratio against such an
-arm compares two machine states, and the error runs in PureBLAS's FAVOUR — a throttled reference
-is a slower reference — so those arms are dropped rather than drawn. The `pb` and `pb_mt` arms of
-the same cells shared one window and held the clock, so the self-speedup figures below are
-unaffected; it is the gate panels that lose cells.
 
 **Where threading pays.** Best cell per operation:
 
@@ -392,11 +383,11 @@ unaffected; it is the gate panels that lose cells.
 
 ### Zen5 · AVX-512
 
-Measured 2026-11-07T03:22 at commit `801db45f`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
+Measured 2026-11-07T14:36 at commit `32999407`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
 
-1125 cells measured, 17 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
+1129 cells measured, 13 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
-963 reference arm(s) in this cache are EXCLUDED from the gate: they did not hold the clock band
+277 reference arm(s) in this cache are EXCLUDED from the gate: they did not hold the clock band
 their sibling arms held in the same cell. A threaded vendor arm can keep its pin on paper and
 still spend part of its own window far below it, because six cores of a vendor BLAS on a
 power-limited part pull the package clock down where one core never does. A ratio against such an
@@ -421,7 +412,7 @@ unaffected; it is the gate panels that lose cells.
 | L3 `trmm` | **5.92×** | 2100 | 0% |
 | L1 `scal` | **5.86×** | 1000000 | 7% |
 | L3 `trsmRrect` | **5.86×** | 2880 | 0% |
-| L3 `gemm` | **5.76×** | 1000 | 1% |
+| L3 `gemm` | **5.74×** | 1000 | 0% |
 | L2 `gemvT` | **5.74×** | 1024 | 1% |
 | L3 `trmmR` | **5.69×** | 1024 | 0% |
 | L1 `iamax` | **5.67×** | 1000000 | 6% |
@@ -474,7 +465,7 @@ microarchitectures — though not equally, which is itself a clue:
 
 | box | n=256 | n=512 | n=1000 | n=1024 | n=2048 |
 |---|---|---|---|---|---|
-| Zen3 · AVX2 | — | — | — | — | 3.17× |
+| Zen3 · AVX2 | 1.20× | 1.19× | 1.95× | 1.71× | 3.17× |
 | Zen4 · AVX-512 | 1.40× | 1.90× | 2.68× | 2.57× | 2.97× |
 | Zen5 · AVX-512 | 1.50× | 2.15× | 3.02× | 2.86× | 3.25× |
 
