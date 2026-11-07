@@ -5368,6 +5368,40 @@ end
     return nothing
 end
 
+# One worker's column band of a side-L symm, WITH ITS OWN EXPANSION of the symmetric operand.
+#
+# The driver-expands form has the driver write one buffer and every worker read it, which costs the
+# handoff of lines dirty in the driver's cache: measured on Zen4 at n=100, the two phases cost 1.88x
+# their own sum at six workers and exactly 1.00x of it at ONE worker, so the expansion is not the
+# problem and the sharing is. Six concurrent expansions cost about one expansion's wall-clock, so
+# expanding per worker removes the handoff without paying six times over.
+#
+# `_symm_scr_mt` is `OncePerTask` and the workers ARE tasks, so each one gets its own buffer here —
+# which is what makes the write and the read land on the same core. That ownership is also what
+# guarantee 3 requires of a buffer a worker holds, and it is satisfied for a stronger reason than
+# usual: this buffer never crosses a join at all.
+#
+# THE ROUTE TOKEN CARRIES THE UNDIVIDED EXTENTS. A size-keyed predicate reading the band's own column
+# count would pick different arithmetic per worker and the bands would disagree bit for bit, which
+# req#11 forbids; `(p.m, p.n, p.m)` is the whole problem's (m, n, k). It also keeps Strassen's own
+# decision on the undivided shape, so the band cannot take the recursion when the whole call declined
+# it — the driver only routes here when `_strassen_owns` is false for the undivided problem.
+@noinline function _symm_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    n = p.m                                               # side L: A is m×m and m is C's row count
+    Ad = view(_symm_scr_mt(T, n), 1:n, 1:n)               # THIS worker's own twin
+    As = PtrMatrix{T}(p.Ap, n, n, p.lda)
+    _symm_materialize!(Ad, p.up, false, As, n)
+    Bc = PtrMatrix{T}(p.Bp + j0 * p.ldb * sizeof(T), n, len, p.ldb)
+    Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
+    _gemm_core!(
+        Cc, Ad, Bc, p.alpha, p.beta, false, false, false, false,
+        (p.m, p.n, p.m), _STR_FLOOR, 1
+    )
+    return nothing
+end
+
 @inline function _trsm_run_chunk(p::GemmPool{T}, nw::Int, i::Int) where {T}
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
@@ -7885,6 +7919,23 @@ const _CSYMM_PACK_CUT = @load_preference("csymm_pack_cut", _CHEMM_PACK_CUT)::Int
 @inline _symm_sme_owns(::Type{T}, m::Int, nc::Int, n::Int, C, B) where {T} =
     _sme_owns(T, m, nc, n, false, false, false, false, C, B, B)
 
+# Largest `n` at which a PER-WORKER expansion of the symmetric operand beats one shared expansion.
+#
+# The per-worker form trades `nw` copies of an n×n buffer for the removal of a cross-core handoff, so it
+# pays exactly while those `nw` buffers still live in cache together. Half of L3 is the share to leave
+# them, the same policy `_l1_block`'s ½ states for its own level, and solving
+# `nw·n²·sizeof(T) ≤ ½·L3` for n is the whole rule — no size literal, and it moves with the detected
+# L3 and with the worker count.
+#
+# Measured on Zen4 (16 MB L3, six workers ⇒ this returns 418), per-worker over shared, bit-identical at
+# every size: 1.54x at n=100, 1.66x at 128, 1.45x at 192, 1.34x at 224, 1.27x at 320, 1.25x at 384,
+# 1.15x at 448, then 0.79x at 480 and 512. The rule lands between 448 and 480 as it should, erring to
+# the side of refusing a size that still wins slightly rather than admitting one that loses.
+# PDM: Derived — cache residency of `nw` private buffers against the detected L3; no candidate set and
+# nothing to measure once the residency criterion is fixed. | tune: none
+@inline _symm_perworker_max(::Type{T}, nw::Int) where {T} =
+    floor(Int, sqrt(_L3_BYTES / (2 * max(1, nw) * sizeof(T))))
+
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
     # Complex side-L in the 3M window → fuse the reflection into the 3M A-split (no materialize, no n²
@@ -7930,6 +7981,25 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
         _strided1(B) && _strided1(C) &&
         !_symm_sme_owns(T, size(C, 1), size(C, 2), n, C, B) ?
         _gemm_workers(size(C, 1), size(C, 2), n) : 1
+    # PER-WORKER EXPANSION, when it pays. The driver-expands form below has one buffer written by the
+    # driver and read by every worker, and that handoff — not the expansion — is what costs: 1.88x the
+    # sum of the two phases at n=100 on Zen4, and exactly 1.00x of it at ONE worker. `_MT_KIND_SYMM`
+    # moves the expansion into the chunk, where each worker writes and reads its own `OncePerTask`
+    # buffer on one core. Measured against this path, bit-identical at every size: 1.54x at n=100,
+    # 1.66x at 128, 1.45x at 192, 1.25x at 384, 1.15x at 448, and 0.79x at 480 — so it is gated.
+    #
+    # Real only, because the chunk expands with `herm = false`; complex side L already has its own
+    # no-materialize 3M route above, and complex side R keeps this path.
+    if side_left && T <: BlasReal && nw > 1 && _strided1(A) &&
+            n <= _symm_perworker_max(T, nw) &&
+            !_strassen_owns(T, size(C, 1), size(C, 2), n, false, A, B, _STR_FLOOR)
+        rA = _root(A); rB = _root(B); rC = _root(C)
+        GC.@preserve rA rB rC _gemm_threaded!(
+            _pm(C), _pm(A), _pm(B), convert(T, α), convert(T, β),
+            false, false, false, false, nw, _MT_KIND_SYMM, up, false, false
+        )
+        return C
+    end
     Ad = view(nw > 1 ? _symm_scr_mt(T, n) : _symm_scr(T, n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)
     aT = convert(T, α); bT = convert(T, β)  # straight to the dispatch core, both real &

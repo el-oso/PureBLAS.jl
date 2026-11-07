@@ -4415,6 +4415,20 @@ const _MT_KIND_ELEM = 19
 # req8-ok: enum discriminant, host-invariant by construction — see the two lines above
 const _MT_KIND_TRMM = 20
 
+# Side-L symm with a PER-WORKER expansion of the symmetric operand: each worker expands A into its own
+# buffer and then runs an ordinary product on its own column band of C, instead of the driver expanding
+# once into one buffer that every worker then reads.
+#
+# WHY A SEPARATE KIND RATHER THAN THE GEMM KIND. The gemm job takes a dense A that already exists; here
+# the expansion is part of the chunk, which is the entire point. Measured on Zen4, the driver-expands
+# form costs 1.88x the SUM of its two phases at n=100, and exactly 1.00x of that sum at ONE worker — so
+# the cost is not the expansion but the handoff of lines dirty in the driver's cache to five readers.
+# Six concurrent expansions cost about one expansion's wall-clock, so moving it into the chunk removes
+# the handoff without paying six times for the copy.
+# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
+# req8-ok: enum discriminant, host-invariant by construction
+const _MT_KIND_SYMM = 21
+
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
 @inline _is_reduction(kind::Int) =
@@ -4616,6 +4630,7 @@ end
     p.kind == _MT_KIND_TRSMR && return _trsmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMMR && return _trmmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMM && return _trmm_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_SYMM && return _symm_run_chunk(p, nw, i)
     p.kind == _MT_KIND_AXPY && return _axpy_run_chunk(p, nw, i)
     p.kind == _MT_KIND_DOT && return _dot_run_chunk(p, nw, i)
     p.kind == _MT_KIND_ASUM && return _asum_run_chunk(p, nw, i)
