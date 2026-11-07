@@ -183,16 +183,16 @@ Best speedup per operation, six threads against one, on each box.
 | L2 `gemvNrect` | 3.18× @384 | 4.78× @448 | 6.03× @758 |
 | L1 `dot` | 3.86× @100000 | 5.58× @1000000 | 6.00× @300000 |
 | L3 `trsm` | 5.67× @1000 | 5.77× @1000 | 5.93× @2100 |
-| L3 `trmm` | 5.74× @1000 | 5.72× @1000 | 5.92× @2100 |
+| L3 `trmm` | 5.74× @1000 | 5.74× @2100 | 5.93× @2100 |
 | L1 `scal` | 4.60× @100000 | 4.31× @300000 | 5.86× @1000000 |
 | L3 `trsmRrect` | 5.86× @2880 | 5.82× @2880 | 5.86× @2880 |
 | L3 `gemm` | 5.80× @1000 | 5.71× @1000 | 5.74× @1000 |
-| L3 `trmmR` | 5.76× @1000 | 5.60× @1000 | 5.69× @1024 |
+| L3 `trmmR` | 5.76× @1000 | 5.61× @1000 | 5.71× @1024 |
 | L2 `gemvT` | 5.15× @512 | 5.00× @1024 | 5.74× @1024 |
 | L1 `iamax` | 4.46× @300000 | 4.36× @1000000 | 5.67× @1000000 |
+| L3 `syr2k` | 5.44× @2100 | 5.01× @4096 | 5.64× @4096 |
 | L3 `trsmR` | 5.48× @1000 | 5.37× @1000 | 5.61× @2100 |
-| L3 `syrk` | 5.30× @1000 | 5.16× @2048 | 5.46× @2100 |
-| L3 `syr2k` | 5.44× @2100 | 4.53× @2100 | 5.39× @4096 |
+| L3 `syrk` | 5.30× @1000 | 5.12× @2100 | 5.54× @2100 |
 | LP `geqrf` | 4.49× @2100 | 4.30× @4096 | 5.39× @4096 |
 | LP `potrfU` | 5.39× @4096 | 5.09× @4096 | 5.31× @4096 |
 | L3 `symm` | 4.66× @2100 | 4.88× @1000 | 5.38× @1000 |
@@ -305,7 +305,7 @@ unaffected; it is the gate panels that lose cells.
 
 ### Zen4 · AVX-512
 
-Measured 2026-11-07T02:58 at commit `801db45f`, AMD Ryzen 5 7640U w/ Radeon 760M Graphics, pinned at 3501 MHz with boost off.
+Measured 2026-11-07T21:33 at commit `76875076`, AMD Ryzen 5 7640U w/ Radeon 760M Graphics, pinned at 3501 MHz with boost off.
 
 1142 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
@@ -318,15 +318,16 @@ Measured 2026-11-07T02:58 at commit `801db45f`, AMD Ryzen 5 7640U w/ Radeon 760M
 | L3 `trsmRrect` | **5.82×** | 2880 | 1% |
 | L2 `gemvTrect` | **5.79×** | 2880 | 2% |
 | L3 `trsm` | **5.77×** | 1000 | 0% |
-| L3 `trmm` | **5.72×** | 1000 | 0% |
+| L3 `trmm` | **5.74×** | 2100 | 0% |
 | L3 `gemm` | **5.71×** | 1000 | 0% |
-| L3 `trmmR` | **5.60×** | 1000 | 0% |
+| L3 `trmmR` | **5.61×** | 1000 | 1% |
 | L1 `dot` | **5.58×** | 1000000 | 7% |
 | L1 `axpy` | **5.39×** | 1000000 | 9% |
 | L3 `trsmR` | **5.37×** | 1000 | 1% |
-| L3 `syrk` | **5.16×** | 2048 | 1% |
 | LP `trtri` | **5.12×** | 2048 | 0% |
+| L3 `syrk` | **5.12×** | 2100 | 1% |
 | LP `potrfU` | **5.09×** | 4096 | 1% |
+| L3 `syr2k` | **5.01×** | 4096 | 1% |
 | L2 `gemvT` | **5.00×** | 1024 | 2% |
 | L2 `ger` | **4.88×** | 512 | 2% |
 | L3 `symm` | **4.88×** | 1000 | 0% |
@@ -337,7 +338,6 @@ Measured 2026-11-07T02:58 at commit `801db45f`, AMD Ryzen 5 7640U w/ Radeon 760M
 | L1 `nrm2` | **4.65×** | 1000000 | 2% |
 | LP `potrf` | **4.60×** | 2100 | 0% |
 | L1 `asum` | **4.56×** | 1000000 | 6% |
-| L3 `syr2k` | **4.53×** | 2100 | 1% |
 | L1 `iamax` | **4.36×** | 1000000 | 6% |
 | L1 `scal` | **4.31×** | 300000 | 12% |
 | LP `geqrf` | **4.30×** | 4096 | 1% |
@@ -372,6 +372,7 @@ Measured 2026-11-07T02:58 at commit `801db45f`, AMD Ryzen 5 7640U w/ Radeon 760M
 | LP `potrf` | 128 | **0.90×** | 1% |
 | LP `pstrf` | 128 | **0.91×** | 1% |
 | LP `potri` | 100 | **0.91×** | 1% |
+| L3 `trmmR` | 8 | **0.91×** | 0% |
 | LP `pstrfU` | 128 | **0.92×** | 2% |
 | LP `geqp3` | 128 | **0.93×** | 0% |
 | LP `pbtrfU` | 128 | **0.93×** | 0% |
@@ -383,7 +384,7 @@ Measured 2026-11-07T02:58 at commit `801db45f`, AMD Ryzen 5 7640U w/ Radeon 760M
 
 ### Zen5 · AVX-512
 
-Measured 2026-11-07T14:36 at commit `32999407`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
+Measured 2026-11-07T21:36 at commit `9f9c295f`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
 
 1129 cells measured, 13 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
 
@@ -409,16 +410,16 @@ unaffected; it is the gate panels that lose cells.
 | L2 `gemvNrect` | **6.03×** | 758 | 14% |
 | L1 `dot` | **6.00×** | 300000 | 4% |
 | L3 `trsm` | **5.93×** | 2100 | 0% |
-| L3 `trmm` | **5.92×** | 2100 | 0% |
+| L3 `trmm` | **5.93×** | 2100 | 0% |
 | L1 `scal` | **5.86×** | 1000000 | 7% |
 | L3 `trsmRrect` | **5.86×** | 2880 | 0% |
 | L3 `gemm` | **5.74×** | 1000 | 0% |
 | L2 `gemvT` | **5.74×** | 1024 | 1% |
-| L3 `trmmR` | **5.69×** | 1024 | 0% |
+| L3 `trmmR` | **5.71×** | 1024 | 0% |
 | L1 `iamax` | **5.67×** | 1000000 | 6% |
+| L3 `syr2k` | **5.64×** | 4096 | 2% |
 | L3 `trsmR` | **5.61×** | 2100 | 1% |
-| L3 `syrk` | **5.46×** | 2100 | 1% |
-| L3 `syr2k` | **5.39×** | 4096 | 1% |
+| L3 `syrk` | **5.54×** | 2100 | 1% |
 | LP `geqrf` | **5.39×** | 4096 | 0% |
 | L3 `symm` | **5.38×** | 1000 | 1% |
 | LP `getri` | **5.34×** | 2048 | 0% |
