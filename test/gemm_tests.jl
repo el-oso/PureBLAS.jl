@@ -681,3 +681,88 @@ end
         end
     end
 end
+
+# THE ADMISSION BOUNDARY IS WHERE A FLOOR CHANGE LANDS, AND NOTHING WAS ANCHORED TO IT.
+#
+# The reproducibility items above each pick a shape and assert the pool runs there, so a floor that
+# ROSE past their shape fails them loudly. The opposite direction had no guard: lowering the floor
+# admits smaller shapes that no item exercised, and those are exactly the shapes whose chunk geometry
+# degenerates. At `_NR`-rounded boundaries `_tri_chunk` emits ZERO-LENGTH chunks — at n=50 with six
+# workers and `_NR`=8 its boundaries are 0,8,8,16,24,32,50, so one worker is handed nothing and skips.
+# That branch becomes reachable the moment the floor drops below it.
+#
+# So this item does not name a size. It walks a ladder and finds, per op, the SMALLEST shape at which
+# the pool actually runs, then checks bit-identity there and asserts the ladder entry below it stays
+# serial. Move the floor and the test moves with it.
+#
+# LIVENESS BY WITNESS, NOT BY PREDICATE: `p.gen` is bumped once per dispatched job by the driver, the
+# same mechanism the pool-usage items use, so this sees any veto between a predicate saying yes and
+# the pool being used. VACUITY GUARD at the end: if no op found a boundary on the ladder, the item
+# FAILS rather than passing with nothing checked.
+@testitem "L3: bit-identical at the admission boundary, wherever the floor puts it" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        ran(f) = (g0 = @atomic p.gen; s0 = P._SME_CALLS[]; f();
+            (@atomic p.gen) != g0 || P._SME_CALLS[] != s0)
+        bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
+        LADDER = (16, 24, 32, 40, 48, 56, 64, 72, 80, 96, 112, 128, 160, 192)
+        tri(s) = tril(randn(s, s)) + s * I
+        # Each entry: name, build the operands at size n, run the op on them in place.
+        OPS = (
+            ("gemm", n -> (randn(n, n), randn(n, n), zeros(n, n)),
+                c -> P.gemm!(c[3], c[1], c[2]; alpha = 1.0, beta = 0.0), 3),
+            ("symm", n -> (let S = randn(n, n); (S + S', randn(n, n), zeros(n, n)) end),
+                c -> P.symm!(c[3], c[1], c[2]; side = 'L', uplo = 'L', alpha = 1.0, beta = 0.0), 3),
+            ("syrk", n -> (randn(n, n), zeros(n, n)),
+                c -> P.syrk!(c[2], c[1]; uplo = 'L', trans = 'N', alpha = 1.0, beta = 0.0), 2),
+            ("syr2k", n -> (randn(n, n), randn(n, n), zeros(n, n)),
+                c -> P.syr2k!(c[3], c[1], c[2]; uplo = 'L', trans = 'N', alpha = 1.0, beta = 0.0), 3),
+            ("trsmL", n -> (tri(n), randn(n, n)),
+                c -> P.trsm!(c[2], c[1]; side = 'L', uplo = 'L', transA = 'N', diag = 'N'), 2),
+            ("trsmR", n -> (tri(n), randn(n, n)),
+                c -> P.trsm!(c[2], c[1]; side = 'R', uplo = 'L', transA = 'N', diag = 'N'), 2),
+            ("trmmL", n -> (tri(n), randn(n, n)),
+                c -> P.trmm!(c[2], c[1]; side = 'L', uplo = 'L', transA = 'N', diag = 'N'), 2),
+            ("trmmR", n -> (tri(n), randn(n, n)),
+                c -> P.trmm!(c[2], c[1]; side = 'R', uplo = 'L', transA = 'N', diag = 'N'), 2),
+        )
+        # A `Ref`, not a plain binding: a testitem body is top-level scope, so `found += 1` inside the
+        # loop below would create a new local and the vacuity guard would always read 0.
+        found = Ref(0)
+        for (nm, mk, op, out) in OPS
+            prev = 0
+            for n in LADDER
+                master = mk(n)
+                threaded = map(copy, master)
+                P.set_num_threads(nt)
+                if !ran(() -> op(threaded))
+                    prev = n                      # still serial here; remember it for the boundary claim
+                    continue
+                end
+                # BOUNDARY: this is the smallest ladder shape the pool takes for this op.
+                found[] += 1
+                if prev > 0
+                    pm = mk(prev); pc = map(copy, pm)
+                    P.set_num_threads(nt)
+                    @test !ran(() -> op(pc))      # the entry below it must stay serial
+                end
+                serial = map(copy, master)
+                P.set_num_threads(1); op(serial)
+                th = map(copy, master)
+                P.set_num_threads(nt); op(th)
+                @test bitsame(th[out], serial[out])
+                break
+            end
+        end
+        # A ladder on which nothing threads would pass every assertion above by checking none of them.
+        @test found[] >= 4
+        P.set_num_threads(1)
+    end
+end

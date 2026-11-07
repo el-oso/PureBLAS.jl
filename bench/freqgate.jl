@@ -42,3 +42,33 @@ end
 # Per-arm clock out of a split record. The csv is ALWAYS last and fields are appended before it, so
 # index from the front only after checking the length (the same invariant plots.jl's reader relies on).
 _freq_of(p) = length(p) >= 6 ? something(tryparse(Int, p[5]), 0) : 0
+
+# CROSS-ARM IN-WINDOW CLOCK AGREEMENT — the check `_freq_offlock` above cannot make.
+#
+# `_freq_of` reads the PIN (field 5), one number per arm. A threaded reference arm can hold that pin on
+# paper and still collapse DURING its own window: six cores of a vendor BLAS on a power-limited part
+# pull the package clock down where one core never does. Measured on Zen5, L3/gemm@1024 — `openblas_mt`
+# ran its window between 953764 and 2000000 kHz and `aocl_mt` between 1799900 and 2000000, while the
+# `pb` and `pb_mt` windows of the same cell held 1993521-2000000. The ratio there compares two machine
+# states, and the error runs in PureBLAS's FAVOUR, because a throttled reference is a slower reference.
+#
+# Arm records carry the window as `flo|fhi` (fields 6 and 7), so the disagreement is readable per cell.
+# `_window_of` returns (lo, hi), zeros when the fields predate the format. A cell is flagged when the
+# lowest floor across its arms sits more than `tol` below the highest ceiling: that is one arm having
+# spent part of its window at a clock another arm never saw.
+#
+# Zero or missing bounds mean UNKNOWN and never flag, for the same reason `_freq_offlock` treats
+# freq==0 as unknown — a stricter rule would condemn every cache written before the fields existed.
+_window_of(p) = length(p) >= 8 ?
+    (something(tryparse(Int, p[6]), 0), something(tryparse(Int, p[7]), 0)) : (0, 0)
+
+function _freq_window_mismatch(windows, tol::Float64 = 0.03)
+    los = Int[]; his = Int[]
+    for (lo, hi) in windows
+        (lo > 0 && hi > 0) || continue
+        push!(los, lo); push!(his, hi)
+    end
+    length(los) >= 2 || return false
+    hi = maximum(his)
+    return hi > 0 && (hi - minimum(los)) / hi > tol
+end

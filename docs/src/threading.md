@@ -126,15 +126,19 @@ for BLAS-2 and for the complex groups.
 A cell with no threaded reference arm is DROPPED rather than compared against a serial one — a
 threaded PureBLAS arm over a single-thread vendor is not the gate and must not be drawn as if it were.
 
-!!! warning "The Zen4 curve is not yet adjudicable"
-    That box is a laptop mainboard with no battery, and it was running on a supply that could not hold
-    its pin once every core was busy: one core held 2795 MHz indefinitely while six oscillated
-    2332–2804 MHz, at 52–58 °C, far below any thermal limit. 1208 of its cached arms are stamped
-    below the pin and 413 cells compare two power states rather than two libraries. The error runs in
-    PureBLAS's favour, because a throttled reference is a slower reference. A larger supply has since
-    moved its sustainable pin to 3501 MHz and `fleet_freqlock.sh verify-mt` confirms six cores hold
-    it, so those cells are being re-measured with both arms in one machine state; until then read the
-    Zen3 and Zen5 curves, whose cross-arm clocks agree on 929 of 937 and 951 of 951 cells.
+!!! warning "A reference arm that throttled is dropped, and the coverage per box differs a lot"
+    A threaded vendor arm can keep its pin on paper and still spend part of its own window far below
+    it: six cores of a vendor BLAS on a power-limited part pull the package clock down where one core
+    never does. A ratio against such an arm compares two power states rather than two libraries, and
+    the error runs in PureBLAS's FAVOUR, because a throttled reference is a slower reference. Those
+    arms are therefore dropped from the gate rather than drawn, and a cell left with no threaded
+    reference disappears from these panels.
+
+    How many arms that removes is a property of the BOX, not of the library, and it is stated per box
+    in the sections below — a laptop part on a shared power budget loses far more than a desktop one.
+    Read the per-box exclusion count before comparing two curves here: a curve drawn from fewer cells
+    is not a better result. The self-speedup panels further down are unaffected, since both of their
+    arms share one window.
 
 ![BLAS-1 — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_l1.svg)
 ![BLAS-2 — PureBLAS threaded / faster of threaded OpenBLAS and AOCL](assets/perf_mtgate_l2.svg)
@@ -171,141 +175,148 @@ Best speedup per operation, six threads against one, on each box.
 | op | Zen3 · AVX2 | Zen4 · AVX-512 | Zen5 · AVX-512 |
 |---|---|---|---|
 | L1 `blascopy` | 4.98× @100000 | 6.30× @1000000 | 7.58× @300000 |
-| L2 `gemvTrect` | 5.49× @758 | 5.79× @2880 | 6.98× @758 |
 | L1 `axpy` | 4.50× @100000 | 5.39× @1000000 | 6.79× @300000 |
 | L1 `swap` | 4.26× @100000 | 6.40× @1000000 | 6.70× @300000 |
+| L2 `gemvTrect` | 5.38× @758 | 5.79× @2880 | 6.69× @758 |
 | L1 `asum` | 4.01× @300000 | 4.56× @1000000 | 6.30× @300000 |
-| L1 `nrm2` | 3.90× @300000 | 4.65× @1000000 | 6.27× @300000 |
-| L2 `gemvNrect` | 3.45× @256 | 4.78× @448 | 6.08× @448 |
+| L1 `nrm2` | 3.70× @100000 | 4.65× @1000000 | 6.27× @300000 |
+| L2 `gemvNrect` | 3.18× @384 | 4.78× @448 | 6.03× @758 |
 | L1 `dot` | 3.86× @100000 | 5.58× @1000000 | 6.00× @300000 |
-| L3 `trmm` | 5.77× @2100 | 5.73× @2100 | 5.88× @2100 |
+| L3 `trsm` | 5.67× @1000 | 5.77× @1000 | 5.93× @2100 |
+| L3 `trmm` | 5.74× @1000 | 5.72× @1000 | 5.92× @2100 |
 | L1 `scal` | 4.60× @100000 | 4.31× @300000 | 5.86× @1000000 |
-| L3 `trsm` | 5.76× @2100 | 5.72× @2100 | 5.86× @2100 |
-| L3 `gemm` | 4.87× @2100 | 5.67× @1000 | 5.74× @1000 |
-| L3 `trsmRrect` | 5.06× @758 | 5.72× @2880 | 5.73× @2880 |
+| L3 `trsmRrect` | 5.86× @2880 | 5.82× @2880 | 5.86× @2880 |
+| L3 `gemm` | 5.80× @1000 | 5.71× @1000 | 5.76× @1000 |
+| L3 `trmmR` | 5.76× @1000 | 5.60× @1000 | 5.69× @1024 |
+| L2 `gemvT` | 5.15× @512 | 5.00× @1024 | 5.74× @1024 |
 | L1 `iamax` | 4.46× @300000 | 4.36× @1000000 | 5.67× @1000000 |
-| L2 `gemvT` | 5.47× @512 | 5.00× @1024 | 5.64× @1000 |
-| L3 `trmmR` | 4.76× @512 | 5.46× @1000 | 5.63× @1024 |
-| L3 `trsmR` | 5.19× @2100 | 5.31× @4096 | 5.62× @4096 |
-| L2 `ger` | 5.55× @512 | 4.88× @512 | 5.50× @1000 |
-| L3 `syr2k` | 5.47× @2100 | 4.52× @2100 | 5.29× @4096 |
-| L3 `syrk` | 5.43× @2100 | 5.12× @2100 | 5.36× @2100 |
-| LP `potrfU` | 5.43× @4096 | 5.19× @4096 | 5.27× @4096 |
-| L3 `symm` | 4.61× @2100 | 4.88× @1000 | 5.35× @1000 |
-| LP `geqrf` | 4.52× @2100 | 4.32× @4096 | 5.31× @4096 |
-| LP `getri` | 4.78× @2048 | 4.68× @2048 | 5.30× @2048 |
-| LP `trtri` | 4.79× @2048 | 4.90× @2048 | 5.27× @2048 |
-| LP `potrf` | 4.73× @4096 | 4.59× @2100 | 5.05× @2100 |
-| LP `potri` | 4.13× @1000 | 4.70× @2048 | 4.92× @2048 |
-| L3 `trsmRband` | 4.29× @512 | 4.28× @512 | 4.84× @512 |
-| L2 `gbmvN` | 4.11× @4096 | 4.13× @4096 | 4.40× @4096 |
-| LP `getrf` | 4.02× @2100 | 3.87× @4096 | 4.28× @4096 |
-| L2 `gemvN` | 3.09× @1024 | 3.95× @1000 | 4.24× @1024 |
-| LP `pptrfL` | 2.92× @2048 | 3.80× @2048 | 4.16× @2048 |
-| LP `pptrfU` | 2.70× @2048 | 3.85× @2048 | 4.08× @2048 |
-| L2 `symv` | 3.21× @2048 | 3.59× @2100 | 3.58× @1024 |
-| LP `gels` | 2.19× @512 | 3.23× @1024 | 3.55× @1000 |
-| LP `geqp3` | 3.07× @1000 | 3.15× @2048 | 3.38× @1000 |
-| LP `sytri` | 3.11× @2048 | 3.24× @2048 | 3.06× @1000 |
-| LP `gesvd` | 3.16× @2048 | 3.10× @2048 | 3.23× @2048 |
-| LP `gelsy` | 2.73× @1000 | 2.86× @1000 | 3.19× @1000 |
-| LP `pstrf` | 2.74× @4096 | 2.52× @4096 | 3.11× @2100 |
-| LP `syev` | 2.86× @2048 | 2.91× @2048 | 3.08× @2048 |
-| LP `pstrfU` | 2.44× @2100 | 1.95× @2100 | 2.78× @2100 |
-| LP `sytrf` | 2.71× @4096 | 2.09× @4096 | 2.46× @4096 |
-| LP `syevN` | 2.53× @2048 | 2.38× @2048 | 2.57× @2048 |
-| LP `gelsd` | 2.35× @1000 | 2.21× @1000 | 2.43× @1000 |
-| LP `pbtrfL` | 1.53× @256 | 1.93× @384 | 2.07× @384 |
-| LP `pbtrfU` | 1.26× @192 | 1.70× @384 | 1.87× @384 |
-| LP `getrs` | 1.01× @512 | 1.05× @2048 | 1.54× @1024 |
-| LP `potrsL` | 1.46× @1000 | 1.00× @512 | 1.07× @1024 |
-| LP `potrsU` | 1.46× @1000 | 1.01× @512 | 1.01× @32 |
-| LP `geev` | 1.27× @1000 | 1.24× @1000 | 1.33× @1000 |
-| LP `sytrs` | 1.01× @2048 | 1.00× @50 | 1.06× @2048 |
+| L3 `trsmR` | 5.48× @1000 | 5.37× @1000 | 5.61× @2100 |
+| L3 `syrk` | 5.30× @1000 | 5.16× @2048 | 5.46× @2100 |
+| L3 `syr2k` | 5.44× @2100 | 4.53× @2100 | 5.39× @4096 |
+| LP `geqrf` | 4.49× @2100 | 4.30× @4096 | 5.39× @4096 |
+| LP `potrfU` | 5.39× @4096 | 5.09× @4096 | 5.31× @4096 |
+| L3 `symm` | 4.66× @2100 | 4.88× @1000 | 5.38× @1000 |
+| LP `getri` | 5.02× @2048 | 4.68× @2048 | 5.34× @2048 |
+| L2 `ger` | 5.18× @512 | 4.88× @512 | 5.32× @1024 |
+| LP `trtri` | 5.17× @2048 | 5.12× @2048 | 5.28× @2048 |
+| LP `potri` | 4.36× @1000 | 4.69× @2048 | 5.02× @2048 |
+| LP `potrf` | 4.82× @2100 | 4.60× @2100 | 5.02× @2100 |
+| L3 `trsmRband` | 4.67× @512 | 4.80× @256 | 4.95× @256 |
+| L2 `gbmvN` | 3.98× @4096 | 4.13× @4096 | 4.54× @4096 |
+| L2 `gemvN` | 3.26× @512 | 3.95× @1000 | 4.40× @1000 |
+| LP `getrf` | 3.93× @4096 | 3.86× @4096 | 4.28× @4096 |
+| LP `pptrfL` | 3.43× @1024 | 3.82× @2048 | 4.18× @2048 |
+| LP `pptrfU` | 3.38× @1024 | 3.84× @2048 | 4.07× @2048 |
+| L2 `symv` | 3.20× @512 | 3.59× @2100 | 3.77× @1024 |
+| LP `gels` | 3.45× @1024 | 3.35× @1024 | 3.75× @1024 |
+| LP `geqp3` | 3.50× @2048 | 3.12× @2048 | 3.38× @1000 |
+| LP `gesvd` | 3.17× @2048 | 2.97× @2048 | 3.25× @2048 |
+| LP `sytri` | 3.11× @2048 | 3.24× @2048 | 3.04× @1000 |
+| LP `gelsy` | 2.96× @1000 | 2.85× @1000 | 3.22× @1000 |
+| LP `pstrf` | 2.72× @4096 | 2.63× @4096 | 3.13× @2100 |
+| LP `syev` | 2.90× @2048 | 2.88× @2048 | 3.07× @2048 |
+| LP `pstrfU` | 2.57× @2100 | 1.96× @2100 | 2.80× @2100 |
+| LP `sytrf` | 2.73× @4096 | 2.23× @4096 | 2.68× @4096 |
+| LP `syevN` | 2.59× @2048 | 2.62× @2048 | 2.58× @2048 |
+| LP `gelsd` | 2.38× @1000 | 2.26× @1000 | 2.46× @1000 |
+| LP `pbtrfL` | 2.18× @384 | 2.05× @384 | 2.28× @384 |
+| LP `pbtrfU` | 2.19× @384 | 1.95× @384 | 2.16× @384 |
+| LP `geev` | 1.28× @1000 | 1.23× @1000 | 1.35× @1000 |
 
 ### Zen3 · AVX2
 
-Measured 2026-11-01T15:11 at commit `51228327`, AMD Ryzen 9 5900X 12-Core Processor, pinned at 3701 MHz with boost off.
+Measured 2026-11-07T07:10 at commit `39d36ab3`, AMD Ryzen 9 5900X 12-Core Processor, pinned at 3701 MHz with boost off.
 
 1142 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
+
+245 reference arm(s) in this cache are EXCLUDED from the gate: they did not hold the clock band
+their sibling arms held in the same cell. A threaded vendor arm can keep its pin on paper and
+still spend part of its own window far below it, because six cores of a vendor BLAS on a
+power-limited part pull the package clock down where one core never does. A ratio against such an
+arm compares two machine states, and the error runs in PureBLAS's FAVOUR — a throttled reference
+is a slower reference — so those arms are dropped rather than drawn. The `pb` and `pb_mt` arms of
+the same cells shared one window and held the clock, so the self-speedup figures below are
+unaffected; it is the gate panels that lose cells.
 
 **Where threading pays.** Best cell per operation:
 
 | op | best speedup | at n | round spread |
 |---|---|---|---|
-| L3 `trmm` | **5.77×** | 2100 | 0% |
-| L3 `trsm` | **5.76×** | 2100 | 0% |
-| L2 `ger` | **5.55×** | 512 | 3% |
-| L2 `gemvTrect` | **5.49×** | 758 | 1% |
-| L3 `syr2k` | **5.47×** | 2100 | 0% |
-| L2 `gemvT` | **5.47×** | 512 | 4% |
-| L3 `syrk` | **5.43×** | 2100 | 1% |
-| LP `potrfU` | **5.43×** | 4096 | 0% |
-| L3 `trsmR` | **5.19×** | 2100 | 0% |
-| L3 `trsmRrect` | **5.06×** | 758 | 20% |
+| L3 `trsmRrect` | **5.86×** | 2880 | 0% |
+| L3 `gemm` | **5.80×** | 1000 | 0% |
+| L3 `trmmR` | **5.76×** | 1000 | 0% |
+| L3 `trmm` | **5.74×** | 1000 | 0% |
+| L3 `trsm` | **5.67×** | 1000 | 0% |
+| L3 `trsmR` | **5.48×** | 1000 | 0% |
+| L3 `syr2k` | **5.44×** | 2100 | 0% |
+| LP `potrfU` | **5.39×** | 4096 | 0% |
+| L2 `gemvTrect` | **5.38×** | 758 | 1% |
+| L3 `syrk` | **5.30×** | 1000 | 0% |
+| L2 `ger` | **5.18×** | 512 | 3% |
+| LP `trtri` | **5.17×** | 2048 | 0% |
+| L2 `gemvT` | **5.15×** | 512 | 3% |
+| LP `getri` | **5.02×** | 2048 | 0% |
 | L1 `blascopy` | **4.98×** | 100000 | 1% |
-| L3 `gemm` | **4.87×** | 2100 | 0% |
-| LP `trtri` | **4.79×** | 2048 | 2% |
-| LP `getri` | **4.78×** | 2048 | 2% |
-| L3 `trmmR` | **4.76×** | 512 | 9% |
-| LP `potrf` | **4.73×** | 4096 | 0% |
-| L3 `symm` | **4.61×** | 2100 | 0% |
+| LP `potrf` | **4.82×** | 2100 | 0% |
+| L3 `trsmRband` | **4.67×** | 512 | 0% |
+| L3 `symm` | **4.66×** | 2100 | 0% |
 | L1 `scal` | **4.60×** | 100000 | 1% |
-| LP `geqrf` | **4.52×** | 2100 | 0% |
 | L1 `axpy` | **4.50×** | 100000 | 3% |
+| LP `geqrf` | **4.49×** | 2100 | 0% |
 | L1 `iamax` | **4.46×** | 300000 | 20% |
-| L3 `trsmRband` | **4.29×** | 512 | 1% |
+| LP `potri` | **4.36×** | 1000 | 0% |
 | L1 `swap` | **4.26×** | 100000 | 2% |
-| LP `potri` | **4.13×** | 1000 | 1% |
-| L2 `gbmvN` | **4.11×** | 4096 | 0% |
-| LP `getrf` | **4.02×** | 2100 | 0% |
 | L1 `asum` | **4.01×** | 300000 | 21% |
-| L1 `nrm2` | **3.90×** | 300000 | 30% |
+| L2 `gbmvN` | **3.98×** | 4096 | 1% |
+| LP `getrf` | **3.93×** | 4096 | 0% |
 | L1 `dot` | **3.86×** | 100000 | 2% |
-| L2 `gemvNrect` | **3.45×** | 256 | 3% |
-| L2 `symv` | **3.21×** | 2048 | 19% |
-| LP `gesvd` | **3.16×** | 2048 | 4% |
-| LP `sytri` | **3.11×** | 2048 | 1% |
-| L2 `gemvN` | **3.09×** | 1024 | 5% |
-| LP `geqp3` | **3.07×** | 1000 | 1% |
-| LP `pptrfL` | **2.92×** | 2048 | 13% |
-| LP `syev` | **2.86×** | 2048 | 6% |
-| LP `pstrf` | **2.74×** | 4096 | 2% |
-| LP `gelsy` | **2.73×** | 1000 | 2% |
-| LP `sytrf` | **2.71×** | 4096 | 1% |
-| LP `pptrfU` | **2.70×** | 2048 | 21% |
-| LP `syevN` | **2.53×** | 2048 | 3% |
-| LP `pstrfU` | **2.44×** | 2100 | 0% |
-| LP `gelsd` | **2.35×** | 1000 | 1% |
-| LP `gels` | **2.19×** | 512 | 0% |
-| LP `pbtrfL` | **1.53×** | 256 | 0% |
-| LP `potrsL` | **1.46×** | 1000 | 0% |
-| LP `potrsU` | **1.46×** | 1000 | 1% |
-| LP `geev` | **1.27×** | 1000 | 4% |
-| LP `pbtrfU` | **1.26×** | 192 | 12% |
+| L1 `nrm2` | **3.70×** | 100000 | 2% |
+| LP `geqp3` | **3.50×** | 2048 | 0% |
+| LP `gels` | **3.45×** | 1024 | 1% |
+| LP `pptrfL` | **3.43×** | 1024 | 0% |
+| LP `pptrfU` | **3.38×** | 1024 | 0% |
+| L2 `gemvN` | **3.26×** | 512 | 3% |
+| L2 `symv` | **3.20×** | 512 | 2% |
+| L2 `gemvNrect` | **3.18×** | 384 | 1% |
+| LP `gesvd` | **3.17×** | 2048 | 4% |
+| LP `sytri` | **3.11×** | 2048 | 0% |
+| LP `gelsy` | **2.96×** | 1000 | 1% |
+| LP `syev` | **2.90×** | 2048 | 1% |
+| LP `sytrf` | **2.73×** | 4096 | 0% |
+| LP `pstrf` | **2.72×** | 4096 | 0% |
+| LP `syevN` | **2.59×** | 2048 | 0% |
+| LP `pstrfU` | **2.57×** | 2100 | 0% |
+| LP `gelsd` | **2.38×** | 1000 | 0% |
+| LP `pbtrfU` | **2.19×** | 384 | 0% |
+| LP `pbtrfL` | **2.18×** | 384 | 0% |
+| LP `geev` | **1.28×** | 1000 | 1% |
 
 **Where threading COSTS.** Every cell that got slower with six threads:
 
 | op | n | speedup | round spread |
 |---|---|---|---|
-| LP `pbtrfU` | 256 | **0.58×** | 3% |
-| L2 `gemvN` | 128 | **0.73×** | 6% |
-| LP `getrs` | 1000 | **0.76×** | 40% |
-| LP `pbtrfU` | 384 | **0.77×** | 1% |
-| LP `getrs` | 1024 | **0.79×** | 14% |
-| LP `sytrf` | 1000 | **0.85×** | 3% |
-| LP `sytrs` | 1000 | **0.87×** | 12% |
-| LP `getrs` | 2048 | **0.88×** | 5% |
-| LP `sytrs` | 1024 | **0.91×** | 5% |
-| LP `potrsL` | 1024 | **0.92×** | 22% |
-| LP `pbtrfL` | 384 | **0.94×** | 4% |
-| L2 `ger` | 4096 | **0.96×** | 1% |
+| L2 `gemvN` | 128 | **0.67×** | 6% |
+| LP `geqp3` | 100 | **0.92×** | 0% |
+| LP `gelsy` | 100 | **0.93×** | 0% |
+| LP `getrf` | 100 | **0.95×** | 0% |
+| LP `geqp3` | 128 | **0.95×** | 0% |
+| LP `gelsy` | 128 | **0.96×** | 0% |
+| LP `pstrfU` | 128 | **0.96×** | 1% |
 
 ### Zen4 · AVX-512
 
-Measured 2026-11-03T00:12 at commit `26da5b14`, AMD Ryzen 5 7640U w/ Radeon 760M Graphics, pinned at 3501 MHz with boost off.
+Measured 2026-11-07T02:58 at commit `801db45f`, AMD Ryzen 5 7640U w/ Radeon 760M Graphics, pinned at 3501 MHz with boost off.
 
 1142 cells measured, 0 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
+
+26 reference arm(s) in this cache are EXCLUDED from the gate: they did not hold the clock band
+their sibling arms held in the same cell. A threaded vendor arm can keep its pin on paper and
+still spend part of its own window far below it, because six cores of a vendor BLAS on a
+power-limited part pull the package clock down where one core never does. A ratio against such an
+arm compares two machine states, and the error runs in PureBLAS's FAVOUR — a throttled reference
+is a slower reference — so those arms are dropped rather than drawn. The `pb` and `pb_mt` arms of
+the same cells shared one window and held the clock, so the self-speedup figures below are
+unaffected; it is the gate panels that lose cells.
 
 **Where threading pays.** Best cell per operation:
 
@@ -313,138 +324,148 @@ Measured 2026-11-03T00:12 at commit `26da5b14`, AMD Ryzen 5 7640U w/ Radeon 760M
 |---|---|---|---|
 | L1 `swap` | **6.40×** | 1000000 | 3% |
 | L1 `blascopy` | **6.30×** | 1000000 | 9% |
+| L3 `trsmRrect` | **5.82×** | 2880 | 1% |
 | L2 `gemvTrect` | **5.79×** | 2880 | 2% |
-| L3 `trmm` | **5.73×** | 2100 | 0% |
-| L3 `trsm` | **5.72×** | 2100 | 0% |
-| L3 `trsmRrect` | **5.72×** | 2880 | 0% |
-| L3 `gemm` | **5.67×** | 1000 | 0% |
+| L3 `trsm` | **5.77×** | 1000 | 0% |
+| L3 `trmm` | **5.72×** | 1000 | 0% |
+| L3 `gemm` | **5.71×** | 1000 | 0% |
+| L3 `trmmR` | **5.60×** | 1000 | 0% |
 | L1 `dot` | **5.58×** | 1000000 | 7% |
-| L3 `trmmR` | **5.46×** | 1000 | 0% |
 | L1 `axpy` | **5.39×** | 1000000 | 9% |
-| L3 `trsmR` | **5.31×** | 4096 | 1% |
-| LP `potrfU` | **5.19×** | 4096 | 1% |
-| L3 `syrk` | **5.12×** | 2100 | 0% |
+| L3 `trsmR` | **5.37×** | 1000 | 1% |
+| L3 `syrk` | **5.16×** | 2048 | 1% |
+| LP `trtri` | **5.12×** | 2048 | 0% |
+| LP `potrfU` | **5.09×** | 4096 | 1% |
 | L2 `gemvT` | **5.00×** | 1024 | 2% |
-| LP `trtri` | **4.90×** | 2048 | 1% |
-| L3 `symm` | **4.88×** | 1000 | 0% |
 | L2 `ger` | **4.88×** | 512 | 2% |
+| L3 `symm` | **4.88×** | 1000 | 0% |
+| L3 `trsmRband` | **4.80×** | 256 | 13% |
 | L2 `gemvNrect` | **4.78×** | 448 | 11% |
-| LP `potri` | **4.70×** | 2048 | 1% |
+| LP `potri` | **4.69×** | 2048 | 0% |
 | LP `getri` | **4.68×** | 2048 | 0% |
 | L1 `nrm2` | **4.65×** | 1000000 | 2% |
-| LP `potrf` | **4.59×** | 2100 | 1% |
+| LP `potrf` | **4.60×** | 2100 | 0% |
 | L1 `asum` | **4.56×** | 1000000 | 6% |
-| L3 `syr2k` | **4.52×** | 2100 | 1% |
+| L3 `syr2k` | **4.53×** | 2100 | 1% |
 | L1 `iamax` | **4.36×** | 1000000 | 6% |
-| LP `geqrf` | **4.32×** | 4096 | 1% |
 | L1 `scal` | **4.31×** | 300000 | 12% |
-| L3 `trsmRband` | **4.28×** | 512 | 6% |
+| LP `geqrf` | **4.30×** | 4096 | 1% |
 | L2 `gbmvN` | **4.13×** | 4096 | 1% |
 | L2 `gemvN` | **3.95×** | 1000 | 23% |
-| LP `getrf` | **3.87×** | 4096 | 1% |
-| LP `pptrfU` | **3.85×** | 2048 | 0% |
-| LP `pptrfL` | **3.80×** | 2048 | 1% |
+| LP `getrf` | **3.86×** | 4096 | 0% |
+| LP `pptrfU` | **3.84×** | 2048 | 0% |
+| LP `pptrfL` | **3.82×** | 2048 | 0% |
 | L2 `symv` | **3.59×** | 2100 | 5% |
+| LP `gels` | **3.35×** | 1024 | 0% |
 | LP `sytri` | **3.24×** | 2048 | 1% |
-| LP `gels` | **3.23×** | 1024 | 1% |
-| LP `geqp3` | **3.15×** | 2048 | 0% |
-| LP `gesvd` | **3.10×** | 2048 | 3% |
-| LP `syev` | **2.91×** | 2048 | 8% |
-| LP `gelsy` | **2.86×** | 1000 | 1% |
-| LP `pstrf` | **2.52×** | 4096 | 1% |
-| LP `syevN` | **2.38×** | 2048 | 2% |
-| LP `gelsd` | **2.21×** | 1000 | 0% |
-| LP `sytrf` | **2.09×** | 4096 | 3% |
-| LP `pstrfU` | **1.95×** | 2100 | 0% |
-| LP `pbtrfL` | **1.93×** | 384 | 0% |
-| LP `pbtrfU` | **1.70×** | 384 | 1% |
-| LP `geev` | **1.24×** | 1000 | 3% |
-| LP `getrs` | **1.05×** | 2048 | 4% |
+| LP `geqp3` | **3.12×** | 2048 | 0% |
+| LP `gesvd` | **2.97×** | 2048 | 3% |
+| LP `syev` | **2.88×** | 2048 | 3% |
+| LP `gelsy` | **2.85×** | 1000 | 0% |
+| LP `pstrf` | **2.63×** | 4096 | 1% |
+| LP `syevN` | **2.62×** | 2048 | 2% |
+| LP `gelsd` | **2.26×** | 1000 | 0% |
+| LP `sytrf` | **2.23×** | 4096 | 0% |
+| LP `pbtrfL` | **2.05×** | 384 | 0% |
+| LP `pstrfU` | **1.96×** | 2100 | 0% |
+| LP `pbtrfU` | **1.95×** | 384 | 0% |
+| LP `geev` | **1.23×** | 1000 | 0% |
 
 **Where threading COSTS.** Every cell that got slower with six threads:
 
 | op | n | speedup | round spread |
 |---|---|---|---|
-| LP `potrsL` | 1000 | **0.81×** | 8% |
-| LP `potrsU` | 1000 | **0.83×** | 5% |
-| LP `potrsU` | 1024 | **0.83×** | 4% |
-| LP `geqp3` | 256 | **0.86×** | 2% |
-| LP `gelsy` | 256 | **0.86×** | 2% |
-| LP `potrsL` | 1024 | **0.86×** | 3% |
-| LP `potrsU` | 2048 | **0.91×** | 11% |
-| LP `sytrf` | 1000 | **0.94×** | 1% |
-| LP `syevN` | 256 | **0.95×** | 1% |
+| LP `getri` | 100 | **0.71×** | 1% |
+| LP `pptrfL` | 128 | **0.80×** | 1% |
+| LP `getri` | 128 | **0.88×** | 1% |
+| LP `potrf` | 128 | **0.90×** | 1% |
+| LP `pstrf` | 128 | **0.91×** | 1% |
+| LP `potri` | 100 | **0.91×** | 1% |
+| LP `pstrfU` | 128 | **0.92×** | 2% |
+| LP `geqp3` | 128 | **0.93×** | 0% |
+| LP `pbtrfU` | 128 | **0.93×** | 0% |
+| LP `getrf` | 128 | **0.94×** | 1% |
+| LP `gelsy` | 128 | **0.94×** | 0% |
+| LP `potrfU` | 128 | **0.95×** | 1% |
+| LP `pptrfU` | 128 | **0.95×** | 1% |
+| LP `pstrfU` | 256 | **0.96×** | 1% |
 
 ### Zen5 · AVX-512
 
-Measured 2026-11-01T01:20 at commit `51228327`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
+Measured 2026-11-07T03:22 at commit `801db45f`, AMD Ryzen AI 5 340 w/ Radeon 840M, pinned at 2000 MHz with boost off.
 
 1125 cells measured, 17 off-lock. Listed below: the threadable ops whose best cell moves further than the 3.7% noise floor.
+
+963 reference arm(s) in this cache are EXCLUDED from the gate: they did not hold the clock band
+their sibling arms held in the same cell. A threaded vendor arm can keep its pin on paper and
+still spend part of its own window far below it, because six cores of a vendor BLAS on a
+power-limited part pull the package clock down where one core never does. A ratio against such an
+arm compares two machine states, and the error runs in PureBLAS's FAVOUR — a throttled reference
+is a slower reference — so those arms are dropped rather than drawn. The `pb` and `pb_mt` arms of
+the same cells shared one window and held the clock, so the self-speedup figures below are
+unaffected; it is the gate panels that lose cells.
 
 **Where threading pays.** Best cell per operation:
 
 | op | best speedup | at n | round spread |
 |---|---|---|---|
 | L1 `blascopy` | **7.58×** | 300000 | 4% |
-| L2 `gemvTrect` | **6.98×** | 758 | 17% |
 | L1 `axpy` | **6.79×** | 300000 | 5% |
 | L1 `swap` | **6.70×** | 300000 | 4% |
+| L2 `gemvTrect` | **6.69×** | 758 | 15% |
 | L1 `asum` | **6.30×** | 300000 | 2% |
 | L1 `nrm2` | **6.27×** | 300000 | 3% |
-| L2 `gemvNrect` | **6.08×** | 448 | 6% |
+| L2 `gemvNrect` | **6.03×** | 758 | 14% |
 | L1 `dot` | **6.00×** | 300000 | 4% |
-| L3 `trmm` | **5.88×** | 2100 | 0% |
+| L3 `trsm` | **5.93×** | 2100 | 0% |
+| L3 `trmm` | **5.92×** | 2100 | 0% |
 | L1 `scal` | **5.86×** | 1000000 | 7% |
-| L3 `trsm` | **5.86×** | 2100 | 0% |
-| L3 `gemm` | **5.74×** | 1000 | 1% |
-| L3 `trsmRrect` | **5.73×** | 2880 | 0% |
+| L3 `trsmRrect` | **5.86×** | 2880 | 0% |
+| L3 `gemm` | **5.76×** | 1000 | 1% |
+| L2 `gemvT` | **5.74×** | 1024 | 1% |
+| L3 `trmmR` | **5.69×** | 1024 | 0% |
 | L1 `iamax` | **5.67×** | 1000000 | 6% |
-| L2 `gemvT` | **5.64×** | 1000 | 5% |
-| L3 `trmmR` | **5.63×** | 1024 | 1% |
-| L3 `trsmR` | **5.62×** | 4096 | 1% |
-| L2 `ger` | **5.50×** | 1000 | 2% |
-| L3 `syrk` | **5.36×** | 2100 | 0% |
-| L3 `symm` | **5.35×** | 1000 | 2% |
-| LP `geqrf` | **5.31×** | 4096 | 1% |
-| LP `getri` | **5.30×** | 2048 | 0% |
-| L3 `syr2k` | **5.29×** | 4096 | 2% |
-| LP `trtri` | **5.27×** | 2048 | 0% |
-| LP `potrfU` | **5.27×** | 4096 | 1% |
-| LP `potrf` | **5.05×** | 2100 | 0% |
-| LP `potri` | **4.92×** | 2048 | 0% |
-| L3 `trsmRband` | **4.84×** | 512 | 1% |
-| L2 `gbmvN` | **4.40×** | 4096 | 2% |
-| LP `getrf` | **4.28×** | 4096 | 0% |
-| L2 `gemvN` | **4.24×** | 1024 | 18% |
-| LP `pptrfL` | **4.16×** | 2048 | 0% |
-| LP `pptrfU` | **4.08×** | 2048 | 0% |
-| L2 `symv` | **3.58×** | 1024 | 6% |
-| LP `gels` | **3.55×** | 1000 | 1% |
-| LP `geqp3` | **3.38×** | 1000 | 0% |
-| LP `gesvd` | **3.23×** | 2048 | 1% |
-| LP `gelsy` | **3.19×** | 1000 | 0% |
-| LP `pstrf` | **3.11×** | 2100 | 1% |
-| LP `syev` | **3.08×** | 2048 | 2% |
-| LP `sytri` | **3.06×** | 1000 | 2% |
-| LP `pstrfU` | **2.78×** | 2100 | 0% |
-| LP `syevN` | **2.57×** | 2048 | 2% |
-| LP `sytrf` | **2.46×** | 4096 | 3% |
-| LP `gelsd` | **2.43×** | 1000 | 1% |
-| LP `pbtrfL` | **2.07×** | 384 | 1% |
-| LP `pbtrfU` | **1.87×** | 384 | 1% |
-| LP `getrs` | **1.54×** | 1024 | 40% |
-| LP `geev` | **1.33×** | 1000 | 3% |
-| LP `potrsL` | **1.07×** | 1024 | 7% |
-| LP `sytrs` | **1.06×** | 2048 | 2% |
+| L3 `trsmR` | **5.61×** | 2100 | 1% |
+| L3 `syrk` | **5.46×** | 2100 | 1% |
+| L3 `syr2k` | **5.39×** | 4096 | 1% |
+| LP `geqrf` | **5.39×** | 4096 | 0% |
+| L3 `symm` | **5.38×** | 1000 | 1% |
+| LP `getri` | **5.34×** | 2048 | 0% |
+| L2 `ger` | **5.32×** | 1024 | 4% |
+| LP `potrfU` | **5.31×** | 4096 | 0% |
+| LP `trtri` | **5.28×** | 2048 | 0% |
+| LP `potri` | **5.02×** | 2048 | 0% |
+| LP `potrf` | **5.02×** | 2100 | 0% |
+| L3 `trsmRband` | **4.95×** | 256 | 4% |
+| L2 `gbmvN` | **4.54×** | 4096 | 2% |
+| L2 `gemvN` | **4.40×** | 1000 | 5% |
+| LP `getrf` | **4.28×** | 4096 | 1% |
+| LP `pptrfL` | **4.18×** | 2048 | 0% |
+| LP `pptrfU` | **4.07×** | 2048 | 0% |
+| L2 `symv` | **3.77×** | 1024 | 5% |
+| LP `gels` | **3.75×** | 1024 | 0% |
+| LP `geqp3` | **3.38×** | 1000 | 1% |
+| LP `gesvd` | **3.25×** | 2048 | 1% |
+| LP `gelsy` | **3.22×** | 1000 | 1% |
+| LP `pstrf` | **3.13×** | 2100 | 0% |
+| LP `syev` | **3.07×** | 2048 | 1% |
+| LP `sytri` | **3.04×** | 1000 | 1% |
+| LP `pstrfU` | **2.80×** | 2100 | 0% |
+| LP `sytrf` | **2.68×** | 4096 | 1% |
+| LP `syevN` | **2.58×** | 2048 | 1% |
+| LP `gelsd` | **2.46×** | 1000 | 1% |
+| LP `pbtrfL` | **2.28×** | 384 | 1% |
+| LP `pbtrfU` | **2.16×** | 384 | 1% |
+| LP `geev` | **1.35×** | 1000 | 1% |
 
 **Where threading COSTS.** Every cell that got slower with six threads:
 
 | op | n | speedup | round spread |
 |---|---|---|---|
-| LP `potrsU` | 1000 | **0.80×** | 5% |
-| LP `potrsU` | 2048 | **0.80×** | 2% |
-| LP `potrsU` | 1024 | **0.82×** | 5% |
-| LP `potrsL` | 1000 | **0.84×** | 7% |
+| LP `pstrfU` | 128 | **0.95×** | 1% |
+| L2 `trmv` | 1024 | **0.95×** | 22% |
+| L2 `spmv` | 1000 | **0.96×** | 19% |
+| LP `geqp3` | 128 | **0.96×** | 0% |
 
 ## Open: `gesvd` gets slower with threads
 
@@ -453,9 +474,9 @@ microarchitectures — though not equally, which is itself a clue:
 
 | box | n=256 | n=512 | n=1000 | n=1024 | n=2048 |
 |---|---|---|---|---|---|
-| Zen3 · AVX2 | 1.30× | 1.57× | 2.00× | 1.82× | 3.16× |
-| Zen4 · AVX-512 | 1.21× | 1.84× | 2.65× | 2.56× | 3.10× |
-| Zen5 · AVX-512 | 1.37× | 2.12× | 3.01× | 2.84× | 3.23× |
+| Zen3 · AVX2 | — | — | — | — | 3.17× |
+| Zen4 · AVX-512 | 1.40× | 1.90× | 2.68× | 2.57× | 2.97× |
+| Zen5 · AVX-512 | 1.50× | 2.15× | 3.02× | 2.86× | 3.25× |
 
 The root cause is **not yet known**. Three plausible explanations have been measured and rejected:
 

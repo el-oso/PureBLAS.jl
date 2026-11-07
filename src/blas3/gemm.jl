@@ -779,7 +779,11 @@ function _blocked_pc_sweep!(
     # out of bounds in an exactly-sized view, which is why only `tA=T` failed. Matches `_gpack_prefit!`.
     blk = cld(mc, mr) * mr * max(kcmax, kce)
     nblk = cld(m, mc)
-    coop = nw > 1
+    # `_EXPINT[12]` is the A/B arm: 1 sends every worker down the private per-worker pack instead, which
+    # `Ap` is already sized for (one `mc`x`kc` block, independent of `nw`). `_EXPINT[13]` witnesses which
+    # branch ran, because an A/B whose arm was never in the call graph produces a believable null.
+    coop = nw > 1 && iszero(@inbounds _EXPINT[12])
+    @inbounds _EXPINT[13] = coop ? 1 : 2
     shp = App
     if coop
         sh = _gpack_shared(T, nblk, blk)
@@ -4006,9 +4010,40 @@ const _MT_JOIN_NS_MEASURED = 616          # req8-ok: a recorded measurement, not
 # PDM: Measured — the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) | tune: via gemm_mt_work
 const _MT_JOIN_CLOCK_MHZ_MEASURED = 2796  # req8-ok: a recorded measurement, not a tuning choice; see the block above
 # PDM: Literal — a machine-INDEPENDENT ratio, in the same class as `_l1_block`'s ½ and `_at_gemm_mc`'s
-# 3/10: it states how much of a call the fixed join cost may consume (here at most 1/32), which is a
-# policy about acceptable overhead, not a property of any particular machine.
-const _MT_AMORTISE = 32   # req8-ok: overhead policy (join ≤ 1/32 of a call), same class as _l1_block's ½ — not a host property
+# 3/10: it states how much of a call the fixed join cost may consume, which is a policy about
+# acceptable overhead, not a property of any particular machine.
+#
+# WHAT THE NUMBER MEANS, which is the part that makes it checkable. At the floor a call costs `A`
+# joins, so splitting it across `nw` workers yields `S = nw·A / (nw + A)`: the policy is a target
+# speedup in disguise, and `A = 8` at six workers asks for `S = 3.43x`. The model runs ahead of the
+# measurement by the split's own efficiency, so the number is set from the measured crossings below
+# rather than from this expression — the expression is what makes the units and the direction checkable.
+#
+# MEASURED with the pool dispatched at an explicit worker count, so the predicate itself is bypassed
+# and the gain is readable on both sides of it. Six workers, pinned 1:1, base-clock locked. The floor
+# serves a PRODUCT and a TRIANGLE from one number, and the two shapes do not cross together — the flop
+# count at which each first reaches a given gain:
+#
+#       target        gemm Zen4   syrk Zen4   gemm Zen3   syrk Zen3
+#       1.5x              88390      171903           —       56345
+#       2.0x             144971      358217       88304       91711
+#       2.5x             199600     1219850      156823      364502
+#
+# A triangle's achieved parallelism is not a product's, and the penalty is not a property of the shape:
+# Zen3's triangle crosses 2x with its product, Zen4's needs 2.5x the flops. `_tri_chunk` balances the
+# triangle's flops by the sqrt rule, so the split is not the cause. **Zen4 syrk at 358k is therefore
+# the binding cell**, and one scalar cannot target the same gain for both shapes.
+#
+# `A = 8` is the floor the fleet's weakest shape supports: 220416 flops, where the worst ADMITTED cell
+# is Zen4 syrk at 266240 flops measuring 1.78x and every other admitted cell measures 2.18x or better.
+# Raising it to 16 refuses four cells that each return more than 2.1x (Zen3 gemm 2.82x and syrk 2.22x
+# at 221184, Zen3 syrk 2.18x at 266240, Zen4 gemm 2.66x at 221184), which costs more than admitting one
+# cell at 1.78x. Lowering it to 4 admits Zen4 syrk at 112896 and 127500 flops, which measure 1.20x and
+# 1.31x — real but far under the target, and 1.31x does not reach the 1.59x that size needs to match a
+# threaded vendor, so admitting it buys neither the policy nor the cell.
+#
+# Zen5 has not been measured at this crossing.
+const _MT_AMORTISE = 8   # req8-ok: overhead policy (target ~2x at six workers), same class as _l1_block's ½ — not a host property
 @inline _mt_flops_per_cycle(::Type{T}) where {T} =
     4 * (_double_pumped(_HW) ? max(1, _vwidth(T) ÷ 2) : _vwidth(T))
 # The shipped default in flops: the recorded join in core cycles at the recorded clock (`÷ 1000` turns
@@ -4380,6 +4415,20 @@ const _MT_KIND_ELEM = 19
 # req8-ok: enum discriminant, host-invariant by construction — see the two lines above
 const _MT_KIND_TRMM = 20
 
+# Side-L symm with a PER-WORKER expansion of the symmetric operand: each worker expands A into its own
+# buffer and then runs an ordinary product on its own column band of C, instead of the driver expanding
+# once into one buffer that every worker then reads.
+#
+# WHY A SEPARATE KIND RATHER THAN THE GEMM KIND. The gemm job takes a dense A that already exists; here
+# the expansion is part of the chunk, which is the entire point. Measured on Zen4, the driver-expands
+# form costs 1.88x the SUM of its two phases at n=100, and exactly 1.00x of that sum at ONE worker — so
+# the cost is not the expansion but the handoff of lines dirty in the driver's cache to five readers.
+# Six concurrent expansions cost about one expansion's wall-clock, so moving it into the chunk removes
+# the handoff without paying six times for the copy.
+# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
+# req8-ok: enum discriminant, host-invariant by construction
+const _MT_KIND_SYMM = 21
+
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
 @inline _is_reduction(kind::Int) =
@@ -4581,6 +4630,7 @@ end
     p.kind == _MT_KIND_TRSMR && return _trsmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMMR && return _trmmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMM && return _trmm_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_SYMM && return _symm_run_chunk(p, nw, i)
     p.kind == _MT_KIND_AXPY && return _axpy_run_chunk(p, nw, i)
     p.kind == _MT_KIND_DOT && return _dot_run_chunk(p, nw, i)
     p.kind == _MT_KIND_ASUM && return _asum_run_chunk(p, nw, i)

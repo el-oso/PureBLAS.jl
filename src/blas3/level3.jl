@@ -1266,6 +1266,56 @@ end
     end
 end
 
+# Pack a SYMMETRIC A panel straight from its stored triangle, with no dense intermediate.
+#
+# WHY THIS EXISTS. `symm` used to expand A into a full n×n scratch and then run an ordinary product on
+# it. The expansion is O(n²) against an O(n³) product, which looks free, and in isolation it nearly is —
+# but the product reads back what the expansion just wrote, and that turnaround is not free at all.
+# Measured on Zen4 at n=100, six workers: the expansion alone is 4.2 us and the product alone 9.7 us,
+# while the two in sequence are 26.8 — the steps cost 1.9x their own sum. Packing from the triangle
+# deletes the write, and with it the read that misses.
+#
+# NO NEW MICROKERNEL IS NEEDED for the bulk of the work, because a packed panel of a symmetric matrix is
+# one of three cases and two of them already exist:
+#   * wholly inside the stored triangle  → every element is `A[i,j]`  → `_pack_A_simd!`
+#   * wholly inside the mirrored half    → every element is `A[j,i]`  → `_pack_A_simd_T!`
+#   * straddling the diagonal            → mixed, and there are only O(n/mr) such panels
+# The diagonal is identical either way, so a panel touching it exactly at its edge still takes a fast
+# path; only a panel that spans the diagonal strictly needs the scalar body below.
+#
+# `up` is A's stored triangle. α rides into the pack exactly as it does for `_pack_A!`.
+function _pack_A_sym!(
+        Ap::AbstractVector{T}, A, ic::Int, pc::Int, mce::Int, kce::Int,
+        up::Bool, alpha::T, mr::Int
+    ) where {T}
+    rlo = ic; rhi = ic + mce - 1                   # 0-based global row span of this panel
+    clo = pc; chi = pc + kce - 1                   # 0-based global column span
+    if _strided1(A) && T <: BlasReal
+        # `_symstored` is 1-based; the spans here are 0-based, so compare the same way it would.
+        if up ? (rhi <= clo) : (rlo >= chi)
+            return _pack_A_simd!(Ap, A, ic, pc, mce, kce, alpha, mr)      # all stored: read A[i,j]
+        elseif up ? (rlo >= chi) : (rhi <= clo)
+            return _pack_A_simd_T!(Ap, A, ic, pc, mce, kce, alpha, mr)    # all mirrored: read A[j,i]
+        end
+    end
+    np = cld(mce, mr)
+    @inbounds for pi in 0:(np - 1)
+        base = pi * mr * kce
+        for p in 0:(kce - 1)
+            for r in 0:(mr - 1)
+                lr = pi * mr + r
+                Ap[base + p * mr + r + 1] = if lr < mce
+                    gi = ic + lr + 1; gp = pc + p + 1                     # 1-based, as `_symstored` wants
+                    alpha * (_symstored(up, gi, gp) ? A[gi, gp] : A[gp, gi])
+                else
+                    zero(T)
+                end
+            end
+        end
+    end
+    return
+end
+
 # Pack a triangular op(A) panel: zero the non-stored half, write the diagonal (unit ⇒ 1). packed_upper
 # = the packed op(A) is upper-triangular (zero where gi>gp). Used only for diagonal-straddling A-panels
 # (off-diagonal panels are fully stored → plain _pack_A!, fully-zero panels are skipped by the driver).
@@ -1576,10 +1626,22 @@ function trmm!(
     # other and the recursion is AHEAD below 2048, so the threaded margin is not bought with a
     # serial loss except at the top of the range (+4.7% at 4096).
     #
-    # `_trsm_workers` decides, on the solve's own `k²·n`: side-L trmm has the same operand shape and
-    # the same flop count, so the amortisation floor transfers exactly rather than by analogy.
+    # THE FLOOR DOES NOT TRANSFER FROM trsm, THOUGH THE FLOP COUNT DOES. Both are `k²·n` on the same
+    # operand shape, which is why this site used `_trsm_workers`, but a solve and a product amortise the
+    # pool differently: trsm's columns carry a sequential substitution, trmm's are a product. Forcing the
+    # pool at six workers, bit-identical to the serial result, gain by flop count (Zen4/Zen3/Zen5):
+    #
+    #       32768   0.79 / 0.95 / 0.93      <- loses
+    #       64000   1.11 / 1.32 / 1.31
+    #      125000   1.58 / 1.64 / 1.86
+    #      262144   1.87 / 2.22 / 2.06
+    #
+    # trsm at the same 125000 flops LOSES, at 0.89x on Zen4 — so one floor cannot serve both, and
+    # `_GEMM_MT_WORK`'s 220416 refused a size at which trmm returns 1.6-1.9x on every box. Halving it
+    # admits 125000 and still refuses 64000, whose 1.11x on the weakest box is not worth six workers.
+    # That is the same standard the shared floor is set to: the worst admitted cell returns about 1.8x.
     if !iszero(alpha) && _trmm_left_owns(A, B, transA, sl, k)
-        nwl = _trsm_workers(k, size(B, 2))
+        nwl = _trmm_workers_l(k, size(B, 2))
         if nwl > 1
             rA = _root(A); rB = _root(B)
             GC.@preserve rA rB _gemm_threaded!(
@@ -1593,7 +1655,7 @@ function trmm!(
     if !sl && eltype(B) === Float64 && transA != 'C' && !iszero(alpha) &&
             _strided1(A) && _strided1(B) && size(B, 2) == k &&
             !_trmmr_sme_owns(Float64, k, size(B, 1), A, B)
-        nwr = _trsm_workers_r(k, size(B, 1), eltype(B))
+        nwr = _trmm_workers_r(k, size(B, 1), eltype(B))
         if nwr > 1
             rA = _root(A); rB = _root(B)
             GC.@preserve rA rB _gemm_threaded!(
@@ -3646,13 +3708,19 @@ end
 #   _EXPINT[10] SME in-place-A column-panel cut (0 = `_SME_INPLACE_NJP`, negative = residency only) --
 #               see `_sme_inplace_njp`
 #   _EXPINT[11] witness: the widest column-panel count the cut above admitted (proves the arm was live)
+#   _EXPINT[12] 1 = disable the COOPERATIVE A-pack (A/B arm; 0 ships: deal the `ic` blocks across the
+#               workers into one shared buffer and meet at a barrier). With 1, every worker packs every
+#               block into its own scratch, which is the redundant form the cooperative pack replaced --
+#               more traffic, no barrier. Tests whether the barrier or the traffic dominates when the
+#               operands come from DRAM rather than L3.
+#   _EXPINT[13] witness: 1 = the cooperative branch ran, 2 = the private branch ran
 #
 # ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
 # OUT-OF-BOUNDS READ that no test will catch — `@inbounds` deletes the check, and a stale heap value
 # that happens to be 0 looks exactly like "knob off". That is not hypothetical: on 2026-08-18 a revert
 # removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
 # read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
-const _EXPINT = fill(0, 11)
+const _EXPINT = fill(0, 13)
 const _EXPFLAG = fill(false, 19)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
@@ -5111,6 +5179,25 @@ end
     return max(1, min(nt, cld(n, _NR)))
 end
 
+# side-L trmm's worker count. Identical to `_trsm_workers` but for the floor: the two ops share the
+# `k²·n` flop count and the operand shape, and they do NOT share an amortisation point, because a
+# product's columns parallelise where a substitution's do not. Measured at 125000 flops, six workers,
+# bit-identical to serial: trmm returns 1.58/1.64/1.86 on Zen4/Zen3/Zen5 while trsm LOSES at 0.89x on
+# Zen4. The derivation and the full gain-by-flops table are at the call site in `trmm!`.
+#
+# HALF, not a separate literal: the number this divides is the measured fork-join amortised at the
+# detected FMA rate, and nothing about trmm changes either of those — what changes is how much of the
+# call the pool can overlap, and one factor of two is what the measurements support. A third knob here
+# would be a tuning parameter with no derivation behind it.
+@inline function _trmm_workers_l(k::Int, n::Int)
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    flops = k * k * n
+    (flops < _GEMM_MT_WORK ÷ 2 || n < _NR) && return 1
+    # Gate, not ration — the argument is at `_gemm_workers`.
+    return max(1, min(nt, cld(n, _NR)))
+end
+
 # One worker's column band. Called from `_gemm_run_chunk` (gemm.jl) on the pool's `_MT_KIND_TRSM` job,
 # where `C` and `B` are the same matrix: trsm solves in place, so the pool's output and RHS coincide.
 # `p.m` is B's row count, which for side 'L' is also A's dimension.
@@ -5136,6 +5223,27 @@ end
     nt > 1 || return 1
     flops = k * k * m
     (flops < _GEMM_MT_WORK || m < _MR * _vwidth(T)) && return 1
+    # Gate, not ration — the argument is at `_gemm_workers`.
+    return max(1, min(nt, cld(m, _MR * _vwidth(T))))
+end
+
+# side-R trmm's worker count: `_trsm_workers_r` with the same halved floor side L takes, and for the
+# same reason. The row split is the mirror of side L's column split and amortises the same way, which
+# the measurement bears out — forcing the pool at six workers, bit-identical to serial, gain by flop
+# count on Zen4/Zen3:
+#
+#       32768   0.77 / 0.69      <- loses
+#       64000   1.11 / 1.18
+#      125000   1.57 / 1.24
+#      262144   1.72 / 1.85
+#
+# The side-R SOLVE at 125000 flops is what the shared floor is set for; the side-R PRODUCT pays there
+# on both boxes. Half admits 125000 and still refuses 64000.
+@inline function _trmm_workers_r(k::Int, m::Int, ::Type{T}) where {T}
+    nt = _MT_NTHREADS[]
+    nt > 1 || return 1
+    flops = k * k * m
+    (flops < _GEMM_MT_WORK ÷ 2 || m < _MR * _vwidth(T)) && return 1
     # Gate, not ration — the argument is at `_gemm_workers`.
     return max(1, min(nt, cld(m, _MR * _vwidth(T))))
 end
@@ -5257,6 +5365,40 @@ end
     Bc = PtrMatrix{T}(p.Bp + j0 * p.ldb * sizeof(T), p.m, len, p.ldb)
     _trmm_left!(p.up, p.tA, p.cA, p.unit, Ac, Bc, p.n)
     isone(p.alpha) || _scal_all!(Bc, p.alpha)
+    return nothing
+end
+
+# One worker's column band of a side-L symm, WITH ITS OWN EXPANSION of the symmetric operand.
+#
+# The driver-expands form has the driver write one buffer and every worker read it, which costs the
+# handoff of lines dirty in the driver's cache: measured on Zen4 at n=100, the two phases cost 1.88x
+# their own sum at six workers and exactly 1.00x of it at ONE worker, so the expansion is not the
+# problem and the sharing is. Six concurrent expansions cost about one expansion's wall-clock, so
+# expanding per worker removes the handoff without paying six times over.
+#
+# `_symm_scr_mt` is `OncePerTask` and the workers ARE tasks, so each one gets its own buffer here —
+# which is what makes the write and the read land on the same core. That ownership is also what
+# guarantee 3 requires of a buffer a worker holds, and it is satisfied for a stronger reason than
+# usual: this buffer never crosses a join at all.
+#
+# THE ROUTE TOKEN CARRIES THE UNDIVIDED EXTENTS. A size-keyed predicate reading the band's own column
+# count would pick different arithmetic per worker and the bands would disagree bit for bit, which
+# req#11 forbids; `(p.m, p.n, p.m)` is the whole problem's (m, n, k). It also keeps Strassen's own
+# decision on the undivided shape, so the band cannot take the recursion when the whole call declined
+# it — the driver only routes here when `_strassen_owns` is false for the undivided problem.
+@noinline function _symm_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    n = p.m                                               # side L: A is m×m and m is C's row count
+    Ad = view(_symm_scr_mt(T, n), 1:n, 1:n)               # THIS worker's own twin
+    As = PtrMatrix{T}(p.Ap, n, n, p.lda)
+    _symm_materialize!(Ad, p.up, false, As, n)
+    Bc = PtrMatrix{T}(p.Bp + j0 * p.ldb * sizeof(T), n, len, p.ldb)
+    Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
+    _gemm_core!(
+        Cc, Ad, Bc, p.alpha, p.beta, false, false, false, false,
+        (p.m, p.n, p.m), _STR_FLOOR, 1
+    )
     return nothing
 end
 
@@ -7777,6 +7919,23 @@ const _CSYMM_PACK_CUT = @load_preference("csymm_pack_cut", _CHEMM_PACK_CUT)::Int
 @inline _symm_sme_owns(::Type{T}, m::Int, nc::Int, n::Int, C, B) where {T} =
     _sme_owns(T, m, nc, n, false, false, false, false, C, B, B)
 
+# Largest `n` at which a PER-WORKER expansion of the symmetric operand beats one shared expansion.
+#
+# The per-worker form trades `nw` copies of an n×n buffer for the removal of a cross-core handoff, so it
+# pays exactly while those `nw` buffers still live in cache together. Half of L3 is the share to leave
+# them, the same policy `_l1_block`'s ½ states for its own level, and solving
+# `nw·n²·sizeof(T) ≤ ½·L3` for n is the whole rule — no size literal, and it moves with the detected
+# L3 and with the worker count.
+#
+# Measured on Zen4 (16 MB L3, six workers ⇒ this returns 418), per-worker over shared, bit-identical at
+# every size: 1.54x at n=100, 1.66x at 128, 1.45x at 192, 1.34x at 224, 1.27x at 320, 1.25x at 384,
+# 1.15x at 448, then 0.79x at 480 and 512. The rule lands between 448 and 480 as it should, erring to
+# the side of refusing a size that still wins slightly rather than admitting one that loses.
+# PDM: Derived — cache residency of `nw` private buffers against the detected L3; no candidate set and
+# nothing to measure once the residency criterion is fixed. | tune: none
+@inline _symm_perworker_max(::Type{T}, nw::Int) where {T} =
+    floor(Int, sqrt(_L3_BYTES / (2 * max(1, nw) * sizeof(T))))
+
 function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
     # Complex side-L in the 3M window → fuse the reflection into the 3M A-split (no materialize, no n²
@@ -7822,6 +7981,25 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
         _strided1(B) && _strided1(C) &&
         !_symm_sme_owns(T, size(C, 1), size(C, 2), n, C, B) ?
         _gemm_workers(size(C, 1), size(C, 2), n) : 1
+    # PER-WORKER EXPANSION, when it pays. The driver-expands form below has one buffer written by the
+    # driver and read by every worker, and that handoff — not the expansion — is what costs: 1.88x the
+    # sum of the two phases at n=100 on Zen4, and exactly 1.00x of it at ONE worker. `_MT_KIND_SYMM`
+    # moves the expansion into the chunk, where each worker writes and reads its own `OncePerTask`
+    # buffer on one core. Measured against this path, bit-identical at every size: 1.54x at n=100,
+    # 1.66x at 128, 1.45x at 192, 1.25x at 384, 1.15x at 448, and 0.79x at 480 — so it is gated.
+    #
+    # Real only, because the chunk expands with `herm = false`; complex side L already has its own
+    # no-materialize 3M route above, and complex side R keeps this path.
+    if side_left && T <: BlasReal && nw > 1 && _strided1(A) &&
+            n <= _symm_perworker_max(T, nw) &&
+            !_strassen_owns(T, size(C, 1), size(C, 2), n, false, A, B, _STR_FLOOR)
+        rA = _root(A); rB = _root(B); rC = _root(C)
+        GC.@preserve rA rB rC _gemm_threaded!(
+            _pm(C), _pm(A), _pm(B), convert(T, α), convert(T, β),
+            false, false, false, false, nw, _MT_KIND_SYMM, up, false, false
+        )
+        return C
+    end
     Ad = view(nw > 1 ? _symm_scr_mt(T, n) : _symm_scr(T, n), 1:n, 1:n)
     _symm_materialize!(Ad, up, herm, A, n)
     aT = convert(T, α); bT = convert(T, β)  # straight to the dispatch core, both real &
