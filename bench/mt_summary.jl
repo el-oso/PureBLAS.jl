@@ -52,30 +52,26 @@ function cells(path)
         p = split(ln, "\t"); length(p) >= 4 || continue
         d = Dict{String, Vector{Float64}}()
         drift = false
-        wins = Tuple{Int, Int}[]
+        wins = Tuple{String, Int, Int, String}[]
         for f in p[4:end]
             _p = split(f, "|"); a, csv = _p[1], _p[end]
             _freq_offlock(_freq_of(_p), ref) && (drift = true)
-            push!(wins, _window_of(_p))
+            lo, hi = _window_of(_p)
+            push!(wins, (String(a), lo, hi, length(_p) >= 9 ? String(_p[8]) : "core"))
             d[String(a)] = parse.(Float64, split(csv, ","))
         end
-        # An ARM that did not hold the clock band its siblings held is removed, for the same reason an
-        # off-lock arm is: a ratio against it compares two machine states. The pin alone cannot see this
-        # — a threaded vendor arm can hold its pin and still spend part of its own window far below it,
-        # which is what `_freq_window_mismatch` reads off `flo|fhi`.
+        # A REFERENCE arm that did not hold the clock band its same-sampler siblings held is removed,
+        # for the same reason an off-lock arm is: a ratio against it compares two machine states. The
+        # pin alone cannot see this — a threaded vendor arm can hold its pin and still spend part of its
+        # own window far below it. `_throttled_ref_arms` holds the criterion and the measurements behind
+        # it, including why a slow PB arm is kept.
         #
         # THE ARM, NOT THE CELL, matching `load_cache` in plots.jl: dropping the cell would also discard
         # the `pb`/`pb_mt` pair, which shared one window and both held the clock, so the self-speedup
         # rows would lose cells the panels keep.
-        if _freq_window_mismatch(wins)
-            ceil_khz = maximum(hi for (_, hi) in wins; init = 0)
-            for f in p[4:end]
-                _p = split(f, "|"); lo = _window_of(_p)[1]
-                if lo > 0 && ceil_khz > 0 && (ceil_khz - lo) / ceil_khz > 0.03
-                    delete!(d, String(_p[1]))
-                    _THROTTLED_ARMS[] += 1
-                end
-            end
+        for a in _throttled_ref_arms(wins)
+            delete!(d, a)
+            _THROTTLED_ARMS[] += 1
         end
         # An off-lock arm corrupts a ratio exactly as much here as in the gate: a floating clock between
         # the two windows IS the thing being measured otherwise. Count them, never average them in.

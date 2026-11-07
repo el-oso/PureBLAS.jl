@@ -3070,11 +3070,12 @@ function load_cache(path; drop_throttled::Bool = false)
                 parse.(Float64, split(csv, ","))
             )
         end
-        # THREADED CACHES ONLY: drop an ARM that did not hold the clock band its siblings held. A
-        # threaded reference arm can hold its pin and still spend part of its own window far below it —
-        # six cores of a vendor BLAS on a power-limited part pull the package clock down where one core
-        # never does — and a ratio against it compares two machine states in PureBLAS's FAVOUR, because
-        # a throttled reference is a slower reference.
+        # THREADED CACHES ONLY: drop a REFERENCE arm that did not hold the clock band its same-sampler
+        # siblings held. A threaded reference arm can hold its pin and still spend part of its own
+        # window far below it — six cores of a vendor BLAS on a power-limited part pull the package
+        # clock down where one core never does — and a ratio against it compares two machine states in
+        # PureBLAS's FAVOUR, because a throttled reference is a slower reference. `_throttled_ref_arms`
+        # holds the criterion, including why a slow PB arm is published rather than dropped.
         #
         # THE ARM, NOT THE CELL. Dropping the cell would also strip it from the "what threading bought"
         # panels, where `pb` and `pb_mt` shared one window and both held the clock — valid data thrown
@@ -3085,13 +3086,10 @@ function load_cache(path; drop_throttled::Bool = false)
         # Gated to `mt_data_` because only a threaded arm can load every core. The serial caches have
         # their own anchor and clock questions, and silently reshaping the published serial panels is not
         # this filter's job.
-        if _IS_MT_CACHE[] && _freq_window_mismatch([(r.flo, r.fhi) for r in values(cell)])
-            ceil_khz = maximum(r.fhi for r in values(cell); init = 0)
-            for (a, r) in collect(cell)
-                if r.flo > 0 && ceil_khz > 0 && (ceil_khz - r.flo) / ceil_khz > 0.03
-                    delete!(cell, a)
-                    _MT_WINDOW_DROPPED[] += 1
-                end
+        if _IS_MT_CACHE[]
+            for a in _throttled_ref_arms((k, r.flo, r.fhi, r.span) for (k, r) in cell)
+                delete!(cell, a)
+                _MT_WINDOW_DROPPED[] += 1
             end
         end
         ops = get!(g, lvl, OpData[])

@@ -92,27 +92,49 @@ for f in "${files[@]}"; do
     # Only the arms that enter a gate ratio are compared. `pb` is excluded deliberately: PureBLAS runs
     # it on one core, so its window legitimately holds a clock a six-thread window cannot, and including
     # it would flag every threaded cell of every op PureBLAS does not thread.
+    #
+    # TWO CONDITIONS BOUND WHAT A SPREAD HERE MEANS, and `bench/freqgate.jl`'s `_throttled_ref_arms`
+    # states them at length for the renderer that acts on them.
+    #
+    # Compared WITHIN ONE SAMPLER, named per arm in `span` (field 8). `core` reads the main thread's own
+    # core, `threads` the running cores from sysfs, `mtanchor` a timed all-cores reduction scaled against
+    # the pin — different quantities, so a spread between two of them is not a clock disagreement.
+    # Measured on Zen3, L1/axpy@300000: `pb_mt` at 2309 MHz (`mtanchor`) beside vendor arms at 3695 and
+    # 3699 (both `core`) on a box pinned 3701, a 38% spread that is entirely the sampler.
+    #
+    # Flagged only when the low floor is a REFERENCE. A slow reference is a slower reference, so the
+    # ratio flatters PureBLAS; a slow `pb_mt` understates both the gate ratio and the threading speedup,
+    # which is conservative and publishable. This extends the `pb` exclusion above to the `pb_mt` window
+    # of any op PureBLAS does not thread, where `mtanchor` must wake idle cores and carries their ramp.
     fout=$(awk -F'\t' -v tol="$TOL" '
         {
-            delete F; nar = 0
+            delete F; delete S; delete SP; nar = 0
             for (i = 4; i <= NF; i++) {
                 n = split($i, p, "|")
                 if (n < 8) continue                      # pre-range record: floor unknown, not zero
                 if (p[1] != "pb_mt" && p[1] != "openblas_mt" && p[1] != "aocl_mt" && p[1] != "accelerate_mt") continue
                 flo = p[6] + 0; if (flo <= 0) continue
-                F[p[1]] = flo; nar++
+                F[p[1]] = flo; S[p[1]] = (n >= 9 ? p[8] : "core"); SP[S[p[1]]] = 1; nar++
             }
             if (nar < 2) next
-            lo = ""; hi = ""; loa = ""; hia = ""
-            for (a in F) {
-                if (lo == "" || F[a] < lo) { lo = F[a]; loa = a }
-                if (hi == "" || F[a] > hi) { hi = F[a]; hia = a }
-            }
             seen++
-            d = (hi - lo) * 100.0 / hi
-            if (d > tol)
-                printf "   %s/%s@%s  %s floor %d MHz vs %s %d MHz  (%.0f%%)\n",
-                       $1, $2, $3, loa, int(lo/1000), hia, int(hi/1000), d
+            worst = 0; msg = ""
+            for (s in SP) {
+                lo = ""; hi = ""; loa = ""; hia = ""
+                for (a in F) {
+                    if (S[a] != s) continue
+                    if (lo == "" || F[a] < lo) { lo = F[a]; loa = a }
+                    if (hi == "" || F[a] > hi) { hi = F[a]; hia = a }
+                }
+                if (loa == "" || loa == hia || loa == "pb_mt") continue
+                d = (hi - lo) * 100.0 / hi
+                if (d > tol && d > worst) {
+                    worst = d
+                    msg = sprintf("   %s/%s@%s  %s floor %d MHz vs %s %d MHz  (%.0f%%, span %s)\n",
+                                  $1, $2, $3, loa, int(lo/1000), hia, int(hi/1000), d, s)
+                }
+            }
+            if (worst > 0) printf "%s", msg
         }
         # A cache with no threaded arms examines nothing here, and saying "held one clock" for that is
         # the vacuity this chain exists to prevent — a serial cache would report the strongest possible
