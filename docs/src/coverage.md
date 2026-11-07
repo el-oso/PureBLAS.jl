@@ -9,6 +9,11 @@ routing tables or colour-banded in the BLAS ones. "Routes" means the call forwar
 after `activate()`, and ⏳ marks a routine that is not gated yet. Types are s = Float32, d = Float64,
 c = ComplexF32, z = ComplexF64.
 
+The Types column lists the element types a routine implements and routes, which is **not** the set of
+types its ratio covers. Every ratio on this page is Float64, or ComplexF64 for a complex routine:
+those are the only element types the benchmark harness times. `Float32` and `ComplexF32` route and are
+tested for correctness, but no reference measurement exists for them, so no cell here gates them.
+
 How the measurements are taken and how to read a cell: [Methodology](methodology.md). Per-routine
 analysis and history: [Notes](notes.md).
 
