@@ -2992,8 +2992,15 @@ end
 const _IS_MT_CACHE = Ref(false)
 const _MT_WINDOW_DROPPED = Ref(0)
 
-function load_cache(path)
-    _IS_MT_CACHE[] = occursin("mt_data_", basename(path))
+# `drop_throttled` MUST stay false on the MERGE path, and that is not a preference.
+#
+# The merge loads the cache, folds the freshly measured arms in, and writes the whole thing back. A
+# filter applied during that load therefore does not hide an arm from a view — it DELETES it from the
+# file. Shipped true-by-default for one run and it destroyed 1224 cached reference arms across 632
+# cells (Zen4 26, Zen3 235, Zen5 963), which is hours of vendor measurement that only existed on disk.
+# Only the RENDER and REPORT paths pass true.
+function load_cache(path; drop_throttled::Bool = false)
+    _IS_MT_CACHE[] = drop_throttled && occursin("mt_data_", basename(path))
     _MT_WINDOW_DROPPED[] = 0
     g = Dict{String, Vector{OpData}}()
     meta = (version = 1, slug = "?", uarch = "?", isa = "?", host = "?", cpu = "?", commit = "?", time = "?")  # legacy ⇒ v1
@@ -3130,7 +3137,9 @@ function load_fleet(prefix::AbstractString = "plots_data_")
         (occursin("_aocl", f) || occursin("_mkl", f)) && continue   # skip leftover v2 split caches
         occursin("_lite", f) == _LITE || continue
         try                                                    # a stale/foreign/half-written cache must NOT
-            g, meta = load_cache(joinpath(@__DIR__, f))        # abort the whole fleet render — skip it loudly
+            # RENDER path: a throttled arm must not be drawn, so it is filtered out of the view here.
+            # Nothing on this path writes the cache back, which is what makes the filter safe to apply.
+            g, meta = load_cache(joinpath(@__DIR__, f); drop_throttled = true)   # a stale/foreign/half-written cache must NOT
             push!(fleet, (meta, g))
         catch e
             @warn "skipping cache $f (stale version or unreadable)" exception = (e, catch_backtrace())
@@ -3329,9 +3338,10 @@ end
 # ── measure (and cache) or load from cache, then draw ────────────────────────────────────────────
 if "plot" in ARGS
     isfile(CACHE) || error("no cache at $CACHE — run without `plot` first to measure")
-    g, _meta = load_cache(CACHE); println("loaded cached data ← $CACHE")
+    # Both of these are PLOT-ONLY paths — no `bench`, so nothing is written back and the filter is safe.
+    g, _meta = load_cache(CACHE; drop_throttled = true); println("loaded cached data ← $CACHE")
 elseif !("bench" in ARGS) && isfile(CACHE)
-    g, _meta = load_cache(CACHE); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
+    g, _meta = load_cache(CACHE; drop_throttled = true); println("loaded cached data ← $CACHE  (pass `bench` to re-measure)")
 else
     _require_lock()        # an off-lock run is INVALID, not merely noisy — refuse at second zero
     _MEASURED_ANYTHING[] = true
