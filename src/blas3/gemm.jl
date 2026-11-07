@@ -321,32 +321,76 @@ end
     return _mk_masked_body(T, MR, NR, B0, true)
 end
 
+# Columns packed together when a panel visit reads exactly ONE line per column (`mr == W`), chosen so
+# the lines live simultaneously in an L1 set without evicting each other. A pass needs a slot for the
+# demand line, its prefetched neighbour, and the packed-output store stream, so half the ways is the
+# budget that leaves room for all three. DERIVED from the detected associativity, not a literal: the
+# fleet is 8-way (G = 4), and a 4-way L1 would need G = 2 or the grouping reintroduces the thrash it
+# exists to remove.
+const _PACK_CG = max(1, _L1D_ASSOC >> 1)
+
 # SIMD pack for tA='N', dense unit-column-stride A: each full mr-row panel column is a contiguous
 # segment of A, so pack = vector load + scale + vector store. The scalar packing was the measured
 # large-n bottleneck (pack_A ≈ 8.6 GB/s; this lifts it toward memory bandwidth). Partial last panel
 # (zero-padded) stays scalar.
+#
+# TRAVERSAL ORDER IS KEYED ON `mr == W`, and that is a cache-residency property, not a style choice.
+# When `mr > W` a panel visit copies `mr/W` ADJACENT vectors, so the line a later visit wants is
+# consumed inside the same iteration and panel-outer is right. When `mr == W` a visit copies one line
+# and moves on, so panel-outer reads one line from each of `kce` columns at stride `lda` and only
+# returns to the next line of those columns a whole pass later. If `lda * sizeof(T)` is a multiple of
+# `_L1_WAY_BYTES` every column of that pass maps to ONE L1 set, the next pass's lines are evicted
+# before use, and in-flight misses to the set are capped by its ways. Measured on Zen4, syrk n=2048
+# (the unified route packs at `mr == W == 8`, `mce == n`, so it is 256 such passes back to back):
+# 48.2 GF/s at lda = 2048 against 51.3 at lda = 2056 — and `trans='T'`, which packs 8 columns at a
+# time through `_pack_A_simd_T!`, is flat at 50.8/51.4 across the same pair.
+#
+# Column-group-outer removes it without copying A: each column becomes a sequential run of lines down
+# the panels, so the neighbour line is consumed on the next inner iteration and the pattern no longer
+# depends on `lda`. The PACKED BYTES AND THEIR ADDRESSES ARE UNCHANGED — only the order of stores
+# differs — so this is invariant across thread counts by construction (req#11) and the microkernel's
+# k-loop still fixes summation order.
 @inline function _pack_A_simd!(
         Ap::AbstractVector{T}, A, ic::Int, pc::Int, mce::Int,
         kce::Int, alpha::T, mr::Int
     ) where {T}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); lda = stride(A, 2)
     np = cld(mce, mr)
+    nf = mce ÷ mr                             # full panels; a trailing partial one is handled below
     GC.@preserve A Ap begin
         Aptr = pointer(A); App = pointer(Ap); av = V(alpha)
-        @inbounds for pi in 0:(np - 1)
-            base = pi * mr * kce
-            r0 = ic + pi * mr
-            if pi * mr + mr <= mce            # full panel — vectorized column copy + scale
-                for p in 0:(kce - 1)
-                    src = Aptr + (r0 + (pc + p) * lda) * sz
-                    dst = App + (base + p * mr) * sz
-                    o = 0
-                    while o < mr
-                        vstore(av * vload(V, src + o * sz), dst + o * sz)
-                        o += W
+        @inbounds begin
+            if mr == W && iszero(_EXPINT[14])
+                for p0 in 0:_PACK_CG:(kce - 1)
+                    pe = min(p0 + _PACK_CG - 1, kce - 1)
+                    for pi in 0:(nf - 1)
+                        base = pi * mr * kce
+                        r0 = ic + pi * mr
+                        for p in p0:pe
+                            vstore(
+                                av * vload(V, Aptr + (r0 + (pc + p) * lda) * sz),
+                                App + (base + p * mr) * sz
+                            )
+                        end
                     end
                 end
-            else                              # partial panel — scalar, zero-padded
+            else
+                for pi in 0:(nf - 1)          # full panel — vectorized column copy + scale
+                    base = pi * mr * kce
+                    r0 = ic + pi * mr
+                    for p in 0:(kce - 1)
+                        src = Aptr + (r0 + (pc + p) * lda) * sz
+                        dst = App + (base + p * mr) * sz
+                        o = 0
+                        while o < mr
+                            vstore(av * vload(V, src + o * sz), dst + o * sz)
+                            o += W
+                        end
+                    end
+                end
+            end
+            for pi in nf:(np - 1)             # partial panel — scalar, zero-padded
+                base = pi * mr * kce
                 for p in 0:(kce - 1)
                     for r in 0:(mr - 1)
                         lr = pi * mr + r

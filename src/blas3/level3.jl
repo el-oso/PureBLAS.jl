@@ -3714,13 +3714,17 @@ end
 #               more traffic, no barrier. Tests whether the barrier or the traffic dominates when the
 #               operands come from DRAM rather than L3.
 #   _EXPINT[13] witness: 1 = the cooperative branch ran, 2 = the private branch ran
+#   _EXPINT[14] 1 = restore the PANEL-OUTER traversal in `_pack_A_simd!`'s `mr == W` case (A/B arm;
+#               0 ships: column-group-outer, see `_PACK_CG`). With 1, a pass reads one line from each
+#               of `kce` columns at stride `lda`, which folds into one L1 set whenever the byte stride
+#               is a multiple of `_L1_WAY_BYTES`. Tests the traversal against the fold directly.
 #
 # ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
 # OUT-OF-BOUNDS READ that no test will catch — `@inbounds` deletes the check, and a stale heap value
 # that happens to be 0 looks exactly like "knob off". That is not hypothetical: on 2026-08-18 a revert
 # removed a previous growth to 8 while a later commit re-added an `_EXPINT[7]` reader, shipping an OOB
 # read in the complex-gemm dispatch. GROW THIS ARRAY IN THE SAME COMMIT AS ANY NEW INDEX.
-const _EXPINT = fill(0, 13)
+const _EXPINT = fill(0, 14)
 const _EXPFLAG = fill(false, 19)
 # SLOT NAMES ARE DECLARED ONCE, HERE. A new experiment CLAIMS A FREE SLOT and writes method-body code
 # only — no new binding, so Revise applies it in-session with zero recompile.
