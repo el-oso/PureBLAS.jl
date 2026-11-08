@@ -23,6 +23,8 @@ makedocs(;
         "Home" => "index.md",
         "Guide" => "guide.md",
         "Internals" => [
+            "How It Works" => "how_it_works.md",
+            "Vectors and Matrix–Vector Products" => "bandwidth_bound.md",
             "Design" => "design.md",
             "Scratch Arena" => "arena.md",
             "SIMD & Hardware Adaptation" => "simd.md",
