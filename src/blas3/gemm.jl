@@ -5261,6 +5261,45 @@ end
 # hardware's.
 const _MT_SPINS = 2048   # req8-ok: politeness window with a wide flat band (570 ns spin-wake … 4000 ns sleep-wake), not a perf tuning
 
+# KEEP THE CORE AWAKE, NOT JUST THE THREAD. A worker that sleeps on its event leaves its core idle, and
+# after a few milliseconds of that the kernel's idle governor puts the core into its deepest state —
+# on Zen3 that is C2/CC6, which power-gates the core and FLUSHES its L1, L2 and TLB. The exit itself is
+# cheap (18 us on that box); the cost is that the next call starts on cold per-core state, and the
+# threaded L3 kernels pay for it heavily because their packs gather across pages. Measured on Zen3,
+# six workers, n=2048, the driver busy for a fixed time between calls with NO memory traffic:
+#
+#     driver idle        0-2 ms    3 ms    5 ms
+#     syrk GF/s            290      222     196
+#     trmm GF/s            296      296     180
+#
+# A light spin on each worker core's SMT sibling keeps the CORE out of deep idle while the pool threads
+# still sleep exactly as before, and the 5 ms loss goes from -30.8% to -0.2% (syrk) and -40.0% to -0.3%
+# (trmm) — so it is the core's idle state, not this pool's wake protocol. AOCL is unaffected because
+# its OpenMP runtime keeps threads spinning for a long time between calls.
+#
+# So after the short fenced spin above, an idle worker keeps its core busy until a deadline measured
+# from when it went idle, and only then sleeps. It YIELDS while it waits rather than fencing: a fenced
+# spin holds the Julia thread, and an unrelated `Threads.@threads` job issued right after a BLAS call
+# then waited the WHOLE window (+10 ms at a 10 ms window, measured on Zen4). Yielding keeps the core
+# just as awake — with nothing else runnable `yield` returns at once — and hands the thread over the
+# moment another task wants it. Same Zen3 box, a 5 ms driver gap, window swept:
+#
+#     window           none    1 ms    3 ms    10 ms    20 ms
+#     syrk GF/s         211     283     284      287      286
+#     trmm GF/s         181     218     298      298      298
+#     unrelated job     +4%     +2%     +2%      +1%      +2%
+#
+# The core only drops into the damaging state after ~2-3 ms of CONTINUOUS idleness, so a window W
+# covers gaps up to about W + 2 ms. 10 ms covers the serial panel phases a blocked factorization runs
+# between threaded trailing updates. Back-to-back calls are unchanged at every window, so arriving work
+# is not delayed, and after the window the worker sleeps and an idle process costs its host nothing.
+const _MT_KEEPAWAKE_NS = 10_000_000   # PDM: Exempt — politeness window, measured in the comment above
+
+@inline function _mt_keepawake_ns()
+    o = @inbounds _EXPINT[16]
+    return o > 0 ? o * 1000 : (o < 0 ? 0 : _MT_KEEPAWAKE_NS)
+end
+
 @noinline _throw_gemm_worker() = error("PureBLAS: a threaded gemm worker failed; C is undefined")
 
 # A worker lives for the process (see `set_num_threads`): there is no shutdown path, and the negative-
@@ -5269,6 +5308,7 @@ const _MT_SPINS = 2048   # req8-ok: politeness window with a wide flat band (570
 function _gemm_pool_worker(p::GemmPool, i::Int)
     seen = 0
     while true
+        idle0 = time_ns()            # this worker just went idle; the keep-awake deadline counts from here
         # WAIT IN A LOOP AROUND THE PREDICATE, not on the wake. An event set for a job this worker
         # already found by SPINNING is still set the next time it tries to sleep, so `wait` returns at
         # once and proves nothing. The GENERATION is what says there is work. Without this loop that
@@ -5282,6 +5322,15 @@ function _gemm_pool_worker(p::GemmPool, i::Int)
                     break
                 end
                 Base.Threads.atomic_fence()
+            end
+            spun && break
+            win = _mt_keepawake_ns()
+            while time_ns() - idle0 < win
+                if (@atomic p.gen) != seen
+                    spun = true
+                    break
+                end
+                yield()
             end
             spun && break
             wait(p.evs[i])

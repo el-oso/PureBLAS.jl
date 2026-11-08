@@ -7,14 +7,20 @@
 #              It runs measurements through public entries; each of those opens and closes its own scope
 #              between the log lines, so no scope is ever live across one.
 #
-#   gemm.jl  — the M4 thread pool, and these four lines are the ONLY yields in a kernel file, so read
-#              the reason carefully before adding a fifth.
+#   gemm.jl  — the M4 thread pool, and these five lines are the ONLY yields in a kernel file, so read
+#              the reason carefully before adding a sixth.
 #              * `Threads.@spawn _gemm_pool_worker` — pool construction, once per process, before any
 #                gemm has borrowed anything.
 #              * `lock(_MT_SETUP_LOCK) do` in `set_num_threads` — the same construction path, serialised
 #                so two concurrent first calls cannot each push a pool. Never reached from `gemm!`.
 #              * `wait(p.evs[i])` — an IDLE worker parking between jobs. It holds no scope: it has not
 #                been given a chunk yet, and the chunk it ran last returned before this line.
+#              * `yield()` in the worker's keep-awake loop — the same idle worker, in the same position
+#                as the `wait` above it and before it: between jobs, holding no scope. It keeps the
+#                CORE busy so it does not fall into a deep idle state that flushes L1/L2/TLB, and it
+#                yields rather than fences so another task that wants this thread gets it at once — a
+#                fenced spin held the thread and stalled an unrelated `@threads` job for the whole
+#                window (+10 ms at a 10 ms window), a yielding one costs it 2-4%.
 #              * `yield()` in the driver's join — the driver has finished its OWN chunk (so its scope is
 #                closed) and is waiting for the others. The yield is not optional: `@spawn` gives no
 #                placement guarantee, two workers can share a thread, and a bare spin here deadlocked a
@@ -275,3 +281,4 @@ blas3/sme_kernel.jl:println(io, "  call void @llvm.aarch64.sme.add.za64.vg1x4.nx
 blas3/sme_kernel.jl:println(io, "  %$(nm)e$k = extractvalue $T4 %$v, $k")
 blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %$(nm)e0, <vscale x 2 x double> %$(nm)e1,")
 blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %$(nm)e2, <vscale x 2 x double> %$(nm)e3)")
+blas3/gemm.jl:yield()
