@@ -6486,10 +6486,12 @@ const _SYRK_MR = @load_preference("syrk_mr", 2)::Int
 @inline _syrk_use_unified(::Type{T}, n::Int) where {T <: BlasReal} =
     _unified_ok(T) || (_unified_layout_ok(T) && n <= _fh_syrk_unified_max())
 
-@inline _syrk_packed!(up::Bool, tr::Bool, α::T, A, C, k::Int) where {T <: BlasReal} =
+# `ov = Val(true)` overwrites C on the first k-block instead of accumulating, for a β=0 caller that
+# skipped the zero pass. Both kernels take the same decision, so which one runs cannot change the bits.
+@inline _syrk_packed!(up::Bool, tr::Bool, α::T, A, C, k::Int, ov::Val = Val(false)) where {T <: BlasReal} =
     _syrk_use_unified(T, size(C, 1)) ?
-    _trgemm_packed_u!(up, α, A, tr, C, k) :
-    _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, A, tr, A, !tr, C, k)
+    _trgemm_packed_u!(up, α, A, tr, C, k, 0, size(C, 1), ov) :
+    _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, α, A, tr, A, !tr, C, k, ov)
 
 # Complex packed syrk/herk dispatch. X=Y=A (both operands the same array). tXp=tr, tYp=!tr (identical to
 # real _syrk_packed!). Conj signs mirror _syrk_gemm!'s conjA=tr&&cc, conjB=!tr&&cc (cc=herm): herk
@@ -6921,10 +6923,12 @@ end
 # `_trgemm_packed!`, there is NO loop-invariant branch to hoist here — the β/α handling is inside
 # `_microkernel_u!` and the three-way classification is already flat — so this is a readability split
 # with no expected effect on generated code.
+# `::Val{B0}` OVERWRITES C instead of accumulating — for the first k-block of a β=0 call, so the
+# driver can drop its up-front zero pass rather than writing zeros and reading them straight back.
 function _trgemm_tiles_u!(
         up::Bool, α::T, PA::Ptr{T}, Cp0::Ptr{T}, ldc::Int, sz::Int, pstr::Int,
-        ic::Int, jc::Int, mce::Int, nce::Int, kce::Int
-    ) where {T <: BlasReal}
+        ic::Int, jc::Int, mce::Int, nce::Int, kce::Int, ::Val{B0} = Val(false)
+    ) where {T <: BlasReal, B0}
     # DERIVED, not passed. The driver has `mr = W = _vwidth(T)` and `nr = _NR`, both compile-time
     # constants; taking them as `::Int` arguments made `div(r0, mr)` / `div(c0, nr)` below into real
     # integer divisions. Measured: 2 `idiv` when passed, 0 when derived.
@@ -6940,11 +6944,11 @@ function _trgemm_tiles_u!(
                 Cblk = Ptr{T}(Cp0 + (r0 + c0 * ldc) * sz)
                 full = up ? (r0 + mre - 1 <= c0) : (r0 >= c0 + nre - 1)
                 if full && mre == mr && nre == nr
-                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, 0, up, Val(1), Val(_NR), Val(:full))
+                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, 0, up, Val(1), Val(_NR), Val(:full), Val(B0))
                 elseif full
-                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, 0, up, Val(1), Val(_NR), Val(:masked))
+                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, 0, up, Val(1), Val(_NR), Val(:masked), Val(B0))
                 else
-                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, c0 - r0, up, Val(1), Val(_NR), Val(:tri))
+                    _microkernel_u!(Cblk, ldc, Ptr{T}(a), Ptr{T}(b), kce, α, mre, nre, c0 - r0, up, Val(1), Val(_NR), Val(:tri), Val(B0))
                 end
             end
             ir += mr
@@ -6962,8 +6966,9 @@ end
 # kernel the SERIAL syrk actually runs — the threaded path used to call `_trgemm_packed!` instead and
 # paid 3-12% for a kernel the serial entry would never have chosen.
 function _trgemm_packed_u!(
-        up::Bool, α::T, A, tAp::Bool, C, k::Int, jlo::Int = 0, jhi::Int = size(C, 1)
-    ) where {T <: BlasReal}
+        up::Bool, α::T, A, tAp::Bool, C, k::Int, jlo::Int = 0, jhi::Int = size(C, 1),
+        ::Val{OV} = Val(false)
+    ) where {T <: BlasReal, OV}
     n = size(C, 1); W = _vwidth(T); mr = W; nr = _NR
     kc = min(_KC, k); mc = _at_mc_kc(_HW, T, kc, mr, cld(n, mr) * mr)
     nc = _gemm_nc(n, nr)
@@ -6980,10 +6985,13 @@ function _trgemm_packed_u!(
             while pc < k
                 kce = min(kc, k - pc); pstr = mr * kce
                 _pack_A!(packA, A, 0, pc, n, kce, tAp, one(T), mr)
+                b0 = OV && pc == 0             # overwrite C on the FIRST k-block (β=0), else accumulate
                 ic = 0
                 while ic < n
                     mce = min(mc, n - ic)
-                    _trgemm_tiles_u!(up, α, PA, Cp0, ldc, sz, pstr, ic, jc, mce, nce, kce)
+                    b0 ?
+                        _trgemm_tiles_u!(up, α, PA, Cp0, ldc, sz, pstr, ic, jc, mce, nce, kce, Val(true)) :
+                        _trgemm_tiles_u!(up, α, PA, Cp0, ldc, sz, pstr, ic, jc, mce, nce, kce, Val(false))
                     ic += mc
                 end
                 pc += kc
@@ -7471,10 +7479,21 @@ function syrk!(
         GC.@preserve rA rC _syrk_dual!(up, trans != 'N', convert(T, alpha), _pm(A), convert(T, beta), _pm(C), n)
         return C
     end
-    _syrk_scaleC!(C, up, beta)
+    T = eltype(C)
+    # β=0 OVERWRITES on the first k-block instead of zeroing C and reading the zeros straight back. The
+    # zero pass is serial and scalar, on the driver, inside the call: at n=2048 it is 16 MiB of
+    # single-core stores, which the first k-block then re-reads as an accumulate. Restricted to the
+    # exact route that honours it — the real packed kernels, which `_syrk_blocked!` below would pick
+    # under these same conditions and which both take the decision — and to α≠0, where reference BLAS
+    # returns zeros rather than 0·A·Aᵀ (0·NaN is NaN, 0·(−x) is −0).
+    ov = T <: BlasReal && iszero(beta) && !iszero(alpha) && k > 0 && _syrk_prefer_packed(T, size(C, 1))
+    ov || _syrk_scaleC!(C, up, beta)
     # ── M4 PHASE 4: SPLIT THE TRIANGLE ACROSS THE POOL ─────────────────────────────────────────────
-    # β is already applied by `_syrk_scaleC!` above, so every worker's chunk is a pure accumulate into
-    # its own write-disjoint column range — no β ordering between workers to get wrong.
+    # β is either already applied by `_syrk_scaleC!` above, or is zero and every chunk overwrites on
+    # its first k-block; either way each worker's chunk writes only its own column range, so there is
+    # no β ordering between workers to get wrong. The pool carries `zero(T)` for the overwrite and
+    # `one(T)` for an accumulate into the pre-scaled C, which is what the chunk and its lost-claim
+    # fallback both read.
     #
     # Restricted to the REAL PACKED path, which is the one `_trgemm_packed!`'s `jlo/jhi` seam was
     # verified on (64 partitions exact, positive control detects an omitted chunk). Complex, the
@@ -7484,18 +7503,18 @@ function syrk!(
     # `_strided1` on BOTH operands because the pool carries POINTERS, and `eltype(A) === T` for the
     # reason `gemm!` tests it — the chunk builds `PtrMatrix{T}` from `p.Ap`, so a mixed-type operand
     # would be reinterpreted rather than converted.
-    T = eltype(C)
     nw = (T === Float64 || T === Float32) && eltype(A) === T &&
         _strided1(A) && _strided1(C) && _syrk_prefer_packed(eltype(C), size(C, 1)) && k > 0 ?
         _syrk_workers(size(C, 1), k) : 1
     if nw > 1
         rA = _root(A); rC = _root(C)
         GC.@preserve rA rC _gemm_threaded!(
-            _pm(C), _pm(A), _pm(A), convert(T, alpha), zero(T),
+            _pm(C), _pm(A), _pm(A), convert(T, alpha), ov ? zero(T) : one(T),
             trans != 'N', trans == 'N', false, false, nw, _MT_KIND_SYRK, up, false
         )
         return C
     end
+    ov && (_syrk_packed!(up, trans != 'N', convert(T, alpha), A, C, k, Val(true)); return C)
     _syrk_blocked!(up, trans != 'N', false, alpha, A, C, k)
     return C
 end
@@ -8248,7 +8267,7 @@ function syr2k!(
         _syrk_scaleC!(C, up, convert(Tr, beta))
         rA = _root(A); rB = _root(Bm); rC = _root(C)
         GC.@preserve rA rB rC _gemm_threaded!(
-            _pm(C), _pm(A), _pm(Bm), convert(Tr, alpha), zero(Tr),
+            _pm(C), _pm(A), _pm(Bm), convert(Tr, alpha), one(Tr),   # one: C is pre-scaled, accumulate
             trans != 'N', trans != 'N', false, false, nw2, _MT_KIND_SYRK, up, true
         )
         return C

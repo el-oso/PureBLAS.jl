@@ -4816,7 +4816,7 @@ end
 # The whole triangle on this thread, for a caller that LOST the pool claim. Same body the chunk runs,
 # with the full column range — so a loser computes exactly what the serial entry would have.
 @inline function _syrk_serial_fallback!(
-        C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T}, alpha::T, tA::Bool, up::Bool, sym2::Bool
+        C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T}, alpha::T, beta::T, tA::Bool, up::Bool, sym2::Bool
     ) where {T}
     k = tA ? A.m : A.n
     # Matches THE CHUNK, not the serial entry — a lost-claim caller must compute what the threaded
@@ -4829,7 +4829,10 @@ end
         _syr2k_accumulate!(_syr2k_route(T, C.n), up, tA, alpha, A, B, C, k, 0, C.n, false)
         return nothing
     end
-    _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, A, tA, A, !tA, C, k)
+    # Same overwrite decision as the chunk: `beta` is zero exactly when the driver skipped the zero pass.
+    iszero(beta) ?
+        _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, A, tA, A, !tA, C, k, Val(true)) :
+        _trgemm_packed!(Val(_tri_mr(T)), Val(_NR), up, alpha, A, tA, A, !tA, C, k)
     return nothing
 end
 
@@ -5222,10 +5225,18 @@ end
         )
         return nothing
     end
-    _trgemm_packed!(
-        Val(_tri_mr(T)), Val(_NR), p.up, p.alpha, X, p.tA, Y, !p.tA, C, p.k,
-        Val(false), j0, j0 + len
-    )
+    # `p.beta` is zero when the driver skipped the zero pass and every chunk must OVERWRITE its first
+    # k-block, and one when C is already scaled and the chunk accumulates. `_syrk_serial_fallback!`
+    # reads the same field, so a lost claim computes the same bits.
+    iszero(p.beta) ?
+        _trgemm_packed!(
+            Val(_tri_mr(T)), Val(_NR), p.up, p.alpha, X, p.tA, Y, !p.tA, C, p.k,
+            Val(true), j0, j0 + len
+        ) :
+        _trgemm_packed!(
+            Val(_tri_mr(T)), Val(_NR), p.up, p.alpha, X, p.tA, Y, !p.tA, C, p.k,
+            Val(false), j0, j0 + len
+        )
     return nothing
 end
 
@@ -5481,7 +5492,7 @@ end
         # following EVERY path out of this driver, not only the happy one. The claim is lost often —
         # with 24 concurrent callers it is the common case, not the rare one.
         if kind == _MT_KIND_SYRK
-            _syrk_serial_fallback!(C, A, B, alpha, tA, up, sym2)
+            _syrk_serial_fallback!(C, A, B, alpha, beta, tA, up, sym2)
         elseif kind == _MT_KIND_ELEM
             # A loser does the WHOLE block through the same `_elem_comb!` the winner's workers call,
             # so it is the one arm in this dispatch where the two paths are the identical broadcast
