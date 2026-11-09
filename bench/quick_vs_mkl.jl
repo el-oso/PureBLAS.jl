@@ -4,8 +4,9 @@
 #
 # It builds its own temporary environment (MKL + Chairmarks + this checkout of PureBLAS), so no project
 # file in the repository changes. It times the SAME `LinearAlgebra` call with two backends behind it:
-# MKL, forwarded by `using MKL`, and PureBLAS, forwarded by `PureBLAS.activate()`. MKL is loaded first,
-# so `deactivate()` hands the calls back to MKL rather than to the OpenBLAS Julia ships with.
+# MKL, forwarded by `using MKL`, and PureBLAS, forwarded by `PureBLAS.activate()`. Each switch back to
+# MKL is `PureBLAS.deactivate()` followed by `MKL.__init__()`: MKL's ILP64 symbols carry a `64_` suffix,
+# and only MKL's own forwarding (`suffix_hint = "64"`) finds them.
 #
 # THESE ARE INDICATIVE NUMBERS, NOT GATE NUMBERS. The fleet's results come from frequency-locked AMD
 # boxes with every thread pinned to its own core; a laptop boosts, throttles, and on recent Intel parts
@@ -25,17 +26,18 @@ using Chairmarks: @be
 
 const NT = Threads.nthreads()
 
-# FAIL BEFORE TIMING ANYTHING if either backend is not what this script claims to be measuring.
-# `deactivate()` re-forwards the libraries that were loaded when PureBLAS started — MKL's here — so check
-# that the round trip really lands back on MKL and that both backends compute the right answer.
+use_mkl() = (PureBLAS.deactivate(); MKL.__init__())
+
+# FAIL BEFORE TIMING ANYTHING if either backend is not what this script claims to be measuring:
+# check that the round trip lands back on MKL and that both backends compute the right answer.
 function check_backends()
     A = randn(300, 200); B = randn(200, 250); ref = [sum(A[i, l] * B[l, j] for l in 1:200) for i in 1:300, j in 1:250]
     PureBLAS.activate()
     PureBLAS.is_active() || error("PureBLAS.activate() did not take effect")
     pb_ok = isapprox(A * B, ref; rtol = 1e-12)
-    PureBLAS.deactivate()
+    use_mkl()
     libs = [basename(l.libname) for l in BLAS.get_config().loaded_libs]
-    any(contains("mkl"), libs) || error("after deactivate() the loaded BLAS is $libs, not MKL")
+    any(contains("mkl"), libs) || error("after use_mkl() the loaded BLAS is $libs, not MKL")
     mkl_ok = isapprox(A * B, ref; rtol = 1e-12)
     (pb_ok && mkl_ok) || error("wrong product: PureBLAS ok=$pb_ok, MKL ok=$mkl_ok")
     println("backends checked: PureBLAS active/inactive round trip lands on ", join(libs, ", "), "; both products correct")
@@ -43,17 +45,17 @@ end
 
 # One op at one thread count: alternate the two backends, pool each backend's samples, take medians.
 function compare(f, setup, nt)
-    BLAS.set_num_threads(nt); PureBLAS.set_num_threads(nt)
-    PureBLAS.deactivate(); f(setup()); PureBLAS.activate(); f(setup())     # compile both paths
+    use_mkl(); BLAS.set_num_threads(nt); PureBLAS.set_num_threads(nt)
+    f(setup()); PureBLAS.activate(); f(setup())                            # compile both paths
     mkl = Float64[]; pb = Float64[]
     for _ in 1:2
-        PureBLAS.deactivate()
+        use_mkl()
         append!(mkl, [s.time for s in (@be setup() f evals = 1 seconds = 0.5).samples])
         sleep(0.3)                                                       # let MKL's threads go idle
         PureBLAS.activate()
         append!(pb, [s.time for s in (@be setup() f evals = 1 seconds = 0.5).samples])
     end
-    PureBLAS.deactivate()
+    use_mkl()
     return median(mkl), median(pb)
 end
 median(v) = (s = sort(v); s[(length(s) + 1) ÷ 2])
