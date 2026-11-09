@@ -41,7 +41,7 @@ because each records a trap that is invisible until it bites.
       ⚠ Related trap already paid for once: the Accelerate dylib needs
       `suffix_hint = "\x1a$NEWLAPACK$ILP64"`. Without the leading `0x1A`, LBT falls back to LP64 and
       `dgemm_64_` **returns zeros rather than raising**.
-- [x] **`openblas_mt` is measured across every group.** `bench/mt_data_neon_mac.home.txt` holds 937
+- [x] **`openblas_mt` is measured across every group.** `bench/mt_data_neon_*.txt` holds 937
       cells with all three threaded arms — `accelerate_mt`, `openblas_mt`, `pb_mt` — so the per-cell
       reference rule has both reference arms it needs.
       ⚠ The cache header records `freq=0kHz base=0kHz boost=-1`: this platform reports no pin, so
