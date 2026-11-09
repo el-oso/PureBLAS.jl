@@ -78,9 +78,10 @@ Where the remaining gap lives, by op family:
 n = 100 is the binding cell and is what the `gemm` gate figure reports. n = 1024 reads 1.67, but
 Accelerate's own q10-q90 spread in that one cell is 2.15x, so it is not a usable number — the cells
 either side of it read 0.83 and 1.03, and both sit under a 1.02 spread. **n = 4096 fell from 1.10 to
-0.76 between the two PureBLAS runs**, six times the machine-state term, so it is either a real
-regression or contention in the single longest-running cell on the ladder; a quiet-box `op=gemm`
-re-measure separates the two.
+0.76 between the two PureBLAS runs**, and the cause is the box, not the code: the 2026-09 source
+(`52332de7`) and the current one, run alternately on the same box the same day, differ by 3% at
+n = 4096 and 1% at n = 100, while both take 0.39-0.43 s at n = 4096 against 0.27 s in the September
+cache. Treat the n = 4096 ratio as invalid until a quiet-box re-measure.
 
 ## What reaches SME, and when
 
