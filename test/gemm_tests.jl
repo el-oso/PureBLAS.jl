@@ -471,10 +471,23 @@ end
             g0 = @atomic p.gen; s0 = P._SME_CALLS[]; f();
             (@atomic p.gen) != g0 || P._SME_CALLS[] != s0
         )
-        for (m, n, k) in ((512, 512, 512), (1024, 1024, 1024), (1024, 1024, 128), (2048, 1024, 512))
+        shapes = ((512, 512, 512), (1024, 1024, 1024), (1024, 1024, 128), (2048, 1024, 512))
+        for (m, n, k) in shapes
             P._gemm_workers(m, n, k) > 1 || continue
             A = randn(m, k); B = randn(k, n); C = zeros(m, n)
             @test ran(() -> P.gemm!(C, A, B))
+        end
+        # The same shapes through the `dgemm_64_` entry `activate()` installs, which must take
+        # `gemm!`'s route and not a serial core of its own.
+        P.activate()
+        try
+            for (m, n, k) in shapes
+                P._gemm_workers(m, n, k) > 1 || continue
+                A = randn(m, k); B = randn(k, n); C = zeros(m, n)
+                @test ran(() -> mul!(C, A, B))
+            end
+        finally
+            P.deactivate()
         end
         n = 1024
         if P._gemm_workers(n, n, n) > 1

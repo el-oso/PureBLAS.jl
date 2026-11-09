@@ -6203,6 +6203,22 @@ end
     return nothing
 end
 
+# `gemm!`'s route for a strided operand of a BLAS element type, shared with the `?gemm_64_` C-ABI entries
+# so that `A * B` after `activate()` runs the same algorithm as the native call: the column split when
+# `nw > 1` and neither Strassen nor SME owns the shape, else the serial core, whose Strassen recursion
+# threads its own leaves. `gemm!` explains why the two forms are chosen this way.
+@inline function _gemm_strided!(
+        C, A, B, α::T, β::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::Int, nw::Int
+    ) where {T}
+    if nw > 1 && !_strassen_owns(T, m, n, k, tA, A, B, _STR_FLOOR) && !_sme_owns(T, m, n, k, tA, tB, cA, cB, C, A, B)
+        rA = _root(A); rB = _root(B); rC = _root(C)
+        GC.@preserve rA rB rC _gemm_threaded!(_pm(C), _pm(A), _pm(B), α, β, tA, tB, cA, cB, nw)
+    else
+        _gemm_core!(C, A, B, α, β, tA, tB, cA, cB, _RT_NONE, _STR_FLOOR, nw)
+    end
+    return C
+end
+
 function gemm!(
         C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix;
         alpha = one(eltype(C)), beta = zero(eltype(C)), transA::Char = 'N', transB::Char = 'N'
@@ -6287,18 +6303,7 @@ function gemm!(
         # the recursion runs once, and each of its leaves is a classical product handed to the column
         # split (`_strassen_leaf!`). A leaf is bit-identical threaded or serial, so the whole recursion
         # is too.
-        if nw > 1 && !_strassen_owns(T, m, n, k, tA, A, B, _STR_FLOOR) &&
-                !_sme_owns(T, m, n, k, tA, tB, transA == 'C', transB == 'C', C, A, B)
-            rA = _root(A); rB = _root(B); rC = _root(C)
-            GC.@preserve rA rB rC _gemm_threaded!(
-                _pm(C), _pm(A), _pm(B), T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', nw
-            )
-        else
-            _gemm_core!(
-                C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C',
-                _RT_NONE, _STR_FLOOR, nw
-            )
-        end
+        _gemm_strided!(C, A, B, T(alpha), T(beta), tA, tB, transA == 'C', transB == 'C', m, n, k, nw)
     elseif _pairT(T) && _strided1(C) && _strided1(A) && _strided1(B) && eltype(A) === T && eltype(B) === T &&
             max(m, n, k) > _fh_cgemm_tiny()
         # Dual planes (dual_l3.md). `_fh_cgemm_tiny` is reused as the floor below which three real sub-gemms plus
