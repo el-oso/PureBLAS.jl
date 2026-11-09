@@ -2666,14 +2666,19 @@ end
 @generated function _uker_cmplx!(
         C::Ptr{T}, ldc::Int, A::Ptr{T}, lda::Int, ir::Int,
         B::Ptr{T}, ldb::Int, jr::Int, k::Int, alr::T, ali::T, mre::Int, nre::Int,
-        ::Val{MR}, ::Val{NR}, ::Val{TB}, ::Val{SA}, ::Val{SB},
-        ::Val{B0}, ::Val{A1},
-        ::Val{AR}, ::Val{FULL},
-        ::Val{TRI}, d0::Int, upper::Bool
-    ) where {T, MR, NR, TB, SA, SB, B0, A1, AR, FULL, TRI}
+        ::Val{F}, d0::Int, upper::Bool
+    ) where {T, F}
     # NOTE: no default args — they generate default-arg TRAMPOLINE methods that juliac's --trim verifier
     # cannot resolve through this @generated function (unresolved invoke ::Any → .so build fails). Every
-    # call site MUST pass all 10 Vals + d0 + upper explicitly. (Regression guard: bench/juliac build.)
+    # call site MUST pass the flag tuple + d0 + upper explicitly. (Regression guard: bench/juliac build.)
+    #
+    # THE TEN COMPILE-TIME SWITCHES ARRIVE AS ONE TUPLE, `F = (MR, NR, TB, SA, SB, B0, A1, AR, FULL, TRI)`,
+    # not as ten `::Val` arguments. A generator receives every static parameter and every argument type,
+    # and Julia marks all of a generator's arguments `@nospecialize` but can record that only for the
+    # first 32. Ten separate switches made this generator 36 wide, which printed "@nospecialize
+    # annotation only supported on the first 32 arguments" on every precompile. Every switch is still a
+    # compile-time constant, so each combination generates exactly the code it did before.
+    MR, NR, TB, SA, SB, B0, A1, AR, FULL, TRI = F
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}; V2W = Vec{2W, T}
     # (`ilv`, the split→interleaved shuffle, was removed with the split accumulators — see below.)
     swp = Expr(:tuple, (l ⊻ 1 for l in 0:(2W - 1))...)                       # (1,0,3,2,…): swap re/im pairs
@@ -2886,7 +2891,7 @@ end
 # `_CGEMM_UNPACK_MAX` past it in the same change, or the knob is inert.
 const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typemax(Int))::Int
 # TB/OV/A1/AR are Val TYPE-PARAMS (not value args) so the trimmer union-splits _uker_sweep! into concrete
-# methods — a value `tB ? Val(true) : Val(false)` reaching `_uker_cmplx!`'s ::Val{TB} through an untyped
+# methods — a value `tB ? Val(true) : Val(false)` reaching `_uker_cmplx!`'s flag tuple through an untyped
 # arg is an "unresolved call" for --trim (the zgemm_64_/cgemm_64_ trim failure). Mirrors the real path.
 @inline function _uker_sweep!(
         ::Val{NR}, Cp, ldc, Ap, lda, Bp, ldb, m::Int, n::Int, k::Int,
@@ -2904,18 +2909,18 @@ const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typema
                 if mre == mr                                         # full-row interior tile → unmasked
                     _uker_cmplx!(
                         Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(true), Val(false), 0, true
+                        Val((_CMR, NR, TB, SA, SB, OV, A1, AR, true, false)), 0, true
                     )
                 else
                     _uker_cmplx!(
                         Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                        Val(_CMR), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false), Val(false), 0, true
+                        Val((_CMR, NR, TB, SA, SB, OV, A1, AR, false, false)), 0, true
                     )
                 end
             else
                 _uker_cmplx!(
                     Cp, ldc, Ap, lda, ir, Bp, ldb, jr, k, alr, ali, mre, nre,
-                    Val(1), Val(NR), Val(TB), Val(SA), Val(SB), Val(OV), Val(A1), Val(AR), Val(false), Val(false), 0, true
+                    Val((1, NR, TB, SA, SB, OV, A1, AR, false, false)), 0, true
                 )
             end
             ir += nrv >= _CMR ? mr : W
