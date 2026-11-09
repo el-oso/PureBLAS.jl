@@ -14,17 +14,32 @@
 # The two backends are measured alternately (MKL, PureBLAS, MKL, PureBLAS) so drift hits both equally,
 # with a pause before each PureBLAS window so MKL's threads have stopped spinning on the cores.
 #
+# EACH THREAD COUNT RUNS IN ITS OWN JULIA PROCESS, started with `-t N` and `MKL_NUM_THREADS=N`. MKL's
+# LAPACK routines (Cholesky among them) keep the thread count MKL started with: `BLAS.set_num_threads(1)`
+# reports 1 but `potrf` still runs on every core. Only the variable set at startup holds it to N.
+#
 # Reading the ratio: MKL time / PureBLAS time, so ABOVE 1 MEANS PUREBLAS IS FASTER.
-using Pkg
-Pkg.activate(; temp = true)
-Pkg.develop(path = joinpath(@__DIR__, ".."); io = devnull)
-Pkg.add(["MKL", "Chairmarks"]; io = devnull)
+const NT_CHILD = get(ENV, "QUICK_VS_MKL_THREADS", "")
+if isempty(NT_CHILD)        # parent: build the environment once, then run one child per thread count
+    using Pkg
+    Pkg.activate(; temp = true)
+    Pkg.develop(path = joinpath(@__DIR__, ".."); io = devnull)
+    Pkg.add(["MKL", "Chairmarks"]; io = devnull)
+    nmax = Threads.nthreads()
+    nmax == 1 && println("note: started with one thread, so only the single-threaded table runs. Use `julia -t auto`.\n")
+    for nt in unique((1, nmax))
+        cmd = `$(Base.julia_cmd()) -t $nt --project=$(Base.active_project()) $(abspath(PROGRAM_FILE))`
+        run(addenv(cmd, "QUICK_VS_MKL_THREADS" => string(nt), "MKL_NUM_THREADS" => string(nt)))
+    end
+    exit()
+end
 
 using MKL                         # forward LinearAlgebra's BLAS/LAPACK to MKL — BEFORE PureBLAS loads
 using PureBLAS, LinearAlgebra, Printf, Random
 using Chairmarks: @be
 
-const NT = Threads.nthreads()
+const NT = parse(Int, NT_CHILD)
+NT == Threads.nthreads() || error("child started with $(Threads.nthreads()) Julia threads, expected $NT")
 
 use_mkl() = (PureBLAS.deactivate(); MKL.__init__())
 
@@ -43,9 +58,9 @@ function check_backends()
     println("backends checked: PureBLAS active/inactive round trip lands on ", join(libs, ", "), "; both products correct")
 end
 
-# One op at one thread count: alternate the two backends, pool each backend's samples, take medians.
-function compare(f, setup, nt)
-    use_mkl(); BLAS.set_num_threads(nt); PureBLAS.set_num_threads(nt)
+# One op at this process's thread count: alternate the two backends, pool each backend's samples, take medians.
+function compare(f, setup)
+    use_mkl(); BLAS.set_num_threads(NT); PureBLAS.set_num_threads(NT)
     f(setup()); PureBLAS.activate(); f(setup())                            # compile both paths
     mkl = Float64[]; pb = Float64[]
     for _ in 1:2
@@ -84,22 +99,14 @@ function cases()
 end
 
 function main()
-    println("PureBLAS vs MKL on ", Sys.CPU_NAME, ", ", Sys.CPU_THREADS, " hardware threads, Julia started with ",
-            NT, " thread", NT == 1 ? "" : "s", "  (ratio = MKL time / PureBLAS time; >1 means PureBLAS is faster)\n")
-    NT == 1 && println("  note: started with one thread, so only the single-threaded column runs. Use `julia -t auto`.\n")
-    check_backends(); println()
-    threads = NT == 1 ? (1,) : (1, NT)
-    @printf("%-10s %8s", "op", "n")
-    for nt in threads; @printf("   %18s", "$(nt) thread$(nt == 1 ? "" : "s")"); end
-    println()
+    println("PureBLAS vs MKL on ", Sys.CPU_NAME, ", ", Sys.CPU_THREADS, " hardware threads — ", NT, " thread",
+            NT == 1 ? "" : "s", "  (ratio = MKL time / PureBLAS time; >1 means PureBLAS is faster)")
+    check_backends()
+    @printf("%-10s %8s %8s %12s\n", "op", "n", "ratio", "PB GF/s")
     for (name, n, fl, setup, f) in cases()
-        @printf("%-10s %8d", name, n)
-        for nt in threads
-            tm, tp = compare(f, setup, nt)
-            @printf("   %5.2fx  %6.1f GF/s", tm / tp, fl / tp / 1e9)
-        end
-        println(); flush(stdout)
+        tm, tp = compare(f, setup)
+        @printf("%-10s %8d %7.2fx %12.1f\n", name, n, tm / tp, fl / tp / 1e9); flush(stdout)
     end
-    println("\nGF/s is PureBLAS's throughput. Numbers are indicative — see the header of this script.")
+    println()
 end
-main()
+abspath(PROGRAM_FILE) == @__FILE__() && main()      # `include`d by quick_chol_diag.jl without running
