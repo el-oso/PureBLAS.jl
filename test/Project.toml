@@ -1,5 +1,8 @@
 [deps]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+# Times serial against threaded getrf in a child process (mt_robust_tests.jl); Chairmarks is the
+# project's only timing tool.
+Chairmarks = "0ca39b1e-fe0b-4e98-acfc-b1656634c4de"
 # Test-only. FixedSizeArray is the concrete case for "a dense array that is not `Array`": it is
 # `<: DenseArray`, so it must ride the same strided fast path Array does, and `_root` must peel it
 # without recursing forever. Pure Julia, one small dependency (Collects).
@@ -44,6 +47,7 @@ TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
 # `StrictMode = "0.5.0"`), so the two move together and the main Project.toml bound must agree.
 StrictModeTest = "0.5"
 TrimCheck = "0.1.5"
+Chairmarks = "1"
 
 # `analysis = "full"` and `fail_mode = "error"` were removed here in the 0.4 migration: 0.4 deleted
 # both keys (one analysis engine per package; throw-vs-warn is now a property of each guarantee).
