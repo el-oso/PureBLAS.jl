@@ -162,6 +162,10 @@ end
             @test P.set_num_threads(Threads.nthreads()) == min(Threads.nthreads(), P._mt_physical_cores())
         end
         @test 1 <= P._mt_physical_cores() <= Sys.EFFECTIVE_CPU_THREADS
+        # Placement: every worker bound to its own default-pool thread.
+        tw = P._gemm_pool(Float64).tids
+        @test length(tw) == Threads.nthreads() - 1
+        @test allunique(tw) && all(in(Threads.threadpooltids(:default)), tw)
         # Independent count on Linux: the allowed CPUs from the HEX mask (`Cpus_allowed`, comma-separated
         # 32-bit groups, most significant first) where the code parses the range list, and each core from
         # `core_cpus_list` where the code reads `thread_siblings_list`.

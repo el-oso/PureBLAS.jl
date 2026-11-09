@@ -4296,6 +4296,7 @@ mutable struct GemmPool{T}
     @atomic busy::Bool               # a claim, so two concurrent gemms cannot share one pool
     @atomic failed::Bool             # a worker's chunk threw; the driver turns this into an error
     const evs::Vector{Threads.Event} # one wake per worker
+    const tids::Vector{Int}          # the thread worker i is sticky to (see `_gemm_pool_start!`)
     # ── job ──
     Cp::Ptr{T}; Ap::Ptr{T}; Bp::Ptr{T}
     m::Int; n::Int; k::Int
@@ -5372,17 +5373,38 @@ end
 
 # One pool per element type, created on first threaded use. `@noinline` with a single call site so the
 # allocation it does — the tasks, the events — is ONE registered barrier, exactly like `_ws_grow!`.
+#
+# EACH WORKER IS STICKY TO ITS OWN THREAD, the way `@threads :static` places its tasks. A worker that
+# can migrate re-enters the shared run queue at every `yield()` of its wait loops, and Julia may wake an
+# idle thread to take it; whenever Julia has more threads than the process has CPUs — `-t N` adds an
+# interactive thread, and `-t auto` counts SMT siblings — that woken thread competes with the working
+# ones for a core. Measured on Zen4, getrf n=1024, quartiles (q25/median/q75), floating vs sticky:
+#   4 CPUs, `-t 4,1`                     17-504 ms        -> 7.3/7.4/7.5 ms
+#   4 cores x 2 SMT, `-t auto` (8+1)     10/14-30/156-343  -> 7.3 ms
+#   the same plus two busy processes     60/175/254        -> 8.0/10.3/11.8 ms
+#   the fleet's `-t 6,0`, one CPU/core   6.15 ms            -> 6.15 ms (gemm 7.37 -> 7.39 ms)
+# Workers skip the thread that creates the pool — the one that called `set_num_threads`, usually the
+# main task's and so the usual driver — so a driver is not sharing its thread with a worker it waits on.
 @noinline function _gemm_pool_start!(p::GemmPool)
     for i in 1:length(p.evs)
-        Threads.@spawn _gemm_pool_worker(p, i)
+        t = Task(() -> _gemm_pool_worker(p, i))
+        t.sticky = true
+        ok = ccall(:jl_set_task_tid, Cint, (Any, Cint), t, p.tids[i] - 1)
+        isone(ok) || error("PureBLAS: could not bind pool worker $i to thread $(p.tids[i])")
+        schedule(t)
     end
     return p
 end
 
 @inline function _gemm_pool_new(::Type{T}) where {T}
     nwmax = max(1, Threads.nthreads() - 1)
+    # The default pool minus the creating thread has at least `nthreads() - 1` threads, so every worker
+    # gets a thread of its own.
+    tids = filter(!=(Threads.threadid()), Threads.threadpooltids(:default))
+    length(tids) >= nwmax ||
+        error("PureBLAS: $nwmax pool workers but only $(length(tids)) threads to bind them to: $tids")
     p = GemmPool{T}(
-        0, 0, false, false, [Threads.Event(true) for _ in 1:nwmax],
+        0, 0, false, false, [Threads.Event(true) for _ in 1:nwmax], tids[1:nwmax],
         Ptr{T}(0), Ptr{T}(0), Ptr{T}(0), 0, 0, 0, 1, 1, 1,
         zero(T), zero(T), false, false, false, false,
         _MT_KIND_GEMM, false, false, false,
@@ -5456,9 +5478,9 @@ const _MT_SETUP_LOCK = ReentrantLock()
 # cores. Measured on Zen4 restricted to 4 cores x 2 SMT, n=1024, `-t auto` (8 Julia threads):
 #   no other load       8 workers: gemm 18.0 ms, getrf 14-19 ms    capped to 4: gemm 10.7 ms, getrf 12-13 ms
 #   two busy processes  8 workers: gemm 5321-18091 ms, getrf 185-12768 ms    capped: gemm 22 ms, getrf 29-36 ms
-# `-t 4` on the same CPUs, for reference: gemm 10.7 / 21.4 ms, getrf 7.7-11.8 / 9.7-10.6 ms. The capped
-# getrf under load stays about 3x behind `-t 4`; the cap removes the collapse, not every cost of the
-# surplus Julia threads.
+# `-t 4` on the same CPUs, for reference: gemm 10.7 / 21.4 ms, getrf 7.7-11.8 / 9.7-10.6 ms. These were
+# taken with floating workers; the remaining cost of the surplus Julia threads is what the sticky
+# placement in `_gemm_pool_start!` removes.
 #
 # The count is over the CPUs this process may run on (`taskset`, cgroups), not the whole machine: the
 # benchmark fleet runs one CPU per core, where every allowed CPU is its own core. On Linux it reads the
@@ -5881,9 +5903,9 @@ end
             # trade as the worker loop. It has nothing else to do — it is inside a blocking BLAS call —
             # so spinning costs the host nothing it was going to get back. And `wait` on an event can
             # allocate, which `gemm!` may not do (req#10, and test/strictmode_tests.jl's static proof).
-            # The yield after the spin window is NOT optional: `@spawn` gives no placement guarantee, so
-            # two workers can share a thread, and a bare spin here then waits on a worker that can never
-            # be scheduled. That exact deadlock cost this session a probe run at 399% CPU.
+            # The yield after the spin window is NOT optional: a driver can run on the thread a sticky
+            # worker is bound to (any task that is not the pool's creator may), and a bare spin here then
+            # waits on a worker that can never be scheduled — a deadlock, once seen at 399% CPU.
             while (@atomic p.done) < nw - 1
                 for _ in 1:_MT_SPINS
                     (@atomic p.done) >= nw - 1 && break
