@@ -10,7 +10,7 @@
 #   Apple M*  (NEON)    -> 16 bytes -> Vec{2,Float64}, Vec{4,Float32}
 
 using CpuId: simdbytes, cpuvendor, cpufeature, cachesize, cpumodel, cachelinesize, cpuid, hasleaf
-using CPUSummary: cache_size
+using CPUSummary: cache_size, num_cores
 using Preferences: @load_preference, load_preference
 
 # Widest SIMD register in bytes. Preference override "simd_bytes" wins (cross-compile / pinning);

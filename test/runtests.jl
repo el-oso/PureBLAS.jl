@@ -4,6 +4,10 @@
 using TestItemRunner
 using PureBLAS
 
+# Every Julia thread may be a worker, whatever the core count: the thread-count items prove bit-identity
+# at worker counts a 2-core CI runner could not otherwise reach. See `set_num_threads`.
+ENV["PUREBLAS_MT_ALL_THREADS"] = "1"
+
 # WHY TestItemRunner AND NOT ReTestItems (migrated 2026-08-16, Julia 1.13.0-rc3):
 # ReTestItems 1.35.2 cannot run on 1.13 and there is no fixed release. It needs `Test.push_testset` /
 # `Test.pop_testset` (both REMOVED in 1.13) and writes `Test.TESTSET_PRINT_ENABLE[]` (now a ScopedValue,

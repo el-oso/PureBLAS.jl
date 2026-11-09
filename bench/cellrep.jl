@@ -458,7 +458,7 @@ if NT > 1
     # pools on first use. The pools are warmed once here so neither arm pays for them.
     P.set_num_threads(NT); P.set_num_threads(1)
     # WITNESS IN THE OUTPUT, not just in a comment: `set_num_threads` CLAMPS to
-    # `min(Threads.nthreads(), _MT_NW_MASK)`, so a process launched without enough `-t` silently
+    # `min(Threads.nthreads(), physical cores, _MT_NW_MASK)`, so a process launched without enough `-t` silently
     # measures fewer workers than asked. Printing what the pool ACCEPTED, read back after the call,
     # means a line from such a process is identifiable afterwards instead of averaging in unnoticed.
     #
