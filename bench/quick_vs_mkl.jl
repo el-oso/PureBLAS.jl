@@ -101,6 +101,7 @@ end
 function main()
     println("PureBLAS vs MKL on ", Sys.CPU_NAME, ", ", Sys.CPU_THREADS, " hardware threads — ", NT, " thread",
             NT == 1 ? "" : "s", "  (ratio = MKL time / PureBLAS time; >1 means PureBLAS is faster)")
+    println("PureBLAS detected ", PureBLAS._HW)
     check_backends()
     @printf("%-10s %8s %8s %12s\n", "op", "n", "ratio", "PB GF/s")
     for (name, n, fl, setup, f) in cases()
