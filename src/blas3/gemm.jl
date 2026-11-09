@@ -5320,6 +5320,13 @@ function _gemm_pool_worker(p::GemmPool, i::Int)
         # stale event makes the worker re-run the PREVIOUS chunk over live output — silently wrong
         # results, and a `done` count that runs ahead of the driver.
         while (@atomic p.gen) == seen
+            # A worker above the `set_num_threads` count takes no job, so it sleeps at once instead of
+            # spinning for the keep-awake window on what is usually the SMT sibling of a working core.
+            # A later, larger count wakes it: the driver notifies every worker its job uses.
+            if i >= _MT_NTHREADS[]
+                wait(p.evs[i])
+                continue
+            end
             spun = false
             for _ in 1:_MT_SPINS
                 if (@atomic p.gen) != seen
@@ -5422,7 +5429,10 @@ const _MT_LOST = Threads.Atomic{Int}(0)
 
 Use at most `n` threads inside PureBLAS's threaded kernels, and return the value actually set. `1`
 turns threading off. Capped at `Threads.nthreads()`, because the workers are Julia tasks and there is
-nothing to run them on beyond that.
+nothing to run them on beyond that, and at the number of physical cores the process may run on: a
+second worker on an SMT sibling adds no arithmetic and makes the pool's hand-offs fragile under load.
+Setting the environment variable `PUREBLAS_MT_ALL_THREADS=1` (exactly `"1"`) lifts the core cap; it is
+read on every call.
 
 Threading is **off until you call this**. That is deliberate: a BLAS that silently takes every thread
 in the process is a surprise to whatever else the process is doing, and the shape matches
@@ -5440,8 +5450,49 @@ call may use; they do not create or destroy threads.
 # carry (`_MT_NW_MASK`, see `GemmPool`); no fleet box comes near it, but the invariant must not depend
 # on that.
 const _MT_SETUP_LOCK = ReentrantLock()
+
+# ONE WORKER PER PHYSICAL CORE. Two workers on SMT siblings share one core's FMA units, so the second
+# adds no arithmetic, and every hand-off in the pool then waits on more runnable threads than there are
+# cores. Measured on Zen4 restricted to 4 cores x 2 SMT, n=1024, `-t auto` (8 Julia threads):
+#   no other load       8 workers: gemm 18.0 ms, getrf 14-19 ms    capped to 4: gemm 10.7 ms, getrf 12-13 ms
+#   two busy processes  8 workers: gemm 5321-18091 ms, getrf 185-12768 ms    capped: gemm 22 ms, getrf 29-36 ms
+# `-t 4` on the same CPUs, for reference: gemm 10.7 / 21.4 ms, getrf 7.7-11.8 / 9.7-10.6 ms. The capped
+# getrf under load stays about 3x behind `-t 4`; the cap removes the collapse, not every cost of the
+# surplus Julia threads.
+#
+# The count is over the CPUs this process may run on (`taskset`, cgroups), not the whole machine: the
+# benchmark fleet runs one CPU per core, where every allowed CPU is its own core. On Linux it reads the
+# distinct sibling lists of the allowed CPUs from sysfs; elsewhere it is the detected core count
+# bounded by `Sys.EFFECTIVE_CPU_THREADS`. A hybrid part (SMT performance cores beside single-thread
+# efficiency cores) counts each core once, which is what the cap means.
+function _mt_physical_cores()
+    fallback = clamp(Int(num_cores()), 1, Sys.EFFECTIVE_CPU_THREADS)
+    (Sys.islinux() && isfile("/proc/self/status")) || return fallback
+    line = ""
+    for l in eachline("/proc/self/status")
+        startswith(l, "Cpus_allowed_list:") && (line = l; break)
+    end
+    isempty(line) && return fallback
+    # A core is identified by its sibling list, not by `core_id`: on arm64 described by a device tree,
+    # `core_id` restarts at 0 in every cluster. A listed CPU with no topology (possible but not present,
+    # or offline) is skipped.
+    cores = Set{String}()
+    for r in split(strip(split(line, ':')[2]), ',')
+        lo, hi = occursin('-', r) ? parse.(Int, split(r, '-')) : (parse(Int, r), parse(Int, r))
+        for cpu in lo:hi
+            f = "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
+            isfile(f) && push!(cores, readchomp(f))
+        end
+    end
+    # `EFFECTIVE_CPU_THREADS` also carries a cgroup CPU quota (`docker --cpus`), which affinity does not.
+    return isempty(cores) ? fallback : clamp(length(cores), 1, Sys.EFFECTIVE_CPU_THREADS)
+end
+
+# `PUREBLAS_MT_ALL_THREADS=1` lifts the core cap so every Julia thread can be a worker. The test suite
+# sets it: req#11's bit-identity items must run more workers than a small CI runner has cores.
 function set_num_threads(n::Integer)
-    nt = clamp(Int(n), 1, min(Threads.nthreads(), _MT_NW_MASK))
+    cores = get(ENV, "PUREBLAS_MT_ALL_THREADS", "") == "1" ? typemax(Int) : _mt_physical_cores()
+    nt = clamp(Int(n), 1, min(Threads.nthreads(), cores, _MT_NW_MASK))
     if nt > 1
         lock(_MT_SETUP_LOCK) do
             isempty(_GEMM_POOL_F64) && push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))

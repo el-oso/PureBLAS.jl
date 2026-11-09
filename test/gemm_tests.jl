@@ -157,6 +157,25 @@ end
         @test P.set_num_threads(4) == 1
     else
         @test P.set_num_threads(Threads.nthreads()) == Threads.nthreads()
+        # The core cap: without the suite's override, no more workers than physical cores.
+        withenv("PUREBLAS_MT_ALL_THREADS" => nothing) do
+            @test P.set_num_threads(Threads.nthreads()) == min(Threads.nthreads(), P._mt_physical_cores())
+        end
+        @test 1 <= P._mt_physical_cores() <= Sys.EFFECTIVE_CPU_THREADS
+        # Independent count on Linux: the allowed CPUs from the HEX mask (`Cpus_allowed`, comma-separated
+        # 32-bit groups, most significant first) where the code parses the range list, and each core from
+        # `core_cpus_list` where the code reads `thread_siblings_list`.
+        if Sys.islinux() && isfile("/proc/self/status")
+            hex = only(l for l in eachline("/proc/self/status") if startswith(l, "Cpus_allowed:"))
+            mask = parse(BigInt, replace(strip(split(hex, ':')[2]), ',' => ""); base = 16)
+            sib = Set{String}()
+            for c in 0:(ndigits(mask; base = 2) - 1)
+                f = "/sys/devices/system/cpu/cpu$c/topology/core_cpus_list"
+                isodd(mask >> c) && isfile(f) && push!(sib, readchomp(f))
+            end
+            @test P._mt_physical_cores() == clamp(length(sib), 1, Sys.EFFECTIVE_CPU_THREADS)
+        end
+        P.set_num_threads(Threads.nthreads())
         for (m, n, k) in ((256, 256, 256), (512, 300, 128), (200, 512, 333), (1024, 129, 64), (192, 7, 192))
             for tA in (false, true), tB in (false, true)
                 A = tA ? randn(k, m) : randn(m, k)
