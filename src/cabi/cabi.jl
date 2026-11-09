@@ -113,9 +113,13 @@ end
     Am = PtrMatrix(A, Int(Arows), Int(Acols), Int(lda))
     Bm = PtrMatrix(B, Int(Brows), Int(Bcols), Int(ldb))
     Cm = PtrMatrix(C, Int(m), Int(n), Int(ldc))
-    # Call the @inline dispatch core directly (not the public kwarg `gemm!`): the kwarg entry boxes
-    # its keyword args (measured +64 B), and the hot L3 D&C path already routes through _gemm_core!.
-    _gemm_core!(Cm, Am, Bm, alpha, beta, trA, trB, ta == 'C', tb == 'C')
+    # `gemm!`'s own strided route, not the public kwarg `gemm!` (the kwarg entry boxes its keyword
+    # args, measured +64 B). Every operand here is a `PtrMatrix` of a BLAS type, which is the case
+    # where `gemm!` asks `_gemm_workers` for a worker count.
+    _gemm_strided!(
+        Cm, Am, Bm, alpha, beta, trA, trB, ta == 'C', tb == 'C', Int(m), Int(n), Int(k),
+        _gemm_workers(Int(m), Int(n), Int(k))
+    )
     return
 end
 
