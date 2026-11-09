@@ -2,7 +2,8 @@
 # and holds no `@scope`: per-thread scratch ownership (see src/arena.jl) only requires that no scope is
 # live across a task switch.
 #
-#   lbt.jl   — `activate()`/`status` printing. User-facing IO, no scratch, never called from a kernel.
+#   lbt.jl   — `activate()`/`status` printing, and the `show` of the `RoutingStatus` that `activate` and
+#              `deactivate` return. User-facing IO, no scratch, never called from a kernel.
 #   tune.jl  — the calibration driver: it sleeps while waiting for an idle machine and logs progress.
 #              It runs measurements through public entries; each of those opens and closes its own scope
 #              between the log lines, so no scope is ever live across one.
@@ -39,6 +40,10 @@ lbt.jl:println(io, "  see the LAPACK/BLAS coverage docs for the exact list.")
 lbt.jl:println(io, "  Note: BLAS.get_config() still lists libopenblas — that is the LOADED library. activate()")
 lbt.jl:println(io, "  overlays per-symbol @cfunction forwards (lbt_set_forward); it does not swap the loaded")
 lbt.jl:println(io, "  library, so get_config cannot report PureBLAS. This status / is_active() is the check.")
+lbt.jl:Base.show(io::IO, ::RoutingStatus) = print(io, "PureBLAS.RoutingStatus(", is_active() ? "active" : "inactive", ")")
+lbt.jl:print(io, "  BLAS.get_config() still lists the loaded library; PureBLAS.status() explains why.")
+lbt.jl:print(io, " — $(_live_count())/$(length(_LBT_REGISTRARS)) BLAS/LAPACK symbols routed to PureBLAS\n")
+lbt.jl:print(io, " — LinearAlgebra uses the loaded BLAS; PureBLAS.activate() reroutes it.")
 tune.jl:sleep(5)
 tune.jl:@warn "tune!: machine still busy after $(maxsecs)s; the next run may refuse to measure."
 tune.jl:@info "PureBLAS.tune!: $(repeats) independent calibration runs (minutes each)." project
