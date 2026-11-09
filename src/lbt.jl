@@ -52,7 +52,38 @@ function __init__()
 end
 
 """
-    activate() -> BLAS.LBTConfig
+    RoutingStatus
+
+What [`activate`](@ref) and [`deactivate`](@ref) return. It displays PureBLAS's routing state as it
+is when shown, so the REPL's echo of `PureBLAS.activate()` reports what is live:
+
+    PureBLAS: ACTIVE — 312/312 BLAS/LAPACK symbols routed to PureBLAS
+
+`config` is `BLAS.get_config()` at the time of the call. It lists the LOADED libraries, which stay
+OpenBLAS: `activate()` forwards individual symbols on top of them rather than loading a library, so
+neither `get_config()` nor `BLAS.vendor()` can name PureBLAS. [`status`](@ref) explains this in full.
+"""
+struct RoutingStatus
+    config::BLAS.LBTConfig
+end
+
+# How many of the forwards `activate` installed still point at the PureBLAS kernel.
+_live_count() = count(((name, p),) -> _live_forward(name) == p, _OUR_PTRS)
+
+function Base.show(io::IO, ::MIME"text/plain", ::RoutingStatus)
+    if is_active()
+        printstyled(io, "PureBLAS: ACTIVE"; bold = true, color = :green)
+        print(io, " — $(_live_count())/$(length(_LBT_REGISTRARS)) BLAS/LAPACK symbols routed to PureBLAS\n")
+        print(io, "  BLAS.get_config() still lists the loaded library; PureBLAS.status() explains why.")
+    else
+        printstyled(io, "PureBLAS: INACTIVE"; bold = true, color = :yellow)
+        print(io, " — LinearAlgebra uses the loaded BLAS; PureBLAS.activate() reroutes it.")
+    end
+end
+Base.show(io::IO, ::RoutingStatus) = print(io, "PureBLAS.RoutingStatus(", is_active() ? "active" : "inactive", ")")
+
+"""
+    activate() -> RoutingStatus
 
 Reroute LinearAlgebra's BLAS/LAPACK to PureBLAS in the current Julia process by registering
 `@cfunction` forwards for every symbol PureBLAS implements (BLAS 1–3 + potrf/getrf/geqrf/gesvd).
@@ -60,6 +91,9 @@ After this, `A*B`, `mul!`, `cholesky`, `qr`, `svd`, and `LinearAlgebra.BLAS.*` d
 Reverse with [`deactivate`](@ref). This is the in-process path — no `libpureblas.so` needed (that is
 the drop-in for non-Julia hosts). AD users should call the native `PureBLAS.*` API directly; this
 C-ABI forward is not differentiable (no compiled BLAS is).
+
+The returned [`RoutingStatus`](@ref) displays as a one-line confirmation in the REPL; a script that
+discards it prints nothing.
 """
 function activate()
     failed = String[]
@@ -75,11 +109,11 @@ function activate()
     isempty(failed) ||
         error("PureBLAS.activate: lbt_set_forward rejected $(length(failed)) symbol(s): $failed")
     _ACTIVE[] = true
-    return BLAS.get_config()
+    return RoutingStatus(BLAS.get_config())
 end
 
 """
-    deactivate() -> BLAS.LBTConfig
+    deactivate() -> RoutingStatus
 
 Restore the BLAS backend that was loaded at startup (typically OpenBLAS), clearing PureBLAS's
 per-symbol forwards.
@@ -94,7 +128,7 @@ function deactivate()
     end
     _ACTIVE[] = false
     empty!(_OUR_PTRS)
-    return BLAS.get_config()
+    return RoutingStatus(BLAS.get_config())
 end
 
 """
@@ -129,10 +163,7 @@ function status(io::IO = stdout)
         println(io, "  Call PureBLAS.activate() to forward $reg BLAS/LAPACK symbols to PureBLAS.")
         return nothing
     end
-    live = 0
-    for (name, p) in _OUR_PTRS
-        _live_forward(name) == p && (live += 1)
-    end
+    live = _live_count()
     printstyled(io, "PureBLAS: ACTIVE"; bold = true, color = :green)
     println(io, " — $live/$reg forwarded symbols currently routed to PureBLAS kernels.")
     println(io, "  Every high-level LinearAlgebra op (*, \\, mul!, lu, cholesky, qr, svd, eigen, schur,")
