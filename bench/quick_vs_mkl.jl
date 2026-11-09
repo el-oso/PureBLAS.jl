@@ -1,12 +1,18 @@
 # QUICK PureBLAS vs Intel MKL comparison, for a machine OUTSIDE the benchmark fleet (an Intel laptop).
 #
 #     julia -t auto bench/quick_vs_mkl.jl          # from the repository root; a few minutes
+#     julia> include("bench/quick_vs_mkl.jl")      # or from a REPL started with `julia -t auto`
 #
-# It builds its own temporary environment (MKL + Chairmarks + this checkout of PureBLAS), so no project
-# file in the repository changes. It times the SAME `LinearAlgebra` call with two backends behind it:
-# MKL, forwarded by `using MKL`, and PureBLAS, forwarded by `PureBLAS.activate()`. Each switch back to
-# MKL is `PureBLAS.deactivate()` followed by `MKL.__init__()`: MKL's ILP64 symbols carry a `64_` suffix,
-# and only MKL's own forwarding (`suffix_hint = "64"`) finds them.
+# It builds its own temporary environment (MKL + Chairmarks + this checkout of PureBLAS) and switches
+# back to the caller's environment once the packages are loaded, so no project file changes. It times
+# the SAME `LinearAlgebra` call with two backends behind it: MKL, forwarded by `using MKL`, and
+# PureBLAS, forwarded by `PureBLAS.activate()`. Each switch back to MKL is `PureBLAS.deactivate()`
+# followed by `MKL.__init__()`: MKL's ILP64 symbols carry a `64_` suffix, and only MKL's own forwarding
+# (`suffix_hint = "64"`) finds them.
+#
+# MKL's thread count is set with MKL's own `MKL_Set_Num_Threads`, which covers all of MKL.
+# `BLAS.set_num_threads` reaches MKL through `MKL_Domain_Set_Num_Threads`, and MKL's LAPACK routines
+# (Cholesky among them) do not follow it: after `BLAS.set_num_threads(1)`, `potrf` still runs on every core.
 #
 # THESE ARE INDICATIVE NUMBERS, NOT GATE NUMBERS. The fleet's results come from frequency-locked AMD
 # boxes with every thread pinned to its own core; a laptop boosts, throttles, and on recent Intel parts
@@ -14,34 +20,29 @@
 # The two backends are measured alternately (MKL, PureBLAS, MKL, PureBLAS) so drift hits both equally,
 # with a pause before each PureBLAS window so MKL's threads have stopped spinning on the cores.
 #
-# EACH THREAD COUNT RUNS IN ITS OWN JULIA PROCESS, started with `-t N` and `MKL_NUM_THREADS=N`. MKL's
-# LAPACK routines (Cholesky among them) keep the thread count MKL started with: `BLAS.set_num_threads(1)`
-# reports 1 but `potrf` still runs on every core. Only the variable set at startup holds it to N.
-#
 # Reading the ratio: MKL time / PureBLAS time, so ABOVE 1 MEANS PUREBLAS IS FASTER.
-const NT_CHILD = get(ENV, "QUICK_VS_MKL_THREADS", "")
-if isempty(NT_CHILD)        # parent: build the environment once, then run one child per thread count
-    using Pkg
-    Pkg.activate(; temp = true)
+using Pkg
+let prev = Base.active_project()
+    Pkg.activate(; temp = true, io = devnull)
     Pkg.develop(path = joinpath(@__DIR__, ".."); io = devnull)
     Pkg.add(["MKL", "Chairmarks"]; io = devnull)
-    nmax = Threads.nthreads()
-    nmax == 1 && println("note: started with one thread, so only the single-threaded table runs. Use `julia -t auto`.\n")
-    for nt in unique((1, nmax))
-        cmd = `$(Base.julia_cmd()) -t $nt --project=$(Base.active_project()) $(abspath(PROGRAM_FILE))`
-        run(addenv(cmd, "QUICK_VS_MKL_THREADS" => string(nt), "MKL_NUM_THREADS" => string(nt)))
+    @eval Main begin
+        using MKL                 # forward LinearAlgebra's BLAS/LAPACK to MKL — BEFORE PureBLAS loads
+        using PureBLAS, LinearAlgebra, Printf, Random
+        using Chairmarks: @be
     end
-    exit()
+    Pkg.activate(prev; io = devnull)
 end
 
-using MKL                         # forward LinearAlgebra's BLAS/LAPACK to MKL — BEFORE PureBLAS loads
-using PureBLAS, LinearAlgebra, Printf, Random
-using Chairmarks: @be
+const NT = Threads.nthreads()
 
-const NT = parse(Int, NT_CHILD)
-NT == Threads.nthreads() || error("child started with $(Threads.nthreads()) Julia threads, expected $NT")
+mkl_set_threads(n) = ccall((:MKL_Set_Num_Threads, MKL.MKL_jll.libmkl_rt), Cvoid, (Cint,), n)
 
-use_mkl() = (PureBLAS.deactivate(); MKL.__init__())
+# Back to MKL at `nt` threads.
+function use_mkl(nt = NT)
+    PureBLAS.deactivate(); MKL.__init__()
+    mkl_set_threads(nt); BLAS.set_num_threads(nt)
+end
 
 # FAIL BEFORE TIMING ANYTHING if either backend is not what this script claims to be measuring:
 # check that the round trip lands back on MKL and that both backends compute the right answer.
@@ -58,13 +59,13 @@ function check_backends()
     println("backends checked: PureBLAS active/inactive round trip lands on ", join(libs, ", "), "; both products correct")
 end
 
-# One op at this process's thread count: alternate the two backends, pool each backend's samples, take medians.
-function compare(f, setup)
-    use_mkl(); BLAS.set_num_threads(NT); PureBLAS.set_num_threads(NT)
-    f(setup()); PureBLAS.activate(); f(setup())                            # compile both paths
+# One op at one thread count: alternate the two backends, pool each backend's samples, take medians.
+function compare(f, setup, nt)
+    PureBLAS.set_num_threads(nt)
+    use_mkl(nt); f(setup()); PureBLAS.activate(); f(setup())               # compile both paths
     mkl = Float64[]; pb = Float64[]
     for _ in 1:2
-        use_mkl()
+        use_mkl(nt)
         append!(mkl, [s.time for s in (@be setup() f evals = 1 seconds = 0.5).samples])
         sleep(0.3)                                                       # let MKL's threads go idle
         PureBLAS.activate()
@@ -99,15 +100,25 @@ function cases()
 end
 
 function main()
-    println("PureBLAS vs MKL on ", Sys.CPU_NAME, ", ", Sys.CPU_THREADS, " hardware threads — ", NT, " thread",
-            NT == 1 ? "" : "s", "  (ratio = MKL time / PureBLAS time; >1 means PureBLAS is faster)")
+    println("PureBLAS vs MKL on ", Sys.CPU_NAME, ", ", Sys.CPU_THREADS, " hardware threads, Julia started with ",
+            NT, " thread", NT == 1 ? "" : "s", "  (ratio = MKL time / PureBLAS time; >1 means PureBLAS is faster)")
     println("PureBLAS detected ", PureBLAS._HW)
-    check_backends()
-    @printf("%-10s %8s %8s %12s\n", "op", "n", "ratio", "PB GF/s")
-    for (name, n, fl, setup, f) in cases()
-        tm, tp = compare(f, setup)
-        @printf("%-10s %8d %7.2fx %12.1f\n", name, n, tm / tp, fl / tp / 1e9); flush(stdout)
-    end
+    NT == 1 && println("  note: started with one thread, so only the single-threaded column runs. Use `julia -t auto`.")
+    check_backends(); println()
+    # PureBLAS uses at most one worker per physical core; MKL gets the same count, which is also its default.
+    threads = unique((1, PureBLAS.set_num_threads(NT)))
+    NT > last(threads) && println("  note: $NT Julia threads, $(last(threads)) physical cores; both libraries use $(last(threads)).")
+    @printf("%-10s %8s", "op", "n")
+    for nt in threads; @printf("   %18s", "$(nt) thread$(nt == 1 ? "" : "s")"); end
     println()
+    for (name, n, fl, setup, f) in cases()
+        @printf("%-10s %8d", name, n)
+        for nt in threads
+            tm, tp = compare(f, setup, nt)
+            @printf("   %5.2fx  %6.1f GF/s", tm / tp, fl / tp / 1e9)
+        end
+        println(); flush(stdout)
+    end
+    println("\nGF/s is PureBLAS's throughput. Numbers are indicative — see the header of this script.")
 end
-abspath(PROGRAM_FILE) == @__FILE__() && main()      # `include`d by quick_chol_diag.jl without running
+@isdefined(QUICK_VS_MKL_NO_MAIN) || main()    # quick_chol_diag.jl defines it to reuse the functions above
