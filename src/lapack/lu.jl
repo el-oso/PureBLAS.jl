@@ -417,16 +417,14 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
         # Fix by choosing a pad that is never aliased if a gate cell ever lands on it.
         R = size(b, 1)
         Mw = view(b, 1:m, 1:n)
-        ld = stride(A, 2); sz = sizeof(eltype(A))
+        ld = stride(A, 2)
+        # Both copies go through the pool in column bands: at n=1024 the pair is 1.3 ms of a 9.6 ms
+        # three-worker call on Zen4, and it does not shrink with the worker count unless it is split.
         info = GC.@preserve A b begin
             pA = pointer(A); pB = pointer(b)
-            @inbounds for j in 0:(n - 1)                       # contiguous per-column copy in (A → scratch)
-                unsafe_copyto!(pB + j * R * sz, pA + j * ld * sz, m)
-            end
+            _copy2d_mt!(pB, R, pA, ld, m, n)                   # contiguous per-column copy in (A → scratch)
             (_, _, i3) = _getrf_core!(Mw, ipiv, nb)
-            @inbounds for j in 0:(n - 1)                       # and back
-                unsafe_copyto!(pA + j * ld * sz, pB + j * R * sz, m)
-            end
+            _copy2d_mt!(pA, ld, pB, R, m, n)                   # and back
             i3
         end
         return A, ipiv, info
@@ -445,6 +443,51 @@ end
 # (Measured Float64 only; complex/F32 take the same one-vector bound in their own element width.)
 # BOTH loops in `_getrf_core!` must use this — the deferred laswp replays the same partition.
 @inline _lu_pb(rem::Int, nb::Int, ::Type{T}) where {T} = rem < nb + _vwidth(T) ? rem : nb
+
+# The pool jobs carry `ipiv` as a raw `Ptr{Int}`, so only a container whose storage IS a dense run
+# of `Int` may reach them. `pointer(::Vector{Int32})` converts to `Ptr{Int}` without complaint and
+# the job then reads twice as far as the vector extends — measured as a segfault inside the
+# look-ahead job at n=1024. Any other container keeps every path serial.
+@inline _lu_ipiv_ok(ipiv) = ipiv isa Union{Vector{Int}, PtrVector{Int}}
+
+# Workers for getrf's data movement — row swaps and the pad copy — which touch `rows` rows of each of
+# `nc` columns, every element read once and written once. The admission is the BLAS-1 byte floor
+# (`_l1_workers`), the right one because these loops are memory passes with no flops to amortise a
+# join against; the cap is one `_NR` column block per worker, the band granularity `_gemm_chunk`
+# deals in. Data movement only, so the split is bit-identical at any worker count by construction.
+@inline function _lu_move_workers(rows::Int, nc::Int, ::Type{T}) where {T}
+    nw = _l1_workers(2 * rows * nc * sizeof(T), nc, T)
+    return nw > 1 ? max(1, min(nw, cld(nc, _NR))) : 1
+end
+
+# `_laswp!` over columns `j1:j2`, in column bands across the pool when the shape earns it.
+function _laswp_mt!(A, ipiv, k1::Int, k2::Int, j1::Int, j2::Int)
+    j1 > j2 && return
+    T = eltype(A)
+    nw = (T <: BlasReal && _strided1(A) && _lu_ipiv_ok(ipiv)) ?
+        _lu_move_workers(k2 - k1 + 1, j2 - j1 + 1, T) : 1
+    nw > 1 || return _laswp!(A, ipiv, k1, k2, j1, j2)
+    Aj = view(A, 1:size(A, 1), j1:j2)
+    r = _root(Aj)
+    GC.@preserve r ipiv begin
+        C = _pm(Aj)
+        lup = LuPanel{T}(Ptr{T}(0), 1, 0, k2 - k1 + 1, pointer(ipiv), 0, k1 - 1, -1)
+        _gemm_threaded!(C, C, C, one(T), zero(T), false, false, false, false, nw,
+            _MT_KIND_LASWP, false, false, false, lup)
+    end
+    return
+end
+
+# `dst[:, 1:n] .= src[:, 1:n]` for `m`-row columns at leading dimensions `ldd`/`lds`, in column bands
+# across the pool when the shape earns it. The caller holds both buffers alive.
+function _copy2d_mt!(dst::Ptr{T}, ldd::Int, src::Ptr{T}, lds::Int, m::Int, n::Int) where {T <: BlasReal}
+    nw = _lu_move_workers(m, n, T)
+    nw > 1 || return _copy2d!(dst, ldd, src, lds, m, n)
+    S = PtrMatrix{T}(src, m, n, lds)
+    _gemm_threaded!(PtrMatrix{T}(dst, m, n, ldd), S, S, one(T), zero(T), false, false, false, false,
+        nw, _MT_KIND_COPY2D)
+    return nothing
+end
 
 """
     _getrf_lookahead!(A, ipiv, m, n, k, pc, pb, jt0, nb) -> Int
@@ -482,7 +525,8 @@ function _getrf_lookahead!(A, ipiv, m::Int, n::Int, k::Int, pc::Int, pb::Int, jt
     # `gemm!` at one thread and two `_gemm_core!`s at six put Strassen on one side and the classical
     # kernel on the other, and the same call then returned different bits at different thread counts:
     # correct to 1e-14, identical pivots, and a reproducibility failure all the same.
-    splittable = pb2 > 0 && wid > pb2 && T <: BlasReal && _strided1(A) && jt0 + pb2 <= n
+    splittable = pb2 > 0 && wid > pb2 && T <: BlasReal && _strided1(A) && _lu_ipiv_ok(ipiv) &&
+        jt0 + pb2 <= n
     if !splittable
         _gemm_core!(C, L21, U12, mo, bo, false, false, false, false, (-1, wid, -1))
         return -1
@@ -538,7 +582,7 @@ function _getrf_core!(A, ipiv, nb::Int)
         (info == 0 && pinfo != 0) && (info = pinfo)
         jt0 = pc + pb
         if jt0 <= n
-            _laswp!(A, ipiv, pc, pc + pb - 1, jt0, n)                # swap trailing columns (needed now)
+            _laswp_mt!(A, ipiv, pc, pc + pb - 1, jt0, n)             # swap trailing columns (needed now)
             trsm!(
                 view(A, pc:(pc + pb - 1), jt0:n), view(A, pc:(pc + pb - 1), pc:(pc + pb - 1));
                 side = 'L', uplo = 'L', transA = 'N', diag = 'U', alpha = true
@@ -566,7 +610,7 @@ function _getrf_core!(A, ipiv, nb::Int)
     pc = 1
     @inbounds while pc <= k
         pb = _lu_pb(k - pc + 1, nb, eltype(A)); jt0 = pc + pb
-        jt0 <= k && _laswp!(A, ipiv, jt0, k, pc, pc + pb - 1)
+        jt0 <= k && _laswp_mt!(A, ipiv, jt0, k, pc, pc + pb - 1)
         pc += pb
     end
     return A, ipiv, info
