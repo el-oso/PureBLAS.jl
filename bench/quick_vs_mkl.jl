@@ -76,21 +76,26 @@ function compare(f, setup, nt)
 end
 median(v) = (s = sort(v); s[(length(s) + 1) ÷ 2])
 
+# Every case owns ONE output buffer, allocated here; `setup` only refills it with `copyto!`, so no sample
+# allocates and every sample works on the same memory. The factorizations are called in their
+# non-allocating forms, `potrf!` and `getrf!(A, ipiv)` with a preallocated pivot vector: `cholesky!` and
+# `lu!` allocate a result wrapper and a pivot vector, and `cholesky!` also runs an O(n^2) symmetry check.
 function cases()
     rng = MersenneTwister(1)
     c = Tuple{String, Int, Float64, Function, Function}[]   # name, n, flops, setup, call
     for n in (256, 1024, 2048)
         A = randn(rng, n, n); B = randn(rng, n, n)
         S = A' * A + n * I; U = triu(A) + n * I
-        push!(c, ("gemm", n, 2.0n^3, () -> zeros(n, n), C -> mul!(C, A, B)))
-        push!(c, ("syrk", n, 1.0n^3, () -> zeros(n, n), C -> BLAS.syrk!('U', 'N', 1.0, A, 0.0, C)))
-        push!(c, ("trsm", n, 1.0n^3, () -> copy(B), X -> BLAS.trsm!('L', 'U', 'N', 'N', 1.0, U, X)))
-        push!(c, ("cholesky", n, n^3 / 3, () -> copy(S), X -> cholesky!(X)))
-        push!(c, ("lu", n, 2n^3 / 3, () -> copy(A), X -> lu!(X)))
+        C = zeros(n, n); X = similar(A); ipiv = Vector{Int}(undef, n)
+        push!(c, ("gemm", n, 2.0n^3, () -> C, C -> mul!(C, A, B)))
+        push!(c, ("syrk", n, 1.0n^3, () -> C, C -> BLAS.syrk!('U', 'N', 1.0, A, 0.0, C)))
+        push!(c, ("trsm", n, 1.0n^3, () -> copyto!(X, B), X -> BLAS.trsm!('L', 'U', 'N', 'N', 1.0, U, X)))
+        push!(c, ("potrf", n, n^3 / 3, () -> copyto!(X, S), X -> LAPACK.potrf!('U', X)))
+        push!(c, ("getrf", n, 2n^3 / 3, () -> copyto!(X, A), X -> LAPACK.getrf!(X, ipiv)))
     end
     for n in (1024, 4096)
-        A = randn(rng, n, n); x = randn(rng, n)
-        push!(c, ("gemv", n, 2.0n^2, () -> zeros(n), y -> mul!(y, A, x)))
+        A = randn(rng, n, n); x = randn(rng, n); y = zeros(n)
+        push!(c, ("gemv", n, 2.0n^2, () -> y, y -> mul!(y, A, x)))
     end
     for n in (10_000, 1_000_000)
         x = randn(rng, n); y = randn(rng, n)
