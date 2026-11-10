@@ -847,6 +847,11 @@ end
             A = randn(n, n); B = randn(n, n); C = zeros(n, n)
             P.gemm!(C, A, B)                                   # warm: grow every pool once
             @test_noalloc P.gemm!(C, A, B)
+            # The keyword entry with every argument non-default, as `mul!(C, A, B, α, β)` and LAPACK
+            # callers use it. Values come from variables, so nothing const-folds the keywords away.
+            al = 2.5; be = 0.5
+            P.gemm!(C, A, B; alpha = al, beta = be, transB = 'T')
+            @test_noalloc P.gemm!(C, A, B; alpha = al, beta = be, transB = 'T')
             D = ForwardDiff.Dual{Nothing, Float64, 1}
             Ad = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n))
             Bd = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n))
