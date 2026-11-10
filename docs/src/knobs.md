@@ -317,13 +317,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-65 `const _X = <literal>` values in `src/` with no `@load_preference`.
+67 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 31 Literal · 28 Exempt · 4 Unaudited.
+**Tier:** 2 Measured · 31 Literal · 30 Exempt · 4 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -436,6 +436,7 @@ on these, not on knobs.
 | `_MT_KIND_ASUM` | 8 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_AXPY` | 6 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_COPY` | 11 | Exempt | job-kind tag, not hardware tuning. |
+| `_MT_KIND_COPY2D` | 23 | Exempt | job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above. |
 | `_MT_KIND_DOT` | 7 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_ELEM` | 19 | Unaudited | — |
 | `_MT_KIND_GBMVN` | 18 | Exempt | job-kind tag, not hardware tuning. |
@@ -444,6 +445,7 @@ on these, not on knobs.
 | `_MT_KIND_GEMVT` | 16 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_GER` | 14 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_IAMAX` | 13 | Exempt | job-kind tag, not hardware tuning. |
+| `_MT_KIND_LASWP` | 22 | Exempt | job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above. |
 | `_MT_KIND_LUAHEAD` | 3 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_SCAL` | 10 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_SUMSQ` | 9 | Exempt | job-kind tag, not hardware tuning. |
