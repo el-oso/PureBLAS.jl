@@ -289,6 +289,80 @@ end
     end
 end
 
+# A DRIVER ON A WORKER'S THREAD. Any task but the pool's creator may run on a thread that hosts a
+# participating worker — a `Threads.@spawn`ed caller, for one — and that worker could only run when the
+# driver yields, after the driver's own chunk. `_gemm_threaded!` publishes such a job with that worker
+# sitting out (`GemmPool.skip`). Both shapes that produces are exercised: at `nw == nthreads()` the pool
+# has no spare worker and the job is one chunk narrower; at `nw == nthreads() - 1` the spare worker,
+# asleep above the thread count, is woken to take the chunk and the count is unchanged.
+#
+# The witness comes first, as in every placement item: a driver that happened to land on a free thread
+# would pass the bit comparison without the path ever running.
+@testitem "threaded driver on a worker's thread: the worker sits out, bits unchanged, 0 B" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Random
+    using Base.Threads: nthreads
+    P = PureBLAS
+    if nthreads() < 3
+        @test_skip "needs ≥3 julia threads: a worker on a thread that is not the creator's, and a second worker"
+    else
+        # A sticky task bound to `tid` — the placement the pool uses for its own workers.
+        function on_thread(f, tid)
+            t = Task(f)
+            t.sticky = true
+            isone(ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1)) || error("could not bind to thread $tid")
+            schedule(t)
+            return fetch(t)
+        end
+        bitsame(X, Y) = all(i -> reinterpret(UInt64, X[i]) === reinterpret(UInt64, Y[i]), eachindex(X))
+        n, k = 1024, 256                        # B is packed at this width; k thin so Strassen declines
+        al, be = 2.5, 0.5                        # α not a power of two, so its placement is visible
+        A = randn(MersenneTwister(7), n, k); B = randn(MersenneTwister(8), n, k)
+        C0 = randn(MersenneTwister(9), n, n)
+        L0 = randn(MersenneTwister(10), n, n)
+        nx = max(2 * nthreads() * P._red_block(Float64), cld(P._L1_MT_MIN, sizeof(Float64))) + 3
+        x = randn(MersenneTwister(11), nx); y = randn(MersenneTwister(12), nx)
+        # The serial answers.
+        P.set_num_threads(1)
+        Cs = copy(C0); P.gemm!(Cs, A, B; alpha = al, beta = be, transB = 'T')
+        Ls = copy(L0); ps = Vector{Int}(undef, n); P.getrf!(Ls, ps)
+        ds = P.dot(x, y)
+        # α and β at their defaults: the keyword entry with a non-default α or β allocates 32 B at any
+        # thread count, on the creator's thread too, so it cannot witness this path. (A testitem's
+        # locals are module globals, so they are not captured here either: that boxes them.)
+        gemm1(Cx, Ax, Bx) = @allocated P.gemm!(Cx, Ax, Bx; transB = 'T')
+        for nw in (nthreads(), nthreads() - 1)
+            @test P.set_num_threads(nw) == nw
+            @test P._gemm_workers(n, n, k) == nw
+            pool = P._gemm_pool(Float64)
+            tid = pool.tids[1]                   # hosts worker 1, which participates at any nw ≥ 2
+            @test tid != Threads.threadid()
+            # Negative control: a driver on the creator's thread has no worker to skip.
+            s0 = P._MT_SKIPPED[]
+            P.gemm!(copy(C0), A, B; alpha = al, beta = be, transB = 'T')
+            @test P._MT_SKIPPED[] == s0
+            Ct = copy(C0)
+            on_thread(() -> P.gemm!(Ct, A, B; alpha = al, beta = be, transB = 'T'), tid)
+            @test P._MT_SKIPPED[] > s0           # the skip path ran
+            @test P._mt_gen_nw(@atomic pool.gen) == nthreads()   # every worker in range, one sitting out
+            @test bitsame(Ct, Cs)
+            s1 = P._MT_SKIPPED[]
+            Lt = copy(L0); pt = Vector{Int}(undef, n)
+            on_thread(() -> P.getrf!(Lt, pt), tid)
+            @test P._MT_SKIPPED[] > s1           # the look-ahead job, whose chunk 1 is the panel
+            @test bitsame(Lt, Ls) && pt == ps
+            s2 = P._MT_SKIPPED[]
+            dt = on_thread(() -> P.dot(x, y), tid)
+            @test P._MT_SKIPPED[] > s2           # the reduction, folded by block index by the driver
+            @test reinterpret(UInt64, dt) === reinterpret(UInt64, ds)
+            # req#10 on this path, with the same minimum-over-windows statistic the threaded gemm item
+            # uses and for the same reason: `@allocated` sums every thread in the process.
+            on_thread(() -> gemm1(Ct, A, B), tid)
+            @test on_thread(() -> minimum(gemm1(Ct, A, B) for _ in 1:8), tid) == 0
+        end
+        P.set_num_threads(1)
+    end
+end
+
 # The flop-balanced triangular chunker. Two properties matter and they are checked separately, because
 # one is a CORRECTNESS invariant and the other is the point of the thing.
 #
