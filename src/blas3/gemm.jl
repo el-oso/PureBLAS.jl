@@ -4316,6 +4316,10 @@ mutable struct GemmPool{T}
     up::Bool                         # syrk/syr2k: which triangle of C is written; trsm: A's triangle
     sym2::Bool                       # syr2k/her2k: run BOTH rank-k passes in this chunk (see below)
     unit::Bool                       # trsm: A has an implicit unit diagonal
+    # The worker bound to the DRIVER's thread, or 0. That worker bumps `done` without running a chunk
+    # (it could only run when the driver yields, so the two would serialize), and the workers above it
+    # shift down one chunk index. Read after `i < nw` like `kind`, under the same invariant.
+    skip::Int
     # ── LOOK-AHEAD PANEL (getrf) ──────────────────────────────────────────────────────────────────
     # A heterogeneous job: worker 1 factors the NEXT panel while the others apply the CURRENT panel's
     # update to the trailing block. The two write disjoint memory — the panel writes its own columns
@@ -5355,16 +5359,24 @@ function _gemm_pool_worker(p::GemmPool, i::Int)
         seen = @atomic p.gen
         nw = _mt_gen_nw(seen)
         if i < nw
-            # `done` MUST be bumped even when the chunk throws. An unhandled exception in a `@spawn`ed
-            # task is stored in the task and surfaces only on `fetch`, which nothing here calls — so a
-            # worker that died would leave the driver waiting on a count that can never arrive. The
-            # flag turns that silent hang into a loud error at the call site.
-            try
-                _gemm_run_chunk(p, nw, i)
-            catch
-                @atomic p.failed = true
-            finally
+            # The worker on the driver's own thread takes no chunk; it only counts itself done. It MUST
+            # count: the driver returns once `done` reaches its target, and a worker that had not yet
+            # read `skip` by then could read a LATER job's value and run a chunk of that job twice.
+            j = p.skip
+            if i == j
                 @atomic p.done += 1
+            else
+                # `done` MUST be bumped even when the chunk throws. An unhandled exception in a `@spawn`ed
+                # task is stored in the task and surfaces only on `fetch`, which nothing here calls — so a
+                # worker that died would leave the driver waiting on a count that can never arrive. The
+                # flag turns that silent hang into a loud error at the call site.
+                try
+                    _gemm_run_chunk(p, j > 0 ? nw - 1 : nw, j > 0 && i > j ? i - 1 : i)
+                catch
+                    @atomic p.failed = true
+                finally
+                    @atomic p.done += 1
+                end
             end
         end
     end
@@ -5385,6 +5397,8 @@ end
 #   the fleet's `-t 6,0`, one CPU/core   6.15 ms            -> 6.15 ms (gemm 7.37 -> 7.39 ms)
 # Workers skip the thread that creates the pool — the one that called `set_num_threads`, usually the
 # main task's and so the usual driver — so a driver is not sharing its thread with a worker it waits on.
+# A driver on any other thread (a `Threads.@spawn`ed caller) does share it, and `_gemm_threaded!` has
+# that worker sit the job out (`GemmPool.skip`) rather than run after the driver's own chunk.
 @noinline function _gemm_pool_start!(p::GemmPool)
     for i in 1:length(p.evs)
         t = Task(() -> _gemm_pool_worker(p, i))
@@ -5407,7 +5421,7 @@ end
         0, 0, false, false, [Threads.Event(true) for _ in 1:nwmax], tids[1:nwmax],
         Ptr{T}(0), Ptr{T}(0), Ptr{T}(0), 0, 0, 0, 1, 1, 1,
         zero(T), zero(T), false, false, false, false,
-        _MT_KIND_GEMM, false, false, false,
+        _MT_KIND_GEMM, false, false, false, 0,
         Ptr{T}(0), 1, 0, 0, Ptr{Int}(0), 0, 0, -1, 0,
         0
     )
@@ -5445,6 +5459,21 @@ const _MT_NTHREADS = Threads.Atomic{Int}(1)
 # asserts only agreement passes vacuously when the scheduler serialises its tasks and no caller ever
 # loses. Bumped on the lost path only, which already pays for a full serial computation.
 const _MT_LOST = Threads.Atomic{Int}(0)
+
+# How many jobs were published with a worker sitting out because the driver was on its thread. A test
+# witness, like `_MT_LOST`: a placement test that only compares bits passes when the driver happened
+# to land on a free thread. Bumped once per such job, on a path that is about to run a whole chunk.
+const _MT_SKIPPED = Threads.Atomic{Int}(0)
+
+# The participating worker (index below `nw`) bound to the calling thread, or 0. `tids` never changes
+# after the pool starts, so this needs no claim.
+@inline function _mt_self_worker(p::GemmPool, nw::Int)
+    tid = Threads.threadid()
+    for i in 1:(nw - 1)
+        p.tids[i] == tid && return i
+    end
+    return 0
+end
 
 """
     set_num_threads(n::Integer) -> Int
@@ -5591,6 +5620,22 @@ end
         lup::LuPanel{T} = _lupanel_none(T)
     ) where {T <: Union{BlasReal, BlasComplex}}
     p = _gemm_pool(T)
+    # THE DRIVER MAY BE ON A PARTICIPATING WORKER'S THREAD — any task but the pool's creator can be, a
+    # `Threads.@spawn`ed caller for one. That worker is sticky to this thread, so it would run only when
+    # the driver yields in its join, after the driver's own chunk: the two serialize and the threaded
+    # part of the call doubles (measured on Zen4, 3 threads one per core, n=1024, against the same
+    # task on the creator's thread: gemm 1.97x, potrf 1.73x, getrf 1.35x on the panel worker's thread
+    # and 1.71x on an update worker's). So that worker sits the job out — it bumps `done` without
+    # running — and its chunk goes to the first worker beyond the job's count when the pool has one
+    # (`-t auto` under the core cap leaves several), else the job is cut one chunk narrower. Both chunk
+    # counts are ones `set_num_threads` produces, so req#11 needs no new argument: the count decides
+    # who computes a chunk, never what. `nwk` workers are woken (the skipping one counted) and `nc`
+    # chunks run — the running workers plus the driver, which takes chunk `nc`. A pool with one worker
+    # whose thread this is has nowhere to move the chunk; that job keeps the serialized shape.
+    skip = _mt_self_worker(p, nw)
+    nwk = skip > 0 ? min(nw, length(p.evs)) : nw - 1
+    skip > 0 && nwk < 2 && (skip = 0; nwk = nw - 1)
+    nc = skip > 0 ? nwk : nw
     # ONE claim, and a serial fallback if it fails. This is what keeps threading composable: a host that
     # runs `Threads.@threads` over many `mul!` calls has one caller win the pool and every other caller
     # run serially on its own thread, which is the right answer anyway — the machine is already busy.
@@ -5866,7 +5911,7 @@ end
         p.m = C.m; p.n = C.n; p.k = tA ? A.m : A.n
         p.alpha = alpha; p.beta = beta
         p.tA = tA; p.tB = tB; p.cA = cA; p.cB = cB
-        p.kind = kind; p.up = up; p.sym2 = sym2; p.unit = unit
+        p.kind = kind; p.up = up; p.sym2 = sym2; p.unit = unit; p.skip = skip
         p.lap = lup.ptr; p.lald = lup.ld; p.lam = lup.m; p.lanb = lup.nb
         p.laipiv = lup.ipiv; p.laroff = lup.roff; p.laioff = lup.ioff; p.lanroute = lup.nroute
         p.lainfo = 0
@@ -5881,7 +5926,9 @@ end
         # Set BEFORE the store, not after: the conservative direction is to poison when unsure, and a
         # throw between the two lines would otherwise release a pool whose workers had been released.
         published = true
-        @atomic p.gen = _mt_gen_next((@atomic p.gen), nw)
+        skip > 0 && Threads.atomic_add!(_MT_SKIPPED, 1)
+        # The word carries the number of workers in range, which is the woken count plus one.
+        @atomic p.gen = _mt_gen_next((@atomic p.gen), nwk + 1)
         # Notify UNCONDITIONALLY. The earlier version had each worker announce a `sleeping` flag and woke
         # only those that had announced, to save a notify on the hot path. It deadlocked: with 4 workers
         # and n=96 it stalled at `gen=524 done=0 sleeping=[1,1,1,1]` — the worker asleep, the wake never
@@ -5889,7 +5936,7 @@ end
         # hangs the caller forever. An unconditional notify cannot lose one: the event may be left set
         # spuriously, and the worker's predicate loop above treats a wake as "look again", not as "there
         # is work", so a stale set costs one extra check and nothing else.
-        for i in 1:(nw - 1)
+        for i in 1:nwk
             notify(p.evs[i])
         end
         # The driver takes the last chunk itself. The join below is in a `finally` because it must
@@ -5897,7 +5944,7 @@ end
         # `GC.@preserve` ends the moment this function returns. Unwinding past a live worker would let
         # it write into memory the caller is free to release.
         try
-            _gemm_run_chunk(p, nw, nw)
+            _gemm_run_chunk(p, nc, nc)
         finally
             # The DRIVER spins; only idle WORKERS have to be polite. Two reasons this is not the same
             # trade as the worker loop. It has nothing else to do — it is inside a blocking BLAS call —
@@ -5905,13 +5952,14 @@ end
             # allocate, which `gemm!` may not do (req#10, and test/strictmode_tests.jl's static proof).
             # The yield after the spin window is NOT optional: a driver can run on the thread a sticky
             # worker is bound to (any task that is not the pool's creator may), and a bare spin here then
-            # waits on a worker that can never be scheduled — a deadlock, once seen at 399% CPU.
-            while (@atomic p.done) < nw - 1
+            # waits on a worker that can never be scheduled — a deadlock, once seen at 399% CPU. With
+            # `skip` that worker only bumps `done`, and it still needs this thread to do it.
+            while (@atomic p.done) < nwk
                 for _ in 1:_MT_SPINS
-                    (@atomic p.done) >= nw - 1 && break
+                    (@atomic p.done) >= nwk && break
                     Base.Threads.atomic_fence()
                 end
-                (@atomic p.done) < nw - 1 && yield()
+                (@atomic p.done) < nwk && yield()
             end
             joined = true
         end
