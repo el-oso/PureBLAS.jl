@@ -326,10 +326,10 @@ end
         Cs = copy(C0); P.gemm!(Cs, A, B; alpha = al, beta = be, transB = 'T')
         Ls = copy(L0); ps = Vector{Int}(undef, n); P.getrf!(Ls, ps)
         ds = P.dot(x, y)
-        # α and β at their defaults: the keyword entry with a non-default α or β allocates 32 B at any
-        # thread count, on the creator's thread too, so it cannot witness this path. (A testitem's
-        # locals are module globals, so they are not captured here either: that boxes them.)
-        gemm1(Cx, Ax, Bx) = @allocated P.gemm!(Cx, Ax, Bx; transB = 'T')
+        # `PureBLAS.gemm!`, not `P.gemm!`: a testitem's locals are module globals, so `P` is a non-const
+        # global, and a keyword call through it is dispatched at run time and boxes its keywords (32 B
+        # with α and β). The arrays and scalars are arguments for the same reason.
+        gemm1(Cx, Ax, Bx, a, b) = @allocated PureBLAS.gemm!(Cx, Ax, Bx; alpha = a, beta = b, transB = 'T')
         for nw in (nthreads(), nthreads() - 1)
             @test P.set_num_threads(nw) == nw
             @test P._gemm_workers(n, n, k) == nw
@@ -356,8 +356,8 @@ end
             @test reinterpret(UInt64, dt) === reinterpret(UInt64, ds)
             # req#10 on this path, with the same minimum-over-windows statistic the threaded gemm item
             # uses and for the same reason: `@allocated` sums every thread in the process.
-            on_thread(() -> gemm1(Ct, A, B), tid)
-            @test on_thread(() -> minimum(gemm1(Ct, A, B) for _ in 1:8), tid) == 0
+            on_thread(() -> gemm1(Ct, A, B, al, be), tid)
+            @test on_thread(() -> minimum(gemm1(Ct, A, B, al, be) for _ in 1:8), tid) == 0
         end
         P.set_num_threads(1)
     end
