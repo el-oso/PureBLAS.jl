@@ -43,12 +43,14 @@ function main()
     rng = MersenneTwister(1)
     for n in (1024, 2048)
         A = randn(rng, n, n); B = randn(rng, n, n); S = A' * A + n * I; U = triu(A) + n * I
+        # One buffer per size, refilled in `setup`; no sample allocates (see quick_vs_mkl.jl's `cases`).
+        C = zeros(n, n); X = similar(A); ipiv = Vector{Int}(undef, n)
         for (name, fl, setup, f) in (
-                ("gemm", 2.0n^3, () -> zeros(n, n), C -> mul!(C, A, B)),
-                ("syrk", 1.0n^3, () -> zeros(n, n), C -> BLAS.syrk!('U', 'N', 1.0, A, 0.0, C)),
-                ("trsm", 1.0n^3, () -> copy(B), X -> BLAS.trsm!('L', 'U', 'N', 'N', 1.0, U, X)),
-                ("potrf", n^3 / 3, () -> copy(S), X -> LAPACK.potrf!('U', X)),
-                ("getrf", 2n^3 / 3, () -> copy(A), X -> LAPACK.getrf!(X)),
+                ("gemm", 2.0n^3, () -> C, C -> mul!(C, A, B)),
+                ("syrk", 1.0n^3, () -> C, C -> BLAS.syrk!('U', 'N', 1.0, A, 0.0, C)),
+                ("trsm", 1.0n^3, () -> copyto!(X, B), X -> BLAS.trsm!('L', 'U', 'N', 'N', 1.0, U, X)),
+                ("potrf", n^3 / 3, () -> copyto!(X, S), X -> LAPACK.potrf!('U', X)),
+                ("getrf", 2n^3 / 3, () -> copyto!(X, A), X -> LAPACK.getrf!(X, ipiv)),
             )
             @printf("%-8s %6d", name, n)
             for nt in threads
