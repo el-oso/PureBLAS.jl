@@ -97,6 +97,14 @@ function cases()
         push!(c, ("potrf", n, n^3 / 3, () -> copyto!(X, S), X -> LAPACK.potrf!('U', X)))
         push!(c, ("getrf", n, 2n^3 / 3, () -> copyto!(X, A), X -> LAPACK.getrf!(X, ipiv)))
     end
+    # The factorizations again at sizes that are not powers of two. At 1024/2048 PureBLAS's getrf and
+    # potrf each copy the matrix into a padded buffer and back (power-of-two leading dimensions alias in
+    # cache); at 1000/2000 neither does, so the two pairs of rows separate the copy's cost from the rest.
+    for n in (1000, 2000)
+        A = randn(rng, n, n); S = A' * A + n * I; X = similar(A); ipiv = Vector{Int}(undef, n)
+        push!(c, ("potrf", n, n^3 / 3, () -> copyto!(X, S), X -> LAPACK.potrf!('U', X)))
+        push!(c, ("getrf", n, 2n^3 / 3, () -> copyto!(X, A), X -> LAPACK.getrf!(X, ipiv)))
+    end
     for n in (1024, 4096)
         A = randn(rng, n, n); x = randn(rng, n); y = zeros(n)
         push!(c, ("gemv", n, 2.0n^2, () -> y, y -> mul!(y, A, x)))
