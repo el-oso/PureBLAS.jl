@@ -60,16 +60,20 @@ function check_backends()
 end
 
 # One op at one thread count: alternate the two backends, pool each backend's samples, take medians.
-function compare(f, setup, nt)
+# `mut`: the call overwrites its own input (trsm, potrf, getrf), so every evaluation needs the refill
+# `setup` does and a sample is one evaluation. Otherwise Chairmarks picks the evaluation count, which
+# matters below about 30 µs, where one evaluation per sample is dominated by timer overhead.
+function compare(f, setup, nt; mut = true)
     PureBLAS.set_num_threads(nt)
     use_mkl(nt); f(setup()); PureBLAS.activate(); f(setup())               # compile both paths
+    times() = [s.time for s in (mut ? (@be setup() f evals = 1 seconds = 0.5) : (@be setup() f seconds = 0.5)).samples]
     mkl = Float64[]; pb = Float64[]
     for _ in 1:2
         use_mkl(nt)
-        append!(mkl, [s.time for s in (@be setup() f evals = 1 seconds = 0.5).samples])
+        append!(mkl, times())
         sleep(0.3)                                                       # let MKL's threads go idle
         PureBLAS.activate()
-        append!(pb, [s.time for s in (@be setup() f evals = 1 seconds = 0.5).samples])
+        append!(pb, times())
     end
     use_mkl()
     return median(mkl), median(pb)
@@ -119,7 +123,7 @@ function main()
     for (name, n, fl, setup, f) in cases()
         @printf("%-10s %8d", name, n)
         for nt in threads
-            tm, tp = compare(f, setup, nt)
+            tm, tp = compare(f, setup, nt; mut = name in ("trsm", "potrf", "getrf"))
             @printf("   %5.2fx  %6.1f GF/s", tm / tp, fl / tp / 1e9)
         end
         println(); flush(stdout)
