@@ -4482,6 +4482,18 @@ const _MT_KIND_TRMM = 20
 # PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
 # req8-ok: enum discriminant, host-invariant by construction
 const _MT_KIND_SYMM = 21
+# getrf's data movement, split by COLUMN BANDS: the row swaps a panel's pivots apply to the columns
+# beside it (`_laswp_run_chunk`) and the strided copy into and out of the de-aliasing pad
+# (`_copy2d_run_chunk`). Neither does arithmetic, so a band split cannot change a bit; what it
+# changes is that a quarter to a third of the threaded call stops running on one thread — measured
+# on Zen4 at three workers, n=1024: pad copy 1.3 ms, trailing swaps 0.9 ms, deferred left swaps
+# 1.2 ms, of a 9.6 ms call whose ideal is 6.0 ms. Both reuse `C`/`A` as (destination, source).
+# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
+# req8-ok: enum discriminant, host-invariant by construction
+const _MT_KIND_LASWP = 22
+# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
+# req8-ok: enum discriminant, host-invariant by construction
+const _MT_KIND_COPY2D = 23
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
@@ -4685,6 +4697,8 @@ end
     p.kind == _MT_KIND_TRMMR && return _trmmr_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMM && return _trmm_run_chunk(p, nw, i)
     p.kind == _MT_KIND_SYMM && return _symm_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_LASWP && return _laswp_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_COPY2D && return _copy2d_run_chunk(p, nw, i)
     p.kind == _MT_KIND_AXPY && return _axpy_run_chunk(p, nw, i)
     p.kind == _MT_KIND_DOT && return _dot_run_chunk(p, nw, i)
     p.kind == _MT_KIND_ASUM && return _asum_run_chunk(p, nw, i)
@@ -4752,22 +4766,78 @@ end
 # lost-claim path is what makes that safe, and it is why adding a job kind means checking every path
 # out of the driver rather than only the happy one.
 @noinline function _luahead_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    c1 = _luahead_split(p.n, p.lanb, nw)
+    Ac = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.m, p.tA ? p.m : p.k, p.lda)
     if i == 1
         Ap = PtrMatrix{T}(p.lap, p.lam, p.lanb, p.lald)
         ipv = PtrVector{Int}(p.laipiv, p.laioff + p.lanb)
         p.lainfo = _getf2!(Ap, p.lam, p.lanb, p.laroff, ipv, p.laioff)
+        # Then the first `c1` update columns, alone — a private A-pack rather than the others'
+        # cooperative one, since they may be past that barrier. Packing is a copy, so the two forms
+        # hold the same values and the column's arithmetic is the same either way.
+        c1 > 0 || return nothing
+        Cc = PtrMatrix{T}(p.Cp, p.m, c1, p.ldc)
+        _gemm_core!(
+            Cc, Ac, _gemm_bchunk(p, 0, c1), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
+            (-1, p.lanroute, -1), false, 1, 1
+        )
         return nothing
     end
-    # `nw - 1` workers over the update, and `i - 1` is this worker's index among them.
-    j0, len = _gemm_chunk(p.n, nw - 1, i - 1)
+    # `nw - 1` workers over the columns past `c1`, and `i - 1` is this worker's index among them.
+    j0, len = _gemm_chunk(p.n - c1, nw - 1, i - 1)
     len > 0 || return nothing
+    j0 += c1
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
-    Ac = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.m, p.tA ? p.m : p.k, p.lda)
     # `p.n` is the whole update's width: route from the problem, compute on the slice.
     _gemm_core!(
         Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
         (-1, p.lanroute, -1), false, nw - 1, i - 1
     )
+    return nothing
+end
+
+# Worker 1's share of the update columns beside the panel it factors. Without one, the job takes
+# max(panel, update/(nw-1)) and at the early steps the panel is the shorter side — measured on Zen4,
+# n=1024, three workers: 0.48 ms of panel against 1.74 ms of update on the other two at the first
+# step — so worker 1 idles for most of the job.
+#
+# PDM: DERIVE — weights from flop counts, no literal. An update column costs 2·m·pb flops and the
+# panel m·pb², i.e. pb/2 columns' worth, so the job is `n + pb/2` column-equivalents, each worker's
+# share is a 1/nw of that, and worker 1's columns are what remains of its share after the panel. The
+# panel kernel runs below the gemm's rate (its base sweeps are store-bound), which this weighting
+# ignores: it leaves worker 1 somewhat overloaded rather than idle, and it adapts by itself if the
+# panel kernel gets faster. Snapped down to whole `_NR` blocks, the band granularity the chunking
+# deals in. Zero whenever the panel alone exceeds a share, which is the late steps' shape.
+@inline function _luahead_split(n::Int, pb::Int, nw::Int)
+    share = (n + pb ÷ 2) ÷ nw - pb ÷ 2
+    return share <= 0 ? 0 : min(n, (share ÷ _NR) * _NR)
+end
+
+# ── getrf DATA MOVEMENT (column bands) ──────────────────────────────────────────────────────────
+# Row swaps over this worker's columns. `C` is the column range being swapped, `lup` carries the
+# pivots: `ipiv[ioff+1 : ioff+nb]` name the rows swapped with rows `ioff+1 : ioff+nb` — the same
+# fields and the same meaning the look-ahead panel gives them. Each column is swapped by one worker,
+# so the bands are independent and the order across bands cannot matter. `_laswp!` lives in lu.jl,
+# included after this file; the call resolves when it first runs, as `_trsm_run_chunk`'s does.
+@noinline function _laswp_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    V = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
+    _laswp!(V, PtrVector{Int}(p.laipiv, p.laioff + p.lanb), p.laioff + 1, p.laioff + p.lanb, 1, len)
+    return nothing
+end
+
+# `C[:, band] .= A[:, band]`, column by column, each column one contiguous run of `m` elements.
+@noinline function _copy2d_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _gemm_chunk(p.n, nw, i)
+    len > 0 || return nothing
+    _copy2d!(p.Cp + j0 * p.ldc * sizeof(T), p.ldc, p.Ap + j0 * p.lda * sizeof(T), p.lda, p.m, len)
+    return nothing
+end
+@inline function _copy2d!(dst::Ptr{T}, ldd::Int, src::Ptr{T}, lds::Int, m::Int, n::Int) where {T}
+    for j in 0:(n - 1)
+        unsafe_copyto!(dst + j * ldd * sizeof(T), src + j * lds * sizeof(T), m)
+    end
     return nothing
 end
 
@@ -5684,6 +5754,12 @@ end
                 PtrVector{Int}(lup.ipiv, lup.ioff + lup.nb), lup.ioff
             )
             _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
+        elseif kind == _MT_KIND_LASWP
+            # A loser swaps the whole column range itself; pure data movement, so the band split it
+            # did not get changes nothing but who does the work.
+            _laswp!(C, PtrVector{Int}(lup.ipiv, lup.ioff + lup.nb), lup.ioff + 1, lup.ioff + lup.nb, 1, C.n)
+        elseif kind == _MT_KIND_COPY2D
+            _copy2d!(C.ptr, C.ld, A.ptr, A.ld, C.m, C.n)
         elseif kind == _MT_KIND_TRSM
             # `nroute` stays -1 for the same reason as gemm's: a loser solves the whole of B, so its
             # own column count IS the routing width. `C` and `B` are the same matrix here.

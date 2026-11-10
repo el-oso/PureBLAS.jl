@@ -669,18 +669,48 @@ end
         # order of magnitude on any host, so the ladder as a whole cannot pass vacuously.
         P.set_num_threads(nthreads())
         @test count(n -> P._trsm_workers(P._lu_nb(n), n - P._lu_nb(n)) > 1, (512, 1024, 2048)) > 0
+        # getrf's data movement is threaded too — the trailing row swaps (`_lu_nb(n)` pivot rows over
+        # the columns to the right), the deferred left swaps, and the pad copy at a 512-aliased
+        # leading dimension. Pure data movement cannot change a bit, so the witness carries this
+        # part: the move predicate must admit the driver's own shapes at n=2048.
+        @test P._lu_move_workers(P._lu_nb(2048), 2048 - P._lu_nb(2048), Float64) > 1
+        @test P._lu_move_workers(2048, 2048, Float64) > 1
         P.set_num_threads(1)
-        for n in (512, 1024, 2048)
-            Random.seed!(4242 + n)
-            A0 = randn(n, n)
+        # n=256 is the small-panel shape (nb=48, no pad); 1024 and 2048 take the pad. The last case is
+        # 1024 at a leading dimension that is not 512-aliased, so the no-pad path at a threaded size
+        # is covered as well.
+        p = P._gemm_pool(Float64)
+        for (n, lda) in ((256, 256), (512, 512), (1024, 1024), (2048, 2048), (1024, 1032))
+            Random.seed!(4242 + n + lda)
+            B0 = randn(lda, n); A0 = view(B0, 1:n, 1:n)
             r = copy(A0); ipr = Vector{Int}(undef, n); P.getrf!(r, ipr)
             for nw in (2, nthreads())
                 P.set_num_threads(nw)
-                g = copy(A0); ipg = Vector{Int}(undef, n); P.getrf!(g, ipg)
+                Bg = copy(B0); g = view(Bg, 1:n, 1:n); ipg = Vector{Int}(undef, n)
+                g0 = @atomic p.gen
+                P.getrf!(g, ipg)
+                n >= 1024 && @test (@atomic p.gen) != g0
                 @test bitsame(g, r)
                 @test ipg == ipr
             end
+            # A pivot vector whose storage is not a dense run of `Int` must stay off the pool jobs,
+            # which carry `ipiv` as a raw `Ptr{Int}`; `pointer(::Vector{Int32})` converted silently
+            # and the look-ahead job read past the vector (a segfault at n=1024). Same bits, no pool
+            # dependence on the element type.
+            P.set_num_threads(nthreads())
+            Bg = copy(B0); g = view(Bg, 1:n, 1:n); ip32 = Vector{Int32}(undef, n)
+            P.getrf!(g, ip32)
+            @test bitsame(g, r)
+            @test ip32 == ipr
         end
+        # The threaded entry allocates nothing at steady state (req#10): warm call first, then measure
+        # inside a function so the return is not boxed at testitem scope.
+        P.set_num_threads(nthreads())
+        let A0 = randn(MersenneTwister(7), 1024, 1024), ip = Vector{Int}(undef, 1024)
+            f(A, ip) = (P.getrf!(A, ip); @allocated P.getrf!(A, ip))
+            @test f(A0, ip) == 0
+        end
+        P.set_num_threads(1)
         # potrf needs n = 2048 to be worth testing at all: below `_chol_faer_base` it issues NO
         # Level-3 call and runs entirely inside a scalar kernel, so a smaller size would compare two
         # serial runs and pass no matter what. The witness is the pool's generation counter rather
