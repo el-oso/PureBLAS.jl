@@ -741,6 +741,129 @@ end
     end
 end
 
+# potrf's own thread-invariance item. The Cholesky cases in the item above are lower-only at two
+# power-of-two sizes; this one covers both triangles, sizes that take the pad round-trip (a leading
+# dimension on the L1 way stride) and sizes that do not, and a view whose row count is not its
+# leading dimension. The pad's two triangle copies run on the pool, so the copy job has its own
+# witness, its own forced lost claim and a place in the allocation check.
+@testitem "potrf: bit-identical at every thread count, both triangles, pad copy on the pool" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Random
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    if nthreads() < 2
+        @test_skip "needs >= 2 julia threads"
+    else
+        bitsame(X, Y) = reinterpret(UInt64, vec(X)) == reinterpret(UInt64, vec(Y))
+        P.set_num_threads(nthreads())
+        p = P._gemm_pool(Float64)
+        jobs() = (@atomic p.gen) >> P._MT_NW_SHIFT
+        # ── the triangle copy alone: it reaches the pool, moves exactly one triangle, and a caller
+        # that loses the claim moves the same elements. `dst` starts as NaN, so `isequal` against a
+        # reference that is NaN outside the triangle also proves nothing else was written.
+        #
+        # THE SIZES COME FROM THE ADMISSION FLOOR, not from this box. The copy moves n·(n+1) elements
+        # (one triangle read, one written) and `_lu_move_workers` declines below `_L1_MT_MIN` bytes,
+        # which follows the host's L1. `nlo` is the first n past that floor with a little margin, so
+        # the smallest admitted shape is exercised wherever the floor sits; the other two clear it
+        # by more than an order of magnitude.
+        nlo = isqrt(P._L1_MT_MIN ÷ sizeof(Float64)) + 3
+        nhi = 8 * nlo
+        for up in (false, true), (n, lds, ldd) in ((nhi, nhi, nhi + 8), (nhi - 24, nhi, nhi - 16), (nlo, nlo + 5, nlo))
+            @test P._lu_move_workers((n + 1) ÷ 2, n, Float64) > 1
+            src = randn(MersenneTwister(n + up), lds, n)
+            ref = fill(NaN, ldd, n)
+            for j in 1:n, i in (up ? (1:j) : (j:n))
+                ref[i, j] = src[i, j]
+            end
+            dst = fill(NaN, ldd, n)
+            g0 = jobs()
+            GC.@preserve src dst P._tricopy_mt!(pointer(dst), ldd, pointer(src), lds, n, up)
+            @test jobs() == g0 + 1
+            @test isequal(dst, ref)
+            # FORCED LOSS: holding the claim makes the fallback certain, and `_MT_LOST` shows it ran.
+            fill!(dst, NaN)
+            lost0 = P._MT_LOST[]
+            _, held = @atomicreplace p.busy false => true
+            @test held
+            GC.@preserve src dst P._tricopy_mt!(pointer(dst), ldd, pointer(src), lds, n, up)
+            @atomic p.busy = false
+            @test P._MT_LOST[] == lost0 + 1
+            @test isequal(dst, ref)
+        end
+        # ── potrf, every worker count. (n, lda): 256/512/1024/2048 pad the lower factorization; 1000
+        # and 1029 do not; (1000, 1024) pads a view; (1024, 1032) is a threaded size without the pad.
+        cases = ((256, 256), (512, 512), (1000, 1000), (1000, 1024), (1024, 1024), (1024, 1032), (1029, 1029), (2048, 2048))
+        for (n, lda) in cases, ul in ('L', 'U')
+            Random.seed!(7 * n + lda)
+            G = randn(n, n); S = G * G' + n * I
+            B0 = zeros(lda, n); copyto!(view(B0, 1:n, :), S)
+            P.set_num_threads(1)
+            r = copy(B0); P.potrf!(view(r, 1:n, 1:n); uplo = ul)
+            for nw in 2:nthreads()
+                P.set_num_threads(nw)
+                g = copy(B0)
+                g0 = jobs()
+                P.potrf!(view(g, 1:n, 1:n); uplo = ul)
+                n >= 2048 && @test jobs() > g0                # the pool ran
+                @test bitsame(g, r)
+            end
+        end
+        # WITNESS THAT THE PAD COPIES ARE POOL JOBS INSIDE potrf: the same matrix factored at a
+        # way-aligned leading dimension makes exactly two more jobs than at one that is not. `n` is
+        # a whole number of L1 ways in bytes, so the pad predicate holds on any cache geometry, and
+        # it is far above the `_L1_MT_MIN` floor, so both copies are admitted.
+        P.set_num_threads(nthreads())
+        let n = max(1024, P._L1_WAY_BYTES ÷ sizeof(Float64))
+            @test n * n * sizeof(Float64) >= 8 * P._L1_MT_MIN
+            G = randn(MersenneTwister(5), n, n); S = G * G' + n * I
+            @test P._chol_needs_pad(S, n)
+            Bq = zeros(n + 8, n); Xq = view(Bq, 1:n, 1:n)
+            @test !P._chol_needs_pad(Xq, n)
+            X = copy(S); j0 = jobs(); P.potrf!(X; uplo = 'L'); jp = jobs() - j0
+            copyto!(Xq, S); j0 = jobs(); P.potrf!(Xq; uplo = 'L'); jq = jobs() - j0
+            @test jp == jq + 2
+            @test bitsame(tril(X), tril(Xq))
+        end
+        # Float32 takes the same padded driver and the same copy job.
+        let n = 1024
+            G = randn(MersenneTwister(6), Float32, n, n); S = G * G' + n * I
+            P.set_num_threads(1); r = copy(S); P.potrf!(r; uplo = 'L')
+            p32 = P._gemm_pool(Float32)
+            for nw in 2:nthreads()
+                P.set_num_threads(nw)
+                g = copy(S); g0 = @atomic p32.gen
+                P.potrf!(g; uplo = 'L')
+                @test (@atomic p32.gen) != g0
+                @test reinterpret(UInt32, vec(g)) == reinterpret(UInt32, vec(r))
+            end
+        end
+        # CONCURRENT callers: all but one lose the claim somewhere inside the call, the pad copies
+        # included, and every result must still be the serial bits.
+        P.set_num_threads(nthreads())
+        let n = 1024
+            G = randn(MersenneTwister(8), n, n); S = G * G' + n * I
+            P.set_num_threads(1); r = copy(S); P.potrf!(r; uplo = 'L')
+            P.set_num_threads(nthreads())
+            lost0 = P._MT_LOST[]
+            tasks = [@spawn (t = copy(S); P.potrf!(t; uplo = 'L'); t) for _ in 1:(nthreads() + 1)]
+            for t in tasks
+                @test bitsame(fetch(t), r)
+            end
+            @test P._MT_LOST[] > lost0
+        end
+        # req#10: 0 B at steady state with the pool on, both triangles, at a padded size. Measured in
+        # a function over pre-built operands, after a warm call.
+        P.set_num_threads(nthreads())
+        let n = 1024
+            G = randn(MersenneTwister(9), n, n); S = G * G' + n * I; X = similar(S)
+            f(X, S, ul) = (copyto!(X, S); P.potrf!(X; uplo = ul); copyto!(X, S); @allocated P.potrf!(X; uplo = ul))
+            @test f(X, S, 'L') == 0
+            @test f(X, S, 'U') == 0
+        end
+        P.set_num_threads(1)
+    end
+end
+
 # trsm had NO thread-invariance item, which is how a complex admission that violated requirement 11 in
 # four places passed its own certification: that certification used square power-of-two B, where every
 # band is a multiple of the row granule and no band ends mid-vector. This item exists so a future

@@ -4488,6 +4488,7 @@ const _MT_KIND_SYMM = 21
 # changes is that a quarter to a third of the threaded call stops running on one thread — measured
 # on Zen4 at three workers, n=1024: pad copy 1.3 ms, trailing swaps 0.9 ms, deferred left swaps
 # 1.2 ms, of a 9.6 ms call whose ideal is 6.0 ms. Both reuse `C`/`A` as (destination, source).
+# potrf's pad round-trip rides `_MT_KIND_COPY2D` as well, with `unit` set to move one triangle.
 # PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
 # req8-ok: enum discriminant, host-invariant by construction
 const _MT_KIND_LASWP = 22
@@ -4828,7 +4829,14 @@ end
 end
 
 # `C[:, band] .= A[:, band]`, column by column, each column one contiguous run of `m` elements.
+# With `p.unit` the block is square and only its `p.up` triangle moves (potrf's pad round-trip); the
+# bands then come from `_tri_chunk`, which deals out equal areas where `_gemm_chunk` deals equal widths.
 @noinline function _copy2d_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    if p.unit
+        j0, len = _tri_chunk(p.n, nw, i, p.up)
+        len > 0 && _tricopy!(p.Cp, p.ldc, p.Ap, p.lda, p.n, p.up, j0, j0 + len)
+        return nothing
+    end
     j0, len = _gemm_chunk(p.n, nw, i)
     len > 0 || return nothing
     _copy2d!(p.Cp + j0 * p.ldc * sizeof(T), p.ldc, p.Ap + j0 * p.lda * sizeof(T), p.lda, p.m, len)
@@ -4837,6 +4845,18 @@ end
 @inline function _copy2d!(dst::Ptr{T}, ldd::Int, src::Ptr{T}, lds::Int, m::Int, n::Int) where {T}
     for j in 0:(n - 1)
         unsafe_copyto!(dst + j * ldd * sizeof(T), src + j * lds * sizeof(T), m)
+    end
+    return nothing
+end
+# Columns `j0:j1-1` (zero-based) of one triangle of an n×n block, diagonal included: rows `j:n-1` of
+# column `j` for the lower triangle, rows `0:j` for the upper. Each column is one contiguous run.
+@inline function _tricopy!(
+        dst::Ptr{T}, ldd::Int, src::Ptr{T}, lds::Int, n::Int, up::Bool, j0::Int, j1::Int
+    ) where {T}
+    sz = sizeof(T)
+    for j in j0:(j1 - 1)
+        o = up ? 0 : j
+        unsafe_copyto!(dst + (j * ldd + o) * sz, src + (j * lds + o) * sz, up ? j + 1 : n - j)
     end
     return nothing
 end
@@ -5759,7 +5779,9 @@ end
             # did not get changes nothing but who does the work.
             _laswp!(C, PtrVector{Int}(lup.ipiv, lup.ioff + lup.nb), lup.ioff + 1, lup.ioff + lup.nb, 1, C.n)
         elseif kind == _MT_KIND_COPY2D
-            _copy2d!(C.ptr, C.ld, A.ptr, A.ld, C.m, C.n)
+            # `unit` marks the triangle form; a loser moves the same elements its bands would have.
+            unit ? _tricopy!(C.ptr, C.ld, A.ptr, A.ld, C.n, up, 0, C.n) :
+                _copy2d!(C.ptr, C.ld, A.ptr, A.ld, C.m, C.n)
         elseif kind == _MT_KIND_TRSM
             # `nroute` stays -1 for the same reason as gemm's: a loser solves the whole of B, so its
             # own column count IS the routing width. `C` and `B` are the same matrix here.
