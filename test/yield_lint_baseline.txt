@@ -57,7 +57,7 @@ tune.jl:@info "Restart Julia to pick them up. They are read at RUNTIME, so this 
 blas3/gemm.jl:wait(p.evs[i])
 blas3/gemm.jl:(@atomic p.done) < nwk && yield()
 blas3/gemm.jl:lock(_MT_SETUP_LOCK) do
-blas3/gemm.jl:ok &= fetch(t)::Bool
+blas3/gemm.jl:fetch(t)::Bool || push!(bad, "thread $tid: sched_setaffinity refused")
 
 # --- 2026-09-20, cooperative barriers. `_pool_barrier` yields, and it is reached from INSIDE a chunk
 #              body — the one place the note above says never yields. The remedy that note prescribes
