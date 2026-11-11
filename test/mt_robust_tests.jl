@@ -53,3 +53,70 @@
         @test tp <= 1.5 * ts
     end
 end
+
+# Worker pinning (`_mt_pin_threads!`): decided once, when the pool is created, so every case runs in its
+# own child process. The child reports the decision and each default-pool thread's CPU mask, read on
+# that thread from /proc/thread-self.
+@testitem "worker threads are pinned on a restricted CPU set, and only there" tags = [:checks] begin
+    using PureBLAS
+    script = """
+    using PureBLAS
+    if get(ENV, "PREPIN", "") == "1"       # a host that pins its own main thread first
+        c = ccall(:sched_getcpu, Cint, ()); m = zeros(UInt64, 16); m[c ÷ 64 + 1] = UInt64(1) << (c % 64)
+        ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(m), m)
+    end
+    PureBLAS.set_num_threads(Threads.nthreads())
+    println("MSG ", PureBLAS._MT_PINNED[])
+    for tid in Threads.threadpooltids(:default)
+        t = Task(() -> strip(match(r"Cpus_allowed_list:\\s*(.*)", read("/proc/thread-self/status", String))[1]))
+        t.sticky = true; ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1); schedule(t)
+        println("MASK ", tid, " ", fetch(t))
+    end
+    """
+    linux = Sys.islinux() && !isnothing(Sys.which("taskset")) && isfile("/sys/devices/system/cpu/online")
+    if !linux
+        @test_skip "needs Linux and taskset"
+    else
+        P = PureBLAS
+        allowed = reduce(union, P._mt_task_masks())
+        online = P._mt_parse_cpulist(read("/sys/devices/system/cpu/online", String))
+        sib(c) = P._mt_parse_cpulist(read("/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list", String))
+        cores = sort!(unique([sort!(collect(intersect(sib(c), allowed))) for c in allowed]); by = first)
+        function child(cpus, env...)
+            jl = `$(Base.julia_cmd()) -t 3,0 --project=$(Base.active_project()) -e $script`
+            cmd = isnothing(cpus) ? jl : `taskset -c $(join(cpus, ',')) $jl`
+            e = filter(kv -> kv.first ∉ ("PUREBLAS_MT_ALL_THREADS", "PUREBLAS_PIN_THREADS"), ENV)
+            out = read(setenv(cmd, merge(e, Dict(env))), String)
+            msg = only(l[5:end] for l in split(out, '\n') if startswith(l, "MSG "))
+            masks = Dict(parse(Int, split(l)[2]) => P._mt_parse_cpulist(split(l)[3]) for l in split(out, '\n') if startswith(l, "MASK "))
+            return msg, masks
+        end
+        if length(cores) < 3
+            @test_skip "needs three cores in this process's CPU set"
+        else
+            three = reduce(vcat, cores[1:3])
+            # Restricted set: the two worker threads (2 and 3) each on one whole core, never the same one;
+            # thread 1 created the pool and keeps the whole set.
+            msg, m = child(three)
+            @test startswith(msg, "on")
+            @test m[2] == Set(cores[2]) && m[3] == Set(cores[3])
+            @test m[1] == Set(three)
+            # Opt-out.
+            msg, m = child(three, "PUREBLAS_PIN_THREADS" => "0")
+            @test startswith(msg, "off (PUREBLAS_PIN_THREADS=0")
+            @test all(==(Set(three)), values(m))
+            # A host that already pinned a thread: left alone.
+            msg, m = child(three, "PREPIN" => "1")
+            @test startswith(msg, "off (a thread of this process already has its own CPU mask")
+            if allowed == online
+                # Whole machine: not pinned by default, pinned when asked.
+                msg, m = child(nothing)
+                @test startswith(msg, "off (the process may use every CPU")
+                @test all(==(online), values(m))
+                msg, m = child(nothing, "PUREBLAS_PIN_THREADS" => "1")
+                @test startswith(msg, "on")
+                @test m[2] == Set(cores[2]) && m[3] == Set(cores[3])
+            end
+        end
+    end
+end
