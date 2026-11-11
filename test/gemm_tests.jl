@@ -162,6 +162,12 @@ end
             @test P.set_num_threads(Threads.nthreads()) == min(Threads.nthreads(), P._mt_physical_cores())
         end
         @test 1 <= P._mt_physical_cores() <= Sys.EFFECTIVE_CPU_THREADS
+        # The OS-independent fallback: in range always, and equal to the topology count when the
+        # process may use every CPU (its one known undercount needs a one-CPU-per-core subset).
+        @test 1 <= P._mt_cores_portable() <= Sys.EFFECTIVE_CPU_THREADS
+        if Sys.islinux() && Sys.EFFECTIVE_CPU_THREADS == Sys.CPU_THREADS
+            @test P._mt_cores_portable() == P._mt_cores_linux() == P._mt_physical_cores()
+        end
         # Placement: every worker bound to its own default-pool thread.
         tw = P._gemm_pool(Float64).tids
         @test length(tw) == Threads.nthreads() - 1
