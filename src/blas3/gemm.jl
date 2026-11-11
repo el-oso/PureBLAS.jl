@@ -5535,6 +5535,103 @@ const _MT_LOST = Threads.Atomic{Int}(0)
 # to land on a free thread. Bumped once per such job, on a path that is about to run a whole chunk.
 const _MT_SKIPPED = Threads.Atomic{Int}(0)
 
+# ── L3 SHARING GROUPS ─────────────────────────────────────────────────────────────────────────────
+# Cores that share a last-level cache exchange a line in about half the time cores in different
+# groups do (Zen3, one-way core-to-core latency: 40.6 ns inside a group, 87.2 ns across). Measured
+# on Zen3 (two groups of six cores), getrf at n = 512 / 1024 / 2048 with every worker used, workers
+# pinned one per core:
+#   6 workers, one group      0.81 /  4.03 / 27.8 ms
+#   6 workers, 3 + 3          1.13 /  5.16 / 29.1 ms
+#   12 workers, 6 + 6         1.00 /  4.10 / 19.9 ms     (unpinned: 1.05 / 4.27 / 20.3)
+#   3 workers, one group      1.16 /  6.74 / 47.1 ms
+# so a small factorization is faster on the calling thread's group alone than on every core.
+#
+# WHERE THE TIME GOES (driver-thread profile, 3 + 3 against one group, n = 1024, +1.16 ms in all):
+# row swaps +0.32 ms, trsm +0.22, the look-ahead update +0.24, the driver's own panel +0.27, the pad
+# copy +0.11. The barrier and the join are not the cost: the driver's barrier wait grows by 0.33 ms
+# over some 30 barriers, 11 µs each, which a 47 ns difference in the hand-off cannot account for.
+# Not the cost either, each measured: restricting ONE job kind to the
+# group (every kind but the narrow update gets slower), the cooperative A-pack (private packs gain
+# 1-3%), which group takes which column bands (reversed: 3% slower), and the caller's thread having
+# written the matrix (restored by the pool instead: 2% faster).
+#
+# So the unit of the decision is the whole call. These tables are filled once, when the first pool is
+# created, from sysfs and each worker thread's CPU mask; they stay empty on a machine whose CPU set
+# lies in one group, and every reader treats empty as "never restrict".
+const _MT_L3_OF = Int[]      # CPU number + 1 -> its L3 group, 0 when unknown
+const _MT_L3_CORES = Int[]   # group -> physical cores of this process's CPU set in it
+# group -> how many leading pool workers can run in it: workers whose thread is confined to that
+# group, or free to move across groups (six unpinned workers of twelve measure the one-group time:
+# 0.81 / 4.03 / 27.9 ms). The first worker confined to a different group ends the run, because a
+# job's workers are always the leading ones.
+const _MT_L3_LEAD = Int[]
+# The group the FIRST worker's thread is confined to, 0 when it may move across groups. Non-zero
+# names the group a restricted call runs in whatever CPU the caller is on: the leading workers are
+# there and cannot follow the caller, and an unpinned caller beside pinned workers is not always
+# on a CPU of that group (Zen3, twelve pinned workers: keyed on the caller's CPU, the restriction
+# was declined at two of the five sizes it applies to). Zero leaves the choice to the caller's CPU.
+const _MT_L3_HOME = Ref(0)
+# thread id -> the worker count the call running on that thread is restricted to, 0 for none.
+# Per thread and not per pool: the cap belongs to one caller's call, and the pools are shared.
+const _MT_CALL_CAP = Int[]
+# How many jobs ran with fewer workers because of `_MT_CALL_CAP`. A test witness, like `_MT_SKIPPED`.
+const _MT_CAPPED = Threads.Atomic{Int}(0)
+
+# The cross-group cost of a threaded LU in the 3 + 3 layout above at a leading dimension that needs
+# no pad copy: 0.28 ms at n = 512 and 1.04 ms at n = 1024 over the one-group time, 133 and 124 ps per
+# byte of matrix — the same price at both sizes, which is why it is recorded per byte.
+# PDM: Measured — recorded cross-L3-group cost of a threaded LU on Zen3 (ps per matrix byte); a fabric latency, no detected const gives it | tune: none — one recorded measurement, the only multi-group part measured
+const _MT_XGROUP_PS_PER_BYTE_MEASURED = 125   # req8-ok: a recorded measurement, not a tuning choice; see the block above
+# PDM: Measured — the locked core clock that cost was recorded under | tune: none — recorded with the value above
+const _MT_XGROUP_CLOCK_MHZ_MEASURED = 3701    # req8-ok: a recorded measurement, not a tuning choice; see the block above
+
+"""
+    _mt_group_cap(flops, bytes, T) -> Int
+
+Worker count to restrict a factorization of `flops` flops over `bytes` bytes of matrix to, or `0`
+for no restriction. Non-zero only when the workers span several L3 groups and the calling thread's
+group alone is the faster place to run it.
+
+With `L` cores in the caller's group and `N` workers in all, the other groups save
+`flops·(1/L − 1/N)` core-cycles of arithmetic at the detected FMA rate and cost the cross-group
+traffic, taken as `2·(1 − L/N)` of the matrix at the recorded per-byte price (the factor is 1 at
+the measured `N = 2L` and 0 when no worker is outside the group). `N` cancels:
+`flops < 2·L·rate·price·bytes`. For a square real matrix on Zen3 that is `n < 178·L`, against
+measured break-evens near `n = 512` at `L = 3` and `n = 1024` at `L = 6`.
+"""
+@inline function _mt_group_cap(flops::Float64, bytes::Float64, ::Type{T}) where {T}
+    nt = _MT_NTHREADS[]
+    (nt > 1 && !isempty(_MT_L3_LEAD)) || return 0
+    return _mt_group_cap_at(_mt_current_cpu(), nt, flops, bytes, T)
+end
+@inline _mt_current_cpu() = @static Sys.islinux() ? Int(ccall(:sched_getcpu, Cint, ())) : -1
+function _mt_group_cap_at(cpu::Int, nt::Int, flops::Float64, bytes::Float64, ::Type{T}) where {T}
+    g = _MT_L3_HOME[]
+    if g == 0
+        (0 <= cpu < length(_MT_L3_OF)) || return 0
+        g = _MT_L3_OF[cpu + 1]
+        g > 0 || return 0
+    end
+    L = min(1 + _MT_L3_LEAD[g], _MT_L3_CORES[g])
+    (2 <= L < nt) || return 0
+    price = _MT_XGROUP_PS_PER_BYTE_MEASURED * _MT_XGROUP_CLOCK_MHZ_MEASURED / 1.0e6   # core cycles per byte
+    return flops < 2 * L * _mt_flops_per_cycle(T) * price * bytes ? L : 0
+end
+
+# Restrict the pool jobs this thread publishes to `cap` workers. Returns the slot to hand back to
+# `_mt_call_uncap!`, 0 when this thread has none (it was adopted after the tables were built).
+@inline function _mt_call_cap!(cap::Int)
+    tid = Threads.threadid()
+    tid <= length(_MT_CALL_CAP) || return 0
+    @inbounds _MT_CALL_CAP[tid] = cap
+    return tid
+end
+@inline _mt_call_uncap!(slot::Int) = (slot > 0 && (@inbounds _MT_CALL_CAP[slot] = 0); nothing)
+@inline function _mt_call_cap()
+    tid = Threads.threadid()
+    return tid <= length(_MT_CALL_CAP) ? @inbounds(_MT_CALL_CAP[tid]) : 0
+end
+
 # The participating worker (index below `nw`) bound to the calling thread, or 0. `tids` never changes
 # after the pool starts, so this needs no claim.
 @inline function _mt_self_worker(p::GemmPool, nw::Int)
@@ -5670,6 +5767,66 @@ end
 # user's own — is never pinned; it keeps the first core free by leaving it unassigned.
 const _MT_PINNED = Ref("not decided (threading has not been enabled)")
 
+# The CPUs that share a level-3 cache with `cpu`, as the kernel prints the list; "" when sysfs has
+# no level-3 entry for it.
+function _mt_l3_key(cpu::Int)
+    d = "/sys/devices/system/cpu/cpu$cpu/cache"
+    isdir(d) || return ""
+    for e in readdir(d)
+        startswith(e, "index") && isfile(joinpath(d, e, "level")) || continue
+        readchomp(joinpath(d, e, "level")) == "3" || continue
+        f = joinpath(d, e, "shared_cpu_list")
+        return isfile(f) ? readchomp(f) : ""
+    end
+    return ""
+end
+
+# The calling thread's CPU mask; empty when the kernel's mask is wider than the buffer.
+function _mt_self_cpus()
+    mask = zeros(UInt64, 64)
+    iszero(ccall(:sched_getaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(mask), mask)) || return Int[]
+    return [64 * (i - 1) + b for i in eachindex(mask) for b in 0:63 if isone((mask[i] >> b) & 1)]
+end
+
+# Fill the L3 group tables (see `_MT_L3_OF`). Runs once, after the worker threads are pinned, under
+# the setup lock and before `_MT_NTHREADS` publishes the pool, so no reader sees them half built.
+function _mt_l3_setup!(tids::Vector{Int})
+    (Sys.islinux() && isempty(_MT_L3_OF)) || return nothing
+    cpus = reduce(union, _mt_task_masks(); init = Set{Int}())
+    isempty(cpus) && return nothing
+    of = zeros(Int, maximum(cpus) + 1)
+    groups = Dict{String, Int}()
+    cores = Set{String}[]
+    for cpu in cpus
+        key = _mt_l3_key(cpu)
+        isempty(key) && continue
+        g = get!(groups, key, length(groups) + 1)
+        g > length(cores) && push!(cores, Set{String}())
+        of[cpu + 1] = g
+        f = "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
+        isfile(f) && push!(cores[g], readchomp(f))
+    end
+    length(cores) < 2 && return nothing
+    # Each worker's group: the one its thread is confined to, 0 when it may move across groups,
+    # -1 when its mask could not be read (which ends every group's leading run).
+    wg = Int[]
+    for tid in tids
+        t = Task(_mt_self_cpus)
+        t.sticky = true
+        isone(ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1)) || (push!(wg, -1); continue)
+        schedule(t)
+        gs = unique!([c < length(of) ? of[c + 1] : 0 for c in fetch(t)::Vector{Int}])
+        push!(wg, isempty(gs) ? -1 : (length(gs) == 1 && gs[1] > 0 ? gs[1] : 0))
+    end
+    lead = [something(findfirst(w -> w != g && w != 0, wg), length(wg) + 1) - 1 for g in eachindex(cores)]
+    append!(_MT_CALL_CAP, zeros(Int, Threads.maxthreadid()))
+    append!(_MT_L3_CORES, length.(cores))
+    append!(_MT_L3_LEAD, lead)
+    append!(_MT_L3_OF, of)
+    _MT_L3_HOME[] = isempty(wg) ? 0 : max(wg[1], 0)
+    return nothing
+end
+
 function _mt_pin_plan(ntids::Int)
     mode = lowercase(get(ENV, "PUREBLAS_PIN_THREADS", "auto"))
     mode in ("0", "false", "no", "off") && return "off (PUREBLAS_PIN_THREADS=$mode)", Vector{Int}[]
@@ -5693,9 +5850,13 @@ function _mt_pin_plan(ntids::Int)
     end
     cores = sort!([sort!(v) for v in values(bysib)]; by = first)
     length(cores) < 2 && return "off (fewer than two cores in the CPU set)", Vector{Int}[]
-    k = min(ntids, length(cores) - 1)
+    # The cores that share an L3 with the first one — the driver's — come first, so the leading
+    # workers are the driver's group (`_MT_L3_LEAD`). A stable sort: CPU order within each part.
+    home = _mt_l3_key(first(cores[1]))
+    rest = sort!(cores[2:end]; by = c -> _mt_l3_key(first(c)) != home, alg = MergeSort)
+    k = min(ntids, length(rest))
     return "on: $k of $ntids worker thread(s) pinned, one core each, CPUs " *
-        join((join(c, ",") for c in cores[2:(k + 1)]), " | "), cores[2:(k + 1)]
+        join((join(c, ",") for c in rest[1:k]), " | "), rest[1:k]
 end
 
 # Runs on the thread it pins: `sched_setaffinity(0, …)` sets the calling thread's mask.
@@ -5740,6 +5901,7 @@ function set_num_threads(n::Integer)
                 plan = _mt_pin_plan(max(1, Threads.nthreads() - 1))
                 push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
                 _mt_pin_threads!(_GEMM_POOL_F64[1].tids, plan)
+                _mt_l3_setup!(_GEMM_POOL_F64[1].tids)
             end
             isempty(_GEMM_POOL_F32) && push!(_GEMM_POOL_F32, _gemm_pool_new(Float32))
             isempty(_GEMM_POOL_C64) && push!(_GEMM_POOL_C64, _gemm_pool_new(ComplexF64))
@@ -5814,6 +5976,15 @@ end
         lup::LuPanel{T} = _lupanel_none(T)
     ) where {T <: Union{BlasReal, BlasComplex}}
     p = _gemm_pool(T)
+    # A caller that restricted itself to its own L3 group (`_mt_group_cap`) runs every job of that
+    # call on the leading workers. A worker count, so req#11 is untouched: it decides who computes a
+    # chunk and never what.
+    let cap = _mt_call_cap()
+        if 1 < cap < nw
+            nw = cap
+            Threads.atomic_add!(_MT_CAPPED, 1)
+        end
+    end
     # THE DRIVER MAY BE ON A PARTICIPATING WORKER'S THREAD — any task but the pool's creator can be, a
     # `Threads.@spawn`ed caller for one. That worker is sticky to this thread, so it would run only when
     # the driver yields in its join, after the driver's own chunk: the two serialize and the threaded

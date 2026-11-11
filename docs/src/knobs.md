@@ -317,13 +317,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-67 `const _X = <literal>` values in `src/` with no `@load_preference`.
+69 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 31 Literal · 30 Exempt · 4 Unaudited.
+**Tier:** 4 Measured · 31 Literal · 30 Exempt · 4 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -458,6 +458,8 @@ on these, not on knobs.
 | `_MT_KIND_TRSM` | 2 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_KIND_TRSMR` | 4 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_SPINS` | 2048 | Literal | how long an idle worker keeps spinning before it sleeps, in fence iterations. This is |
+| `_MT_XGROUP_CLOCK_MHZ_MEASURED` | 3701 | Measured | the locked core clock that cost was recorded under |
+| `_MT_XGROUP_PS_PER_BYTE_MEASURED` | 125 | Measured | recorded cross-L3-group cost of a threaded LU on Zen3 (ps per matrix byte); a fabric latency, no detected const gives it |
 | `_STR_FLOOR` | 1 | Exempt | level-1-claim tag, not hardware tuning. |
 | `_STR_LVL1` | 2 | Exempt | level-1-claim tag, not hardware tuning. |
 | `_STR_OFF` | 0 | Exempt | level-1-claim TAGS, not hardware tuning. They name which depth rule a caller asks |

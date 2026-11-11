@@ -8,12 +8,14 @@
 #              It runs measurements through public entries; each of those opens and closes its own scope
 #              between the log lines, so no scope is ever live across one.
 #
-#   gemm.jl  — the M4 thread pool, and these five lines are the ONLY yields in a kernel file, so read
-#              the reason carefully before adding a sixth.
+#   gemm.jl  — the M4 thread pool, and these six lines are the ONLY yields in a kernel file, so read
+#              the reason carefully before adding a seventh.
 #              * `lock(_MT_SETUP_LOCK) do` in `set_num_threads` — the same construction path, serialised
 #                so two concurrent first calls cannot each push a pool. Never reached from `gemm!`.
 #              * `fetch(t)` in `_mt_pin_threads!` — inside that lock, once per process: waits for a
 #                sticky task to set its thread's CPU mask. No kernel has run and no scope is open.
+#              * `fetch(t)` in `_mt_l3_setup!` — the same place, straight after the pinning: waits for
+#                a sticky task to read its thread's CPU mask. Once per process, no scope open.
 #              * `wait(p.evs[i])` — an IDLE worker parking between jobs. It holds no scope: it has not
 #                been given a chunk yet, and the chunk it ran last returned before this line.
 #              * `yield()` in the worker's keep-awake loop — the same idle worker, in the same position
@@ -58,6 +60,7 @@ blas3/gemm.jl:wait(p.evs[i])
 blas3/gemm.jl:(@atomic p.done) < nwk && yield()
 blas3/gemm.jl:lock(_MT_SETUP_LOCK) do
 blas3/gemm.jl:fetch(t)::Bool || push!(bad, "thread $tid: sched_setaffinity refused")
+blas3/gemm.jl:gs = unique!([c < length(of) ? of[c + 1] : 0 for c in fetch(t)::Vector{Int}])
 
 # --- 2026-09-20, cooperative barriers. `_pool_barrier` yields, and it is reached from INSIDE a chunk
 #              body — the one place the note above says never yields. The remedy that note prescribes
