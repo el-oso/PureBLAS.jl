@@ -5583,17 +5583,39 @@ const _MT_SETUP_LOCK = ReentrantLock()
 #
 # The count is over the CPUs this process may run on (`taskset`, cgroups), not the whole machine: the
 # benchmark fleet runs one CPU per core, where every allowed CPU is its own core. On Linux it reads the
-# distinct sibling lists of the allowed CPUs from sysfs; elsewhere it is the detected core count
-# bounded by `Sys.EFFECTIVE_CPU_THREADS`. A hybrid part (SMT performance cores beside single-thread
-# efficiency cores) counts each core once, which is what the cap means.
+# distinct sibling lists of the allowed CPUs from sysfs; elsewhere, and whenever that read fails or
+# returns something out of range, it is `_mt_cores_portable`. A hybrid part (SMT performance cores
+# beside single-thread efficiency cores) counts each core once, which is what the cap means.
 #
 # THE UNION OVER EVERY THREAD OF THE PROCESS, not `/proc/self/status` alone: that file is the MAIN
 # thread's mask, and a host that pins each Julia thread to its own core (ThreadPinning.jl, or bench/
 # plots.jl's `_pin_threads!`) leaves the main thread one core wide. Read from it alone, the cap fell
 # to 1 and turned threading off — measured on Zen3, 6 threads pinned one per core: 1 worker.
 function _mt_physical_cores()
-    fallback = clamp(Int(num_cores()), 1, Sys.EFFECTIVE_CPU_THREADS)
-    (Sys.islinux() && isdir("/proc/self/task")) || return fallback
+    portable = _mt_cores_portable()
+    Sys.islinux() || return portable
+    c = try
+        _mt_cores_linux()
+    catch                                    # any unexpected /proc or /sys content: do not guess from it
+        0
+    end
+    # `EFFECTIVE_CPU_THREADS` also carries a cgroup CPU quota (`docker --cpus`), which affinity does not.
+    return 1 <= c <= Sys.EFFECTIVE_CPU_THREADS ? c : portable
+end
+
+# The OS-independent estimate: the CPUs this process may use (libuv's count, which honours affinity and
+# a cgroup quota on Linux) divided by the machine's threads per core. It needs no topology files, and it
+# undercounts exactly one case: a CPU set with one logical CPU per core on an SMT machine
+# (`taskset -c 0,2,4,…`), where it halves the count — the reason the Linux path is tried first.
+function _mt_cores_portable()
+    cores = max(1, Int(num_cores()))
+    tpc = max(1, Sys.CPU_THREADS ÷ cores)
+    return clamp(cld(Sys.EFFECTIVE_CPU_THREADS, tpc), 1, cores)
+end
+
+# Distinct cores among the CPUs any thread of this process may use, or 0 when that cannot be read.
+function _mt_cores_linux()
+    isdir("/proc/self/task") || return 0
     cpus = Set{Int}()
     for t in readdir("/proc/self/task")
         f = "/proc/self/task/$t/status"
@@ -5610,7 +5632,7 @@ function _mt_physical_cores()
             union!(cpus, lo:hi)
         end
     end
-    isempty(cpus) && return fallback
+    isempty(cpus) && return 0
     # A core is identified by its sibling list, not by `core_id`: on arm64 described by a device tree,
     # `core_id` restarts at 0 in every cluster. A listed CPU with no topology (possible but not present,
     # or offline) is skipped.
@@ -5619,8 +5641,7 @@ function _mt_physical_cores()
         f = "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
         isfile(f) && push!(cores, readchomp(f))
     end
-    # `EFFECTIVE_CPU_THREADS` also carries a cgroup CPU quota (`docker --cpus`), which affinity does not.
-    return isempty(cores) ? fallback : clamp(length(cores), 1, Sys.EFFECTIVE_CPU_THREADS)
+    return length(cores)
 end
 
 # `PUREBLAS_MT_ALL_THREADS=1` lifts the core cap so every Julia thread can be a worker. The test suite
