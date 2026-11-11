@@ -392,6 +392,22 @@ const _LU_PAD = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matri
 # factorisation and the row swaps are shared verbatim. Float64 keeps every fast path it had: with
 # `T === Float64` the guard below is a compile-time constant and folds away.
 function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _lu_nb(min(size(A)...))) where {T <: Real}
+    # A small factorization on a machine whose workers span several L3 groups runs on the calling
+    # thread's group alone (`_mt_group_cap`, gemm.jl). The restriction covers every pool job of the
+    # call — swaps, trsm, both updates, the pad copy — because restricting some and not others moves
+    # the trailing matrix between groups twice a step.
+    m, n = size(A); k = min(m, n)
+    cap = (T <: BlasReal && _strided1(A)) ?
+        _mt_group_cap(k * k * (3.0 * max(m, n) - k) / 3, Float64(m) * n * sizeof(T), T) : 0
+    cap > 0 || return _getrf_real!(A, ipiv, nb)
+    slot = _mt_call_cap!(cap)
+    try
+        return _getrf_real!(A, ipiv, nb)
+    finally
+        _mt_call_uncap!(slot)
+    end
+end
+function _getrf_real!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int) where {T <: Real}
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))

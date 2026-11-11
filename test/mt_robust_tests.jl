@@ -126,3 +126,82 @@ end
         end
     end
 end
+
+# A factorization small enough to lose time crossing L3 groups runs on the caller's group alone
+# (`_mt_group_cap`). CI runners and most desktops have one group, where the tables stay empty and
+# the path never runs, so the item states a two-group machine in the tables and restores them.
+@testitem "getrf restricted to the caller's L3 group: witnessed, bit-identical at every thread count, 0 B" tags = [:checks] begin
+    using PureBLAS, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    if nthreads() < 3
+        @test_skip "needs >= 3 julia threads"
+    else
+        bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        flops(n) = 2.0 * n^3 / 3
+        bytes(n) = 8.0 * n^2
+        nt = P.set_num_threads(nthreads())
+        @test nt == nthreads()
+        tabs = (P._MT_L3_OF, P._MT_L3_CORES, P._MT_L3_LEAD, P._MT_CALL_CAP)
+        saved = map(copy, tabs)
+        home = P._MT_L3_HOME[]
+        L = nt - 1                                   # the caller's group: all but one worker
+        try
+            foreach(empty!, tabs)
+            # No tables: never restricted, whatever the size.
+            @test P._mt_group_cap(flops(64), bytes(64), Float64) == 0
+            append!(P._MT_L3_OF, ones(Int, 4096))    # every CPU in group 1, wherever this task runs
+            append!(P._MT_L3_CORES, [L, L])
+            append!(P._MT_L3_LEAD, [L - 1, 0])
+            append!(P._MT_CALL_CAP, zeros(Int, Threads.maxthreadid()))
+            P._MT_L3_HOME[] = 0                      # floating workers: the caller's CPU picks the group
+            # The decision: small is restricted to L, large is not, and a caller whose group holds
+            # none of the leading workers is never restricted.
+            sizes = filter(n -> P._mt_group_cap_at(0, nt, flops(n), bytes(n), Float64) == L, [256, 384, 512])
+            @test !isempty(sizes)
+            @test P._mt_group_cap_at(0, nt, flops(8192), bytes(8192), Float64) == 0
+            @test P._mt_group_cap_at(0, L, flops(256), bytes(256), Float64) == 0      # no worker outside
+            P._MT_L3_OF[1] = 2
+            @test P._mt_group_cap_at(0, nt, flops(256), bytes(256), Float64) == 0
+            # ...unless the leading workers are confined to a group: then that group is the one.
+            P._MT_L3_HOME[] = 1
+            @test P._mt_group_cap_at(0, nt, flops(256), bytes(256), Float64) == L
+            P._MT_L3_HOME[] = 0
+            P._MT_L3_OF[1] = 1
+            for n in sizes
+                Random.seed!(77 + n)
+                A0 = randn(n, n)
+                P.set_num_threads(1)
+                r = copy(A0); ipr = Vector{Int}(undef, n); P.getrf!(r, ipr)
+                for nw in 2:nt
+                    P.set_num_threads(nw)
+                    g = copy(A0); ipg = Vector{Int}(undef, n)
+                    c0 = P._MT_CAPPED[]
+                    P.getrf!(g, ipg)
+                    # A pool job ran with fewer workers than it asked for, exactly when the call was
+                    # wider than the group.
+                    @test (P._MT_CAPPED[] > c0) == (nw > L)
+                    @test bitsame(g, r)
+                    @test ipg == ipr
+                    @test all(iszero, P._MT_CALL_CAP)
+                end
+            end
+            # A throw inside the restricted call hands the restriction back.
+            P.set_num_threads(nt)
+            @test_throws DimensionMismatch P.getrf!(randn(256, 256), Vector{Int}(undef, 3))
+            @test all(iszero, P._MT_CALL_CAP)
+            # Steady state allocates nothing (req#10): warm call, then measure inside a function.
+            let n = first(sizes), A = randn(MersenneTwister(5), n, n), ip = Vector{Int}(undef, n)
+                f(A, ip) = (P.getrf!(A, ip); @allocated P.getrf!(A, ip))
+                c0 = P._MT_CAPPED[]
+                @test f(A, ip) == 0
+                @test P._MT_CAPPED[] > c0
+            end
+        finally
+            foreach(empty!, tabs)
+            foreach((t, s) -> append!(t, s), tabs, saved)
+            P._MT_L3_HOME[] = home
+            P.set_num_threads(1)
+        end
+    end
+end
