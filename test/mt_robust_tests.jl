@@ -78,12 +78,13 @@ end
         @test_skip "needs Linux and taskset"
     else
         P = PureBLAS
-        allowed = reduce(union, P._mt_task_masks())
+        raw = reduce(union, P._mt_task_masks())                 # what a child inherits
         online = P._mt_parse_cpulist(read("/sys/devices/system/cpu/online", String))
+        allowed = intersect(raw, online)
         sib(c) = P._mt_parse_cpulist(read("/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list", String))
         cores = sort!(unique([sort!(collect(intersect(sib(c), allowed))) for c in allowed]); by = first)
-        function child(cpus, env...)
-            jl = `$(Base.julia_cmd()) -t 3,0 --project=$(Base.active_project()) -e $script`
+        function child(cpus, env...; nt = 3)
+            jl = `$(Base.julia_cmd()) -t $nt,0 --project=$(Base.active_project()) -e $script`
             cmd = isnothing(cpus) ? jl : `taskset -c $(join(cpus, ',')) $jl`
             e = filter(kv -> kv.first ∉ ("PUREBLAS_MT_ALL_THREADS", "PUREBLAS_PIN_THREADS"), ENV)
             out = read(setenv(cmd, merge(e, Dict(env))), String)
@@ -91,31 +92,36 @@ end
             masks = Dict(parse(Int, split(l)[2]) => P._mt_parse_cpulist(split(l)[3]) for l in split(out, '\n') if startswith(l, "MASK "))
             return msg, masks
         end
-        if length(cores) < 3
-            @test_skip "needs three cores in this process's CPU set"
+        if length(cores) < 2
+            @test_skip "needs two cores in this process's CPU set"
         else
-            three = reduce(vcat, cores[1:3])
-            # Restricted set: the two worker threads (2 and 3) each on one whole core, never the same one;
-            # thread 1 created the pool and keeps the whole set.
-            msg, m = child(three)
-            @test startswith(msg, "on")
-            @test m[2] == Set(cores[2]) && m[3] == Set(cores[3])
-            @test m[1] == Set(three)
-            # Opt-out.
-            msg, m = child(three, "PUREBLAS_PIN_THREADS" => "0")
-            @test startswith(msg, "off (PUREBLAS_PIN_THREADS=0")
-            @test all(==(Set(three)), values(m))
-            # A host that already pinned a thread: left alone.
-            msg, m = child(three, "PREPIN" => "1")
-            @test startswith(msg, "off (a thread of this process already has its own CPU mask")
+            # A restricted set must leave a core out, or it is the whole machine: up to 3 cores of >= 3.
+            if length(cores) >= 3
+                nc = min(3, length(cores) - 1)
+                sub = reduce(vcat, cores[1:nc])
+                # The worker threads 2..nc each on one whole core, never the same one; thread 1 created the
+                # pool and keeps the whole set.
+                msg, m = child(sub; nt = nc)
+                @test startswith(msg, "on")
+                @test all(m[t] == Set(cores[t]) for t in 2:nc)
+                @test m[1] == Set(sub)
+                # Opt-out.
+                msg, m = child(sub, "PUREBLAS_PIN_THREADS" => "0"; nt = nc)
+                @test startswith(msg, "off (PUREBLAS_PIN_THREADS=0")
+                @test all(==(Set(sub)), values(m))
+                # A host that already pinned a thread: left alone.
+                msg, m = child(sub, "PREPIN" => "1"; nt = nc)
+                @test startswith(msg, "off (a thread of this process already has its own CPU mask")
+            end
             if allowed == online
                 # Whole machine: not pinned by default, pinned when asked.
-                msg, m = child(nothing)
+                nc = min(3, length(cores))
+                msg, m = child(nothing; nt = nc)
                 @test startswith(msg, "off (the process may use every CPU")
-                @test all(==(online), values(m))
-                msg, m = child(nothing, "PUREBLAS_PIN_THREADS" => "1")
+                @test all(==(raw), values(m))
+                msg, m = child(nothing, "PUREBLAS_PIN_THREADS" => "1"; nt = nc)
                 @test startswith(msg, "on")
-                @test m[2] == Set(cores[2]) && m[3] == Set(cores[3])
+                @test all(m[t] == Set(cores[t]) for t in 2:nc)
             end
         end
     end

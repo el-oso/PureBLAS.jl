@@ -5570,7 +5570,14 @@ whole machine nothing is pinned: there it gains nothing, and two processes would
 cores. The thread that makes the first call is never pinned, and nothing is pinned if any thread already
 has its own CPU mask. The environment variable `PUREBLAS_PIN_THREADS`, read at that first call,
 overrides the rule: `0` never pins, `1` pins on the whole machine too. [`status`](@ref) reports what was
-done.
+done. The decision is made once, at that first call, and never revisited; pinning threads yourself
+afterwards overrides it.
+
+What a pin means for the rest of the program: any other task that runs on a pinned thread is confined
+to that core, and a process started from such a task inherits the one-core mask. Several processes
+started inside ONE restricted set (Distributed workers under a single `taskset`, one container, one
+Slurm step) each pin to the same cores; set `PUREBLAS_PIN_THREADS=0` for them, or give each its own CPU
+set. With more Julia threads than cores, only one worker thread per core is pinned and the rest are not.
 """
 # Pool creation is under a lock. Without one, two concurrent first calls both see an empty vector and
 # both `push!` a pool: two sets of workers, and a `Vector` mutated from two threads at once. This is the
@@ -5671,9 +5678,11 @@ function _mt_pin_plan(ntids::Int)
     masks = _mt_task_masks()
     isempty(masks) && return "off (no per-thread CPU masks readable)", Vector{Int}[]
     allequal(masks) || return "off (a thread of this process already has its own CPU mask)", Vector{Int}[]
-    allowed = first(masks)
+    # A task's mask lists every POSSIBLE CPU when unrestricted, which can exceed the online set (hot-add
+    # slots, offlined CPUs); only the online part says whether someone chose a subset.
     online = isfile("/sys/devices/system/cpu/online") ?
-        _mt_parse_cpulist(read("/sys/devices/system/cpu/online", String)) : allowed
+        _mt_parse_cpulist(read("/sys/devices/system/cpu/online", String)) : first(masks)
+    allowed = intersect(first(masks), online)
     !force && allowed == online &&
         return "off (the process may use every CPU; PUREBLAS_PIN_THREADS=1 pins anyway)", Vector{Int}[]
     bysib = Dict{String, Vector{Int}}()
@@ -5685,7 +5694,7 @@ function _mt_pin_plan(ntids::Int)
     cores = sort!([sort!(v) for v in values(bysib)]; by = first)
     length(cores) < 2 && return "off (fewer than two cores in the CPU set)", Vector{Int}[]
     k = min(ntids, length(cores) - 1)
-    return "on: $k worker thread(s), one core each, CPUs " *
+    return "on: $k of $ntids worker thread(s) pinned, one core each, CPUs " *
         join((join(c, ",") for c in cores[2:(k + 1)]), " | "), cores[2:(k + 1)]
 end
 
@@ -5698,17 +5707,23 @@ function _mt_pin_self(cpus::Vector{Int})
     return iszero(ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(mask), mask))
 end
 
-function _mt_pin_threads!(tids::Vector{Int})
-    msg, cores = _mt_pin_plan(length(tids))
-    ok = true
+# Worker threads beyond the first `k` stay unpinned. They take part in a job only when the core cap is
+# lifted (`PUREBLAS_MT_ALL_THREADS=1`, which the test suite sets) or when a worker on the driver's thread
+# sits out and hands its chunk to a spare; neither puts two pinned workers on one core.
+#
+# `fetch` waits for each target thread to run its pin task, so a thread busy in a task that never
+# yields delays this call until it does.
+function _mt_pin_threads!(tids::Vector{Int}, (msg, cores))
+    bad = String[]
     for (tid, cpus) in zip(tids, cores)
         t = Task(() -> _mt_pin_self(cpus))
         t.sticky = true
-        isone(ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1)) || (ok = false; continue)
+        isone(ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1)) ||
+            (push!(bad, "thread $tid: could not schedule the pin task there"); continue)
         schedule(t)
-        ok &= fetch(t)::Bool
+        fetch(t)::Bool || push!(bad, "thread $tid: sched_setaffinity refused")
     end
-    _MT_PINNED[] = ok ? msg : "partial: " * msg * " — sched_setaffinity refused at least one thread"
+    _MT_PINNED[] = isempty(bad) ? msg : "partial: " * msg * " (" * join(bad, "; ") * ")"
     return nothing
 end
 
@@ -5720,9 +5735,11 @@ function set_num_threads(n::Integer)
     if nt > 1
         lock(_MT_SETUP_LOCK) do
             # The four pools share one set of worker threads, so they are pinned once, with the first.
+            # The plan is made before the pool exists, so a throw in it leaves no pool behind.
             if isempty(_GEMM_POOL_F64)
+                plan = _mt_pin_plan(max(1, Threads.nthreads() - 1))
                 push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
-                _mt_pin_threads!(_GEMM_POOL_F64[1].tids)
+                _mt_pin_threads!(_GEMM_POOL_F64[1].tids, plan)
             end
             isempty(_GEMM_POOL_F32) && push!(_GEMM_POOL_F32, _gemm_pool_new(Float32))
             isempty(_GEMM_POOL_C64) && push!(_GEMM_POOL_C64, _gemm_pool_new(ComplexF64))
