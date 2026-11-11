@@ -178,6 +178,21 @@ end
                 isodd(mask >> c) && isfile(f) && push!(sib, readchomp(f))
             end
             @test P._mt_physical_cores() == clamp(length(sib), 1, Sys.EFFECTIVE_CPU_THREADS)
+            # A host that pins its threads one per core leaves THIS thread one core wide; the count is
+            # over the whole process, so it must not drop. Pin this thread to one core, then restore.
+            c0 = P._mt_physical_cores()
+            if c0 > 1
+                old = zeros(UInt64, 16)
+                ccall(:sched_getaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(old), old)
+                cpu = ccall(:sched_getcpu, Cint, ())
+                one = zeros(UInt64, 16); one[cpu ÷ 64 + 1] = UInt64(1) << (cpu % 64)
+                try
+                    @test iszero(ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(one), one))
+                    @test P._mt_physical_cores() == c0
+                finally
+                    ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(old), old)
+                end
+            end
         end
         P.set_num_threads(Threads.nthreads())
         for (m, n, k) in ((256, 256, 256), (512, 300, 128), (200, 512, 333), (1024, 129, 64), (192, 7, 192))

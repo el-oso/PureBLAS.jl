@@ -5586,24 +5586,38 @@ const _MT_SETUP_LOCK = ReentrantLock()
 # distinct sibling lists of the allowed CPUs from sysfs; elsewhere it is the detected core count
 # bounded by `Sys.EFFECTIVE_CPU_THREADS`. A hybrid part (SMT performance cores beside single-thread
 # efficiency cores) counts each core once, which is what the cap means.
+#
+# THE UNION OVER EVERY THREAD OF THE PROCESS, not `/proc/self/status` alone: that file is the MAIN
+# thread's mask, and a host that pins each Julia thread to its own core (ThreadPinning.jl, or bench/
+# plots.jl's `_pin_threads!`) leaves the main thread one core wide. Read from it alone, the cap fell
+# to 1 and turned threading off — measured on Zen3, 6 threads pinned one per core: 1 worker.
 function _mt_physical_cores()
     fallback = clamp(Int(num_cores()), 1, Sys.EFFECTIVE_CPU_THREADS)
-    (Sys.islinux() && isfile("/proc/self/status")) || return fallback
-    line = ""
-    for l in eachline("/proc/self/status")
-        startswith(l, "Cpus_allowed_list:") && (line = l; break)
+    (Sys.islinux() && isdir("/proc/self/task")) || return fallback
+    cpus = Set{Int}()
+    for t in readdir("/proc/self/task")
+        f = "/proc/self/task/$t/status"
+        line = ""
+        try                                  # a thread can exit between `readdir` and the read
+            for l in eachline(f)
+                startswith(l, "Cpus_allowed_list:") && (line = l; break)
+            end
+        catch
+        end
+        isempty(line) && continue
+        for r in split(strip(split(line, ':')[2]), ',')
+            lo, hi = occursin('-', r) ? parse.(Int, split(r, '-')) : (parse(Int, r), parse(Int, r))
+            union!(cpus, lo:hi)
+        end
     end
-    isempty(line) && return fallback
+    isempty(cpus) && return fallback
     # A core is identified by its sibling list, not by `core_id`: on arm64 described by a device tree,
     # `core_id` restarts at 0 in every cluster. A listed CPU with no topology (possible but not present,
     # or offline) is skipped.
     cores = Set{String}()
-    for r in split(strip(split(line, ':')[2]), ',')
-        lo, hi = occursin('-', r) ? parse.(Int, split(r, '-')) : (parse(Int, r), parse(Int, r))
-        for cpu in lo:hi
-            f = "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
-            isfile(f) && push!(cores, readchomp(f))
-        end
+    for cpu in cpus
+        f = "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
+        isfile(f) && push!(cores, readchomp(f))
     end
     # `EFFECTIVE_CPU_THREADS` also carries a cgroup CPU quota (`docker --cpus`), which affinity does not.
     return isempty(cores) ? fallback : clamp(length(cores), 1, Sys.EFFECTIVE_CPU_THREADS)
