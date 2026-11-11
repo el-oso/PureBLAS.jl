@@ -5563,6 +5563,14 @@ The worker pool is created on the first call that asks for more than one thread,
 of the process — upstream reports that adopted threads which come and go leak their thread storage and
 heap, so a pool is created once and never retired. Later calls only change how many of those workers a
 call may use; they do not create or destroy threads.
+
+**Thread pinning (Linux).** When the pool is created, each worker thread is pinned to its own physical
+core if the process runs on a restricted CPU set (`taskset`, `numactl`, a container's cpuset). On the
+whole machine nothing is pinned: there it gains nothing, and two processes would pin to the same
+cores. The thread that makes the first call is never pinned, and nothing is pinned if any thread already
+has its own CPU mask. The environment variable `PUREBLAS_PIN_THREADS`, read at that first call,
+overrides the rule: `0` never pins, `1` pins on the whole machine too. [`status`](@ref) reports what was
+done.
 """
 # Pool creation is under a lock. Without one, two concurrent first calls both see an empty vector and
 # both `push!` a pool: two sets of workers, and a `Vector` mutated from two threads at once. This is the
@@ -5593,24 +5601,10 @@ const _MT_SETUP_LOCK = ReentrantLock()
 # to 1 and turned threading off — measured on Zen3, 6 threads pinned one per core: 1 worker.
 function _mt_physical_cores()
     fallback = clamp(Int(num_cores()), 1, Sys.EFFECTIVE_CPU_THREADS)
-    (Sys.islinux() && isdir("/proc/self/task")) || return fallback
-    cpus = Set{Int}()
-    for t in readdir("/proc/self/task")
-        f = "/proc/self/task/$t/status"
-        line = ""
-        try                                  # a thread can exit between `readdir` and the read
-            for l in eachline(f)
-                startswith(l, "Cpus_allowed_list:") && (line = l; break)
-            end
-        catch
-        end
-        isempty(line) && continue
-        for r in split(strip(split(line, ':')[2]), ',')
-            lo, hi = occursin('-', r) ? parse.(Int, split(r, '-')) : (parse(Int, r), parse(Int, r))
-            union!(cpus, lo:hi)
-        end
-    end
-    isempty(cpus) && return fallback
+    Sys.islinux() || return fallback
+    masks = _mt_task_masks()
+    isempty(masks) && return fallback
+    cpus = reduce(union, masks)
     # A core is identified by its sibling list, not by `core_id`: on arm64 described by a device tree,
     # `core_id` restarts at 0 in every cluster. A listed CPU with no topology (possible but not present,
     # or offline) is skipped.
@@ -5623,6 +5617,101 @@ function _mt_physical_cores()
     return isempty(cores) ? fallback : clamp(length(cores), 1, Sys.EFFECTIVE_CPU_THREADS)
 end
 
+# A Linux CPU list as the kernel prints it ("0-5,12-17").
+function _mt_parse_cpulist(s::AbstractString)
+    cpus = Set{Int}()
+    for r in split(strip(s), ',')
+        isempty(r) && continue
+        e = split(r, '-')
+        union!(cpus, parse(Int, e[1]):parse(Int, e[end]))
+    end
+    return cpus
+end
+
+# The CPU mask of every thread of this process, from /proc/self/task. Empty off Linux.
+function _mt_task_masks()
+    masks = Set{Int}[]
+    isdir("/proc/self/task") || return masks
+    for t in readdir("/proc/self/task")
+        line = ""
+        try                                  # a thread can exit between `readdir` and the read
+            for l in eachline("/proc/self/task/$t/status")
+                startswith(l, "Cpus_allowed_list:") && (line = l; break)
+            end
+        catch
+        end
+        isempty(line) || push!(masks, _mt_parse_cpulist(split(line, ':')[2]))
+    end
+    return masks
+end
+
+# ── PINNING THE WORKER THREADS ────────────────────────────────────────────────────────────────────
+# A worker that Linux may move can end up sharing a core with another worker while a core the process
+# owns sits idle. Measured on Zen3 (two CCXs, CPUs 0-5 and 6-11), `taskset -c 0,1,2,6,7,8 julia -t 6,0`:
+# all six threads ran on CPUs 0-2, getrf n=1024 363 ms; with each thread pinned to its own core,
+# 5.16 ms. On the WHOLE machine the same pin gains nothing (gemm n=1024 6.77 vs 6.79 ms, getrf 4.03 vs
+# 4.02) and costs a factor of two when two processes run at once, because both pin to the same cores
+# (gemm 13.3 ms pinned vs 7.3 unpinned, getrf 7.4 vs 5.5). So the default pins only when the process's
+# CPU set is smaller than the machine: someone chose those CPUs for it, and another process can share
+# them only if it was put there too.
+#
+# `PUREBLAS_PIN_THREADS`, read when the pool is created: unset/"auto" applies that rule, "0" never
+# pins, "1" pins on the whole machine as well. A thread is pinned to a whole physical core (all its SMT
+# siblings in the set), never to one logical CPU: bench/plots.jl measured the single-CPU form at half
+# the pool's speed. Nothing is pinned when any thread of the process already has its own mask (the
+# host pinned its threads, e.g. ThreadPinning.jl), and the creating thread — the usual driver, the
+# user's own — is never pinned; it keeps the first core free by leaving it unassigned.
+const _MT_PINNED = Ref("not decided (threading has not been enabled)")
+
+function _mt_pin_plan(ntids::Int)
+    mode = lowercase(get(ENV, "PUREBLAS_PIN_THREADS", "auto"))
+    mode in ("0", "false", "no", "off") && return "off (PUREBLAS_PIN_THREADS=$mode)", Vector{Int}[]
+    force = mode in ("1", "true", "yes", "on")
+    Sys.islinux() || return "off (pinning is implemented on Linux only)", Vector{Int}[]
+    masks = _mt_task_masks()
+    isempty(masks) && return "off (no per-thread CPU masks readable)", Vector{Int}[]
+    allequal(masks) || return "off (a thread of this process already has its own CPU mask)", Vector{Int}[]
+    allowed = first(masks)
+    online = isfile("/sys/devices/system/cpu/online") ?
+        _mt_parse_cpulist(read("/sys/devices/system/cpu/online", String)) : allowed
+    !force && allowed == online &&
+        return "off (the process may use every CPU; PUREBLAS_PIN_THREADS=1 pins anyway)", Vector{Int}[]
+    bysib = Dict{String, Vector{Int}}()
+    for cpu in allowed
+        f = "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
+        isfile(f) || continue
+        push!(get!(bysib, readchomp(f), Int[]), cpu)
+    end
+    cores = sort!([sort!(v) for v in values(bysib)]; by = first)
+    length(cores) < 2 && return "off (fewer than two cores in the CPU set)", Vector{Int}[]
+    k = min(ntids, length(cores) - 1)
+    return "on: $k worker thread(s), one core each, CPUs " *
+        join((join(c, ",") for c in cores[2:(k + 1)]), " | "), cores[2:(k + 1)]
+end
+
+# Runs on the thread it pins: `sched_setaffinity(0, …)` sets the calling thread's mask.
+function _mt_pin_self(cpus::Vector{Int})
+    mask = zeros(UInt64, cld(maximum(cpus) + 1, 64))
+    for c in cpus
+        mask[c ÷ 64 + 1] |= UInt64(1) << (c % 64)
+    end
+    return iszero(ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(mask), mask))
+end
+
+function _mt_pin_threads!(tids::Vector{Int})
+    msg, cores = _mt_pin_plan(length(tids))
+    ok = true
+    for (tid, cpus) in zip(tids, cores)
+        t = Task(() -> _mt_pin_self(cpus))
+        t.sticky = true
+        isone(ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1)) || (ok = false; continue)
+        schedule(t)
+        ok &= fetch(t)::Bool
+    end
+    _MT_PINNED[] = ok ? msg : "partial: " * msg * " — sched_setaffinity refused at least one thread"
+    return nothing
+end
+
 # `PUREBLAS_MT_ALL_THREADS=1` lifts the core cap so every Julia thread can be a worker. The test suite
 # sets it: req#11's bit-identity items must run more workers than a small CI runner has cores.
 function set_num_threads(n::Integer)
@@ -5630,7 +5719,11 @@ function set_num_threads(n::Integer)
     nt = clamp(Int(n), 1, min(Threads.nthreads(), cores, _MT_NW_MASK))
     if nt > 1
         lock(_MT_SETUP_LOCK) do
-            isempty(_GEMM_POOL_F64) && push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
+            # The four pools share one set of worker threads, so they are pinned once, with the first.
+            if isempty(_GEMM_POOL_F64)
+                push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
+                _mt_pin_threads!(_GEMM_POOL_F64[1].tids)
+            end
             isempty(_GEMM_POOL_F32) && push!(_GEMM_POOL_F32, _gemm_pool_new(Float32))
             isempty(_GEMM_POOL_C64) && push!(_GEMM_POOL_C64, _gemm_pool_new(ComplexF64))
             isempty(_GEMM_POOL_C32) && push!(_GEMM_POOL_C32, _gemm_pool_new(ComplexF32))

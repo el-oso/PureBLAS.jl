@@ -161,6 +161,7 @@ function status(io::IO = stdout)
     if !_ACTIVE[]
         printstyled(io, "PureBLAS: INACTIVE\n"; bold = true, color = :yellow)
         println(io, "  Call PureBLAS.activate() to forward $reg BLAS/LAPACK symbols to PureBLAS.")
+        _status_threads(io)
         return nothing
     end
     live = _live_count()
@@ -173,5 +174,8 @@ function status(io::IO = stdout)
     println(io, "  Note: BLAS.get_config() still lists libopenblas — that is the LOADED library. activate()")
     println(io, "  overlays per-symbol @cfunction forwards (lbt_set_forward); it does not swap the loaded")
     println(io, "  library, so get_config cannot report PureBLAS. This status / is_active() is the check.")
+    _status_threads(io)
     return nothing
 end
+
+_status_threads(io::IO) = println(io, "  Threads: ", get_num_threads(), " (set_num_threads); worker pinning: ", _MT_PINNED[])

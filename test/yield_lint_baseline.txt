@@ -8,10 +8,12 @@
 #              It runs measurements through public entries; each of those opens and closes its own scope
 #              between the log lines, so no scope is ever live across one.
 #
-#   gemm.jl  — the M4 thread pool, and these four lines are the ONLY yields in a kernel file, so read
-#              the reason carefully before adding a fifth.
+#   gemm.jl  — the M4 thread pool, and these five lines are the ONLY yields in a kernel file, so read
+#              the reason carefully before adding a sixth.
 #              * `lock(_MT_SETUP_LOCK) do` in `set_num_threads` — the same construction path, serialised
 #                so two concurrent first calls cannot each push a pool. Never reached from `gemm!`.
+#              * `fetch(t)` in `_mt_pin_threads!` — inside that lock, once per process: waits for a
+#                sticky task to set its thread's CPU mask. No kernel has run and no scope is open.
 #              * `wait(p.evs[i])` — an IDLE worker parking between jobs. It holds no scope: it has not
 #                been given a chunk yet, and the chunk it ran last returned before this line.
 #              * `yield()` in the worker's keep-awake loop — the same idle worker, in the same position
@@ -41,6 +43,7 @@ lbt.jl:Base.show(io::IO, ::RoutingStatus) = print(io, "PureBLAS.RoutingStatus(",
 lbt.jl:print(io, "  BLAS.get_config() still lists the loaded library; PureBLAS.status() explains why.")
 lbt.jl:print(io, " — $(_live_count())/$(length(_LBT_REGISTRARS)) BLAS/LAPACK symbols routed to PureBLAS\n")
 lbt.jl:print(io, " — LinearAlgebra uses the loaded BLAS; PureBLAS.activate() reroutes it.")
+lbt.jl:_status_threads(io::IO) = println(io, "  Threads: ", get_num_threads(), " (set_num_threads); worker pinning: ", _MT_PINNED[])
 tune.jl:sleep(5)
 tune.jl:@warn "tune!: machine still busy after $(maxsecs)s; the next run may refuse to measure."
 tune.jl:@info "PureBLAS.tune!: $(repeats) independent calibration runs (minutes each)." project
@@ -54,6 +57,7 @@ tune.jl:@info "Restart Julia to pick them up. They are read at RUNTIME, so this 
 blas3/gemm.jl:wait(p.evs[i])
 blas3/gemm.jl:(@atomic p.done) < nwk && yield()
 blas3/gemm.jl:lock(_MT_SETUP_LOCK) do
+blas3/gemm.jl:ok &= fetch(t)::Bool
 
 # --- 2026-09-20, cooperative barriers. `_pool_barrier` yields, and it is reached from INSIDE a chunk
 #              body — the one place the note above says never yields. The remedy that note prescribes
