@@ -760,6 +760,70 @@ end
     end
 end
 
+# getrf runs a panel step as ONE job when the pool's workers span cache groups (`_lustep_try!`), and
+# the pool only reports that on a host that has more than one group and pinned threads — which is
+# neither the CI runner nor most development machines. So the item above never reaches that path
+# there. This one declares a split by hand (`_MT_G0`, the number of participants in the driver's
+# group) so the grouped step runs on any host with three threads, and asserts that it did.
+#
+# Shapes: a 512-aliased leading dimension (the pad path) and one that is not, a size that is not a
+# multiple of the panel width, and a tall and a wide matrix, because the step's column layout is
+# computed from the trailing width and the next panel's width and those differ in each.
+@testitem "getrf grouped panel step: bit-identical to serial, taken, 0 B" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    if nthreads() < 3
+        @test_skip "needs >= 3 julia threads: two local participants and one remote"
+    else
+        bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+        P.set_num_threads(nthreads())
+        saved = P._MT_G0[]
+        try
+            for (m, n, lda) in ((1024, 1024, 1024), (1024, 1024, 1032), (1000, 1000, 1000),
+                    (2048, 2048, 2048), (1500, 1100, 1500), (1100, 1500, 1100))
+                Random.seed!(777 + m + n + lda)
+                B0 = randn(lda, n); k = min(m, n)
+                P.set_num_threads(1)
+                r = copy(B0); ipr = Vector{Int}(undef, k); P.getrf!(view(r, 1:m, 1:n), ipr)
+                P.set_num_threads(nthreads())
+                # Every split of the participants into a local and a remote set.
+                for g0 in 1:(nthreads() - 1)
+                    P._MT_G0[] = g0
+                    g = copy(B0); ipg = Vector{Int}(undef, k)
+                    s0 = P._MT_LUSTEPS[]
+                    P.getrf!(view(g, 1:m, 1:n), ipg)
+                    # All but one participant local is the split every size here admits.
+                    g0 == nthreads() - 1 && @test P._MT_LUSTEPS[] > s0
+                    @test bitsame(g, r)
+                    @test ipg == ipr
+                end
+            end
+            # A singular next panel reports the same `info` through the grouped step.
+            P._MT_G0[] = nthreads() - 1
+            Z = randn(MersenneTwister(5), 1024, 1024); Z[:, 200] .= 0
+            P.set_num_threads(1)
+            zr = copy(Z); _, _, ir = P.getrf!(zr, Vector{Int}(undef, 1024))
+            P.set_num_threads(nthreads())
+            s0 = P._MT_LUSTEPS[]
+            zg = copy(Z); _, _, ig = P.getrf!(zg, Vector{Int}(undef, 1024))
+            @test P._MT_LUSTEPS[] > s0
+            @test ig == ir == 200
+            @test bitsame(zg, zr)
+            # req#10 on the grouped step: warm call, then measure inside a function.
+            let A0 = randn(MersenneTwister(7), 1024, 1024), ip = Vector{Int}(undef, 1024)
+                f(A, ip) = (PureBLAS.getrf!(A, ip); @allocated PureBLAS.getrf!(A, ip))
+                s1 = P._MT_LUSTEPS[]
+                @test f(A0, ip) == 0
+                @test P._MT_LUSTEPS[] > s1
+            end
+        finally
+            P._MT_G0[] = saved
+            P.set_num_threads(1)
+        end
+    end
+end
+
 # potrf's own thread-invariance item. The Cholesky cases in the item above are lower-only at two
 # power-of-two sizes; this one covers both triangles, sizes that take the pad round-trip (a leading
 # dimension on the L1 way stride) and sizes that do not, and a view whose row count is not its

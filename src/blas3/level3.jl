@@ -5189,6 +5189,14 @@ end
     return max(1, min(nt, cld(n, _NR)))
 end
 
+# Whether `trsm!(B, A; side = 'L')` with α = 1 on a strided real k×n `B` goes straight to
+# `_trsm_left!` — none of the staging branches ahead of it in `trsm!` (the tiny-k bypass, the
+# per-column sweep for narrow B, the ragged-lane widening) takes the call. A caller that solves B in
+# column bands through `_trsm_left!` with `nroute = n` computes what that `trsm!` call computes only
+# when this holds, so it must mirror those three branch conditions.
+@inline _trsm_plain_L(k::Int, n::Int, ::Type{T}) where {T} =
+    (k > _trsm_dbase() || n > _trsm_ncut()) && n > _fh_trsm_narrow_max() && n >= _vwidth(T)
+
 # side-L trmm's worker count. Identical to `_trsm_workers` but for the floor: the two ops share the
 # `k²·n` flop count and the operand shape, and they do NOT share an amortisation point, because a
 # product's columns parallelise where a substitution's do not. Measured at 125000 flops, six workers,
@@ -5413,7 +5421,7 @@ end
 end
 
 @inline function _trsm_run_chunk(p::GemmPool{T}, nw::Int, i::Int) where {T}
-    j0, len = _gemm_chunk(p.n, nw, i)
+    j0, len = _gemm_chunk(p.n, nw, _mt_band(nw, i))
     len > 0 || return nothing
     Ac = PtrMatrix{T}(p.Ap, p.m, p.m, p.lda)
     Bc = PtrMatrix{T}(p.Bp + j0 * p.ldb * sizeof(T), p.m, len, p.ldb)

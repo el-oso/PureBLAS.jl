@@ -310,13 +310,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-65 `const _X = <literal>` values in `src/` with no `@load_preference`.
+68 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 32 Literal · 31 Unaudited.
+**Tier:** 2 Measured · 32 Literal · 34 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -417,6 +417,8 @@ on these, not on knobs.
 | `_GEMM_TINY` | 6 | Literal | below this the naive loop beats the packed path. TUNABLE. |
 | `_GEMVT_BAND` | 16 | Unaudited | — |
 | `_MT_AMORTISE` | 8 | Unaudited | — |
+| `_MT_GROUP_PASSES` | 3 | Unaudited | — |
+| `_MT_GROUP_ROUNDS` | 8 | Unaudited | — |
 | `_MT_JOIN_CLOCK_MHZ_MEASURED` | 2796 | Measured | the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) |
 | `_MT_JOIN_NS_MEASURED` | 616 | Measured | recorded fork-join round trip on Zen4 (ns); feeds gemm_mt_work's shipped default |
 | `_MT_KIND_ASUM` | 8 | Unaudited | — |
@@ -433,6 +435,7 @@ on these, not on knobs.
 | `_MT_KIND_IAMAX` | 13 | Unaudited | — |
 | `_MT_KIND_LASWP` | 22 | Unaudited | — |
 | `_MT_KIND_LUAHEAD` | 3 | Unaudited | — |
+| `_MT_KIND_LUSTEP` | 24 | Unaudited | — |
 | `_MT_KIND_SCAL` | 10 | Unaudited | — |
 | `_MT_KIND_SUMSQ` | 9 | Unaudited | — |
 | `_MT_KIND_SWAP` | 12 | Unaudited | — |
