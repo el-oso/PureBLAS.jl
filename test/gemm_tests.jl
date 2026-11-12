@@ -141,6 +141,19 @@ end
     @test threading_items_can_run
 end
 
+@testitem "fast-core count matches the sysctl command" begin
+    using PureBLAS
+    P = PureBLAS
+    # Independent of the library call: the `sysctl` command, and on any other OS the documented 0.
+    if Sys.isapple() && success(`sysctl -n hw.nperflevels`)
+        q(k) = parse(Int, readchomp(`sysctl -n $k`))
+        nl = q("hw.nperflevels")
+        @test P._FAST_CORES == (nl > 1 ? sum(l -> q("hw.perflevel$l.physicalcpu"), 0:(nl - 2)) : 0)
+    else
+        @test P._FAST_CORES == 0
+    end
+end
+
 @testitem "threaded gemm: same answer as the serial path, and still 0 B" tags = [:checks] begin
     using PureBLAS, Base.Threads
     P = PureBLAS
@@ -159,9 +172,10 @@ end
         @test P.set_num_threads(Threads.nthreads()) == Threads.nthreads()
         # The core cap: without the suite's override, no more workers than physical cores.
         withenv("PUREBLAS_MT_ALL_THREADS" => nothing) do
-            @test P.set_num_threads(Threads.nthreads()) == min(Threads.nthreads(), P._mt_physical_cores())
+            @test P.set_num_threads(Threads.nthreads()) == min(Threads.nthreads(), P._mt_core_cap())
         end
         @test 1 <= P._mt_physical_cores() <= Sys.EFFECTIVE_CPU_THREADS
+        @test 1 <= P._mt_core_cap() <= P._mt_physical_cores()
         # Placement: every worker bound to its own default-pool thread.
         tw = P._gemm_pool(Float64).tids
         @test length(tw) == Threads.nthreads() - 1
