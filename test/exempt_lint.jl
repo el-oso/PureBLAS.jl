@@ -18,7 +18,7 @@ const _EX_SRC = joinpath(@__DIR__, "..", "src")
 # Files that still carry the marker, path relative to src/ with `/` separators. A file listed here
 # is skipped — and the lint FAILS once such a file is clean, so an entry cannot outlive its reason
 # and the list can only shrink.
-const _EX_PENDING = ("blas3/gemm.jl",)
+const _EX_PENDING = ()
 
 const _EX_MARKER = r"\bPDM\b.*\bExempt\b"
 

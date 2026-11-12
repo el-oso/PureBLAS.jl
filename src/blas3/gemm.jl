@@ -1912,7 +1912,7 @@ const _STRASSEN_NOPAD = @load_preference("strassen_nopad", 1)::Int   # req8-ok: 
 # ONLY Zen4: both cells IMPROVE on Zen3 and pass on Zen5, so this is a Zen4 cache behaviour at that
 # size and a 2-3% classical-kernel gap, not a structural cost of the shallower depth. Open work.
 #
-# PDM: Measured — the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | tune: none — orphaned; the threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048
+# PDM: Measured — the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_gemm_mt_work()` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | tune: none — orphaned; the threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048
 # req8-ok: three-box gate table and a two-box threading table above; 2048 checked and rejected
 const _STRASSEN_BASE = @load_preference("strassen_base", 1024)::Int
 @inline _fh_strassen_base() = (f = _FKR_strassen_base[]; f >= 0 ? f : _STRASSEN_BASE)
@@ -1948,23 +1948,13 @@ const _STRASSEN_BASE = @load_preference("strassen_base", 1024)::Int
 # The criterion, in one sentence: drop the level-1 exemption where a classical threaded route exists;
 # keep it where the only alternative is serial. `2 * _STRASSEN_BASE` is the arithmetic of the first
 # half, not a second tuning constant — it is the leaf floor the deeper levels already obey.
-# PDM: Exempt — level-1-claim TAGS, not hardware tuning. They name which depth rule a caller asks
-# for; no cache size, vector width or µarch could place them, and a Preference over them would be
-# meaningless. (Repeated per const: the marker binds to the NEXT const only, so one comment above
-# the group would leave the rest listed as Unaudited in the knob registry.)
-# req8-ok: an enumeration value naming which level-1 rule a caller asks for; no hardware fact places it.
-const _STR_OFF = 0
-# PDM: Exempt — level-1-claim tag, not hardware tuning.
-# req8-ok: an enumeration value naming which level-1 rule a caller asks for; no hardware fact places it.
-const _STR_FLOOR = 1
-# PDM: Exempt — level-1-claim tag, not hardware tuning.
-# req8-ok: an enumeration value naming which level-1 rule a caller asks for; no hardware fact places it.
-const _STR_LVL1 = 2
+# Which depth rule a caller asks for. Labels only: nothing reads the underlying integer.
+@enum _StrMode::UInt8 _STR_OFF _STR_FLOOR _STR_LVL1
 
-@inline _strassen_owns(::Type{T}, m::Int, n::Int, k::Int, tA::Bool, A, B, mode::Integer) where {T} =
+@inline _strassen_owns(::Type{T}, m::Int, n::Int, k::Int, tA::Bool, A, B, mode::_StrMode) where {T} =
     T <: BlasReal && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k, mode) > 0
 
-@inline function _strassen_depth(m::Int, n::Int, k::Int, mode::Integer)
+@inline function _strassen_depth(m::Int, n::Int, k::Int, mode::_StrMode)
     d = 0; s = min(m, n, k)
     mode == _STR_OFF && return d
     # Under `_STR_LVL1`, `d == 0 ||` keeps level 1 on the `strassen_min` criterion alone, so every
@@ -3506,7 +3496,7 @@ function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T, nw:
     return C
 end
 # Entry: pick adaptive depth, pad m,n,k up to a multiple of 2^depth (odd-n) if needed, recurse.
-function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C, mode::Integer, nw::Int = 1)
+function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C, mode::_StrMode, nw::Int = 1)
     T = eltype(C); D = _strassen_depth(m, n, k, mode)
     # PAD-VS-DEPTH. When a dimension is not a multiple of 2^D the else-branch below pads: three scratch
     # slots, two `fill!`s, two operand copies and a copy-back — three extra O(n^2) DRAM passes. Spending
@@ -3670,7 +3660,7 @@ end
 # the real one. The outlined entry gives the whole tree its own frame instead.
 @inline _gemm_core!(
     C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-    rt::NTuple{3, Int} = _RT_NONE, strassen::Integer = _STR_OFF, nw::Int = 1, wi::Int = 1
+    rt::NTuple{3, Int} = _RT_NONE, strassen::_StrMode = _STR_OFF, nw::Int = 1, wi::Int = 1
 ) where {T} =
     _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, rt, strassen, nw, wi)
 
@@ -3681,7 +3671,7 @@ end
 # single-product callers, where it is worth 8.2% at the smallest gate cell (gemm@8).
 @noinline _gemm_core_out!(
     C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-    rt::NTuple{3, Int} = _RT_NONE, strassen::Integer = _STR_OFF, nw::Int = 1, wi::Int = 1
+    rt::NTuple{3, Int} = _RT_NONE, strassen::_StrMode = _STR_OFF, nw::Int = 1, wi::Int = 1
 ) where {T} =
     _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, rt, strassen, nw, wi)
 
@@ -3737,7 +3727,7 @@ end
 
 @inline function _gemm_core_body!(
         C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-        rt::NTuple{3, Int}, strassen::Integer, nw::Int, wi::Int
+        rt::NTuple{3, Int}, strassen::_StrMode, nw::Int, wi::Int
     ) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
     # EVERY SIZE-KEYED PREDICATE BELOW ROUTES FROM THE TOKEN, not from the local extents. A caller
@@ -4005,55 +3995,44 @@ end
 # The criterion is AMORTISATION: a worker may only be woken when the call is at least `_MT_AMORTISE`
 # times the fork-join cost, so the fixed price can never exceed 1/`_MT_AMORTISE` of the call. In flops:
 #     work ≥ _MT_AMORTISE × (join time) × (flops a core retires per unit time)
-# ONE factor is derived and TWO are not:
-#   * `_mt_flops_per_cycle(T)`: 2 flops per FMA × lanes × two FMA pipes, halved on a double-pumped
-#     datapath, where a 512-bit FMA occupies the 256-bit pipes twice and so has the SAME throughput as
-#     the 256-bit form (kb `double-pumped-avx512-no-gain`). Detected consts — a formula.
-#   * the join time: a few cache-line round trips between driver and workers. That is a latency of the
-#     coherence fabric, clocked by the UNCORE — not a count of core cycles, and not something any
-#     detected const (cache sizes, ISA, vendor) predicts.
-#   * the core clock that turns that latency into retired flops: not detected either, and a locked gate
-#     clock is not the clock a host runs at.
-# So the product is NOT physically predictable from detected consts ⇒ MEASURE tier. req#8b: "Yes ⇒
-# Derive, No ⇒ Measure; there is NO third option." This shipped as `# PDM: Literal` over a comment
-# conceding exactly that; the marker was wrong, and expressing the join "in cycles" baked the measuring
-# box's core clock into a number that is really nanoseconds. Both are retired here.
+# Neither host factor is predictable from a detected const, so both are MEASURED ON THE HOST, once,
+# when `set_num_threads` creates the pool (`_mt_measure_host!`):
+#   * the join time: a few cache-line round trips between driver and worker — a latency of the
+#     coherence fabric that cache sizes, ISA and vendor do not give. Measured as the round trip of
+#     the smallest threaded job there is: the driver and ONE worker, with no work in it (an empty
+#     copy) and no other worker polling, through the pool's own publish and join. That is the least
+#     a call pays for threading at all, which is what a floor that decides WHETHER to thread is
+#     held against.
 #
-# WHAT "MEASURE" MEANS IN THIS TREE — checked, not assumed: `grep OncePerProcess src/` finds no live
-# resolver. Every Measure-tier knob (`gemvt_pf`, `gemvt_u`, …) ships a fixed default behind a
-# `nothing`-defaulted preference and leaves the on-host selection to `tune!()` (bench/calibrate.jl),
-# which writes the PIN. The reason a resolver cannot sit here is recorded at `_gemm_poolvec` below and
-# in test/Project.toml under `gemvn_minner`: a `OncePerProcess` reachable from a kernel breaks the
-# ALL-PATHS static no-allocation proof `gemm!` carries (test/strictmode_tests.jl), and the only remedy
-# is a pin — which is the user's tier, not the agent's. So this knob takes the tree's live shape: the
-# default is the one measurement on record, the candidates are named for a calibrator to duel.
+#     NOT the round trip across every worker the call will wake, although that is what the call
+#     pays. It is two to five times longer (Zen3: about 400 ns for one worker, 930 for six
+#     participants, 2200 for twelve; Zen4: 300 and 750 for six), and `_MT_AMORTISE` was chosen
+#     against a join of the short kind, so the product with the long one refuses calls that gain
+#     the most. Measured against the floor this one gives, six participants, µs per call: Zen4
+#     gemm n=48 4.28 against 1.64 and trsm (side L) n=64 16.9 against 5.28; Zen3 gemm n=48 4.17
+#     against 1.55, and at twelve participants gemm n=72 13.8 against 3.4.
+#   * the flop rate: what one core retires in the unpacked SIMD product, the kernel a pooled chunk
+#     near the floor runs, on operands that fill its L1. Measured rather than computed from an
+#     FMA-pipe count and a clock, because Julia reports neither the clock a host runs at nor how
+#     many FMA pipes a core has.
+# The product is in flops and holds no unit of time, so the clock the host happens to run at cancels.
 #
-# THE SHIPPED DEFAULT'S MEASUREMENT (Zen4, 4 workers, freq-locked): a pool wake-to-join round trip of
-# 616 ns under a 2796 MHz core clock. Both are HOST FACTS recorded as such — neither is a tuning choice
-# — and the default multiplies them back into the core-cycles-per-join the formula consumes (1722; the
-# retired literal rounded it to 1720).
+# NOTHING IS MEASURED WHEN THE PACKAGE IS PRECOMPILED: a precompile process has one thread, so it has
+# no join to time, and a cache built on one machine is loaded on others.
 #
-# A CALIBRATOR NOW EXISTS: `calibrate_gemm_mt_work` in bench/calibrate.jl, reached by `tune!()`. It is
-# the only knob there that needs a THREADED process, and it DECLINES rather than guessing when given a
-# single-threaded one — which is why this knob shipped without one. It does not duel the candidate
-# ladder: it measures the fork-join round trip on THIS host with its own parked pool, mirroring the
-# protocol below, and feeds it through the same formula, because only the join is a host fact (the
-# amortisation ratio is policy, the FMA rate is detected). Cross-checked on the box the 616 ns came
-# from: 568 ns at 2791 MHz, 0.92x the shipped floor. A result outside the candidate bracket is REPORTED
-# rather than pinned — that bracket spans the spin-wake and sleep-wake regimes, so a join beyond it
-# means the measurement caught something other than the pool.
+# WITHOUT A POOL THERE IS NO FLOOR TO KNOW. A process that never asks for a second thread — and the
+# trimmed library, which has none — leaves `_MT_NTHREADS` at 1, and every `*_workers` predicate
+# returns before it reads the floor. `_MT_FLOOR` holds `typemax(Int)` until a pool exists, which says
+# the same thing: no call is large enough to thread.
 #
-# It carries its OWN pool rather than including the probe that produced 616 ns because
-# `bench/probes/*.jl` is gitignored: that probe is not in the repository, so the single measurement the
-# shipped floor rests on cannot be reproduced from a checkout.
+# THE STORE IS A PLAIN ATOMIC, set on the setup path and only read here. A `OncePerProcess` reachable
+# from a kernel breaks the ALL-PATHS static no-allocation proof `gemm!` carries
+# (test/strictmode_tests.jl); see `_gemm_poolvec`.
 #
-# STILL OPEN, and the USER'S decision rather than a code edit: Zen3 and Zen5 have not confirmed the
-# shipped number, and the trim build's pin list (juliac/build.jl) is the user's tier — no pin is added
-# here. Unpinned, the shipped default is a plain const, so the `.so` is deterministic and trim-clean.
-# PDM: Measured — recorded fork-join round trip on Zen4 (ns); feeds gemm_mt_work's shipped default | tune: via gemm_mt_work
-const _MT_JOIN_NS_MEASURED = 616          # req8-ok: a recorded measurement, not a tuning choice; see the block above
-# PDM: Measured — the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) | tune: via gemm_mt_work
-const _MT_JOIN_CLOCK_MHZ_MEASURED = 2796  # req8-ok: a recorded measurement, not a tuning choice; see the block above
+# `gemm_mt_work` pins the floor in flops, and a pinned build measures nothing for it.
+# `calibrate_gemm_mt_work` (bench/calibrate.jl, reached by `tune!()`) is the calibrator that writes
+# that pin; it times the same round trip with a pool of its own.
+
 # PDM: Literal — a machine-INDEPENDENT ratio, in the same class as `_l1_block`'s ½ and `_at_gemm_mc`'s
 # 3/10: it states how much of a call the fixed join cost may consume, which is a policy about
 # acceptable overhead, not a property of any particular machine.
@@ -4079,29 +4058,34 @@ const _MT_JOIN_CLOCK_MHZ_MEASURED = 2796  # req8-ok: a recorded measurement, not
 # triangle's flops by the sqrt rule, so the split is not the cause. **Zen4 syrk at 358k is therefore
 # the binding cell**, and one scalar cannot target the same gain for both shapes.
 #
-# `A = 8` is the floor the fleet's weakest shape supports: 220416 flops, where the worst ADMITTED cell
-# is Zen4 syrk at 266240 flops measuring 1.78x and every other admitted cell measures 2.18x or better.
-# Raising it to 16 refuses four cells that each return more than 2.1x (Zen3 gemm 2.82x and syrk 2.22x
-# at 221184, Zen3 syrk 2.18x at 266240, Zen4 gemm 2.66x at 221184), which costs more than admitting one
-# cell at 1.78x. Lowering it to 4 admits Zen4 syrk at 112896 and 127500 flops, which measure 1.20x and
-# 1.31x — real but far under the target, and 1.31x does not reach the 1.59x that size needs to match a
-# threaded vendor, so admitting it buys neither the policy nor the cell.
+# `A = 8` is the floor the fleet's weakest shape supports: about 220000 flops on Zen4, where the worst
+# ADMITTED cell is Zen4 syrk at 266240 flops measuring 1.78x and every other admitted cell measures
+# 2.18x or better. Raising it to 16 refuses four cells that each return more than 2.1x (Zen3 gemm 2.82x
+# and syrk 2.22x at 221184, Zen3 syrk 2.18x at 266240, Zen4 gemm 2.66x at 221184), which costs more
+# than admitting one cell at 1.78x. Lowering it to 4 admits Zen4 syrk at 112896 and 127500 flops, which
+# measure 1.20x and 1.31x — real but far under the target, and 1.31x does not reach the 1.59x that size
+# needs to match a threaded vendor, so admitting it buys neither the policy nor the cell.
 #
 # Zen5 has not been measured at this crossing.
 const _MT_AMORTISE = 8   # req8-ok: overhead policy (target ~2x at six workers), same class as _l1_block's ½ — not a host property
-@inline _mt_flops_per_cycle(::Type{T}) where {T} =
-    4 * (_double_pumped(_HW) ? max(1, _vwidth(T) ÷ 2) : _vwidth(T))
-# The shipped default in flops: the recorded join in core cycles at the recorded clock (`÷ 1000` turns
-# ns × MHz into cycles), amortised at the DETECTED FMA rate.
-const _GEMM_MT_WORK_SHIPPED =
-    (_MT_JOIN_NS_MEASURED * _MT_JOIN_CLOCK_MHZ_MEASURED ÷ 1000) * _MT_AMORTISE * _mt_flops_per_cycle(Float64)
-# The candidate set a calibrator would duel: a power-of-two ladder from ¼× to 4× the shipped floor. The
-# bracket is NOT derived — it spans the two measured protocol regimes (a spin wake at ~570 ns, a sleep
-# wake at ~4000 ns, same probe) and nothing detected bounds a fabric latency. Stated as such.
-const _GEMM_MT_WORK_CANDIDATES = ntuple(i -> (_GEMM_MT_WORK_SHIPPED >> 2) << (i - 1), 5)
-# PDM: Measured — the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (Zen4, 616 ns @ 2796 MHz). | tune: calibrate_gemm_mt_work measures the fork-join round trip on host and applies the same formula; DECLINES on a single-threaded process, and reports rather than pins a result outside the ¼×…4× bracket
+
+# What the pool measured about its host. Written once, under `_MT_SETUP_LOCK`, before the first
+# `_MT_NTHREADS > 1` is published. The two factors stay `NaN` in a build whose floor is pinned.
+mutable struct MTHost
+    measured::Bool
+    join_ns::Float64         # fork-join round trip of an empty job: the driver and one worker
+    flops_per_ns::Float64    # one core, the unpacked SIMD product, operands resident in L1
+end
+const _MT_HOST = MTHost(false, NaN, NaN)
+
+# PDM: Measured — the join is an uncore latency and the flop rate needs a clock Julia does not report; both are measured on the host when the pool is created, and their product with `_MT_AMORTISE` is the floor. A pin replaces the measured floor. | tune: calibrate_gemm_mt_work measures the fork-join round trip with its own pool and applies the same formula; DECLINES on a single-threaded process, and reports rather than pins a result outside ¼×…4× of the floor the library measured
 const _GEMM_MT_WORK_PREF = @load_preference("gemm_mt_work", nothing)
-const _GEMM_MT_WORK = something(_GEMM_MT_WORK_PREF, _GEMM_MT_WORK_SHIPPED)::Int   # req8-ok: shipped default until tune!() moves it
+# The floor in flops: the pin, or the measured product.
+@inline _mt_floor() = @static isnothing(_GEMM_MT_WORK_PREF) ?
+    ceil(Int, _MT_AMORTISE * _MT_HOST.join_ns * _MT_HOST.flops_per_ns) : _GEMM_MT_WORK_PREF::Int
+# The floor in force. `set_num_threads` stores it before it publishes a thread count above one.
+const _MT_FLOOR = Threads.Atomic{Int}(typemax(Int))
+@inline _gemm_mt_work() = _MT_FLOOR[]
 
 """
     _gemm_workers(m, n, k) -> Int
@@ -4112,7 +4096,7 @@ given a whole `_NR`-wide column block is a worker whose microkernel runs ragged,
 the thread saves.
 """
 # ── BLAS-1 THREADING: A DIFFERENT AMORTISATION UNIT, NOT A SMALLER NUMBER ───────────────────────────
-# `_GEMM_MT_WORK` is a FLOP floor, because a gemm is compute-bound and its cost is flops over the FMA
+# `_gemm_mt_work()` is a FLOP floor, because a gemm is compute-bound and its cost is flops over the FMA
 # rate. BLAS-1 is BYTE-bound: an axpy at n=30000 does 60000 flops, two orders of magnitude below that
 # floor, and a flop test would therefore refuse to thread the exact cells OpenBLAS threads for a
 # measured 1.98x. The floor has to be in bytes.
@@ -4257,8 +4241,8 @@ end
     # must reach a decision with multiplies and compares only. (On a single-threaded process the line
     # above already ends it, which is why the gate never sees this at all.)
     flops = 2 * m * n * k
-    (flops < _GEMM_MT_WORK || n < _NR) && return 1
-    # `_GEMM_MT_WORK` gates above; it must not also ration. The join decides WHETHER to thread, never
+    (flops < _gemm_mt_work() || n < _NR) && return 1
+    # `_gemm_mt_work()` gates above; it must not also ration. The join decides WHETHER to thread, never
     # how many to wake — the bound is the splittable work, since a worker without a block of its own
     # only adds a join. The full pool is fastest at every size the gate admits.
     return max(1, min(nt, cld(n, _NR)))
@@ -4286,6 +4270,102 @@ const _MT_NW_SHIFT = 8 * sizeof(UInt16)      # low half-word holds nw; the count
 const _MT_NW_MASK = Int(typemax(UInt16))     # so `set_num_threads` clamps to what the word can carry
 @inline _mt_gen_next(g::Int, nw::Int) = (((g >> _MT_NW_SHIFT) + 1) << _MT_NW_SHIFT) | nw
 @inline _mt_gen_nw(g::Int) = g & _MT_NW_MASK
+# Which body a chunk runs. Labels only: nothing reads the underlying integer, so the order of the
+# members carries no meaning.
+@enum _MTKind::UInt8 begin
+    _MT_KIND_GEMM
+    _MT_KIND_SYRK
+    _MT_KIND_TRSM
+    _MT_KIND_LUAHEAD
+    _MT_KIND_TRSMR
+    _MT_KIND_TRMMR
+    # BLAS-1 elementwise: `y .+= a .* x` over a contiguous element range. `Cp` is y, `Ap` is x, `m` is
+    # the WHOLE vector length (which is also the route width) and `n` is 1.
+    _MT_KIND_AXPY
+    # BLAS-1 REDUCTION over a fixed block grid: `Ap` is x, `Bp` is y, `m` is the whole length. Each
+    # worker reduces a contiguous range of BLOCK INDICES and writes one partial per block; the driver
+    # folds them in index order afterwards. The fold is the driver's, not a worker's, which is what
+    # keeps the order fixed.
+    _MT_KIND_DOT
+    # Σ|xᵢ| over the same block grid. ONE operand: `Ap` is x, `Bp` is unused.
+    _MT_KIND_ASUM
+    # Σxᵢ² over the same block grid — `nrm2`'s fast path. `Ap` is x.
+    #
+    # THE OVERFLOW GUARD STILL WORKS, and blocking makes it fire LESS often rather than differently:
+    # `_nrm2` takes the scaled `lassq` path when the sum is not finite or is zero. A fold of finite
+    # block partials can still reach Inf, which the guard catches; and a block is smaller than the
+    # whole vector, so a value that overflowed one long accumulator may now stay finite and take the
+    # fast path. That is a more accurate answer, not a different contract. Crucially the grid is fixed,
+    # so WHICH path runs cannot vary with the worker count, which is what req#11 asks of it.
+    _MT_KIND_SUMSQ
+    # x .*= a — elementwise, one operand. `Cp` is x, `alpha` is a.
+    _MT_KIND_SCAL
+    # y .= x — elementwise, no arithmetic at all. `Ap` is x, `Cp` is y.
+    _MT_KIND_COPY
+    # x, y = y, x — elementwise, no arithmetic. `Ap` is x, `Cp` is y; both are read and written.
+    _MT_KIND_SWAP
+    # iamax — an ARGMAX, not a reduction: the chunks write block INDICES to `_REDI` and the driver's
+    # fold is a strict-`>` scan rather than a sum. `Ap` is x.
+    _MT_KIND_IAMAX
+    # ger — the first BLAS-2 kind. `Cp` is A, `Ap` is x, `Bp` is y. A column split, and the one op in
+    # the library where the split needs no correctness argument at all: there is no accumulation
+    # chain, each `A[i,j]` is written once, and both route arms fold α into `y[j]` identically.
+    _MT_KIND_GER
+    # gemv-N — a ROW-BAND split. The matrix goes in the `C` slot so that `m`, `n` and `ldc` land in
+    # their natural fields; `Ap` is x (handed over whole) and `Bp` is y (offset per band). `C` is read,
+    # not written, which is a slot convention and not a claim about the op.
+    _MT_KIND_GEMVN
+    # gemv-T — a COLUMN-BAND split, same slot convention as gemv-N: the matrix in `C`, x in `Ap`
+    # (whole), y in `Bp` (offset per band). `up` carries `B0`.
+    _MT_KIND_GEMVT
+    # symv — a COLUMN-BLOCK split with per-block private `y` ("notepads"). The matrix is in `C`, x in
+    # `Ap`, y in `Bp`, and `up` is the stored triangle (its original meaning, unlike the gemv kinds
+    # where it carries `B0`). The only kind whose chunks write to TWO different destinations: block 1
+    # goes straight into `y`, blocks 2..nblk into their notepad slot, and the driver folds in block
+    # order.
+    _MT_KIND_SYMV
+    # gbmv-N — a ROW-BAND split of the output, and the cheapest threaded kind in BLAS-2: a band of a
+    # BANDED matrix needs only the columns within `kl + ku` of its own rows, so there is no partial,
+    # no fold and no route token. `Cp` is the banded store AB, `Ap` is x, `Bp` is y, and the
+    # half-widths ride in the `A` slot's own dimensions (`A.n`, `A.ld`). β is already applied — the
+    # kernel accumulates.
+    _MT_KIND_GBMVN
+    # Strassen's combine passes: `C = α·(A ± B ± L) + β·C` over a block, elementwise. The one job kind
+    # in this list that carries a FOURTH operand, and it needs no new field for it — `lap`/`lald` are
+    # already on the pool for the getrf look-ahead panel, and a kind reinterpreting an existing slot is
+    # the same thing `gbmvN` does when it carries `kl`/`ku` in the A slot's own dimensions.
+    #
+    # The two signs and the presence of `L` ride in `up`, `sym2` and `unit` respectively, which that
+    # kind does not otherwise use. `α` and `β` are the pool's own.
+    _MT_KIND_ELEM
+    # Side-L trmm: a COLUMN band of B against the whole of A, run by `_trmm_left!`. Distinct from
+    # `_MT_KIND_TRMMR`, which splits ROWS for side R and packs op(A) per band.
+    _MT_KIND_TRMM
+    # Side-L symm with a PER-WORKER expansion of the symmetric operand: each worker expands A into its
+    # own buffer and then runs an ordinary product on its own column band of C, instead of the driver
+    # expanding once into one buffer that every worker then reads.
+    #
+    # WHY A SEPARATE KIND RATHER THAN THE GEMM KIND. The gemm job takes a dense A that already exists;
+    # here the expansion is part of the chunk, which is the entire point. Measured on Zen4, the
+    # driver-expands form costs 1.88x the SUM of its two phases at n=100, and exactly 1.00x of that sum
+    # at ONE worker — so the cost is not the expansion but the handoff of lines dirty in the driver's
+    # cache to five readers. Six concurrent expansions cost about one expansion's wall-clock, so moving
+    # it into the chunk removes the handoff without paying six times for the copy.
+    _MT_KIND_SYMM
+    # getrf's data movement, split by COLUMN BANDS: the row swaps a panel's pivots apply to the columns
+    # beside it (`_laswp_run_chunk`) and the strided copy into and out of the de-aliasing pad
+    # (`_copy2d_run_chunk`). Neither does arithmetic, so a band split cannot change a bit; what it
+    # changes is that a quarter to a third of the threaded call stops running on one thread — measured
+    # on Zen4 at three workers, n=1024: pad copy 1.3 ms, trailing swaps 0.9 ms, deferred left swaps
+    # 1.2 ms, of a 9.6 ms call whose ideal is 6.0 ms. Both reuse `C`/`A` as (destination, source).
+    # potrf's pad round-trip rides `_MT_KIND_COPY2D` as well, with `unit` set to move one triangle.
+    _MT_KIND_LASWP
+    _MT_KIND_COPY2D
+    # One whole getrf panel step with the workers in two sets, so that a column band is swapped, solved
+    # and updated by one worker and the data a step produces stays in the cache group that produced it
+    # (`_lustep_run_chunk` in lu.jl).
+    _MT_KIND_LUSTEP
+end
 mutable struct GemmPool{T}
     @atomic gen::Int                 # `counter << _MT_NW_SHIFT | nw`; bumped to publish a job (see above)
     @atomic done::Int                # workers that have finished the current job
@@ -4308,7 +4388,7 @@ mutable struct GemmPool{T}
     # generation is waiting on this worker's `done` and cannot let a field change. `kind` is exactly
     # such a field, so widening the word would add risk to the one thing that must not break, for no
     # safety we do not already have.
-    kind::Int                        # `_MT_KIND_GEMM` | `_MT_KIND_SYRK` | `_MT_KIND_TRSM`
+    kind::_MTKind                    # which body a chunk runs
     up::Bool                         # syrk/syr2k: which triangle of C is written; trsm: A's triangle
     sym2::Bool                       # syr2k/her2k: run BOTH rank-k passes in this chunk (see below)
     unit::Bool                       # trsm: A has an implicit unit diagonal
@@ -4349,170 +4429,22 @@ mutable struct GemmPool{T}
     # it. See `_pool_barrier` for why the resetting form deadlocks.
     @atomic bar::Int
 end
-# PDM: Exempt — job-kind TAGS, not hardware tuning. They name which body a chunk runs; nothing about
-# a cache size, a vector width or a µarch could change them, and a Preference over them would be
-# meaningless. Same class as a sentinel.
-const _MT_KIND_GEMM = 0
-# PDM: Exempt — job-kind tag, not hardware tuning. (Repeated: the marker binds to the NEXT const only,
-# so one comment above a pair leaves the second listed as Unaudited in the knob registry.)
-const _MT_KIND_SYRK = 1
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_TRSM = 2
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_LUAHEAD = 3
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_TRSMR = 4
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_TRMMR = 5
-# BLAS-1 elementwise: `y .+= a .* x` over a contiguous element range. `Cp` is y, `Ap` is x, `m` is the
-# WHOLE vector length (which is also the route width) and `n` is 1.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_AXPY = 6
-# BLAS-1 REDUCTION over a fixed block grid: `Ap` is x, `Bp` is y, `m` is the whole length. Each worker
-# reduces a contiguous range of BLOCK INDICES and writes one partial per block; the driver folds them in
-# index order afterwards. The fold is the driver's, not a worker's, which is what keeps the order fixed.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_DOT = 7
-# Σ|xᵢ| over the same block grid. ONE operand: `Ap` is x, `Bp` is unused.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_ASUM = 8
-# Σxᵢ² over the same block grid — `nrm2`'s fast path. `Ap` is x.
-#
-# THE OVERFLOW GUARD STILL WORKS, and blocking makes it fire LESS often rather than differently: `_nrm2`
-# takes the scaled `lassq` path when the sum is not finite or is zero. A fold of finite block partials can
-# still reach Inf, which the guard catches; and a block is smaller than the whole vector, so a value that
-# overflowed one long accumulator may now stay finite and take the fast path. That is a more accurate
-# answer, not a different contract. Crucially the grid is fixed, so WHICH path runs cannot vary with the
-# worker count, which is what req#11 asks of it.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_SUMSQ = 9
-# x .*= a — elementwise, one operand. `Cp` is x, `alpha` is a.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_SCAL = 10
-# y .= x — elementwise, no arithmetic at all. `Ap` is x, `Cp` is y.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_COPY = 11
-# x, y = y, x — elementwise, no arithmetic. `Ap` is x, `Cp` is y; both are read and written.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_SWAP = 12
-# iamax — an ARGMAX, not a reduction: the chunks write block INDICES to `_REDI` and the driver's fold
-# is a strict-`>` scan rather than a sum. `Ap` is x.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_IAMAX = 13
-# ger — the first BLAS-2 kind. `Cp` is A, `Ap` is x, `Bp` is y. A column split, and the one op in the
-# library where the split needs no correctness argument at all: there is no accumulation chain, each
-# `A[i,j]` is written once, and both route arms fold α into `y[j]` identically.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_GER = 14
-# gemv-N — a ROW-BAND split. The matrix goes in the `C` slot so that `m`, `n` and `ldc` land in their
-# natural fields; `Ap` is x (handed over whole) and `Bp` is y (offset per band). `C` is read, not
-# written, which is a slot convention and not a claim about the op.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_GEMVN = 15
-# gemv-T — a COLUMN-BAND split, same slot convention as gemv-N: the matrix in `C`, x in `Ap` (whole),
-# y in `Bp` (offset per band). `up` carries `B0`.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_GEMVT = 16
-# symv — a COLUMN-BLOCK split with per-block private `y` ("notepads"). The matrix is in `C`, x in
-# `Ap`, y in `Bp`, and `up` is the stored triangle (its original meaning, unlike the gemv kinds where
-# it carries `B0`). The only kind whose chunks write to TWO different destinations: block 1 goes
-# straight into `y`, blocks 2..nblk into their notepad slot, and the driver folds in block order.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_SYMV = 17
-# gbmv-N — a ROW-BAND split of the output, and the cheapest threaded kind in BLAS-2: a band of a
-# BANDED matrix needs only the columns within `kl + ku` of its own rows, so there is no partial, no
-# fold and no route token. `Cp` is the banded store AB, `Ap` is x, `Bp` is y, and the half-widths ride
-# in the `A` slot's own dimensions (`A.n`, `A.ld`). β is already applied — the kernel accumulates.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_GBMVN = 18
-# Strassen's combine passes: `C = α·(A ± B ± L) + β·C` over a block, elementwise. The one job kind in
-# this list that carries a FOURTH operand, and it needs no new field for it — `lap`/`lald` are already
-# on the pool for the getrf look-ahead panel, and a kind reinterpreting an existing slot is the same
-# thing `gbmvN` does when it carries `kl`/`ku` in the A slot's own dimensions.
-#
-# The two signs and the presence of `L` ride in `up`, `sym2` and `unit` respectively, which that kind
-# does not otherwise use. `α` and `β` are the pool's own.
-# An enum discriminant, host-invariant by construction: nothing about the machine can make 19 a better
-# tag than 20, so there is no residency or latency criterion to derive it from and no candidate set to
-# measure. Same category as `_STEIN_SEED0`.
-# req8-ok: enum discriminant, host-invariant by construction — see the two lines above
-const _MT_KIND_ELEM = 19
-
-# Side-L trmm: a COLUMN band of B against the whole of A, run by `_trmm_left!`. Distinct from
-# `_MT_KIND_TRMMR`, which splits ROWS for side R and packs op(A) per band.
-# An enum discriminant, host-invariant by construction: nothing about the machine can make 20 a better
-# tag than 21, so there is no residency or latency criterion to derive it from and no candidate set to
-# measure. Same category as `_MT_KIND_ELEM` above.
-# PDM: Exempt — job-kind tag, not hardware tuning. Nothing a machine reports could place it, and a
-# Preference over it would be meaningless; same class as a sentinel.
-# req8-ok: enum discriminant, host-invariant by construction — see the two lines above
-const _MT_KIND_TRMM = 20
-
-# Side-L symm with a PER-WORKER expansion of the symmetric operand: each worker expands A into its own
-# buffer and then runs an ordinary product on its own column band of C, instead of the driver expanding
-# once into one buffer that every worker then reads.
-#
-# WHY A SEPARATE KIND RATHER THAN THE GEMM KIND. The gemm job takes a dense A that already exists; here
-# the expansion is part of the chunk, which is the entire point. Measured on Zen4, the driver-expands
-# form costs 1.88x the SUM of its two phases at n=100, and exactly 1.00x of that sum at ONE worker — so
-# the cost is not the expansion but the handoff of lines dirty in the driver's cache to five readers.
-# Six concurrent expansions cost about one expansion's wall-clock, so moving it into the chunk removes
-# the handoff without paying six times for the copy.
-# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
-# req8-ok: enum discriminant, host-invariant by construction
-const _MT_KIND_SYMM = 21
-# getrf's data movement, split by COLUMN BANDS: the row swaps a panel's pivots apply to the columns
-# beside it (`_laswp_run_chunk`) and the strided copy into and out of the de-aliasing pad
-# (`_copy2d_run_chunk`). Neither does arithmetic, so a band split cannot change a bit; what it
-# changes is that a quarter to a third of the threaded call stops running on one thread — measured
-# on Zen4 at three workers, n=1024: pad copy 1.3 ms, trailing swaps 0.9 ms, deferred left swaps
-# 1.2 ms, of a 9.6 ms call whose ideal is 6.0 ms. Both reuse `C`/`A` as (destination, source).
-# potrf's pad round-trip rides `_MT_KIND_COPY2D` as well, with `unit` set to move one triangle.
-# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
-# req8-ok: enum discriminant, host-invariant by construction
-const _MT_KIND_LASWP = 22
-# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
-# req8-ok: enum discriminant, host-invariant by construction
-const _MT_KIND_COPY2D = 23
-# One whole getrf panel step with the workers in two sets, so that a column band is swapped, solved
-# and updated by one worker and the data a step produces stays in the cache group that produced it
-# (`_lustep_run_chunk` in lu.jl).
-# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
-# req8-ok: enum discriminant, host-invariant by construction
-const _MT_KIND_LUSTEP = 24
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
-@inline _is_reduction(kind::Int) =
+@inline _is_reduction(kind::_MTKind) =
     kind == _MT_KIND_DOT || kind == _MT_KIND_ASUM || kind == _MT_KIND_SUMSQ
 
 # The argmax kinds, which have their OWN post-join fold. Separate from `_is_reduction` because the two
 # folds share nothing: a sum accumulates every partial, an argmax selects one and must see the block
 # order to break ties. Keeping them apart also keeps `_is_reduction`'s buffer contract intact — that
 # one sizes `_red_partials`, this one sizes `_REDI`.
-@inline _is_argmax(kind::Int) = kind == _MT_KIND_IAMAX
+@inline _is_argmax(kind::_MTKind) = kind == _MT_KIND_IAMAX
 
 # symv's fold is its own again: a block-ordered accumulate of private `y` vectors into the real one,
 # over only the rows each block can reach. Named separately for the same reason as the two above —
 # the three folds share no code and each sizes a different buffer.
-@inline _is_symv(kind::Int) = kind == _MT_KIND_SYMV
+@inline _is_symv(kind::_MTKind) = kind == _MT_KIND_SYMV
 
 """
     _syrk_workers(n, k) -> Int
@@ -4534,7 +4466,7 @@ the cap would trade a rare idle worker for narrower chunks everywhere.
     nt = _MT_NTHREADS[]
     nt > 1 || return 1
     flops = n * (n + 1) * k
-    (flops < _GEMM_MT_WORK || n < _NR) && return 1
+    (flops < _gemm_mt_work() || n < _NR) && return 1
     # Gate, not ration — the argument is at `_gemm_workers`.
     return max(1, min(nt, cld(n, _NR)))
 end
@@ -4635,15 +4567,13 @@ end
 end
 @inline _gemm_chunk(n::Int, nw::Int, i::Int) = _gemm_chunk(n, nw, i, _NR)
 
-# The band granularity gemv-T needs: a multiple of every NC its sweep can select. `_gemvt_cols!` is
-# called with `Val(16)`, `Val(8)` or `Val(4)` — whatever `_gemvt_nc()` resolves to is snapped to one
-# of those three — and the deep arm always takes `_GEMVT_NC_DEEP`, so 16 covers the lot and is also a
-# multiple of `_NR` on every width this library builds for.
+# The band granularity gemv-T needs: a multiple of every column-group width its sweep can run, so
+# that no band boundary moves a column between two groupings (req#11). The sweep takes one of
+# `_GEMVT_NC_ARMS` and the deep arm always takes `_GEMVT_NC_DEEP`; their least common multiple covers
+# the lot.
 # ponytail: one constant for all arms; compute the exact NC in the driver if small-`n` gemv-T ever
-# needs the finer split that a 16-column granularity denies it.
-# PDM: Exempt — not a performance value. It is the least common multiple of the column-group widths `_gemvt_cols!` can be called with (4, 8, 16), so it is fixed by the kernel's own shape and tuning it would break req#11.
-# req8-ok: req#11 granularity, lcm of the NC values `_gemvt_cols!` dispatches to — not a tuning literal
-const _GEMVT_BAND = 16
+# needs the finer split that this granularity denies it.
+const _GEMVT_BAND = lcm(_GEMVT_NC_ARMS..., _GEMVT_NC_DEEP)
 
 # ── FLOP-BALANCED COLUMN SPLIT FOR A TRIANGULAR OUTPUT (syrk / syr2k / herk / her2k) ────────────────
 # `_gemm_chunk`'s equal-WIDTH split is wrong for a triangle. Column j of a lower-triangular C has n − j
@@ -4732,7 +4662,7 @@ end
     # both must route from the full trailing width or the pair is not the single update it replaces.
     _gemm_core!(
         Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
-        (-1, p.lanroute >= 0 ? p.lanroute : p.n, -1), false, nw, i
+        (-1, p.lanroute >= 0 ? p.lanroute : p.n, -1), _STR_OFF, nw, i
     )
     return nothing
 end
@@ -4783,7 +4713,7 @@ end
         Cc = PtrMatrix{T}(p.Cp, p.m, c1, p.ldc)
         _gemm_core!(
             Cc, Ac, _gemm_bchunk(p, 0, c1), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
-            (-1, p.lanroute, -1), false, 1, 1
+            (-1, p.lanroute, -1), _STR_OFF, 1, 1
         )
         return nothing
     end
@@ -4796,7 +4726,7 @@ end
     # `p.n` is the whole update's width: route from the problem, compute on the slice.
     _gemm_core!(
         Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
-        (-1, p.lanroute, -1), false, nw - 1, i - 1
+        (-1, p.lanroute, -1), _STR_OFF, nw - 1, i - 1
     )
     return nothing
 end
@@ -4894,9 +4824,11 @@ end
     # across arrivals is the imbalance of one elementwise pass, not of a product.
     while (@atomic p.bar) < target
         (@atomic p.failed) && return false
-        for _ in 1:_MT_SPINS
+        span = _mt_poll_span(); t0 = time_ns()
+        while true
             (@atomic p.bar) >= target && return true
             Base.Threads.atomic_fence()
+            time_ns() - t0 >= span && break
         end
         GC.safepoint(); Base.yield()
     end
@@ -5344,11 +5276,11 @@ end
     return nothing
 end
 
-# SPIN, THEN SLEEP — and the spin window is the whole design, not a detail. Measured (same probe, 4
+# POLL, THEN SLEEP — and the polling window is the whole design, not a detail. Measured (same probe, 4
 # workers, Zen4): a pool that only spins wakes in 570 ns but makes an unrelated workload in the same
 # process 3.11x slower while doing NOTHING; a pool that only sleeps costs ~4000 ns per wake, which is
-# worse than `@spawn`. Back-to-back BLAS calls land inside the spin window and pay the cheap price; an
-# idle process falls through to the sleep and costs its host nothing.
+# worse than `@spawn`. Back-to-back BLAS calls land while the workers still poll and pay the cheap
+# price; an idle process falls through to the sleep and costs its host nothing.
 #
 # The protocol has one trap, and the PREDICATE LOOP in the worker is the answer to it (an earlier
 # design used a `_SLEEPING` announce flag instead; it deadlocked and is gone — see the driver's notify
@@ -5356,14 +5288,43 @@ end
 # same job for new work: the event stays set, `wait` returns at once, and the worker must not re-run
 # the previous chunk. So the worker waits in a loop around the GENERATION, treats a wake as "look
 # again" rather than "there is work", and the driver notifies unconditionally, so no wake can be lost.
-# PDM: Literal — how long an idle worker keeps spinning before it sleeps, in fence iterations. This is
-# a POLITENESS window, not a performance tuning: the two ends are measured and far apart (spin-only
-# wakes in 570 ns but taxes an unrelated workload in the same process by 3.1-3.4x; sleep-only costs
-# ~4000 ns and taxes nothing), so any value in a wide middle band buys the same thing — back-to-back
-# calls stay cheap, an idle process stops burning cores. It is the same knob OpenBLAS spells
-# THREAD_TIMEOUT. No detected const predicts it because the criterion is the HOST's behaviour, not the
-# hardware's.
-const _MT_SPINS = 2048   # req8-ok: politeness window with a wide flat band (570 ns spin-wake … 4000 ns sleep-wake), not a perf tuning
+#
+# HOW LONG A WAITER POLLS BEFORE IT YIELDS. Every wait in the pool — an idle worker's, the
+# driver's join, a barrier — polls an atomic word in a fenced loop and yields the Julia thread between
+# spans of polling, so that a task queued on that thread is not held up. A poll sees a change within
+# nanoseconds; a yield is blind for as long as it takes. The span is `_MT_AMORTISE` yields long, so
+# that the blind time is at most 1/`_MT_AMORTISE` of the polling time, the share of fixed overhead
+# the amortisation floor already allows. The yield is timed on the host when the pool is created
+# (`_mt_yield_ns`).
+#
+# THE SPAN IS HELD BY THE CLOCK, NOT BY A COUNT OF POLLS. A count needs the cost of one poll, and
+# that cost is not a constant of the host: on Apple silicon the same loop reads 0.58 ns a poll in
+# one call and 9.7 ns in another, so a count sized on one made the blind share seventeen times too
+# small or too large in the other. A waiter therefore reads the clock after every poll, which
+# costs it about 20 ns between two looks at the word.
+#
+# TWO SPANS, BECAUSE A YIELD DOES NOT COST THE SAME ON EVERY THREAD. The thread that runs Julia's
+# event loop pays for waking that loop on every yield; the others do not. One yield with nothing
+# else to run, timed directly: 640 ns on the main thread and 70 ns on a task bound to another
+# thread on Zen4, 10 µs and 36 ns on Apple silicon. The pool is usually created from the main
+# thread, so `_MT_POLL_NS_HOME` is taken on the creating thread and serves a waiter on that thread,
+# and `_MT_POLL_NS` is taken on a worker's thread and serves every other. Both are zero until the
+# pool has been measured; its workers yield between single looks until then.
+const _MT_POLL_NS = Threads.Atomic{UInt64}(0)
+const _MT_POLL_NS_HOME = Threads.Atomic{UInt64}(0)
+@inline _mt_poll_span() = Threads.threadid() == _MT_HOME[] ? _MT_POLL_NS_HOME[] : _MT_POLL_NS[]
+
+# One `yield()` on the calling thread with nothing else to run, in ns. A median of settled medians:
+# the first yields of a thread cost several times what later ones do, and one settled run of
+# readings can be made of those alone.
+function _mt_yield_ns(step::Int, deadline::UInt64)
+    one = function ()
+        yield()
+        return nothing
+    end
+    b = _mt_batch(one, step, deadline)
+    return _mt_settled(() -> _mt_settled(() -> _mt_time(one, b), deadline), deadline)
+end
 
 # KEEP THE CORE AWAKE, NOT JUST THE THREAD. A worker that sleeps on its event leaves its core idle, and
 # after a few milliseconds of that the kernel's idle governor puts the core into its deepest state —
@@ -5381,12 +5342,12 @@ const _MT_SPINS = 2048   # req8-ok: politeness window with a wide flat band (570
 # (trmm) — so it is the core's idle state, not this pool's wake protocol. AOCL is unaffected because
 # its OpenMP runtime keeps threads spinning for a long time between calls.
 #
-# So after the short fenced spin above, an idle worker keeps its core busy until a deadline measured
-# from when it went idle, and only then sleeps. It YIELDS while it waits rather than fencing: a fenced
-# spin holds the Julia thread, and an unrelated `Threads.@threads` job issued right after a BLAS call
-# then waited the WHOLE window (+10 ms at a 10 ms window, measured on Zen4). Yielding keeps the core
-# just as awake — with nothing else runnable `yield` returns at once — and hands the thread over the
-# moment another task wants it. Same Zen3 box, a 5 ms driver gap, window swept:
+# So an idle worker keeps polling, and so keeps its core busy, until a deadline measured from when it
+# went idle, and only then sleeps. It YIELDS between spans of polling: a spin that never yields holds
+# the Julia thread, and an unrelated `Threads.@threads` job issued right after a BLAS call then waited
+# the WHOLE window (+10 ms at a 10 ms window, measured on Zen4). Yielding keeps the core just as awake
+# — with nothing else runnable `yield` returns at once — and hands the thread over the moment another
+# task wants it. Same Zen3 box, a 5 ms driver gap, window swept:
 #
 #     window           none    1 ms    3 ms    10 ms    20 ms
 #     syrk GF/s         211     283     284      287      286
@@ -5397,7 +5358,8 @@ const _MT_SPINS = 2048   # req8-ok: politeness window with a wide flat band (570
 # covers gaps up to about W + 2 ms. 10 ms covers the serial panel phases a blocked factorization runs
 # between threaded trailing updates. Back-to-back calls are unchanged at every window, so arriving work
 # is not delayed, and after the window the worker sleeps and an idle process costs its host nothing.
-const _MT_KEEPAWAKE_NS = 10_000_000   # PDM: Exempt — politeness window, measured in the comment above
+# PDM: Measured — the window sweep above: flat from 3 ms on both kernels, 10 ms covers the panel gaps.
+const _MT_KEEPAWAKE_NS = 10_000_000   # req8-ok: politeness window measured in the sweep above, not a perf tuning
 
 @inline function _mt_keepawake_ns()
     o = @inbounds _EXPINT[16]
@@ -5426,25 +5388,24 @@ function _gemm_pool_worker(p::GemmPool, i::Int)
                 wait(p.evs[i])
                 continue
             end
-            spun = false
-            for _ in 1:_MT_SPINS
+            found = false
+            span = _MT_POLL_NS[]; t0 = time_ns(); t = t0
+            while true
                 if (@atomic p.gen) != seen
-                    spun = true
+                    found = true
                     break
                 end
                 Base.Threads.atomic_fence()
+                t = time_ns()
+                t - t0 >= span && break
             end
-            spun && break
-            win = _mt_keepawake_ns()
-            while time_ns() - idle0 < win
-                if (@atomic p.gen) != seen
-                    spun = true
-                    break
-                end
+            found && break
+            # Inside the keep-awake window the worker yields and polls again; past it, it sleeps.
+            if t - idle0 < _mt_keepawake_ns()
                 yield()
+            else
+                wait(p.evs[i])
             end
-            spun && break
-            wait(p.evs[i])
         end
         # ONE load gives both the generation and this job's worker count (see `GemmPool`). A pool holds
         # `nw_max` workers but a given call may want fewer; the surplus see they are out of range and go
@@ -5493,9 +5454,18 @@ end
 # main task's and so the usual driver — so a driver is not sharing its thread with a worker it waits on.
 # A driver on any other thread (a `Threads.@spawn`ed caller) does share it, and `_gemm_threaded!` has
 # that worker sit the job out (`GemmPool.skip`) rather than run after the driver's own chunk.
+# A CALLABLE, NOT A CLOSURE: a task body with a nameable type can be compiled ahead of time (see the
+# `precompile` directives in PureBLAS.jl), where a closure is compiled on the worker's thread when the
+# pool starts.
+struct PoolWorkerJob{T}
+    p::GemmPool{T}
+    i::Int
+end
+(w::PoolWorkerJob)() = _gemm_pool_worker(w.p, w.i)
+
 @noinline function _gemm_pool_start!(p::GemmPool)
     for i in 1:length(p.evs)
-        t = Task(() -> _gemm_pool_worker(p, i))
+        t = Task(PoolWorkerJob(p, i))
         t.sticky = true
         ok = ccall(:jl_set_task_tid, Cint, (Any, Cint), t, p.tids[i] - 1)
         isone(ok) || error("PureBLAS: could not bind pool worker $i to thread $(p.tids[i])")
@@ -5573,14 +5543,15 @@ const _MT_SKIPPED = Threads.Atomic{Int}(0)
 # worker thread in turn times a read of it against a read of a buffer it wrote itself. Both reads
 # are on the SAME core, back to back, so a slower core or a lower clock cancels in their ratio, and
 # the workers are split only when those ratios fall into two sets with a clear gap between them —
-# they are compared with each other, never with a fixed cost. (When every worker is in another group
-# than the creator there is no gap to see, and the pool stays ungrouped.) Nothing here asks the
-# operating system or the CPU where a thread runs, so it works on any machine Julia does; it is
-# measured on x86-64 only (Zen3, Zen4). It is right for exactly as long as the threads
-# stay where they were — which is the pinned case. The measurement is therefore taken several times
-# with every thread loaded in between, and threads that float, whose readings change, leave the pool
-# ungrouped, as does a machine with one group (`_mt_group_order!`). It is taken once, when the pool
-# is created: threads pinned after that are not seen.
+# they are compared with each other, never with a fixed cost (`_mt_cut`). When every worker is in
+# another group than the creator there is no gap to see, and the pool stays ungrouped. The measurement asks nothing of the operating system or the CPU about caches, so it
+# runs on any machine Julia does; it is measured on x86-64 only (Zen3, Zen4).
+#
+# IT IS RIGHT FOR EXACTLY AS LONG AS THE THREADS STAY WHERE THEY WERE, so it is taken only when the
+# operating system says they must: every thread bound to a single CPU (`_mt_affinity_count`). A
+# thread allowed more than one CPU may be moved at any time and is left ungrouped, as is every
+# thread on an OS that cannot bind one (macOS). It is taken once, when the pool is created: threads
+# pinned after that are not seen.
 #
 # `_MT_TIDS` lists the worker threads with the creator's group first. `_MT_G0` is how many
 # participants of a job belong to that group when the driver is the creator — its workers plus the
@@ -5606,26 +5577,6 @@ end
 # comparison that covers the grouped step passes without it whenever the step is not taken.
 const _MT_LUSTEPS = Threads.Atomic{Int}(0)
 
-# PDM: Exempt — the sample count behind each worker's reading, not a tuning value.
-# A worker's reading is the median of this many rounds.
-# req8-ok: sample count of a median; no hardware fact places it
-const _MT_GROUP_ROUNDS = 8
-# PDM: Exempt — how many times the whole classification is taken, not a tuning value.
-# The passes are separated by a busy burst and must agree; see `_mt_group_order!`.
-# req8-ok: repeat count of a consistency check; no hardware fact places it
-const _MT_GROUP_PASSES = 3
-# PDM: Literal — how clear the separation must be before the workers are split in two: the lowest
-# reading of the far set over the highest of the near set. The readings are compared with each other
-# and never with a fixed cost, so a machine on which every worker reads alike has one group whatever
-# that reading is. Zen3, two groups: 1.36-1.48 near and 4.02-4.86 far, a gap of 2.7; six workers
-# inside one group read 1.42-1.48, a widest gap of 1.04.
-const _MT_GROUP_GAP = 2.0   # req8-ok: separation margin between two measured clusters (gap 2.7 against 1.04), not a perf tuning
-# PDM: Literal — how long every thread is kept busy between two passes, so that a scheduler free to
-# move a thread gets the chance to. A property of the host's scheduler, not of the hardware: on
-# Linux, with unpinned threads on a two-group Zen3, the classification changed across one 20 ms
-# burst in 14 of 14 trials that had a thread in each group.
-const _MT_GROUP_BURST_NS = 20_000_000   # req8-ok: scheduler-reaction window measured on the host OS, not a perf tuning
-
 # One round on the calling thread: time a read of `shared`, which another thread has just written,
 # against a read of `own`, written here first. The sum is returned so neither read can be dropped.
 function _mt_xfer_ratio(shared::Vector{UInt64}, own::Vector{UInt64}, r::Int)
@@ -5649,69 +5600,285 @@ function _mt_on_thread(f, tid::Int)
     return t
 end
 
-function _mt_busy(ns::Int)
-    t0 = time_ns()
-    x = 0
-    while time_ns() - t0 < ns
-        x += 1
+# The two task bodies of the measurement, as callables for the reason `PoolWorkerJob` gives.
+#
+# A reader stays on its thread for the whole measurement and waits for its turn in a fenced loop
+# rather than being started once per reading. A core left idle between readings drops into a sleep
+# state, and its next reading then times the wake and a cold cache instead of the transfer: measured
+# on Zen3, three workers in each of two groups, a pool created in a fresh process found the split in
+# 2 of 5 processes with a task per reading. `turn` names the reader whose reading is due, 0 while the
+# creating thread refills the buffer, and -1 when the measurement is over. The loop passes a GC
+# safepoint on every look, because a thread that spins without one would stall a collection
+# another thread asks for.
+struct XferJob
+    turn::Threads.Atomic{Int}
+    w::Int
+    out::Base.RefValue{Float64}
+    shared::Vector{UInt64}
+    own::Vector{UInt64}
+end
+function (j::XferJob)()
+    r = 0
+    while true
+        t = j.turn[]
+        t < 0 && return nothing
+        if t == j.w
+            j.out[] = _mt_xfer_ratio(j.shared, j.own, r += 1)[1]
+            j.turn[] = 0
+        end
+        Base.Threads.atomic_fence()
+        GC.safepoint()
     end
-    return x
+end
+struct AffinityJob
+    cnt::Vector{Int}
+    w::Int
+end
+(j::AffinityJob)() = (j.cnt[j.w] = _mt_affinity_count(); nothing)
+struct YieldJob
+    out::Threads.Atomic{UInt64}          # 0 until the time is in
+    step::Int
+    deadline::UInt64
+end
+(j::YieldJob)() = (j.out[] = max(1, unsafe_trunc(UInt64, _mt_yield_ns(j.step, j.deadline))); nothing)
+
+# How many CPUs the calling thread may run on, or 0 when the operating system does not say. libuv
+# answers on Linux, FreeBSD and Windows and reports "not supported" on macOS, which has no thread
+# affinity to report.
+function _mt_affinity_count()
+    n = Int(ccall(:uv_cpumask_size, Cint, ()))
+    n > 0 || return 0
+    mask = zeros(Cchar, n)                               # one entry per CPU
+    self = Ref(ccall(:uv_thread_self, UInt, ()))
+    iszero(ccall(:uv_thread_getaffinity, Cint, (Ptr{UInt}, Ptr{Cchar}, Csize_t), self, mask, n)) || return 0
+    return count(!iszero, mask)
 end
 
-# One pass: which of `tids` read the calling thread's fresh lines at a clearly higher cost than the
-# rest. All false when the readings do not fall into two sets `_MT_GROUP_GAP` apart.
-function _mt_group_pass(tids::Vector{Int}, shared::Vector{UInt64})
-    med = Vector{Float64}(undef, length(tids))
-    rs = Vector{Float64}(undef, _MT_GROUP_ROUNDS)
-    ratio = Ref(0.0)
-    for (w, tid) in pairs(tids)
-        own = similar(shared)
-        for r in 0:_MT_GROUP_ROUNDS                     # round 0 compiles and warms; it is not kept
-            fill!(shared, r % UInt64)
-            wait(_mt_on_thread(() -> (ratio[] = _mt_xfer_ratio(shared, own, r)[1]; nothing), tid))
-            r > 0 && (rs[r] = ratio[])
-        end
-        med[w] = sort!(rs)[(_MT_GROUP_ROUNDS + 1) ÷ 2]
-    end
-    # Split at the widest gap between neighbouring readings, if it is wide enough.
+# Whether the calling thread and every thread of `tids` is bound to exactly one CPU. The caller is
+# asked first: a process that pins nothing — the usual one — is answered without waking a thread.
+function _mt_all_bound(tids::Vector{Int})
+    isone(_mt_affinity_count()) || return false
+    cnt = zeros(Int, length(tids))
+    foreach(wait, [_mt_on_thread(AffinityJob(cnt, w), tid) for (w, tid) in pairs(tids)])
+    return all(isone, cnt)
+end
+
+# PDM: Literal — how far apart two sets of workers must read before they are called two groups: the
+# lowest median of the far set over the highest of the near set. It separates two effects of
+# different size, and the spread of the readings cannot place it: workers inside one group differ
+# from each other by a few percent, steadily, so a margin taken from their noise splits a single
+# group (measured: 18% of pools on six Zen3 cores of one group, with the margin set to each set's
+# own interquartile width). Zen3, two groups: medians 1.36-1.48 near and 4.02-4.86 far, a gap of
+# 2.7; six workers inside one group read 1.42-1.48, a widest gap of 1.04.
+const _MT_GROUP_GAP = 2.0   # req8-ok: separation margin between two measured clusters (gap 2.7 against 1.04), not a perf tuning
+
+# Cut the workers in two by their readings (`rd[w]` holds worker `w`'s) and return the far set, all
+# false when there is none: the cut is at the widest gap between the workers' medians, and counts
+# only when that gap reaches `_MT_GROUP_GAP`. The readings are compared with each other, never
+# with a fixed cost, so a machine on which every worker reads alike has one group whatever that
+# reading is.
+function _mt_cut(rd::Vector{Vector{Float64}})
+    far = falses(length(rd))
+    med = [sort(x)[(length(x) + 1) ÷ 2] for x in rd]
     p = sortperm(med)
-    gap = 1.0; cut = 0
-    for j in 1:(length(p) - 1)
-        g = med[p[j + 1]] / med[p[j]]
-        g > gap && (gap = g; cut = j)
-    end
-    far = falses(length(tids))
+    gap, cut = findmax([med[p[j + 1]] / med[p[j]] for j in 1:(length(p) - 1)])
     gap >= _MT_GROUP_GAP && (far[p[(cut + 1):end]] .= true)
     return far
 end
 
+# Which of `tids` read the calling thread's fresh lines at a clearly higher cost than the rest; all
+# false when there is no such set.
+#
+# Every round gives each worker one more reading. The first cut is taken once a worker has three,
+# the fewest whose median a single reading taken across an interrupt cannot move, and the answer is
+# accepted at the first round that repeats the one before it — the point where another round has
+# stopped changing the outcome. No round count is fixed; a measurement still unsettled at
+# `deadline` reports no split.
+function _mt_group_split(tids::Vector{Int}, shared::Vector{UInt64}, deadline::UInt64)
+    turn = Threads.Atomic{Int}(0)
+    ratio = Ref(0.0)
+    ts = [_mt_on_thread(XferJob(turn, w, ratio, shared, similar(shared)), tid) for (w, tid) in pairs(tids)]
+    rd = [Float64[] for _ in tids]
+    prev = nothing
+    r = 0
+    try
+        while true
+            for w in eachindex(tids)
+                fill!(shared, r % UInt64)
+                turn[] = w
+                while !iszero(turn[])
+                    Base.Threads.atomic_fence()
+                    GC.safepoint()
+                end
+                r > 0 && push!(rd[w], ratio[])           # round 0 compiles and warms; it is not kept
+            end
+            r += 1
+            time_ns() >= deadline && return falses(length(tids))
+            length(first(rd)) >= 3 || continue
+            far = _mt_cut(rd)
+            far == prev && return far
+            prev = far
+        end
+    finally
+        turn[] = -1
+        foreach(wait, ts)
+    end
+end
+
 # Fill `_MT_TIDS`, `_MT_G0` and `_MT_HOME`. Called once, by the thread creating the pools, under
-# `_MT_SETUP_LOCK`; it allocates, like the rest of that setup path. A machine with one group
-# returns after the first pass; one with several pays the bursts as well.
-function _mt_group_order!()
+# `_MT_SETUP_LOCK`; it allocates, like the rest of that setup path.
+function _mt_group_order!(deadline::UInt64)
     tids = filter(!=(Threads.threadid()), Threads.threadpooltids(:default))
     empty!(_MT_TIDS); append!(_MT_TIDS, tids)
     _MT_G0[] = typemax(Int)
     _MT_HOME[] = Threads.threadid()
-    length(tids) >= 2 || return nothing
+    (length(tids) >= 2 && _mt_all_bound(tids)) || return nothing
     # Half an L2: more than an L1, so the read is long against the clock's resolution, and small
     # enough that the writer still holds every line in its own L2 when the reader asks for it.
     shared = Vector{UInt64}(undef, max(1, (_L2_BYTES ÷ 2) ÷ sizeof(UInt64)))
-    far = _mt_group_pass(tids, shared)
+    far = _mt_group_split(tids, shared, deadline)
     any(far) || return nothing
-    # THREADS THAT ARE FREE TO MOVE MUST NOT BE GROUPED, and one pass cannot tell: an idle thread
-    # stays where it last ran, so it classifies as cleanly as a pinned one. Loading every thread at
-    # once is what makes a scheduler rebalance them, so the pass is repeated after a burst of exactly
-    # that, and any difference between passes leaves the pool ungrouped.
-    for _ in 2:_MT_GROUP_PASSES
-        ts = [_mt_on_thread(() -> (_mt_busy(_MT_GROUP_BURST_NS); nothing), tid) for tid in tids]
-        _mt_busy(_MT_GROUP_BURST_NS)
-        foreach(wait, ts)
-        _mt_group_pass(tids, shared) == far || return nothing
-    end
     empty!(_MT_TIDS)
     append!(_MT_TIDS, tids[.!far]); append!(_MT_TIDS, tids[far])
     _MT_G0[] = count(!, far) + 1
+    return nothing
+end
+
+# PDM: Literal — how long the pool may spend measuring its host when it is created. A limit on a
+# one-off cost, stated rather than measured: no property of a machine places it. Every stopping
+# rule below also stops at this deadline and uses the readings it has.
+const _MT_MEASURE_NS = 10_000_000   # req8-ok: time limit on a one-off setup cost, not a tuning value
+
+# The smallest step the clock shows between two consecutive readings: its resolution, or what
+# reading it costs where that is larger (42 ns on Apple silicon, 20 ns on Linux x86-64). Steps are
+# taken until one is no smaller than the smallest before it.
+function _mt_clock_step()
+    s = typemax(Int)
+    while true
+        t0 = time_ns()
+        t = time_ns()
+        while t == t0
+            t = time_ns()
+        end
+        d = Int(t - t0)
+        d >= s && return s
+        s = d
+    end
+end
+
+# ns per call of `f`, timed over `b` consecutive calls.
+function _mt_time(f, b::Int)
+    t0 = time_ns()
+    for _ in 1:b
+        f()
+    end
+    return (time_ns() - t0) / b
+end
+
+# The number of consecutive calls of `f` to time as one reading: doubled until the reading spans
+# `_MT_AMORTISE`² clock steps. A reading a few steps long moves by a whole step at a time — an
+# empty fork-join on Apple silicon reads 4, 5 or 6 steps, ±20% — and the floor is built from 1/
+# `_MT_AMORTISE` shares, so the clock is allowed 1/`_MT_AMORTISE` of one such share.
+#
+# Each size is judged on a SETTLED reading, not on one call: the first call of anything here is
+# slow — a worker has to be woken, code and data are cold — and a single slow call looks long
+# enough at a batch of one.
+function _mt_batch(f, step::Int, deadline::UInt64)
+    b = 1
+    while time_ns() < deadline
+        t = let b = b                        # a fresh binding: the closure must not capture the loop's own
+            _mt_settled(() -> _mt_time(f, b), deadline)
+        end
+        t * b >= _MT_AMORTISE^2 * step && break
+        b *= 2
+    end
+    return b
+end
+
+# The median of repeated readings of `f`, taken until one falls inside the range of those before
+# it — the point where another reading has stopped saying anything new about the spread — or until
+# `deadline`. No count is fixed: a quiet host settles in three readings, a noisy one takes more.
+function _mt_settled(f, deadline::UInt64)
+    xs = Float64[f(), f()]
+    while true
+        lo, hi = extrema(xs)
+        x = f()
+        push!(xs, x)
+        (lo <= x <= hi || time_ns() >= deadline) && break
+    end
+    return sort!(xs)[(length(xs) + 1) ÷ 2]
+end
+
+# Flops per nanosecond one core retires in the kernel a pooled chunk near the floor runs: the
+# unpacked SIMD product, on operands that together fill the L1 — the size of the calls the floor
+# decides between. NOT the public `gemm!`: that entry may hand a call to a route no pooled chunk
+# takes (Apple's SME kernel owns Float64 products and reads eight times the rate of the vector
+# kernel the pool's chunks run there), and its rate would set a floor for work that never happens.
+# A median of settled medians: the first products of a process run on cold code and cold pages,
+# and one settled run of readings can be made of those alone.
+function _mt_flop_rate(step::Int, deadline::UInt64)
+    n = max(_NR, min(isqrt(_L1_BYTES ÷ (3 * sizeof(Float64))), _GEMM_UNPACK_MAX))
+    A = fill(0.5, n, n); B = fill(0.25, n, n); C = zeros(n, n)
+    ns = GC.@preserve A B C begin
+        pA = _pm(A); pB = _pm(B); pC = _pm(C)
+        product = function ()
+            _gemm_unpacked!(Val(false), Val(true), n, n, n, 1.0, pA, pB, 0.0, pC)
+            return nothing
+        end
+        b = _mt_batch(product, step, deadline)
+        _mt_settled(() -> _mt_settled(() -> _mt_time(product, b), deadline), deadline)
+    end
+    return 2.0 * n^3 / ns
+end
+
+# The round trip of the smallest threaded job there is — the driver and one worker, with nothing to
+# do: an empty copy — in ns. This is the pool's own publish, wake and join. A reading during which
+# some other caller held the pool ran no job; it is taken again. A median of settled medians, for
+# the reason `_mt_flop_rate` gives.
+function _mt_join_cost(step::Int, deadline::UInt64)
+    z = PtrMatrix{Float64}(Ptr{Float64}(0), 0, 1, 1)
+    trip = function ()
+        _gemm_threaded!(z, z, z, 1.0, 0.0, false, false, false, false, 2, _MT_KIND_COPY)
+        return nothing
+    end
+    b = _mt_batch(trip, step, deadline)
+    reading = function ()
+        while true
+            lost = _MT_LOST[]
+            ns = _mt_time(trip, b)
+            _MT_LOST[] == lost && return ns
+            yield()
+        end
+    end
+    return _mt_settled(() -> _mt_settled(reading, deadline), deadline)
+end
+
+# Measure the polling spans and what the amortisation floor is built from. Called once, under
+# `_MT_SETUP_LOCK`, after the pools exist and before a thread count above one is published: the
+# workers are all asleep, so a worker's thread is free to time its own yields. The creating thread
+# polls for that time instead of blocking on the task, so that it is doing what a driver does
+# while a worker idles: running, not asleep. A worker polls for a job only while it is inside the
+# published count, so that count is raised to two for the join readings: one worker polls and the
+# rest sleep. `_MT_FLOOR` still refuses every Level-3 call meanwhile, and a byte-floored call that
+# takes the pool is seen through `_MT_LOST`. A pinned floor is not measured.
+function _mt_measure_host!(deadline::UInt64)
+    h = _MT_HOST
+    step = _mt_clock_step()
+    p = _gemm_pool(Float64)
+    _MT_POLL_NS_HOME[] = unsafe_trunc(UInt64, _MT_AMORTISE * _mt_yield_ns(step, deadline))
+    there = Threads.Atomic{UInt64}(0)
+    _mt_on_thread(YieldJob(there, step, deadline), maximum(_MT_TIDS))
+    while iszero(there[])
+        Base.Threads.atomic_fence()
+        GC.safepoint()
+    end
+    _MT_POLL_NS[] = _MT_AMORTISE * there[]
+    @static if isnothing(_GEMM_MT_WORK_PREF)
+        h.flops_per_ns = _mt_flop_rate(step, deadline)
+        _MT_NTHREADS[] = 2
+        h.join_ns = _mt_join_cost(step, deadline)
+    end
+    h.measured = true
     return nothing
 end
 
@@ -5741,10 +5908,13 @@ Threading is **off until you call this**. That is deliberate: a BLAS that silent
 in the process is a surprise to whatever else the process is doing, and the shape matches
 `openblas_set_num_threads`, which is what a host expects to find.
 
-That first call also measures which worker threads share a last-level cache with the calling thread,
-so that `getrf!` can keep a panel step's data inside one cache group on a machine that has several.
-The measurement describes the threads where they are at that moment: pin them first. Threads that are
-not pinned, and machines with a single group, are left ungrouped.
+The call that creates the pool also measures the host, once, in a few milliseconds: what waking the
+pool and joining it costs and how fast one core multiplies, which together set the size below which a
+call stays on one thread; how long a waiting thread polls between yields; and, when every thread is
+bound to a single CPU, which worker threads share a last-level cache with the calling thread, so that
+`getrf!` can keep a panel step's data inside one cache group on a machine that has several. That last
+measurement describes the threads where they are at that moment: pin them first. Threads that are not
+pinned, and machines with a single group, are left ungrouped.
 
 The worker pool is created on the first call that asks for more than one thread, and lives for the rest
 of the process — upstream reports that adopted threads which come and go leak their thread storage and
@@ -5799,11 +5969,14 @@ function set_num_threads(n::Integer)
     nt = clamp(Int(n), 1, min(Threads.nthreads(), cores, _MT_NW_MASK))
     if nt > 1
         lock(_MT_SETUP_LOCK) do
-            isempty(_GEMM_POOL_F64) && _mt_group_order!()
+            deadline = time_ns() + UInt64(_MT_MEASURE_NS)
+            isempty(_GEMM_POOL_F64) && _mt_group_order!(deadline)
             isempty(_GEMM_POOL_F64) && push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
             isempty(_GEMM_POOL_F32) && push!(_GEMM_POOL_F32, _gemm_pool_new(Float32))
             isempty(_GEMM_POOL_C64) && push!(_GEMM_POOL_C64, _gemm_pool_new(ComplexF64))
             isempty(_GEMM_POOL_C32) && push!(_GEMM_POOL_C32, _gemm_pool_new(ComplexF32))
+            _MT_HOST.measured || _mt_measure_host!(deadline)
+            _MT_FLOOR[] = _mt_floor()
         end
     end
     # The atomic store below is what publishes the pool: a reader that sees `nt > 1` here sees the
@@ -5870,7 +6043,7 @@ end
 @noinline function _gemm_threaded!(
         C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T},
         alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, nw::Int,
-        kind::Int = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false, unit::Bool = false,
+        kind::_MTKind = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false, unit::Bool = false,
         lup::LuPanel{T} = _lupanel_none(T)
     ) where {T <: Union{BlasReal, BlasComplex}}
     p = _gemm_pool(T)
@@ -6216,14 +6389,15 @@ end
             # trade as the worker loop. It has nothing else to do — it is inside a blocking BLAS call —
             # so spinning costs the host nothing it was going to get back. And `wait` on an event can
             # allocate, which `gemm!` may not do (req#10, and test/strictmode_tests.jl's static proof).
-            # The yield after the spin window is NOT optional: a driver can run on the thread a sticky
+            # The yield after a span of polling is NOT optional: a driver can run on the thread a sticky
             # worker is bound to (any task that is not the pool's creator may), and a bare spin here then
             # waits on a worker that can never be scheduled — a deadlock, once seen at 399% CPU. With
             # `skip` that worker only bumps `done`, and it still needs this thread to do it.
             while (@atomic p.done) < nwk
-                for _ in 1:_MT_SPINS
-                    (@atomic p.done) >= nwk && break
+                span = _mt_poll_span(); t0 = time_ns()
+                while (@atomic p.done) < nwk
                     Base.Threads.atomic_fence()
+                    time_ns() - t0 >= span && break
                 end
                 (@atomic p.done) < nwk && yield()
             end
@@ -6660,7 +6834,7 @@ function gemm!(
         # into a `Float64` C, which `_gemm_core!` promotes happily) would hand it a `PtrMatrix{Float32}`
         # and raise a MethodError where the serial path computed an answer.
         # THE AMORTISATION FLOOR IS COUNTED IN COMPLEX CELLS, NOT REAL FLOPS. `_gemm_workers` divides
-        # `2*m*n*k` by `_GEMM_MT_WORK`, and one complex cell is three or four real products depending
+        # `2*m*n*k` by `_gemm_mt_work()`, and one complex cell is three or four real products depending
         # on the route, so a complex call carries several times the work the floor was calibrated on
         # and declines the pool later than it needs to. Conservative in the safe direction — it never
         # threads a call too small to pay the join — and a complex floor is a tuning question that

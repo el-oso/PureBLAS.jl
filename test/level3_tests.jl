@@ -320,7 +320,7 @@ end
         nt = min(4, Threads.nthreads())
         P.set_num_threads(nt)
         k = clamp(4 * P._TRMM_BASE_R, P._TRMM_BASE_R + 1, P._TRMM_PACK_MIN)
-        n = max(2 * P._NR, 2 * cld(P._GEMM_MT_WORK, k * k))
+        n = max(2 * P._NR, 2 * cld(P._gemm_mt_work(), k * k))
         Aref = tril(randn(k, k)) + k * I          # referenced half only; the other half is zero
         A = copy(Aref)
         for c in 1:k, r in 1:(c - 1)
@@ -368,7 +368,7 @@ end
         # inside the band the column route is armed for — above `_TRMM_BASE_R`, at or below
         # `_TRMM_PACK_MIN` — because outside it a different driver owns the call.
         #
-        # liveness-ok: this route's admission is decided by `_trsm_workers` against `_GEMM_MT_WORK`,
+        # liveness-ok: this route's admission is decided by `_trsm_workers` against `_gemm_mt_work()`,
         # not by `_L1_MT_MIN` (a BLAS-1 byte floor) and not by an SME predicate (side L has none).
         # The item asks the entry's OWN predicates below — `_trmm_left_owns` and `_trsm_workers` —
         # and skips when they decline, so the gate is consulted rather than guessed.
@@ -386,7 +386,7 @@ end
         ks = (P._TRMM_BASE_R ÷ 2, max(lo, 4 * P._TRMM_BASE_R), 2 * P._TRMM_PACK_MIN)
         for k in ks
         # the narrowest B that clears the flop floor, doubled so the floor is not the thing under test
-        n = max(2 * P._NR, 2 * cld(P._GEMM_MT_WORK, k * k))
+        n = max(2 * P._NR, 2 * cld(P._gemm_mt_work(), k * k))
         # LIVENESS, read from the pool's own publish counter rather than from a buffer. `gen` is
         # bumped to publish a job and its low bits carry the worker count, so a bumped `gen` with
         # nw > 1 means a split actually ran. This cannot be satisfied by a build that threads
