@@ -166,18 +166,23 @@ end
         tw = P._gemm_pool(Float64).tids
         @test length(tw) == Threads.nthreads() - 1
         @test allunique(tw) && all(in(Threads.threadpooltids(:default)), tw)
-        # Independent count on Linux: the allowed CPUs from the HEX mask (`Cpus_allowed`, comma-separated
-        # 32-bit groups, most significant first) where the code parses the range list, and each core from
-        # `core_cpus_list` where the code reads `thread_siblings_list`.
-        if Sys.islinux() && isfile("/proc/self/status")
-            hex = only(l for l in eachline("/proc/self/status") if startswith(l, "Cpus_allowed:"))
-            mask = parse(BigInt, replace(strip(split(hex, ':')[2]), ',' => ""); base = 16)
-            sib = Set{String}()
-            for c in 0:(ndigits(mask; base = 2) - 1)
-                f = "/sys/devices/system/cpu/cpu$c/topology/core_cpus_list"
-                isodd(mask >> c) && isfile(f) && push!(sib, readchomp(f))
+        # A host that pins its threads one per core leaves THIS thread one core wide; the count is fixed
+        # for the process, so it must not drop. Pin this thread to one core (Linux, where the test can),
+        # then restore.
+        if Sys.islinux()
+            c0 = P._mt_physical_cores()
+            if c0 > 1
+                old = zeros(UInt64, 16)
+                ccall(:sched_getaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(old), old)
+                cpu = ccall(:sched_getcpu, Cint, ())
+                one = zeros(UInt64, 16); one[cpu ÷ 64 + 1] = UInt64(1) << (cpu % 64)
+                try
+                    @test iszero(ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(one), one))
+                    @test P._mt_physical_cores() == c0
+                finally
+                    ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(old), old)
+                end
             end
-            @test P._mt_physical_cores() == clamp(length(sib), 1, Sys.EFFECTIVE_CPU_THREADS)
         end
         P.set_num_threads(Threads.nthreads())
         for (m, n, k) in ((256, 256, 256), (512, 300, 128), (200, 512, 333), (1024, 129, 64), (192, 7, 192))
