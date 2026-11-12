@@ -205,7 +205,7 @@ end
 
 # PDM: Literal — LAPACK's SMLSIZ: algorithm-intrinsic, machine-independent. tuning.md §4.
 const _STEDC_NB = 25   # req8-ok: LAPACK dstedc SMLSIZ — algorithm-intrinsic base-case crossover (NOT a
-# hardware tuning knob; machine-independent, like _SVD_DC_CROSS). steqr↔D&C switch.
+# hardware tuning knob; machine-independent). steqr↔D&C switch.
 
 # --- owned scratch for the D&C recursion -----------------------------------------------------------
 # Every buffer below was a per-call `Vector`/`Matrix` inside `_dc_eigen!`/`_stedc!`; together they were

@@ -45,9 +45,16 @@ end
     # reported, because a category that is allowed to be non-empty quietly fills up again.
     missing_marker = [r.key for r in knob_rows() if r.tier == "Unaudited"]
     isempty(missing_marker) || @error "knob(s) with no `# PDM:` marker. Every tuning knob must declare \
-        its tier and why: `# PDM: <Derived|Measured|Literal|Exempt> — <one line> | tune: <cost>`. A \
+        its tier and why: `# PDM: <Derived|Measured|Literal> — <one line> | tune: <cost>`. A \
         Literal additionally needs fleet evidence that one value suits every µarch (task #164)." knobs = missing_marker
     @test isempty(missing_marker)
+end
+
+@testitem "knob registry: no `PDM: Exempt` marker in src/" begin
+    include(joinpath(@__DIR__, "exempt_lint.jl"))    # defines exempt_scan; the CLI guard skips execution
+    hits = exempt_scan()
+    isempty(hits) || @error "the PDM ladder has no Exempt tier — see test/exempt_lint.jl" hits
+    @test isempty(hits)
 end
 
 @testitem "knob registry: docs/src/knobs.md is current" begin

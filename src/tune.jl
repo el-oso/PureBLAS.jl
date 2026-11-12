@@ -119,6 +119,18 @@ const _TUNABLE_KEYS = (
     "sme_dot_min", "sme_asum_min", "sme_scal_min", "sme_axpy_min",
 )
 
+# The tunable keys whose calibrator decomposes its own crossover instead of duelling candidate values
+# (see the notes in the list above), and so are not members of the multiple-comparison family.
+const _TUNE_DECOMPOSED_KEYS = ("sme_inplace_njp", "sme_dot_min", "sme_asum_min", "sme_scal_min", "sme_axpy_min")
+all(in(_TUNABLE_KEYS), _TUNE_DECOMPOSED_KEYS) ||
+    error("PureBLAS: every `_TUNE_DECOMPOSED_KEYS` entry must also be listed in `_TUNABLE_KEYS`")
+# The Bonferroni denominator that splits `_TUNE_ALPHA` (cpuinfo.jl): the number of Measure-tier keys
+# that are settled by a duel between candidates. Counted from the list, so it follows the list. It
+# counts KEYS, so a calibrator that writes two keys counts twice; that errs high, which is the safe
+# direction — a larger denominator buys MORE rounds, costing conservatism and never correctness.
+const _TUNE_NKNOBS = count(!in(_TUNE_DECOMPOSED_KEYS), _TUNABLE_KEYS)
+const _TUNE_ROUNDS = _tune_rounds(6)        # widest sweep in the tree; the default for callers
+
 """
 Block until the 1-minute load average falls below calibrate.jl's contention threshold, or give up.
 A calibration run leaves its own load behind, so consecutive runs must be spaced or the second one

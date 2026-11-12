@@ -5030,7 +5030,7 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::In
         #   Zen4 1.0489    1.0115    0.9112      (AVX-512, _NVREG=32)
         # The SIGN INVERTS at n=128: a blanket predicate would have taken Zen4's passing 1.05 cell down
         # to ~1.00. The conflict only costs more than the copy when A's columns are actually RE-READ:
-        #   * the leaf SPILLS (it holds _RL_MR*_CHOL_NB accumulators + _CHOL_NB T-vectors + ~2 more; at
+        #   * the leaf SPILLS (it holds _RL_MR*_CHOL_TILE accumulators + _CHOL_TILE T-vectors + ~2 more; at
         #     3*4+4+2 = 18 that exceeds AVX2's 16 ymm but not AVX-512's 32 zmm), so AVX2 re-reads A; or
         #   * A does not fit L2, so every re-read is an L3 trip regardless of register file.
         # Both terms are formulas over detected consts, not a µarch literal. This reproduces all six
@@ -5039,7 +5039,7 @@ function _trsm_right!(up::Bool, tr::Bool, cj::Bool, unit::Bool, A, B, nroute::In
         # GATED ON THE SPILL TERM ALONE. The pad is a TRADE (copy vs conflict), so the aliasing stride
         # is only half the test — it says a conflict exists, not that removing it beats the copy. What
         # decides that is whether A's columns are actually RE-READ, and the leaf only re-reads them when
-        # it SPILLS: `_RL_MR_LIVE` = 3·_CHOL_NB + _CHOL_NB + 2 = 18 live vectors, over AVX2's 16 ymm and
+        # it SPILLS: `_RL_MR_LIVE` = 3·_CHOL_TILE + _CHOL_TILE + 2 = 18 live vectors, over AVX2's 16 ymm and
         # under AVX-512's 32 zmm. Measured:
         #   Zen3 (spills)     — wins at EVERY size: +12.8/5.9/15.5/9.9/4.9/2.3% at n=128..4096,
         #                       gate worst 0.821 → 0.924, n=512 and n=1024 closed.
@@ -5463,7 +5463,7 @@ const _L1_WAY_D = _way_doubles(_L1_BYTES, _L1D_ASSOC)
 # The motivating correlation is real but NOT causal: the two sub-gate cells (ldb=128, 256) are exactly
 # the two where `_alias_ld` is false, while ldb=512/1024 get the dealias arm and beat AOCL 1.27-1.66×.
 # Whatever makes 512/1024 fast, it is not this predicate. Do not re-derive the quarter-period widening.
-# Next suspect for trsmR n=128 is the fused leaf's hardcoded MR=3 × NC=_CHOL_NB=4 = 12-accumulator top
+# Next suspect for trsmR n=128 is the fused leaf's hardcoded MR=3 × NC=_CHOL_TILE=4 = 12-accumulator top
 # tier (lapack.jl:792-816): on AVX2's 16 ymm that is 12 accs + 3 T-vectors + 1 broadcast = exactly 16,
 # with 10 loop-invariant broadcasts that must spill (UNVERIFIED — check with @assert_no_spill first).
 
@@ -5711,7 +5711,7 @@ function trsm!(
     # `BlasReal`, NOT complex, and the reason is measured rather than assumed. Admitting complex here
     # breaks req#11 in three independent places, each because something below reads the band's own ROW
     # count where `mrt` only substitutes the column count:
-    #   * `_CGEMM_3M`'s window is `min(m, nrt, k) >= _fh_cgemm_3m_kmin()` with `m = size(C, 1)`, so a
+    #   * the complex-gemm 3M window is `min(m, nrt, k) >= _fh_cgemm_3m_kmin()` with `m = size(C, 1)`, so a
     #     band narrower than kmin=16 declines Karatsuba while the unsplit solve takes it. The real
     #     split survives only because every real predicate is a `max`.
     #   * `_trsm_cmplx_small_R!` routes on `size(B, 1) >= _ZGT_W`, not `mrt`, and the last band can be
@@ -6551,7 +6551,7 @@ const _CSYRK_3M_MIN = @load_preference("csyrk_3m_min", 128)::Int
 # Does the rank-k 3M window apply? Hoisted so the unpacked branch can YIELD to it — without this the
 # unpacked path shadows 3M entirely for trans='N' at n ≤ _CSYRK_UNPACK_MAX (192 on AVX-512).
 @inline _ctrk_3m_ok(n::Int, k::Int) =
-    _CGEMM_3M && _fh_csyrk_3m_min() <= n <= _fh_cgemm_3m_max() && k >= _fh_cgemm_3m_kmin()
+    _fh_csyrk_3m_min() <= n <= _fh_cgemm_3m_max() && k >= _fh_cgemm_3m_kmin()
 
 # C[tri] += α·(P1−P2 + i·(P3−P1−P2)) — triangular RMW combine of the 3 real Karatsuba products (caller
 # pre-scaled β·C). Mirror of _combine3! (gemm.jl) restricted to the stored triangle (loop bounds only;
@@ -6615,8 +6615,8 @@ end
 # (W=4) — opposite in sign to every throughput model, and `768/W` fits both points with no criterion,
 # which req#8b classifies as a violation rather than a derivation.
 # So REMOVE the term instead of predicting it. With both passes fused there is no O(n²) cost left to
-# form a ratio against O(n²k), and profitability becomes n-INDEPENDENT — the same on/off question
-# `_CGEMM_3M` already answers. That deletes `_CSYRK_3M_MIN` as a size knob for a structural reason.
+# form a ratio against O(n²k), and profitability becomes n-INDEPENDENT, as it is for complex gemm's
+# 3M route (gemm.jl). That deletes `_CSYRK_3M_MIN` as a size knob for a structural reason.
 #
 # HOW THE SPLIT FUSES FOR FREE: `_pack_A_cmplx!`/`_pack_B_cmplx!` (gemm.jl) ALREADY deinterleave complex
 # input into two REAL panels in one pass, in the same panel layout the real microkernel indexes. The
@@ -6739,7 +6739,7 @@ end
         alr::T, ali::T, X, Y, C, k::Int
     ) where {A1, NR, T}
     n = size(C, 1)
-    # `_vwidth(T) == 4` REMOVED — see the derivation at `_CGEMM_3M` (gemm.jl): the 25% flop cut is
+    # `_vwidth(T) == 4` REMOVED — see the derivation at `_CGEMM_3M_MIN` (gemm.jl): the 25% flop cut is
     # algebraic, so nothing physical made this width-dependent; the test was an artefact of only ever
     # having measured AVX2. Measured on Zen4 (W=8), 3m/base, bench/probes/sk1_3m_avx512.jl:
     #     n         128*    256    512    1024   2048
@@ -7982,10 +7982,10 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     n = size(A, 1)
     # Complex side-L in the 3M window → fuse the reflection into the 3M A-split (no materialize, no n²
     # complex scratch). Deletes the materialize tax that dominated mid-n hemm/symm. Concrete-complex only
-    # (generic T<:Number / AD path falls through to materialize+_gemm_core!); AVX2-gated via _CGEMM_3M.
+    # (generic T<:Number / AD path falls through to materialize+_gemm_core!).
     # (n≤40 tried a direct triangle sweep — measured SLOWER than materialize: its many small _uker calls +
     # branchy panel fill cost more than one gemm at tiny n. Reverted; tiny-n stays on materialize.)
-    if side_left && eltype(C) <: BlasComplex && _CGEMM_3M && _strided1(A) && _strided1(B) && _strided1(C)
+    if side_left && eltype(C) <: BlasComplex && _strided1(A) && _strided1(B) && _strided1(C)
         m2 = size(B, 2)
         if _fh_cgemm_3m_min() <= max(n, m2) <= _fh_cgemm_3m_max() && min(n, m2) >= _fh_cgemm_3m_kmin()
             return _hemm_3m_L!(up, herm, α, β, A, B, C)

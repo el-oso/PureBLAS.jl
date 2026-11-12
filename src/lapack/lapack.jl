@@ -315,8 +315,6 @@ function _tricopy_mt!(dst::Ptr{T}, ldd::Int, src::Ptr{T}, lds::Int, n::Int, up::
     return nothing
 end
 
-# PDM: Exempt — boolean switch (path on/off), not a tuned size.
-const _POTRF_PAD = @load_preference("potrf_pad", true)::Bool   # disable to A/B the pad's benefit per µarch
 
 # Transposed-triangle copies for the UPPER → gating-LOWER reuse: Lever A (F64, U=Lᵀ) and Lever C (complex
 # Hermitian, U=Lᴴ, so `CJ=true` conjugates). Generic over T; the `CJ` flag is a type param so the conj
@@ -661,7 +659,7 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     # pads po2 strides — so this closes real-upper's small-n + AVX2 mid-n gaps by reuse, portably. Transpose A's
     # upper into the (alias-free) scratch's lower, factor, transpose L back. F32 rides the same faer path (now
     # generic over T<:BlasReal) — closing F32-upper once F32-lower gates.
-    if _POTRF_PAD && up && (T === Float64 || T === Float32) && _strided1(A)
+    if up && (T === Float64 || T === Float32) && _strided1(A)
         # Large n: factor the upper triangle NATIVELY (transpose-mirror hybrid) instead of paying the
         # whole-matrix round-trip. The crossover is a RESIDENCY criterion, hence Derive tier: the
         # round-trip's cost is 4 extra n² DRAM passes, which is negligible against O(n³) while the
@@ -699,7 +697,7 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     # transpose CONJUGATES (Val(true)). Mirrors Lever A — closes zpotrf-upper's small/mid-n gap (the generic
     # _potrf_upper! recursion's trsm!/herk! overhead loses there; _cpotrf_lower! gates). Conj-transpose A's
     # upper into the scratch lower, factor, conj-transpose Lᴴ back into A's upper.
-    if _POTRF_PAD && up && T <: BlasComplex && _strided1(A)
+    if up && T <: BlasComplex && _strided1(A)
         let f = _potrf_upper_lever_cmplx!(A, n)
             f == 0 || throw(PosDefException(f))     # throw before transposing back ⇒ A upper unchanged
         end
@@ -719,7 +717,7 @@ function _potrf_gen!(A, n::Int, base::Int, up::Bool)
     # operand, and no closure captures anything. The copy-back is inside the block. Nothing escapes.
     # ld = `_offway_ld(n, T)`, exactly the rule `_potrf_pad` applied — and now it is a property of THIS
     # call rather than of whatever size an earlier call grew the field to.
-    if _POTRF_PAD && (T <: BlasReal || T <: BlasComplex) && _potrf_needs_pad(A, n)
+    if (T <: BlasReal || T <: BlasComplex) && _potrf_needs_pad(A, n)
         @scope arn begin
             ldb = _offway_ld(n, T)
             b = borrow!(arn, T, n, n, ldb)
@@ -775,60 +773,34 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 # So 16 is a measured µarch-invariant base cap (a crossover, not a cache/width size), correctly flat. Knob-able.
 @inline _chol_sth(::Type{T}) where {T} = 16      # base-case element crossover (µarch-invariant; fleet-tuned later)
 @inline _chol_sb(::Type{T}) where {T} = 32       # small-n rl block size (= 2·_chol_sth)
-# trsm/syrk column block = the register-TILE WIDTH of the fused Cholesky base kernel (columns unrolled with
-# register rank-update accumulators). PDM: proven-invariant Exempt, NOT a cache/width size — 4 columns ×
-# their accumulators fit the register file on every ISA, and the small Cholesky base does not benefit from a
-# wider tile (same finding as `_chol_sth`: "bigger-on-wide-SIMD regresses"). A register-tile crossover, flat
-# across µarch. Pinned (P-tier) for calibration; fleet-confirm the invariance before deriving off _NVREG.
-# NOT TUNABLE — STRUCTURAL, AND VALIDATED. The fused base kernel below is HAND-UNROLLED for exactly four
-# columns (d0..d3, l10..l32, indices c0..c0+3); `_fh_chol_nb()` appears only as the guard
-# `nb == _fh_chol_nb()`. So any other value does not run slower, it runs WRONG:
-#     chol_nb = 1, 2, 8, 16, 32  -> PosDefException
-#     chol_nb = 3                -> SILENTLY WRONG, rel err 1.0e-01   <-- no exception at all
-#     chol_nb = 4                -> rel err 1.5e-15
-# (measured 2026-08-22, n=256, oracle-confirmed PD input; same on Zen3 and Zen4.)
-# nb=3 passes the guard and the body then reads c0+3, one column past intent; nb=8 passes the guard and
-# leaves four columns unfactored, surfacing later as a PosDefException far from the cause.
-#
-# It was exposed as a `@load_preference` while its own comment already said "proven-invariant Exempt" —
-# the marker said Literal/tune-candidate and contradicted the prose. A preference with exactly one legal
-# value is not a knob, it is a footgun: pinning chol_nb=3 silently corrupts every Cholesky in the
-# process. The preference is KEPT (removing it would break an existing LocalPreferences) but now fails
-# LOUDLY at load, naming itself, instead of corrupting results.
-# PDM: Exempt — structural: hand-unrolled 4-column register tile, not a tuning size. | tune: n/a — only 4 is correct
-const _CHOL_NB = @load_preference("chol_nb", 4)::Int   # trsm panel column block (register-tile width)
-_CHOL_NB == 4 || throw(ArgumentError(
-    "PureBLAS: preference `chol_nb` = $_CHOL_NB is not supported — the fused Cholesky base kernel is " *
-    "hand-unrolled for exactly 4 columns, and any other value silently produces a WRONG factorization " *
-    "(or a misleading PosDefException). Remove the `chol_nb` pin from LocalPreferences.toml."))
-@inline _fh_chol_nb() = _CHOL_NB   # NO force hook: structural, not tunable — a sweep must not corrupt it
+# The column width of the register tile in the fused Cholesky base kernels: the trsm panel solves
+# (`_trsm_right_lower_f64!`, `_trsm_rl_split_f64!`) and the syrk trailing updates (`_syrk_lower_f64!` and
+# its split twin) are each HAND-UNROLLED for exactly this many columns (d0..d3, l10..l32, accumulators
+# for columns c0..c0+3), with rank-update accumulators held in registers. This const is the loop step
+# and the full-tile guard of those kernels, so it describes their shape and cannot be changed on its
+# own: a different value does not run slower, it runs WRONG. Measured 2026-08-22 at n=256 on an
+# oracle-confirmed positive-definite input (same on Zen3 and Zen4), varying the step of one kernel:
+#     trsm step 1, 2, 8, 16, 32          -> PosDefException
+#     trsm step 3                        -> SILENTLY WRONG, rel err 1.0e-01, no exception
+#     syrk step 2, 3, 8, 16, 32, 64, 128 -> SILENTLY WRONG, rel err 9.0e-02 .. 2.4e-01, no exception
+#     syrk step 1                        -> PosDefException
+#     both 4                             -> rel err 1.5e-15
+# A step of 3 passes the guard and the body then reads column c0+3, one past intent; 8 passes the guard
+# and leaves four columns unfactored. A timing sweep that does not check the result reports those arms
+# as wins (1.12x-1.63x at syrk step 16..128) because they skip the work.
+# So it has no preference and no force hook. Four columns of accumulators fit the register file on
+# every ISA, and the small Cholesky base does not gain from a wider tile (same finding as `_chol_sth`).
+# PDM: Literal — the column count the fused Cholesky base kernels are hand-unrolled for; a structural invariant of that code. | tune: n/a — only 4 is correct
+const _CHOL_TILE = 4   # req8-ok: the unroll width of the hand-written kernels below, not a tuned size
 # Live vector count of the fused side-R leaf's top tier (`_trsm_rl_split_f64!` below): MR=3 row-tiers ×
-# _CHOL_NB column accumulators, plus the _CHOL_NB T-vectors and the diagonal/broadcast pair. Compared
+# _CHOL_TILE column accumulators, plus the _CHOL_TILE T-vectors and the diagonal/broadcast pair. Compared
 # against `_NVREG` this says whether that leaf SPILLS on this box — 3*4+4+2 = 18, over AVX2's 16 ymm and
 # under AVX-512's 32 zmm. `_trsm_right!` uses it to decide whether an lda conflict on A is worth a
 # de-aliasing copy: the conflict only outweighs the copy when A's columns are actually RE-READ, which
 # happens when the leaf spills (or when A does not fit L2). DERIVE (req#8) — a formula over detected
-# consts, not a µarch literal. Lives here, not in level3.jl, because `_CHOL_NB` is defined in this file
+# consts, not a µarch literal. Lives here, not in level3.jl, because `_CHOL_TILE` is defined in this file
 # and level3.jl is included FIRST (PureBLAS.jl:20-21), so a const there cannot see it.
-const _RL_MR_LIVE = 3 * _CHOL_NB + _CHOL_NB + 2
-# NOT TUNABLE — STRUCTURAL, and WORSE THAN chol_nb: every non-default value returns a silently wrong
-# factorization rather than throwing. Same hand-unrolled register tile, same guard-only use.
-#     chol_nc = 2, 3, 8, 16, 32, 64, 128 -> WRONG, rel err 9.0e-02 .. 2.4e-01, NO exception
-#     chol_nc = 1                        -> PosDefException
-#     chol_nc = 4                        -> rel err 1.2e-15
-# (measured 2026-08-22, n=256, oracle-confirmed PD input.)
-#
-# THIS IS ALSO WHY A PERF SWEEP MUST CHECK CORRECTNESS. bench/probes/knob_bulk_sweep.jl timed chol_nc at
-# 16/32/64/128 and reported 1.12x / 1.35x / 1.63x "wins" on Zen4. Those arms were not faster kernels —
-# they were the WRONG kernel, fast because it was not doing the work. `Measure.ab` takes a `check`
-# argument; not passing one is what let a corrupted arm be published as the campaign's biggest speedup.
-# PDM: Exempt — structural: hand-unrolled 4-column register tile, not a tuning size. | tune: n/a — only 4 is correct
-const _CHOL_NC = @load_preference("chol_nc", 4)::Int   # syrk column block (register-tile width)
-_CHOL_NC == 4 || throw(ArgumentError(
-    "PureBLAS: preference `chol_nc` = $_CHOL_NC is not supported — the fused Cholesky base kernel is " *
-    "hand-unrolled for exactly 4 columns, and any other value SILENTLY produces a wrong factorization. " *
-    "Remove the `chol_nc` pin from LocalPreferences.toml."))
-@inline _fh_chol_nc() = _CHOL_NC   # NO force hook: structural, not tunable — a sweep must not corrupt it
+const _RL_MR_LIVE = 3 * _CHOL_TILE + _CHOL_TILE + 2
 # Split the base k-reduction into 6 independent FMA chains (vs 3) — pays off only where the reduction is
 # latency-bound: Haswell-class Intel AVX2 (narrow OOO). Auto-on there, off on Zen/AVX-512 (their OOO hides
 # the chain — measured slight regression), overridable. See [[_INTEL_AVX2]] in cpuinfo.jl.
@@ -917,8 +889,8 @@ function _trsm_right_lower_f64!(p00::Ptr{T}, p10::Ptr{T}, bs::Int, m::Int, ld::I
     W = _vwidth(T); V = Vec{W, T}
     c0 = 1
     @inbounds while c0 <= bs
-        nb = min(_fh_chol_nb(), bs - c0 + 1)
-        if nb == _fh_chol_nb()
+        nb = min(_CHOL_TILE, bs - c0 + 1)
+        if nb == _CHOL_TILE
             d0 = inv(unsafe_load(p00, _clidx(c0, c0, ld)));         l10 = -unsafe_load(p00, _clidx(c0 + 1, c0, ld))
             d1 = inv(unsafe_load(p00, _clidx(c0 + 1, c0 + 1, ld))); l20 = -unsafe_load(p00, _clidx(c0 + 2, c0, ld)); l21 = -unsafe_load(p00, _clidx(c0 + 2, c0 + 1, ld))
             d2 = inv(unsafe_load(p00, _clidx(c0 + 2, c0 + 2, ld))); l30 = -unsafe_load(p00, _clidx(c0 + 3, c0, ld)); l31 = -unsafe_load(p00, _clidx(c0 + 3, c0 + 1, ld)); l32 = -unsafe_load(p00, _clidx(c0 + 3, c0 + 2, ld))
@@ -1020,7 +992,7 @@ function _trsm_right_lower_f64!(p00::Ptr{T}, p10::Ptr{T}, bs::Int, m::Int, ld::I
                 i += W
             end
         end
-        c0 += _fh_chol_nb()
+        c0 += _CHOL_TILE
     end
     return nothing
 end
@@ -1051,7 +1023,7 @@ end
 function _syrk_lower_f64!(p11::Ptr{T}, p10::Ptr{T}, m::Int, bs::Int, ld::Int) where {T}
     W = _vwidth(T); V = Vec{W, T}
     j = 1
-    @inbounds while j + _fh_chol_nc() - 1 <= m
+    @inbounds while j + _CHOL_TILE - 1 <= m
         i = ((j - 1) ÷ W) * W + 1                # W-aligned triangular start (skip upper blocks)
         while i + 3W - 1 <= m                          # MR=3 × NC=4 = 12 accumulators
             r1 = i + W; r2 = i + 2W
@@ -1129,7 +1101,7 @@ function _syrk_lower_f64!(p11::Ptr{T}, p10::Ptr{T}, m::Int, bs::Int, ld::Int) wh
             end
             vstore(a0, b0, msk); vstore(a1, b1, msk); vstore(a2, b2, msk); vstore(a3, b3, msk)
         end
-        j += _fh_chol_nc()
+        j += _CHOL_TILE
     end
     while j <= m
         _syrk_panel_f64!(p11, p10, j, m, bs, ld); j += 1
@@ -1275,7 +1247,7 @@ end
 #     Zen4  0 spill-stores /  0 reloads   trsmR n=128 vs AOCL 1.05
 #     Zen3 10 spill-stores / 21 reloads   trsmR n=128 vs AOCL 0.84
 # That correlation is seductive and WRONG as a lever. Gating the row-tiers to cut live values (the 10
-# invariants scale with `_CHOL_NB`, not MR, so each dropped tier only buys back NC registers) gives:
+# invariants scale with `_CHOL_TILE`, not MR, so each dropped tier only buys back NC registers) gives:
 #     MR=3  10/21 spills → trsmR 1.16/0.81 vs AOCL, 1.13/0.95 vs OB   ← ships
 #     MR=2   9/ 9 spills → trsmR 0.87/0.39 vs AOCL, 0.84/0.55 vs OB
 #     MR=1   3/ 2 spills → trsmR 0.87/0.40 vs AOCL, 0.88/0.56 vs OB
@@ -1291,8 +1263,8 @@ end
     W = _vwidth(T); V = Vec{W, T}
     c0 = 1
     @inbounds while c0 <= bs
-        nb = min(_fh_chol_nb(), bs - c0 + 1)
-        if nb == _fh_chol_nb()
+        nb = min(_CHOL_TILE, bs - c0 + 1)
+        if nb == _CHOL_TILE
             # FUSED: downdate (vs solved cols in T) + within-panel 4×4 solve in ONE register pass, store to T
             # once (kills the store/re-load round-trip of the old two-pass split kernel). +11–25% at the panel
             # shape (Zen3, bs=128). Coeffs from the diag factor p00; @simd ivdep kept on the downdate k-loop.
@@ -1400,7 +1372,7 @@ end
                 i += W
             end
         end
-        c0 += _fh_chol_nb()
+        c0 += _CHOL_TILE
     end
     return nothing
 end
@@ -1436,7 +1408,7 @@ end
     ) where {T}
     W = _vwidth(T); V = Vec{W, T}
     j = 1
-    @inbounds while j + _fh_chol_nc() - 1 <= m
+    @inbounds while j + _CHOL_TILE - 1 <= m
         i = ((j - 1) ÷ W) * W + 1
         while i + 3W - 1 <= m                          # MR=3 × NC=4 = 12 accumulators
             r1 = i + W; r2 = i + 2W
@@ -1514,7 +1486,7 @@ end
             end
             vstore(a0, b0, msk); vstore(a1, b1, msk); vstore(a2, b2, msk); vstore(a3, b3, msk)
         end
-        j += _fh_chol_nc()
+        j += _CHOL_TILE
     end
     while j <= m
         _syrk_panel_split_f64!(p11, ld1, pT, ldt, j, m, bs); j += 1
