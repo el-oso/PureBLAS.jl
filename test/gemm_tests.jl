@@ -1115,7 +1115,7 @@ end
 
 # What the pool measures when it is created. The cut that finds cache groups is checked on readings
 # stated by hand, because a host with one group never produces a split; the rest is that a created
-# pool has a poll count and a floor at all.
+# pool has a polling span and a floor at all.
 @testitem "threaded pool: host measurement" tags = [:checks] begin
     using PureBLAS
     using Base.Threads: nthreads
@@ -1140,7 +1140,7 @@ end
     else
         P.set_num_threads(nthreads())
         try
-            @test P._MT_POLLS[] >= 1 && P._MT_POLLS_HOME[] >= 1
+            @test P._MT_POLL_NS[] >= 1 && P._MT_POLL_NS_HOME[] >= 1
             @test 0 < P._gemm_mt_work() < typemax(Int)
             if isnothing(P._GEMM_MT_WORK_PREF)
                 h = P._MT_HOST

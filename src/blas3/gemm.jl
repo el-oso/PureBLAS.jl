@@ -4828,9 +4828,11 @@ end
     # across arrivals is the imbalance of one elementwise pass, not of a product.
     while (@atomic p.bar) < target
         (@atomic p.failed) && return false
-        for _ in 1:_mt_polls()
+        span = _mt_poll_span(); t0 = time_ns()
+        while true
             (@atomic p.bar) >= target && return true
             Base.Threads.atomic_fence()
+            time_ns() - t0 >= span && break
         end
         GC.safepoint(); Base.yield()
     end
@@ -5291,57 +5293,41 @@ end
 # the previous chunk. So the worker waits in a loop around the GENERATION, treats a wake as "look
 # again" rather than "there is work", and the driver notifies unconditionally, so no wake can be lost.
 #
-# HOW MANY TIMES A WAITER POLLS BEFORE IT YIELDS. Every wait in the pool — an idle worker's, the
+# HOW LONG A WAITER POLLS BEFORE IT YIELDS. Every wait in the pool — an idle worker's, the
 # driver's join, a barrier — polls an atomic word in a fenced loop and yields the Julia thread between
-# blocks of polls, so that a task queued on that thread is not held up. A poll sees a change within
-# nanoseconds; a yield is blind for as long as it takes. The block is sized so that the blind time is
-# at most 1/`_MT_AMORTISE` of the polling time, the share of fixed overhead the amortisation floor
-# already allows: the count is the number of polls that take as long as `_MT_AMORTISE` yields, both
-# timed on the host when the pool is created (`_mt_poll_count`).
+# spans of polling, so that a task queued on that thread is not held up. A poll sees a change within
+# nanoseconds; a yield is blind for as long as it takes. The span is `_MT_AMORTISE` yields long, so
+# that the blind time is at most 1/`_MT_AMORTISE` of the polling time, the share of fixed overhead
+# the amortisation floor already allows. The yield is timed on the host when the pool is created
+# (`_mt_yield_ns`).
 #
-# TWO COUNTS, BECAUSE A YIELD DOES NOT COST THE SAME ON EVERY THREAD. The thread that runs Julia's
-# event loop pays for waking that loop on every yield; the others do not. Measured on Zen4, one
-# yield with nothing else to run: 660 ns on the main thread, 70 ns on a task bound to another
-# thread. The pool is usually created from the main thread, so `_MT_POLLS_HOME` is timed on the
-# creating thread and serves a waiter on that thread, and `_MT_POLLS` is timed on a worker's thread
-# and serves every other. Both are zero until the pool has been measured; its workers yield
-# between single looks until then.
-const _MT_POLLS = Threads.Atomic{Int}(0)
-const _MT_POLLS_HOME = Threads.Atomic{Int}(0)
-@inline _mt_polls() = Threads.threadid() == _MT_HOME[] ? _MT_POLLS_HOME[] : _MT_POLLS[]
+# THE SPAN IS HELD BY THE CLOCK, NOT BY A COUNT OF POLLS. A count needs the cost of one poll, and
+# that cost is not a constant of the host: on Apple silicon the same loop reads 0.58 ns a poll in
+# one call and 9.7 ns in another, so a count sized on one made the blind share seventeen times too
+# small or too large in the other. A waiter therefore reads the clock after every poll, which
+# costs it about 20 ns between two looks at the word.
+#
+# TWO SPANS, BECAUSE A YIELD DOES NOT COST THE SAME ON EVERY THREAD. The thread that runs Julia's
+# event loop pays for waking that loop on every yield; the others do not. One yield with nothing
+# else to run, timed directly: 640 ns on the main thread and 70 ns on a task bound to another
+# thread on Zen4, 10 µs and 36 ns on Apple silicon. The pool is usually created from the main
+# thread, so `_MT_POLL_NS_HOME` is taken on the creating thread and serves a waiter on that thread,
+# and `_MT_POLL_NS` is taken on a worker's thread and serves every other. Both are zero until the
+# pool has been measured; its workers yield between single looks until then.
+const _MT_POLL_NS = Threads.Atomic{UInt64}(0)
+const _MT_POLL_NS_HOME = Threads.Atomic{UInt64}(0)
+@inline _mt_poll_span() = Threads.threadid() == _MT_HOME[] ? _MT_POLL_NS_HOME[] : _MT_POLL_NS[]
 
-# `n` polls of a generation word that does not change, in ns.
-function _mt_poll_ns(p::GemmPool, n::Int)
-    seen = @atomic p.gen
-    t0 = time_ns()
-    for _ in 1:n
-        (@atomic p.gen) != seen && break
-        Base.Threads.atomic_fence()
-    end
-    return Float64(time_ns() - t0)
-end
-
-# The number of polls that take as long as `_MT_AMORTISE` yields on the calling thread. The poll
-# block is doubled until it is at least that long and long against the clock (`_mt_batch` gives the
-# same margin). Both times are medians of settled medians: the first yields of a thread cost
-# several times what later ones do (Zen4: the count came out 3.7 times too high from one settled
-# run of readings), and one run can be made of those alone.
-function _mt_poll_count(p::GemmPool, step::Int, deadline::UInt64)
-    yields = function ()
-        for _ in 1:_MT_AMORTISE
-            yield()
-        end
+# One `yield()` on the calling thread with nothing else to run, in ns. A median of settled medians:
+# the first yields of a thread cost several times what later ones do, and one settled run of
+# readings can be made of those alone.
+function _mt_yield_ns(step::Int, deadline::UInt64)
+    one = function ()
+        yield()
         return nothing
     end
-    b = _mt_batch(yields, step, deadline)
-    ty = _mt_settled(() -> _mt_settled(() -> _mt_time(yields, b), deadline), deadline)
-    n = 1
-    while _mt_poll_ns(p, n) < max(ty, _MT_AMORTISE^2 * step)
-        n *= 2
-    end
-    block = n
-    tp = _mt_settled(() -> _mt_settled(() -> _mt_poll_ns(p, block), deadline), deadline)
-    return max(1, unsafe_trunc(Int, block * ty / tp + 0.5))
+    b = _mt_batch(one, step, deadline)
+    return _mt_settled(() -> _mt_settled(() -> _mt_time(one, b), deadline), deadline)
 end
 
 # KEEP THE CORE AWAKE, NOT JUST THE THREAD. A worker that sleeps on its event leaves its core idle, and
@@ -5361,7 +5347,7 @@ end
 # its OpenMP runtime keeps threads spinning for a long time between calls.
 #
 # So an idle worker keeps polling, and so keeps its core busy, until a deadline measured from when it
-# went idle, and only then sleeps. It YIELDS between blocks of polls: a spin that never yields holds
+# went idle, and only then sleeps. It YIELDS between spans of polling: a spin that never yields holds
 # the Julia thread, and an unrelated `Threads.@threads` job issued right after a BLAS call then waited
 # the WHOLE window (+10 ms at a 10 ms window, measured on Zen4). Yielding keeps the core just as awake
 # — with nothing else runnable `yield` returns at once — and hands the thread over the moment another
@@ -5406,16 +5392,19 @@ function _gemm_pool_worker(p::GemmPool, i::Int)
                 continue
             end
             found = false
-            for _ in 1:_MT_POLLS[]
+            span = _MT_POLL_NS[]; t0 = time_ns(); t = t0
+            while true
                 if (@atomic p.gen) != seen
                     found = true
                     break
                 end
                 Base.Threads.atomic_fence()
+                t = time_ns()
+                t - t0 >= span && break
             end
             found && break
             # Inside the keep-awake window the worker yields and polls again; past it, it sleeps.
-            if time_ns() - idle0 < _mt_keepawake_ns()
+            if t - idle0 < _mt_keepawake_ns()
                 yield()
             else
                 wait(p.evs[i])
@@ -5649,13 +5638,12 @@ struct AffinityJob
     w::Int
 end
 (j::AffinityJob)() = (j.cnt[j.w] = _mt_affinity_count(); nothing)
-struct PollJob{T}
-    out::Threads.Atomic{Int}             # 0 until the count is in
-    p::GemmPool{T}
+struct YieldJob
+    out::Threads.Atomic{UInt64}          # 0 until the time is in
     step::Int
     deadline::UInt64
 end
-(j::PollJob)() = (j.out[] = _mt_poll_count(j.p, j.step, j.deadline); nothing)
+(j::YieldJob)() = (j.out[] = max(1, unsafe_trunc(UInt64, _mt_yield_ns(j.step, j.deadline))); nothing)
 
 # How many CPUs the calling thread may run on, or 0 when the operating system does not say. libuv
 # answers on Linux, FreeBSD and Windows and reports "not supported" on macOS, which has no thread
@@ -5868,26 +5856,26 @@ function _mt_join_cost(step::Int, deadline::UInt64)
     return _mt_settled(() -> _mt_settled(reading, deadline), deadline)
 end
 
-# Measure the poll counts and what the amortisation floor is built from. Called once, under
+# Measure the polling spans and what the amortisation floor is built from. Called once, under
 # `_MT_SETUP_LOCK`, after the pools exist and before a thread count above one is published: the
 # workers are all asleep, so a worker's thread is free to time its own yields. The creating thread
-# polls for that count instead of blocking on the task, so that it is doing what a driver does
-# while a worker idles: running, not asleep. A worker polls for a job only while it is inside the published count, so that
-# count is raised to two for the join readings: one worker polls and the rest sleep. `_MT_FLOOR`
-# still refuses every Level-3 call meanwhile, and a byte-floored call that takes the pool is seen
-# through `_MT_LOST`. A pinned floor is not measured.
+# polls for that time instead of blocking on the task, so that it is doing what a driver does
+# while a worker idles: running, not asleep. A worker polls for a job only while it is inside the
+# published count, so that count is raised to two for the join readings: one worker polls and the
+# rest sleep. `_MT_FLOOR` still refuses every Level-3 call meanwhile, and a byte-floored call that
+# takes the pool is seen through `_MT_LOST`. A pinned floor is not measured.
 function _mt_measure_host!(deadline::UInt64)
     h = _MT_HOST
     step = _mt_clock_step()
     p = _gemm_pool(Float64)
-    _MT_POLLS_HOME[] = _mt_poll_count(p, step, deadline)
-    polls = Threads.Atomic{Int}(0)
-    _mt_on_thread(PollJob(polls, p, step, deadline), maximum(_MT_TIDS))
-    while iszero(polls[])
+    _MT_POLL_NS_HOME[] = unsafe_trunc(UInt64, _MT_AMORTISE * _mt_yield_ns(step, deadline))
+    there = Threads.Atomic{UInt64}(0)
+    _mt_on_thread(YieldJob(there, step, deadline), maximum(_MT_TIDS))
+    while iszero(there[])
         Base.Threads.atomic_fence()
         GC.safepoint()
     end
-    _MT_POLLS[] = polls[]
+    _MT_POLL_NS[] = _MT_AMORTISE * there[]
     @static if isnothing(_GEMM_MT_WORK_PREF)
         h.flops_per_ns = _mt_flop_rate(step, deadline)
         _MT_NTHREADS[] = 2
@@ -6404,14 +6392,15 @@ end
             # trade as the worker loop. It has nothing else to do — it is inside a blocking BLAS call —
             # so spinning costs the host nothing it was going to get back. And `wait` on an event can
             # allocate, which `gemm!` may not do (req#10, and test/strictmode_tests.jl's static proof).
-            # The yield after a block of polls is NOT optional: a driver can run on the thread a sticky
+            # The yield after a span of polling is NOT optional: a driver can run on the thread a sticky
             # worker is bound to (any task that is not the pool's creator may), and a bare spin here then
             # waits on a worker that can never be scheduled — a deadlock, once seen at 399% CPU. With
             # `skip` that worker only bumps `done`, and it still needs this thread to do it.
             while (@atomic p.done) < nwk
-                for _ in 1:_mt_polls()
-                    (@atomic p.done) >= nwk && break
+                span = _mt_poll_span(); t0 = time_ns()
+                while (@atomic p.done) < nwk
                     Base.Threads.atomic_fence()
+                    time_ns() - t0 >= span && break
                 end
                 (@atomic p.done) < nwk && yield()
             end

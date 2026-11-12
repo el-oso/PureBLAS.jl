@@ -136,7 +136,7 @@ end
 precompile(set_num_threads, (Int,))
 precompile(Tuple{XferJob})
 precompile(Tuple{AffinityJob})
-precompile(Tuple{PollJob{Float64}})
+precompile(Tuple{YieldJob})
 for T in (Float64, Float32, ComplexF64, ComplexF32)
     precompile(Tuple{PoolWorkerJob{T}})
 end
