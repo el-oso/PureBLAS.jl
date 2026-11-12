@@ -259,6 +259,44 @@ const _SME_LANES = @load_preference(
     end
 )::Int
 
+# CORES OUTSIDE THE SLOWEST PERFORMANCE LEVEL, 0 when there is only one level or this is not Darwin.
+# Darwin numbers its levels fastest first, so the slowest is `hw.perflevel<nperflevels-1>`; on an M6
+# the levels read "Super" 2, "Performance" 4, "Efficiency" 6, and this is 6. `set_num_threads` caps
+# the pool at it.
+#
+# A threaded job is split into equal chunks and the join waits for the slowest, so a chunk that lands
+# on an Efficiency core sets the time of the whole job, and macOS cannot pin a thread to keep it off
+# one. Measured on that M6: inside threaded getrf at 12 workers the larger trailing updates split six
+# fast chunks against six about 3x slower, the slow six on different threads from one update to the
+# next; at 6 workers no chunk ran above 3x its update's median. Whole calls, 6 workers against 12:
+#   potrf 2.2-2.75x, getrf 1.8-2.3x, nrm2 1.5-3.75x, blascopy! 1.9-2.7x faster (n = 512..2048)
+#   trsm 1.9-2.2x faster to n = 1024, equal at 2048
+#   ComplexF64 gemm 0.92x at n = 1024, 0.85x at 2048 — the one pooled kernel the cap slows
+#
+# `hw.perflevelN.physicalcpu` is a 32-bit integer, read into a 32-bit buffer. A missing key fails the
+# call and reads as 0, so an OS without these keys gets no cap rather than a wrong one.
+# Trim-safe for the same reason as `_sysctl_probe`: precompile time, folded into the const.
+function _sysctl_i32(name::String)
+    Sys.isapple() || return 0
+    return try
+        out = Ref{Int32}(0)
+        sz = Ref{Csize_t}(sizeof(Int32))
+        rc = ccall(:sysctlbyname, Cint, (Cstring, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
+                   name, out, sz, C_NULL, 0)
+        (rc == 0 && sz[] == sizeof(Int32)) ? Int(out[]) : 0
+    catch
+        0
+    end
+end
+# PDM: Exempt — the detected core count itself (`hw.perflevelN.physicalcpu`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+const _FAST_CORES = @load_preference(
+    "fast_cores",
+    let n = _sysctl_i32("hw.nperflevels")
+        n > 1 ? sum(l -> _sysctl_i32("hw.perflevel$l.physicalcpu"), 0:(n - 2)) : 0
+    end
+)::Int
+
+
 # `_SME_F32` gates the Float32 gemm path. It differs from `_SME_F64` in two ways, both of which
 # were established by executing the instruction rather than by reading the feature table:
 #
