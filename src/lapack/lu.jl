@@ -565,6 +565,174 @@ function _getrf_lookahead!(A, ipiv, m::Int, n::Int, k::Int, pc::Int, pb::Int, jt
     return _gemm_pool(T).lainfo
 end
 
+# ── ONE PANEL STEP AS ONE JOB, SPLIT BY CACHE GROUP ──────────────────────────────────────────────
+# With workers in more than one cache group (`_MT_G0`, gemm.jl) the job-by-job step in
+# `_getrf_core!` loses time to data crossing between groups: every job in it — swaps (`_laswp_mt!`),
+# solve (`trsm!`), narrow update and look-ahead (`_getrf_lookahead!`) — re-deals the
+# trailing columns over all workers, the packed panel is shared by all of them, and each join waits
+# for the slowest reader. Measured on Zen3, six workers, n=1024: 4.02 ms inside one group, 5.17 ms
+# split three and three.
+#
+# Here the step is a single job and a column band belongs to one worker for all of it: that worker
+# swaps the band's rows, solves its part of U12 and applies the update to it, packing the panel for
+# itself. The bands are laid out by group. The driver's group ("local") takes the next panel's
+# columns and the columns after them; the other workers ("remote") take the rightmost columns and
+# touch nothing else. So the next panel is updated, factored and read back inside one group, a
+# trailing column changes group at most once in the whole factorization (when the local share
+# reaches it), and the only data a step sends across is the current panel, read once by each remote
+# worker.
+#
+#   columns of the trailing block:  | next panel (pb2) |   local wide (Lw)   |  remote (R)  |
+#   local workers, first:             all, in sub-bands
+#   then, after meeting:              worker 1 factors    1: first c1 | rest     —
+#   remote workers:                         —                  —             own band, start to end
+#
+# THE ARITHMETIC IS THE SERIAL STEP'S. Swaps move data. Every column of the solve is independent and
+# routes from the whole trailing width (`_trsm_left!`'s `nroute`), which is what `trsm!` does when
+# `_trsm_plain_L` holds. Every column's update is one rank-`pb` product routed from the whole width,
+# as both halves of `_getrf_lookahead!` are. Band boundaries are whole `_NR` blocks from the block's
+# first column, so no column changes kernel. The next panel is factored after every local worker has
+# finished its columns, the precondition the look-ahead has always had.
+#
+# MEASURED on Zen3, clock locked, threads pinned one per core, ms, job-by-job step -> this one:
+#   3 + 3 workers       n=512 1.131 -> 0.951   1024 5.160 -> 4.653   1000 4.578 -> 3.997   2048 29.16 -> 26.95
+#   5 + 1 workers       n=512 1.075 -> 0.869   1024 5.070 -> 4.321   1000 4.459 -> 3.827   2048 29.93 -> 27.36
+#   6 + 6 workers       n=512 1.003 -> 0.815   1024 4.090 -> 3.543   1000 3.544 -> 2.939   2048 19.92 -> 17.62
+#   6 in one group      n=512 0.808            1024 4.021            1000 3.560            2048 27.78
+# The form itself costs nothing: forced onto six workers that share one group it reads 0.786 / 4.108 /
+# 3.617 / 27.16 against the last row.
+#
+# The deferred left swaps at the end of `_getrf_core!` stay spread over every worker: keeping them
+# in the local group, whose data they move, measured slower (3 + 3, n=1024: 5.045 against 4.692).
+struct LuStep{T}
+    a::Ptr{T}        # A[1, 1]
+    ld::Int
+    m::Int           # rows of A
+    n::Int           # columns of A
+    pb::Int          # current panel width
+    jt0::Int         # first trailing column
+    pb2::Int         # next panel width
+    ipiv::Ptr{Int}
+    g0::Int          # participants in the driver's group, the driver included
+end
+# The step as the pool job carries it: `C` is the whole of A, `lup` is the next panel as the
+# look-ahead job describes it, with the local participant count in the slot that job uses for the
+# panel's row count (which is `m - jt0 + 1` here and needs no slot).
+@inline _lustep(C::PtrMatrix{T}, pb::Int, lup::LuPanel{T}) where {T} =
+    LuStep{T}(C.ptr, C.ld, C.m, C.n, pb, lup.roff + 1, lup.nb, lup.ipiv, lup.m)
+@inline _lustep(p::GemmPool{T}) where {T} =
+    LuStep{T}(p.Cp, p.ldc, p.m, p.n, p.k, p.laroff + 1, p.lanb, p.laipiv, p.lam)
+
+# Swap, solve and update trailing columns `j0+1 : j0+len` (counted from `jt0`).
+@inline function _lustep_band!(s::LuStep{T}, j0::Int, len::Int) where {T}
+    len > 0 || return nothing
+    sz = sizeof(T); pc = s.jt0 - s.pb
+    wid = s.n - s.jt0 + 1
+    col = s.a + (s.jt0 - 1 + j0) * s.ld * sz
+    _laswp!(PtrMatrix{T}(col, s.m, len, s.ld), PtrVector{Int}(s.ipiv, s.jt0 - 1), pc, s.jt0 - 1, 1, len)
+    pan = s.a + (pc - 1) * s.ld * sz
+    U = PtrMatrix{T}(col + (pc - 1) * sz, s.pb, len, s.ld)
+    _trsm_left!(false, false, false, true, PtrMatrix{T}(pan + (pc - 1) * sz, s.pb, s.pb, s.ld), U, wid)
+    mt = s.m - s.jt0 + 1
+    mt > 0 || return nothing
+    # A private pack of the panel (`nw = 1`): a shared one would be written by one group and read
+    # by the other.
+    # ponytail: every worker of a group reads the whole panel for its own pack. A pack shared
+    # within each group would read it once per group; it needs a barrier counter and a shared
+    # buffer per group, which the pool has one of each.
+    _gemm_core!(
+        PtrMatrix{T}(col + (s.jt0 - 1) * sz, mt, len, s.ld),
+        PtrMatrix{T}(pan + (s.jt0 - 1) * sz, mt, s.pb, s.ld), U,
+        -one(T), one(T), false, false, false, false, (-1, wid, -1), false, 1, 1
+    )
+    return nothing
+end
+
+@inline function _lustep_panel!(s::LuStep{T}) where {T}
+    mt = s.m - s.jt0 + 1
+    Pn = PtrMatrix{T}(s.a + (s.jt0 - 1 + (s.jt0 - 1) * s.ld) * sizeof(T), mt, s.pb2, s.ld)
+    return _getf2!(Pn, mt, s.pb2, s.jt0 - 1, PtrVector{Int}(s.ipiv, s.jt0 - 1 + s.pb2), s.jt0 - 1)
+end
+
+# The whole step on one thread, in the serial order; returns the next panel's `info`.
+function _lustep_serial!(s::LuStep{T}) where {T}
+    _lustep_band!(s, 0, s.pb2)
+    info = _lustep_panel!(s)
+    _lustep_band!(s, s.pb2, s.n - s.jt0 + 1 - s.pb2)
+    return info
+end
+
+# The local group's wide columns `Lw` for a step of trailing width `wid`, or -1 when the remote
+# workers would not get a whole `_NR` block each.
+#
+# PDM: DERIVE — flop weights, no literal, the same accounting as `_luahead_split`: an update column
+# is one unit and the panel `pb2/2` of them, so the step is `wid + pb2/2` units and a worker's share
+# a `1/nw` of that. The local group owes the next panel's columns (`pb2`), the panel, and `Lw`; `Lw`
+# is what brings it to `g0` shares, snapped down to whole `_NR` blocks and never below zero.
+#
+# At zero the local group is over its share — worker 1's sub-band of the next panel's columns plus
+# the panel is the step's longest path — and the step is grouped all the same. Declining those steps
+# for the ungrouped form, which spreads the next panel's columns over every worker, was measured
+# and is slower (Zen3, three workers in each of two groups, ms): n=512 1.028 against 0.956, n=1024
+# 4.862 against 4.676, n=1000 4.137 against 3.977.
+@inline function _lustep_local(wid::Int, pb2::Int, nw::Int, g0::Int)
+    Lw = max(0, (((g0 * (2 * wid + pb2)) ÷ (2 * nw) - (3 * pb2) ÷ 2) ÷ _NR) * _NR)
+    return wid - pb2 - Lw >= (nw - g0) * _NR ? Lw : -1
+end
+
+# Chunks `1 : g0-1` and the driver's chunk `nw` are the local group; `g0 : nw-1` are remote — the
+# order `_MT_TIDS` gives the pool's workers.
+@noinline function _lustep_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    s = _lustep(p)
+    g0 = s.g0; pb2 = s.pb2
+    wid = s.n - s.jt0 + 1
+    Lw = _lustep_local(wid, pb2, nw, g0)
+    if g0 <= i < nw
+        j0, len = _gemm_chunk(wid - pb2 - Lw, nw - g0, i - g0 + 1)
+        _lustep_band!(s, pb2 + Lw + j0, len)
+        return nothing
+    end
+    li = i == nw ? g0 : i
+    j0, len = _gemm_chunk(pb2, g0, li)
+    _lustep_band!(s, j0, len)
+    _pool_barrier(p, g0) || return nothing
+    c1 = _luahead_split(Lw, pb2, g0)
+    if li == 1
+        p.lainfo = _lustep_panel!(s)
+        _lustep_band!(s, pb2, c1)
+    else
+        j0, len = _gemm_chunk(Lw - c1, g0 - 1, li - 1)
+        _lustep_band!(s, pb2 + c1 + j0, len)
+    end
+    return nothing
+end
+
+# Run the step that follows panel `pc` as one grouped job. Returns the next panel's `info`, or `-2`
+# when the step is not eligible and the caller must run it job by job.
+function _lustep_try!(A, ipiv, m::Int, n::Int, k::Int, pc::Int, pb::Int, jt0::Int, nb::Int)
+    T = eltype(A)
+    g0 = _MT_G0[]
+    (T <: BlasReal && _MT_NTHREADS[] > g0 && pc + pb <= m && jt0 <= k) || return -2
+    wid = n - jt0 + 1
+    pb2 = _lu_pb(k - jt0 + 1, nb, T)
+    (wid > pb2 && iszero(pb2 % _NR) && jt0 + pb2 <= n) || return -2
+    (_strided1(A) && _lu_ipiv_ok(ipiv) && _trsm_plain_L(pb, wid, T)) || return -2
+    # The worker count the look-ahead's wide half would use, so the two forms engage together.
+    nw = _gemm_workers(m - pc - pb + 1, wid - pb2, pb)
+    (nw > g0 && _lustep_local(wid, pb2, nw, g0) >= 0) || return -2
+    # `g0` and the chunk roles are true for a driver on the pool creator's thread only.
+    Threads.threadid() == _MT_HOME[] || return -2
+    r = _root(A)
+    info = GC.@preserve r ipiv begin
+        C = _pm(A)
+        lup = LuPanel{T}(Ptr{T}(0), 1, g0, pb2, pointer(ipiv), jt0 - 1, jt0 - 1, wid)
+        Threads.atomic_add!(_MT_LUSTEPS, 1)
+        _gemm_threaded!(C, PtrMatrix{T}(C.ptr, C.m, pb, C.ld), C, -one(T), one(T),
+            false, false, false, false, nw, _MT_KIND_LUSTEP, false, false, false, lup)
+    end
+    return Int(info)
+end
+
 function _getrf_core!(A, ipiv, nb::Int)
     m, n = size(A); k = min(m, n)
     nb = clamp(nb, 1, k)
@@ -581,7 +749,11 @@ function _getrf_core!(A, ipiv, nb::Int)
         ahead = -1
         (info == 0 && pinfo != 0) && (info = pinfo)
         jt0 = pc + pb
-        if jt0 <= n
+        # The whole step as one job when the workers span cache groups; `-2` when it does not apply.
+        grouped = jt0 <= n ? _lustep_try!(A, ipiv, m, n, k, pc, pb, jt0, nb) : -2
+        if grouped != -2
+            ahead = grouped
+        elseif jt0 <= n
             _laswp_mt!(A, ipiv, pc, pc + pb - 1, jt0, n)             # swap trailing columns (needed now)
             trsm!(
                 view(A, pc:(pc + pb - 1), jt0:n), view(A, pc:(pc + pb - 1), pc:(pc + pb - 1));
