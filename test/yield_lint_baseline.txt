@@ -283,3 +283,10 @@ blas3/sme_kernel.jl:println(io, "  %$(nm)e$k = extractvalue $T4 %$v, $k")
 blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %$(nm)e0, <vscale x 2 x double> %$(nm)e1,")
 blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %$(nm)e2, <vscale x 2 x double> %$(nm)e3)")
 blas3/gemm.jl:yield()
+
+# --- 2026-11-12, the cache-group measurement (`_mt_group_order!`). It runs once, from
+#              `set_num_threads`, under `_MT_SETUP_LOCK` and before the first pool exists: the same
+#              cold construction path as the `lock` entry above, never reached from a kernel and
+#              holding no `@scope`. The `wait` is the creating thread waiting for a short task it
+#              bound to one worker thread to time two buffer reads there.
+blas3/gemm.jl:wait(_mt_on_thread(() -> (ratio[] = _mt_xfer_ratio(shared, own, r)[1]; nothing), tid))
