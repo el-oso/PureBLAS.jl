@@ -4015,9 +4015,10 @@ end
 #     the most. Measured against the floor this one gives, six participants, µs per call: Zen4
 #     gemm n=48 4.28 against 1.64 and trsm (side L) n=64 16.9 against 5.28; Zen3 gemm n=48 4.17
 #     against 1.55, and at twelve participants gemm n=72 13.8 against 3.4.
-#   * the flop rate: what one core retires in a serial `gemm!` whose operands sit in its L2. Measured
-#     rather than computed from an FMA-pipe count and a clock, because Julia reports neither the clock
-#     a host runs at nor how many FMA pipes a core has.
+#   * the flop rate: what one core retires in the unpacked SIMD product, the kernel a pooled chunk
+#     near the floor runs, on operands that fill its L1. Measured rather than computed from an
+#     FMA-pipe count and a clock, because Julia reports neither the clock a host runs at nor how
+#     many FMA pipes a core has.
 # The product is in flops and holds no unit of time, so the clock the host happens to run at cancels.
 #
 # NOTHING IS MEASURED WHEN THE PACKAGE IS PRECOMPILED: a precompile process has one thread, so it has
@@ -4077,7 +4078,7 @@ const _MT_AMORTISE = 8   # req8-ok: overhead policy (target ~2x at six workers),
 mutable struct MTHost
     measured::Bool
     join_ns::Float64         # fork-join round trip of an empty job: the driver and one worker
-    flops_per_ns::Float64    # one core, serial `gemm!`, operands resident in L2
+    flops_per_ns::Float64    # one core, the unpacked SIMD product, operands resident in L1
 end
 const _MT_HOST = MTHost(false, NaN, NaN)
 
@@ -4827,7 +4828,7 @@ end
     # across arrivals is the imbalance of one elementwise pass, not of a product.
     while (@atomic p.bar) < target
         (@atomic p.failed) && return false
-        for _ in 1:_MT_POLLS[]
+        for _ in 1:_mt_polls()
             (@atomic p.bar) >= target && return true
             Base.Threads.atomic_fence()
         end
@@ -5295,10 +5296,19 @@ end
 # blocks of polls, so that a task queued on that thread is not held up. A poll sees a change within
 # nanoseconds; a yield is blind for as long as it takes. The block is sized so that the blind time is
 # at most 1/`_MT_AMORTISE` of the polling time, the share of fixed overhead the amortisation floor
-# already allows: `_MT_POLLS` is the number of polls that take as long as `_MT_AMORTISE` yields, both
-# timed on the host when the pool is created (`_mt_poll_count`). Zero until then; the workers of a
-# pool that has not been measured yet yield between single looks.
+# already allows: the count is the number of polls that take as long as `_MT_AMORTISE` yields, both
+# timed on the host when the pool is created (`_mt_poll_count`).
+#
+# TWO COUNTS, BECAUSE A YIELD DOES NOT COST THE SAME ON EVERY THREAD. The thread that runs Julia's
+# event loop pays for waking that loop on every yield; the others do not. Measured on Zen4, one
+# yield with nothing else to run: 660 ns on the main thread, 70 ns on a task bound to another
+# thread. The pool is usually created from the main thread, so `_MT_POLLS_HOME` is timed on the
+# creating thread and serves a waiter on that thread, and `_MT_POLLS` is timed on a worker's thread
+# and serves every other. Both are zero until the pool has been measured; its workers yield
+# between single looks until then.
 const _MT_POLLS = Threads.Atomic{Int}(0)
+const _MT_POLLS_HOME = Threads.Atomic{Int}(0)
+@inline _mt_polls() = Threads.threadid() == _MT_HOME[] ? _MT_POLLS_HOME[] : _MT_POLLS[]
 
 # `n` polls of a generation word that does not change, in ns.
 function _mt_poll_ns(p::GemmPool, n::Int)
@@ -5311,24 +5321,25 @@ function _mt_poll_ns(p::GemmPool, n::Int)
     return Float64(time_ns() - t0)
 end
 
-# The number of polls that take as long as `_MT_AMORTISE` yields. The poll block is doubled until it
-# is at least that long, so the block that decides is long against the clock's resolution.
-function _mt_poll_count(p::GemmPool)
-    ty = _mt_settled() do
-        t0 = time_ns()
+# The number of polls that take as long as `_MT_AMORTISE` yields on the calling thread. The poll
+# block is doubled until it is at least that long and long against the clock (`_mt_batch` gives the
+# same margin), and only that last block is read more than once.
+function _mt_poll_count(p::GemmPool, step::Int, deadline::UInt64)
+    yields = function ()
         for _ in 1:_MT_AMORTISE
             yield()
         end
-        Float64(time_ns() - t0)
+        return nothing
     end
+    b = _mt_batch(yields, step)
+    ty = _mt_settled(() -> _mt_time(yields, b), deadline)
     n = 1
-    while true
-        tp = let n = n                       # a fresh binding: the closure must not capture the loop's own
-            _mt_settled(() -> _mt_poll_ns(p, n))
-        end
-        tp >= ty && return max(1, unsafe_trunc(Int, n * ty / tp + 0.5))
+    while _mt_poll_ns(p, n) < max(ty, _MT_AMORTISE^2 * step)
         n *= 2
     end
+    block = n
+    tp = _mt_settled(() -> _mt_poll_ns(p, block), deadline)
+    return max(1, unsafe_trunc(Int, block * ty / tp + 0.5))
 end
 
 # KEEP THE CORE AWAKE, NOT JUST THE THREAD. A worker that sleeps on its event leaves its core idle, and
@@ -5636,6 +5647,13 @@ struct AffinityJob
     w::Int
 end
 (j::AffinityJob)() = (j.cnt[j.w] = _mt_affinity_count(); nothing)
+struct PollJob{T}
+    out::Base.RefValue{Int}
+    p::GemmPool{T}
+    step::Int
+    deadline::UInt64
+end
+(j::PollJob)() = (j.out[] = _mt_poll_count(j.p, j.step, j.deadline); nothing)
 
 # How many CPUs the calling thread may run on, or 0 when the operating system does not say. libuv
 # answers on Linux, FreeBSD and Windows and reports "not supported" on macOS, which has no thread
@@ -5687,8 +5705,9 @@ end
 # Every round gives each worker one more reading. The first cut is taken once a worker has three,
 # the fewest whose median a single reading taken across an interrupt cannot move, and the answer is
 # accepted at the first round that repeats the one before it — the point where another round has
-# stopped changing the outcome. No round count is fixed.
-function _mt_group_split(tids::Vector{Int}, shared::Vector{UInt64})
+# stopped changing the outcome. No round count is fixed; a measurement still unsettled at
+# `deadline` reports no split.
+function _mt_group_split(tids::Vector{Int}, shared::Vector{UInt64}, deadline::UInt64)
     turn = Threads.Atomic{Int}(0)
     ratio = Ref(0.0)
     ts = [_mt_on_thread(XferJob(turn, w, ratio, shared, similar(shared)), tid) for (w, tid) in pairs(tids)]
@@ -5707,6 +5726,7 @@ function _mt_group_split(tids::Vector{Int}, shared::Vector{UInt64})
                 r > 0 && push!(rd[w], ratio[])           # round 0 compiles and warms; it is not kept
             end
             r += 1
+            time_ns() >= deadline && return falses(length(tids))
             length(first(rd)) >= 3 || continue
             far = _mt_cut(rd)
             far == prev && return far
@@ -5720,7 +5740,7 @@ end
 
 # Fill `_MT_TIDS`, `_MT_G0` and `_MT_HOME`. Called once, by the thread creating the pools, under
 # `_MT_SETUP_LOCK`; it allocates, like the rest of that setup path.
-function _mt_group_order!()
+function _mt_group_order!(deadline::UInt64)
     tids = filter(!=(Threads.threadid()), Threads.threadpooltids(:default))
     empty!(_MT_TIDS); append!(_MT_TIDS, tids)
     _MT_G0[] = typemax(Int)
@@ -5729,7 +5749,7 @@ function _mt_group_order!()
     # Half an L2: more than an L1, so the read is long against the clock's resolution, and small
     # enough that the writer still holds every line in its own L2 when the reader asks for it.
     shared = Vector{UInt64}(undef, max(1, (_L2_BYTES ÷ 2) ÷ sizeof(UInt64)))
-    far = _mt_group_split(tids, shared)
+    far = _mt_group_split(tids, shared, deadline)
     any(far) || return nothing
     empty!(_MT_TIDS)
     append!(_MT_TIDS, tids[.!far]); append!(_MT_TIDS, tids[far])
@@ -5737,67 +5757,126 @@ function _mt_group_order!()
     return nothing
 end
 
+# PDM: Literal — how long the pool may spend measuring its host when it is created. A limit on a
+# one-off cost, stated rather than measured: no property of a machine places it. Every stopping
+# rule below also stops at this deadline and uses the readings it has.
+const _MT_MEASURE_NS = 10_000_000   # req8-ok: time limit on a one-off setup cost, not a tuning value
+
+# The smallest step the clock shows between two consecutive readings: its resolution, or what
+# reading it costs where that is larger (42 ns on Apple silicon, 20 ns on Linux x86-64). Steps are
+# taken until one is no smaller than the smallest before it.
+function _mt_clock_step()
+    s = typemax(Int)
+    while true
+        t0 = time_ns()
+        t = time_ns()
+        while t == t0
+            t = time_ns()
+        end
+        d = Int(t - t0)
+        d >= s && return s
+        s = d
+    end
+end
+
+# ns per call of `f`, timed over `b` consecutive calls.
+function _mt_time(f, b::Int)
+    t0 = time_ns()
+    for _ in 1:b
+        f()
+    end
+    return (time_ns() - t0) / b
+end
+
+# The number of consecutive calls of `f` to time as one reading: doubled until the reading spans
+# `_MT_AMORTISE`² clock steps. A reading a few steps long moves by a whole step at a time — an
+# empty fork-join on Apple silicon reads 4, 5 or 6 steps, ±20% — and the floor is built from 1/
+# `_MT_AMORTISE` shares, so the clock is allowed 1/`_MT_AMORTISE` of one such share.
+function _mt_batch(f, step::Int)
+    b = 1
+    while _mt_time(f, b) * b < _MT_AMORTISE^2 * step
+        b *= 2
+    end
+    return b
+end
+
 # The median of repeated readings of `f`, taken until one falls inside the range of those before
-# it — the point where another reading has stopped saying anything new about the spread. No count
-# is fixed: a quiet host settles in three readings, a noisy one takes more.
-function _mt_settled(f)
+# it — the point where another reading has stopped saying anything new about the spread — or until
+# `deadline`. No count is fixed: a quiet host settles in three readings, a noisy one takes more.
+function _mt_settled(f, deadline::UInt64)
     xs = Float64[f(), f()]
     while true
         lo, hi = extrema(xs)
         x = f()
         push!(xs, x)
-        lo <= x <= hi && break
+        (lo <= x <= hi || time_ns() >= deadline) && break
     end
     return sort!(xs)[(length(xs) + 1) ÷ 2]
 end
 
-# Flops per nanosecond one core retires in a serial `gemm!` whose three operands share half an L2.
-# Runs while `_MT_NTHREADS` is still 1, so the product cannot thread. A median of settled medians:
-# the first products of a process run on cold code and cold pages, and one settled run of readings
-# can be made of those alone.
-function _mt_flop_rate()
-    n = max(_NR, isqrt(_L2_BYTES ÷ (2 * 3 * sizeof(Float64))))
+# Flops per nanosecond one core retires in the kernel a pooled chunk near the floor runs: the
+# unpacked SIMD product, on operands that together fill the L1 — the size of the calls the floor
+# decides between. NOT the public `gemm!`: that entry may hand a call to a route no pooled chunk
+# takes (Apple's SME kernel owns Float64 products and reads eight times the rate of the vector
+# kernel the pool's chunks run there), and its rate would set a floor for work that never happens.
+# A median of settled medians: the first products of a process run on cold code and cold pages,
+# and one settled run of readings can be made of those alone.
+function _mt_flop_rate(step::Int, deadline::UInt64)
+    n = max(_NR, min(isqrt(_L1_BYTES ÷ (3 * sizeof(Float64))), _GEMM_UNPACK_MAX))
     A = fill(0.5, n, n); B = fill(0.25, n, n); C = zeros(n, n)
-    one_ns = function ()
-        t0 = time_ns()
-        gemm!(C, A, B)
-        return Float64(time_ns() - t0)
+    ns = GC.@preserve A B C begin
+        pA = _pm(A); pB = _pm(B); pC = _pm(C)
+        product = function ()
+            _gemm_unpacked!(Val(false), Val(true), n, n, n, 1.0, pA, pB, 0.0, pC)
+            return nothing
+        end
+        b = _mt_batch(product, step)
+        _mt_settled(() -> _mt_settled(() -> _mt_time(product, b), deadline), deadline)
     end
-    return 2.0 * n^3 / _mt_settled(() -> _mt_settled(one_ns))
+    return 2.0 * n^3 / ns
 end
 
 # The round trip of the smallest threaded job there is — the driver and one worker, with nothing to
-# do: an empty copy — in ns. This is the pool's own publish, wake and join. A trip during which
+# do: an empty copy — in ns. This is the pool's own publish, wake and join. A reading during which
 # some other caller held the pool ran no job; it is taken again. A median of settled medians, for
 # the reason `_mt_flop_rate` gives.
-function _mt_join_cost()
+function _mt_join_cost(step::Int, deadline::UInt64)
     z = PtrMatrix{Float64}(Ptr{Float64}(0), 0, 1, 1)
-    one_ns = function ()
+    trip = function ()
+        _gemm_threaded!(z, z, z, 1.0, 0.0, false, false, false, false, 2, _MT_KIND_COPY)
+        return nothing
+    end
+    b = _mt_batch(trip, step)
+    reading = function ()
         while true
             lost = _MT_LOST[]
-            t0 = time_ns()
-            _gemm_threaded!(z, z, z, 1.0, 0.0, false, false, false, false, 2, _MT_KIND_COPY)
-            ns = Float64(time_ns() - t0)
+            ns = _mt_time(trip, b)
             _MT_LOST[] == lost && return ns
             yield()
         end
     end
-    return _mt_settled(() -> _mt_settled(one_ns))
+    return _mt_settled(() -> _mt_settled(reading, deadline), deadline)
 end
 
-# Measure the poll count and what the amortisation floor is built from. Called once, under
-# `_MT_SETUP_LOCK`, after the pools exist and before a thread count above one is published, so
-# the product that gives the flop rate runs on one thread. A worker polls for a job only while it
-# is inside the published count, so that count is raised to two for the join readings: one worker
-# polls and the rest sleep. `_MT_FLOOR` still refuses every Level-3 call meanwhile, and a
-# byte-floored call that takes the pool is seen through `_MT_LOST`. A pinned floor is not measured.
-function _mt_measure_host!()
+# Measure the poll counts and what the amortisation floor is built from. Called once, under
+# `_MT_SETUP_LOCK`, after the pools exist and before a thread count above one is published: the
+# workers are all asleep, so a worker's thread is free to time its own yields. A worker polls for
+# a job only while it is inside the published count, so that count is raised to two for the join
+# readings: one worker polls and the rest sleep. `_MT_FLOOR` still refuses every Level-3 call
+# meanwhile, and a byte-floored call that takes the pool is seen through `_MT_LOST`. A pinned
+# floor is not measured.
+function _mt_measure_host!(deadline::UInt64)
     h = _MT_HOST
-    _MT_POLLS[] = _mt_poll_count(_gemm_pool(Float64))
+    step = _mt_clock_step()
+    p = _gemm_pool(Float64)
+    _MT_POLLS_HOME[] = _mt_poll_count(p, step, deadline)
+    polls = Ref(0)
+    wait(_mt_on_thread(PollJob(polls, p, step, deadline), maximum(_MT_TIDS)))
+    _MT_POLLS[] = polls[]
     @static if isnothing(_GEMM_MT_WORK_PREF)
-        h.flops_per_ns = _mt_flop_rate()
+        h.flops_per_ns = _mt_flop_rate(step, deadline)
         _MT_NTHREADS[] = 2
-        h.join_ns = _mt_join_cost()
+        h.join_ns = _mt_join_cost(step, deadline)
     end
     h.measured = true
     return nothing
@@ -5890,12 +5969,13 @@ function set_num_threads(n::Integer)
     nt = clamp(Int(n), 1, min(Threads.nthreads(), cores, _MT_NW_MASK))
     if nt > 1
         lock(_MT_SETUP_LOCK) do
-            isempty(_GEMM_POOL_F64) && _mt_group_order!()
+            deadline = time_ns() + UInt64(_MT_MEASURE_NS)
+            isempty(_GEMM_POOL_F64) && _mt_group_order!(deadline)
             isempty(_GEMM_POOL_F64) && push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
             isempty(_GEMM_POOL_F32) && push!(_GEMM_POOL_F32, _gemm_pool_new(Float32))
             isempty(_GEMM_POOL_C64) && push!(_GEMM_POOL_C64, _gemm_pool_new(ComplexF64))
             isempty(_GEMM_POOL_C32) && push!(_GEMM_POOL_C32, _gemm_pool_new(ComplexF32))
-            _MT_HOST.measured || _mt_measure_host!()
+            _MT_HOST.measured || _mt_measure_host!(deadline)
             _MT_FLOOR[] = _mt_floor()
         end
     end
@@ -6314,7 +6394,7 @@ end
             # waits on a worker that can never be scheduled — a deadlock, once seen at 399% CPU. With
             # `skip` that worker only bumps `done`, and it still needs this thread to do it.
             while (@atomic p.done) < nwk
-                for _ in 1:_MT_POLLS[]
+                for _ in 1:_mt_polls()
                     (@atomic p.done) >= nwk && break
                     Base.Threads.atomic_fence()
                 end
