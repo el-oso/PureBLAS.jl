@@ -47,7 +47,7 @@ end
 function ladder()
     gs = [500_000]
     while last(gs) <= _MT_KEEPAWAKE_GAP_NS
-        push!(gs, round(Int, last(gs) * sqrt(2)))
+        push!(gs, round(Int, 500_000 * 2^(length(gs) / 2)))
     end
     return gs
 end
