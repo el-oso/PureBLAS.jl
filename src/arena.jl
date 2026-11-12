@@ -381,7 +381,7 @@ end
 # 1048576 on Zen4 but 65530 on a stock Linux box, past which `mmap` fails and `_throw_arena_mmap`
 # ends the run INSIDE THE SANITIZER rather than in the code under test. `_syl_dlasy2` alone is ~4k calls ×
 # 4 borrows at n=64, so a fenced full-suite run was not obviously under the stock limit and the
-# "fence everything" hatch was hollow. `_ARENA_FENCE_QUARANTINE` (below) fixes that: releases are held
+# "fence everything" hatch was hollow. The quarantine (below) fixes that: releases are held
 # poisoned in a bounded FIFO and munmapped once they age out, so the footprint is capped. The fence stays
 # per-scope opt-in all the same — it is ~1000× the cost of a bump, so it is a debugging tool, not a mode.
 const _ARENA_PROT_NONE = Cint(0)
@@ -409,6 +409,7 @@ function _arena_efence_alloc(::Type{T}, bytes::Int) where {T}
     rc == Cint(0) || _throw_arena_mprotect()
     push!(_ARENA_FENCE_PTR, p)
     push!(_ARENA_FENCE_LEN, total)
+    _ARENA_FENCE_PEAK[] = max(_ARENA_FENCE_PEAK[], length(_ARENA_FENCE_PTR))
     # Right-align the block against the guard page so an overrun faults immediately, and keep the returned
     # pointer 64-byte aligned (the page base is, and the rounded size preserves it).
     off = total - _ARENA_PAGE - cld(bytes, _ARENA_ALIGN) * _ARENA_ALIGN
@@ -423,19 +424,18 @@ const _ARENA_MADV_DONTNEED = Cint(4)   # Linux MADV_DONTNEED
 # `_dtgex2_big!` has; 580k borrows took the map count 334 → 40389). The ceiling is `vm.max_map_count`,
 # and past it `mmap` fails, so the run dies inside the sanitizer instead of inside the code under test.
 # That made the "fence the whole suite" hatch above hollow. So: keep the most RECENT releases poisoned
-# and `munmap` the ones that age out. A use-after-release is still caught for that many subsequent
-# borrows, which covers the hazard this exists to find — a handle used just after its scope exits — and
-# the fence's address-space footprint becomes bounded instead of unbounded.
-# TIER: a sanitizer budget, not a machine-dependent tuning constant; the PDM ladder does not apply (no
-# generated-code property depends on it). The value is set by the SMALLEST default `vm.max_map_count`
-# in the wild, 65530, leaving an order of magnitude for the rest of the process's mappings.
-# A sanitizer's retention depth, and no property of the host makes one depth better than another — there
-# is no residency or latency criterion to derive it from and no candidate set to measure. It is bounded
-# from above by the smallest stock `vm.max_map_count` (65530), and this path never runs in a gated
-# measurement or in the trimmed `.so`.
-# PDM: Exempt — a debug sanitizer's retention depth, not hardware tuning; no host property favours one value.
-# req8-ok: sanitizer retention depth, not a machine-dependent tuning knob — bounded by the OS map limit.
-const _ARENA_FENCE_QUARANTINE = 4096
+# and `munmap` the ones that age out.
+#
+# THE DEPTH IS THE FENCE'S OWN HIGH-WATER MARK: as many releases stay poisoned as there have ever been
+# fenced borrows live at once (`_ARENA_FENCE_PEAK`). Two properties follow, and neither needs a number:
+#   * COVERAGE. A scope exit releases at most that many borrows — they were all live together — so
+#     every handle a scope hands back is still poisoned when control returns to its caller. That is
+#     the hazard this exists to find: a handle used just after its scope exits. A handle used later
+#     faults for as long as fewer than that many further releases have happened.
+#   * FOOTPRINT. The quarantine never holds more mappings than the workload itself held live, so the
+#     fence at most doubles the mapping count the code under test already needed: its retention
+#     scales with the workload instead of approaching `vm.max_map_count` on its own.
+const _ARENA_FENCE_PEAK = Ref(0)
 const _ARENA_QUAR_PTR = Ptr{UInt8}[]
 const _ARENA_QUAR_LEN = Int[]
 
@@ -459,7 +459,7 @@ function _arena_efence_release!(nlive::Int)
         # …and hold the poisoned mapping in a bounded FIFO. Only once it ages out of the quarantine is the
         # address space actually returned; until then the guarantee above is unchanged.
         push!(_ARENA_QUAR_PTR, p); push!(_ARENA_QUAR_LEN, n)
-        while length(_ARENA_QUAR_PTR) > _ARENA_FENCE_QUARANTINE
+        while length(_ARENA_QUAR_PTR) > _ARENA_FENCE_PEAK[]
             ccall(:munmap, Cint, (Ptr{UInt8}, Csize_t), popfirst!(_ARENA_QUAR_PTR), popfirst!(_ARENA_QUAR_LEN))
         end
     end
@@ -743,12 +743,12 @@ end
     @fenced_scope s begin … end
 
 `@scope`, but every borrow is its own mmap behind a PROT_NONE guard page and scope exit poisons the
-address for the life of the process — so a use of a released handle FAULTS instead of silently reading
-whatever the next borrow wrote. Same two expansion-time rules as `@scope`.
+address while it sits in the quarantine — so a use of a released handle FAULTS instead of silently
+reading whatever the next borrow wrote. Same two expansion-time rules as `@scope`.
 
 This is the opt-in: there is no global fence mode, so a routine is fenced exactly when its own scope is
 written with this macro, and a plain `Pkg.test()` cannot arm anything. It is a debugging tool — one mmap
-plus two syscalls per borrow, and the address space is never reclaimed — so it belongs in a dedicated run,
+plus two syscalls per borrow — so it belongs in a dedicated run,
 and the fault it raises is not reliably catchable in-process (see `test/arena_tests.jl`, which drives it
 from a subprocess for exactly that reason).
 """

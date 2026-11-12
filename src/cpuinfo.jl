@@ -27,7 +27,7 @@ using Preferences: @load_preference, load_preference
 # 16 is a floor rather than a guess — aarch64 mandates 128-bit NEON. SVE can be wider but its width is
 # runtime-variable and so cannot fold to a const; a wider part is under-used, never mis-compiled. The
 # same floor covers x86 hosts whose feature leaves a VM has masked.
-# PDM: Exempt — the detected SIMD width itself; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+# PDM: Derived — the detected SIMD width itself (`simdbytes()` on x86, the 16 B NEON floor elsewhere); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _SIMD_BYTES = let p = @load_preference("simd_bytes", nothing)
     if !isnothing(p)
         Int(p)::Int
@@ -148,7 +148,7 @@ end
 # at which parallel streams collide in ONE L1 set: gemvN column streams at lda·sizeof ≡ 0 (mod way) all
 # index the same set, so at most `ways` of them can coexist — the panel width selector keys on this.
 # Fallback 8 (Zen2–5 and most Intel L1d are 8-way; Ice-Lake-class 48K/12-way also yields 4K ways).
-# PDM: Exempt — the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+# PDM: Derived — the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _L1D_ASSOC = @load_preference(
     "l1d_assoc",
     let w = try
@@ -216,7 +216,7 @@ end
 # is 12+4) — as does `hw.cpusubfamily`. A table keyed on that is a legitimate req8-ok literal, since
 # the quantity is genuinely not detectable; a table keyed on `Sys.CPU_NAME` is not, it is a wrong
 # answer for two of the three parts.
-# PDM: Exempt — the detected L3 size itself (floored at L2 where no L3/SLC is queryable, see above); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+# PDM: Derived — the detected L3 size itself (`cachesize()`, floored at L2 where no L3/SLC is queryable, see above); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _L3_BYTES = @load_preference(
     "l3_bytes",
     let s = try
@@ -244,14 +244,14 @@ const _L3_BYTES = @load_preference(
 # THE ARCH TERM LEADS THE PREFERENCE, not the other way round: the override exists for cross-compile
 # and trim builds, and `sme_f64 = true` set on an x86 box would otherwise have this file emit aarch64
 # IR there. A preference may relax a detection result; it may not contradict the instruction set.
-# PDM: Exempt — the detected FEAT_SME2 + FEAT_SME_F64F64 pair itself; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+# PDM: Derived — the detected FEAT_SME2 + FEAT_SME_F64F64 pair itself (`sysctlbyname`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _SME_F64 = Sys.ARCH === :aarch64 && @load_preference(
     "sme_f64",
     _sysctl_int("hw.optional.arm.FEAT_SME2") == 1 &&
         _sysctl_int("hw.optional.arm.FEAT_SME_F64F64") == 1
 )::Bool
 
-# PDM: Exempt — the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+# PDM: Derived — the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _SME_LANES = @load_preference(
     "sme_lanes",
     let b = _sysctl_int("hw.optional.arm.sme_max_svl_b")
@@ -288,7 +288,7 @@ function _sysctl_i32(name::String)
         0
     end
 end
-# PDM: Exempt — the detected core count itself (`hw.perflevelN.physicalcpu`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+# PDM: Derived — the detected core count itself (`hw.perflevelN.physicalcpu`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _FAST_CORES = @load_preference(
     "fast_cores",
     let n = _sysctl_i32("hw.nperflevels")
@@ -309,7 +309,7 @@ const _FAST_CORES = @load_preference(
 # FEAT_SME2 is CONJOINED rather than relied on to imply the 32-bit capability. No part is available
 # on which the two bits disagree, so "SME2 implies the 32-bit outer product" cannot be checked;
 # a conjunction fails safe where an assumed implication does not.
-# PDM: Exempt — the detected FEAT_SME2 + SME_F32F32 pair itself; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+# PDM: Derived — the detected FEAT_SME2 + SME_F32F32 pair itself (`sysctlbyname`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _SME_F32 = Sys.ARCH === :aarch64 && @load_preference(
     "sme_f32",
     _sysctl_feature("hw.optional.arm.FEAT_SME2") &&
@@ -338,7 +338,7 @@ const _SME_F32_KEY_ABSENT = Sys.ARCH === :aarch64 &&
 # needed tiles at once, and none do: every ZA user is its own `llvmcall` that enables ZA on entry
 # and disables it on exit, and the driver calls them strictly in sequence — pack B, pack A, then the
 # macrokernel. So the transpose packer and the register tile can both own tile 0.
-# PDM: Exempt — the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+# PDM: Derived — the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _SME_LANES_F32 = @load_preference(
     "sme_lanes_f32",
     let b = _sysctl_int("hw.optional.arm.sme_max_svl_b")
@@ -359,7 +359,7 @@ end
 # CpuId.cpumodel()[:Family] is raw-packed (ext<<4 | base); display family adds ext only when base==0xF
 # (Zen4: raw 0xaf → 0xF + 0xA = 0x19 = Zen4; Zen5 = 0x1A). Baked to a const, Preferences-overridable.
 _display_family(raw::Integer) = (raw & 0x0F) == 0x0F ? Int(raw & 0x0F) + Int(raw >> 4) : Int(raw & 0x0F)
-# PDM: Exempt — the detected CPU display family itself; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+# PDM: Derived — the detected CPU display family itself (CPUID, via `cpumodel()`); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _CPU_FAMILY = @load_preference(
     "cpu_family",
     try
@@ -395,8 +395,7 @@ const _NVREG = _SIMD_BYTES >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
 # default for every non-AMD part, so nothing regresses. `hasleaf` is REQUIRED: `CpuId.cpufeature` has no
 # max-leaf guard and Intel returns the highest basic leaf's data for out-of-range queries, which would
 # make bit 2 garbage there.
-# PDM: Exempt — a detected hardware fact like `_SIMD_BYTES`; the preference exists for cross-compile and
-# trim builds, not for tuning.
+# PDM: Derived — the detected FP datapath width itself (CPUID Fn8000_001A FP128/FP256/FP512, else the register width); the preference exists for cross-compile and trim builds. | tune: n/a
 const _FP_DATAPATH_BYTES = @load_preference("fp_datapath_bytes", let w = _SIMD_BYTES
         ok = (Sys.ARCH === :x86_64 || Sys.ARCH === :i686) && (try
                 hasleaf(0x8000_001a)
@@ -973,39 +972,32 @@ Reading `ENV` here is trim-safe by placement, not by luck: every call site sits 
 # __init__), never per call: an ENV read in a BLAS hot path is itself a regression — measured, the
 # gemv-T m-unroll instrument cost Zen5 gemvT n=64 0.959 -> 0.767 with the VALUE unchanged.
 #
-# TRIM PAYS NOTHING: gated on `_FORCE_HOOKS`, which juliac/build.jl sets false, so the shared library
-# compiles no ENV access, no Refs, no branch. Instrumentation is a development affordance, not a shipped
-# feature. Defaults true so a normal JIT user can A/B without rebuilding.
-# PDM: Exempt — boolean switch (path on/off), not a tuned size.
-const _FORCE_HOOKS = @load_preference("force_hooks", true)::Bool
+# ALWAYS COMPILED, the trimmed shared library included: every `_fh_<knob>()` accessor reads its
+# `_FKR_<knob>` Ref unconditionally, so the Refs cannot be switched off without the accessors.
 const _FK_NAMES = ("gbtrf_cmult", "bt_nb", "cgemm_3m_kmin", "cgemm_3m_max", "cgemm_3m_min", "cgemm_tiny", "csyr2k_pack_cut", "csyrk_3m_min", "csyrk_pack_cut", "csyrk_pack_cut_t", "ctrmm_pack_min", "ctrsm_direct_max", "ctrsm_ncut", "ctrsm_rec_l", "qr_nb_c", "strassen_maxdepth", "strassen_min", "syrk_dbase", "syrk_pack_cut", "syr2k_pack_cut", "syrk_unified_max", "potrf_unative_min", "tri_c_t_unb", "tri_t_unb", "trmm_ddirect", "trmm_rkc", "trmm_rpack", "trsm_narrow_max", "zhemv_pf_tiles", "trsm_base", "trsm_ncut", "trsm_ncut_r", "trsm_dbase", "trsm_r_fuse", "trmm_rpanel", "trtri_base", "syrk_base",
                    "ger_panel_np", "brd_nb", "potrf_upper_direct_max", "sytrf_cmult", "gbtrf_cross",
                    "pbtrf_nb", "pbtrf_nb_small", "pbtrf_cross_kd", "pbtrf_u_native_kd",
                    "axpy_unroll", "axpy_dram", "zaxpy_narrow", "gemvt_perscan", "gemm_split_max",
                    "gemvn_rb", "gemvn_mb", "cger_cold_den", "strassen_nopad", "strassen_base")
-@static if _FORCE_HOOKS
-    # One NAMED const Ref per knob, so a knob read is a const-resolved Ref load — never a keyed lookup.
-    #
-    # This block used to be a `Dict{String,Ref}` read through `_fk(name) = _FK[name][]`, and its own
-    # comment claimed "the hot path only ever reads the Ref it captured" — which the implementation did
-    # NOT do: every call hashed a String. It went unnoticed while the hooks sat on cold paths; wiring 28
-    # more (this campaign) put it inside hemm/L3 and StrictMode's @owned check caught it immediately:
-    # "hot path resolves a runtime AbstractDict lookup (owned-scratch/GKH violation): give the type a
-    # const-dispatched accessor instead of a runtime keyed lookup." That is the GKH ownership rule.
-    #
-    # `_FK` survives as a name => the SAME Ref map, because __init__ and the probes want to reach a knob
-    # by string. Only the hot accessors changed: they now read `_FKR_<knob>[]` directly.
-    for _n in _FK_NAMES
-        @eval const $(Symbol("_FKR_", _n)) = Ref(-1)
-    end
-    const _FK = Dict{String, Base.RefValue{Int}}(
-        n => getfield(@__MODULE__, Symbol("_FKR_", n)) for n in _FK_NAMES)
-    # Keyed reader — for __init__ and probes ONLY. Never call it from a kernel: it is the very lookup
-    # the named Refs exist to avoid.
-    @inline _fk(name::String) = _FK[name][]
-else
-    @inline _fk(::String) = -1
+# One NAMED const Ref per knob, so a knob read is a const-resolved Ref load — never a keyed lookup.
+#
+# This block used to be a `Dict{String,Ref}` read through `_fk(name) = _FK[name][]`, and its own
+# comment claimed "the hot path only ever reads the Ref it captured" — which the implementation did
+# NOT do: every call hashed a String. It went unnoticed while the hooks sat on cold paths; wiring 28
+# more (this campaign) put it inside hemm/L3 and StrictMode's @owned check caught it immediately:
+# "hot path resolves a runtime AbstractDict lookup (owned-scratch/GKH violation): give the type a
+# const-dispatched accessor instead of a runtime keyed lookup." That is the GKH ownership rule.
+#
+# `_FK` survives as a name => the SAME Ref map, because __init__ and the probes want to reach a knob
+# by string. Only the hot accessors changed: they now read `_FKR_<knob>[]` directly.
+for _n in _FK_NAMES
+    @eval const $(Symbol("_FKR_", _n)) = Ref(-1)
 end
+const _FK = Dict{String, Base.RefValue{Int}}(
+    n => getfield(@__MODULE__, Symbol("_FKR_", n)) for n in _FK_NAMES)
+# Keyed reader — for __init__ and probes ONLY. Never call it from a kernel: it is the very lookup
+# the named Refs exist to avoid.
+@inline _fk(name::String) = _FK[name][]
 
 @inline function _force_knob(name::String)::Int
     v = get(ENV, "PUREBLAS_FORCE_" * name, "")
@@ -1015,18 +1007,6 @@ end
 end
 
 const _TUNE_ALPHA = 0.05                    # library-wide P(ANY knob flips at a tie), the one dial
-# req8-ok: NOT a machine-dependent tuning value — it is a COUNT of the Measure-tier knobs in this tree,
-# used as the Bonferroni denominator that splits `_TUNE_ALPHA` across them. It depends on the source,
-# not on the host, so there is nothing to derive from a detected const. Being stale-high is the safe
-# direction (a larger denominator buys MORE rounds), so drift costs conservatism, never correctness.
-# Keep in step with bench/probes/knob_stability_audit.jl, which enumerates them.
-# DELIBERATELY NOT LOWERED as knobs are converted (2026-08-19: cgemvt_cfg, gemvt_nc, pptrf_spr_min,
-# pstrf_rowcache, axpy_band, axpy_dram all demoted to Derive). Lowering it shrinks `_TUNE_ROUNDS`, i.e.
-# buys FEWER rounds for the duels that remain — the opposite of the retirement's intent. Per the note
-# above, drift high costs conservatism only. Reset it if the Measure tier is ever repopulated.
-# PDM: Exempt — a COUNT of Measure-tier knobs (the Bonferroni denominator), not a tuning value.
-# req8-ok: a COUNT of Measure knobs in this source tree (Bonferroni denominator), not a machine value
-const _TUNE_NKNOBS = 12                     # 13 until cgemvn_nc_big was demoted to Derive (2026-08-07)
 
 """
     _tune_rounds(ncand) -> Int
@@ -1034,6 +1014,7 @@ const _TUNE_NKNOBS = 12                     # 13 until cgemvn_nc_big was demoted
 Rounds needed so that `ncand` duels together risk at most `_TUNE_ALPHA/_TUNE_NKNOBS` of a spurious
 displacement at a tie. Pure, integer, evaluated at the call site — so a sweep with 2 candidates does
 not pay for a sweep with 6, and adding a candidate automatically buys the rounds it costs.
+`_TUNE_NKNOBS`, the Bonferroni denominator, is counted from the knob list in tune.jl.
 """
 @inline function _tune_rounds(ncand::Int)
     budget = _TUNE_ALPHA / _TUNE_NKNOBS
@@ -1043,7 +1024,6 @@ not pay for a sweep with 6, and adding a candidate automatically buys the rounds
     end
     return r
 end
-const _TUNE_ROUNDS = _tune_rounds(6)        # widest sweep in the tree; the default for callers
 
 """
     _tune_duel(fa, fb; rounds=_TUNE_ROUNDS, reps=5, δ=2) -> Int
@@ -1288,8 +1268,8 @@ end
 # is cache-resident, there is nothing to win, and the syscall would be pure overhead on exactly the
 # small-n cells that are hardest to hold. So it fires ONLY when A cannot fit in L3.
 #
-# PDM: Exempt — a capability switch, not hardware tuning. Set `madvise_hugepages = false` to disable.
-const _MADVISE_HUGEPAGES = @load_preference("madvise_hugepages", true)::Bool
+# THE CAPABILITY IS DETECTED, NOT SWITCHED: the call is compiled on Linux only (`Sys.islinux()`), and
+# a kernel that cannot honour it (THP `never`, or built without it) refuses the advice and is ignored.
 const _MADV_HUGEPAGE = Cint(14)
 const _HUGEPAGE_BYTES = 2 * 1024 * 1024
 
@@ -1298,7 +1278,7 @@ Ask the kernel to back `A`'s pages with huge pages, if `A` is large enough to be
 Advisory and best-effort: any failure is ignored. Returns nothing.
 """
 @inline function _advise_huge!(A::AbstractMatrix{T}) where {T}
-    @static if _MADVISE_HUGEPAGES && Sys.islinux()
+    @static if Sys.islinux()
         # Only DRAM-resident operands, and only ones we can take a real pointer to.
         if T <: Union{BlasReal, BlasComplex} && _strided1(A)
             nb = length(A) * sizeof(T)
@@ -1321,7 +1301,7 @@ end
 
 "Array form of `_advise_huge!` — any rank, used by the public `alloc` below."
 @inline function _advise_huge_arr!(A::Array{T}) where {T}
-    @static if _MADVISE_HUGEPAGES && Sys.islinux()
+    @static if Sys.islinux()
         nb = length(A) * sizeof(T)
         if nb > _HUGEPAGE_BYTES
             GC.@preserve A begin

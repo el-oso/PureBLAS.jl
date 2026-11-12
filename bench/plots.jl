@@ -1250,7 +1250,7 @@ const RBANDSZ = (64, 128, 256, 512)
 # LAPACK factorizations, to 4096. NON-PO2 entries (50/100/1000/2100) are one per RESIDENCY BAND, the
 # same set L2SZ/L3SZ use — and they matter MORE here than anywhere else: the panel kernels these ops
 # route through (`_trsm_rl_split_f64!`, `_trsm_right_lower_f64!`) handle a sub-W row tail and a
-# `nb < _fh_chol_nb()` column remainder in SEPARATE code paths, and a po2-only ladder leaves BOTH
+# `nb < _CHOL_TILE` column remainder in SEPARATE code paths, and a po2-only ladder leaves BOTH
 # permanently empty. That is not hypothetical: those two tails were scalar loops walking the whole
 # solved prefix one row and one column at a time, worth -59% at n=50 on the side-R gate shape, and the
 # po2 ladder had reported the op as passing for months. See kb pureblas-nonpo2-sizes-were-invisible.

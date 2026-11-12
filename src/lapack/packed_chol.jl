@@ -34,9 +34,11 @@ const _PPTRF_TPSV_MIN = 32
 # (bench/probes/tail_merge_crossover.jl, pptrf_nb_scan.jl, review_closeout.jl.) Zen3 lower: same shape, 0.70–0.89.
 # COST: the scratch is n×n instead of 2·n·48, and the grow-only arena keeps it (n=4096 F64 ≥ 128 MB). No
 # cap: a 128-wide cap measured 12–21% slower at 2048/4096. A memory cap is a policy call, not a speed one.
-# PDM: Exempt — 0 is the "whole matrix" sentinel; a positive pin restores a fixed panel width. | tune: n/a
-const _PPTRF_BLK_NB = @load_preference("pptrf_blk_nb", 0)::Int   # req8-ok: sentinel, not a tuning value
-@inline _pptrf_nb(n::Int) = _PPTRF_BLK_NB > 0 ? min(_PPTRF_BLK_NB, n) : n
+# PDM: Derived — unset, the panel is the whole matrix (nb = n, table above); a pin caps the panel width and so the scratch. | tune: n/a
+const _PPTRF_BLK_NB = @load_preference("pptrf_blk_nb", nothing)::Union{Nothing, Int}
+(isnothing(_PPTRF_BLK_NB) || _PPTRF_BLK_NB > 0) ||
+    throw(ArgumentError("PureBLAS: preference `pptrf_blk_nb` = $_PPTRF_BLK_NB must be a positive panel width"))
+@inline _pptrf_nb(n::Int) = isnothing(_PPTRF_BLK_NB) ? n : min(_PPTRF_BLK_NB, n)
 
 # Smallest n where unpacking pays. MEASURED: 2.26× at n=32 (bench/probes/pptrf_unpack_strategy.jl), so
 # the crossover is below 32; it has NOT been measured between 8 and 32, and this value is provisional
@@ -77,11 +79,13 @@ const _PPTRF_BLK_MIN = @load_preference("pptrf_blk_min", 16)::Int
 # vector-width unit the crossover is expressed in (one SIMD store's work amortising a call). Blast
 # radius is tiny-n and AD, where correctness matters and a few ns do not. Preference override retained.
 # `@load_preference` stays at MODULE level, never in the body: an in-body load is a recorded hazard in
-# this tree (it does not const-fold the way the module-level form does). 0 is the unset sentinel, so the
-# per-type derivation still applies when no preference is set.
-# PDM: Exempt — 0 is the unset sentinel, not a size. | tune: n/a
-const _PPTRF_SPR_PREF = @load_preference("pptrf_spr_min", 0)::Int   # req8-ok: unset sentinel, not a tuning value
-@inline _pptrf_spr_min(::Type{T}) where {T} = _PPTRF_SPR_PREF > 0 ? _PPTRF_SPR_PREF : 2 * _vwidth(T)
+# this tree (it does not const-fold the way the module-level form does). The default is `nothing`
+# because the derivation is per element type and one preference value cannot express it.
+# PDM: Derived — unset, the cutoff is `2 * _vwidth(T)` per element type; a pin replaces it for every type. | tune: n/a
+const _PPTRF_SPR_PREF = @load_preference("pptrf_spr_min", nothing)::Union{Nothing, Int}
+(isnothing(_PPTRF_SPR_PREF) || _PPTRF_SPR_PREF > 0) ||
+    throw(ArgumentError("PureBLAS: preference `pptrf_spr_min` = $_PPTRF_SPR_PREF must be a positive order"))
+@inline _pptrf_spr_min(::Type{T}) where {T} = isnothing(_PPTRF_SPR_PREF) ? 2 * _vwidth(T) : _PPTRF_SPR_PREF
 
 # ── pptrf!: packed Cholesky factorization (dpptrf.f) ──────────────────────────────────────────────
 # uplo='U': A = Uᴴ·U (left-looking — solve Uᴴu = col then the diagonal). uplo='L': A = L·Lᴴ
