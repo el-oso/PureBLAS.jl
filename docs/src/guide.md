@@ -116,5 +116,5 @@ eighth for free, but the full win needs the advice before the first write.
 `PureBLAS.hugepages_enabled()` reports whether the system can honour it: Linux with transparent huge
 pages in `madvise` or `always` mode. Elsewhere `alloc` is exactly `Array{T}(undef, …)`, so it is
 always safe to call. Setting `transparent_hugepage=always` system-wide gets the same benefit for
-matrices you allocate by other means. To switch the entry-point advice off, set the
-`madvise_hugepages` preference to `false`.
+matrices you allocate by other means. The entry-point advice has no switch of its own: it follows
+the system setting, and is a no-op where transparent huge pages are set to `never`.

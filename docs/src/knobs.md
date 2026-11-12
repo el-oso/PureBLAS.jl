@@ -5,18 +5,17 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 177 of them.
+Every `@load_preference` key in `src/` — 170 of them.
 
 | Tier | Meaning |
 |---|---|
-| **Derived** | Default is a formula over detected hardware consts. |
+| **Derived** | Default is a formula over detected hardware consts, or the detection itself. |
 | **Measured** | Not derivable — the optimum depends on something we cannot detect. Wants a `tune!()` pin. |
 | **Measured, orphaned** | Measured with no calibrator in `bench/calibrate.jl`, so `tune!()` can never set it and the pin it wants is unreachable. Its `tune!()` cell reads `none`. A missing tool, not a missing verdict — the tier says where the number came from and does not change when a calibrator arrives. |
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
-| **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 80 Derived · 24 Measured (15 calibrated · 9 orphaned) · 52 Literal · 21 Exempt.
-**Default form** (mechanical): 70 formula · 22 delegates · 8 sibling · 65 literal · 5 flag · 7 other.
+**Tier:** 93 Derived · 24 Measured (15 calibrated · 9 orphaned) · 53 Literal.
+**Default form** (mechanical): 70 formula · 24 delegates · 8 sibling · 61 literal · 7 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -38,7 +37,7 @@ Every `@load_preference` key in `src/` — 177 of them.
 | `cgemvn_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
 | `cgemvt_cfg` | sibling | Derived | _CGEMVT_CFG_BIG is already a complete _NVREG derivation. | n/a |
 | `cgemvt_half` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
-| `cgemvt_nc` | literal | Exempt | legacy pin, superseded by _cgemvt_cfg; retained only so an old preference still parses. | n/a, dead |
+| `cgemvt_nc` | literal | Literal | column block of the L2-resident complex gemv-T/C regime; 4 beats 8 there (table in `_gemv_tc_cmplx!`), measured on Zen4 ONLY. | candidate |
 | `cgemvt_pf` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4` | — |
 | `cger_cold_den` | literal | Derived | DRAM residency of A with cache headroom, the `_trmv_blk!` criterion; fleet table above. | candidate |
 | `gemv_mr` | delegates | Measured | the PANEL path's height; `_gemvn_rowblock_mr` below DERIVES the row-block path's height instead, and a pin wins for both tiers, disabling that derivation. | 0.3 s |
@@ -82,7 +81,6 @@ Every `@load_preference` key in `src/` — 177 of them.
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
-| `spmv_panel` | flag | Exempt | boolean switch (path on/off), not a tuned size. | — |
 | `spmv_panel_minap` | formula | Derived | formula over detected consts: `_L1_BYTES` | — |
 
 ## BLAS-3 (trmm/trsm/syrk/symm)
@@ -139,18 +137,16 @@ Every `@load_preference` key in `src/` — 177 of them.
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
-| `cpu_family` | other | Exempt | the detected CPU display family itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
-| `fast_cores` | other | Exempt | the detected core count itself (`hw.perflevelN.physicalcpu`); the override exists for cross-compile and trim builds, not tuning. | n/a |
-| `force_hooks` | flag | Exempt | boolean switch (path on/off), not a tuned size. | — |
-| `fp_datapath_bytes` | formula | Exempt | a detected hardware fact like `_SIMD_BYTES`; the preference exists for cross-compile and | — |
-| `l1d_assoc` | other | Exempt | the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | n/a |
-| `l3_bytes` | formula | Exempt | the detected L3 size itself (floored at L2 where no L3/SLC is queryable, see above); the override exists for cross-compile and trim builds, not tuning. | n/a |
-| `madvise_hugepages` | flag | Exempt | a capability switch, not hardware tuning. Set `madvise_hugepages = false` to disable. | — |
-| `simd_bytes` | delegates | Exempt | the detected SIMD width itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
-| `sme_f32` | other | Exempt | the detected FEAT_SME2 + SME_F32F32 pair itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
-| `sme_f64` | other | Exempt | the detected FEAT_SME2 + FEAT_SME_F64F64 pair itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
-| `sme_lanes` | formula | Exempt | the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | n/a |
-| `sme_lanes_f32` | formula | Exempt | the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `cpu_family` | other | Derived | the detected CPU display family itself (CPUID, via `cpumodel()`); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `fast_cores` | other | Derived | the detected core count itself (`hw.perflevelN.physicalcpu`); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `fp_datapath_bytes` | formula | Derived | the detected FP datapath width itself (CPUID Fn8000_001A FP128/FP256/FP512, else the register width); the preference exists for cross-compile and trim builds. | n/a |
+| `l1d_assoc` | other | Derived | the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `l3_bytes` | formula | Derived | the detected L3 size itself (`cachesize()`, floored at L2 where no L3/SLC is queryable, see above); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `simd_bytes` | delegates | Derived | the detected SIMD width itself (`simdbytes()` on x86, the 16 B NEON floor elsewhere); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `sme_f32` | other | Derived | the detected FEAT_SME2 + SME_F32F32 pair itself (`sysctlbyname`); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `sme_f64` | other | Derived | the detected FEAT_SME2 + FEAT_SME_F64F64 pair itself (`sysctlbyname`); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `sme_lanes` | formula | Derived | the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `sme_lanes_f32` | formula | Derived | the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | n/a |
 
 ## LAPACK · banded_chol
 
@@ -181,14 +177,11 @@ Every `@load_preference` key in `src/` — 177 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `chol_base_split` | formula | Derived | formula over detected consts: `_INTEL_AVX2` | — |
-| `chol_nb` | literal | Exempt | structural: hand-unrolled 4-column register tile, not a tuning size. | n/a — only 4 is correct |
-| `chol_nc` | literal | Exempt | structural: hand-unrolled 4-column register tile, not a tuning size. | n/a — only 4 is correct |
 | `cpotf2_mr` | formula | Derived | formula over detected consts: `_at_cpotf2_mr(_HW)` | — |
 | `cpotrf_base` | formula | Derived | 32 + 4*lanes: a width-independent overhead floor plus a per-lane slope. | n/a |
 | `cpotrf_nbmax` | formula | Derived | formula over detected consts: `_at_cpotrf_nbmax(_HW)` | — |
 | `potrf_base` | literal | Literal | recursion-overhead floor, µarch-flat at 16-32; the residency guess 64 is worse. | no |
 | `potrf_base_f32` | sibling | Derived | sizeof ratio: F32 is half F64's bytes, so half the n. | n/a, follows potrf_base |
-| `potrf_pad` | flag | Exempt | boolean switch (path on/off), not a tuned size. | — |
 | `potrf_upper_direct_max` | delegates | Measured | a tiny-n crossover inside a noisy band; only host measurement resolves it. | candidate |
 
 ## LAPACK · lu
@@ -204,8 +197,8 @@ Every `@load_preference` key in `src/` — 177 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `pptrf_blk_min` | literal | Literal | smallest n where unpacking pays; measured 2.26x at n=32, untested between 8 and 32. | candidate |
-| `pptrf_blk_nb` | literal | Exempt | 0 is the "whole matrix" sentinel; a positive pin restores a fixed panel width. | n/a |
-| `pptrf_spr_min` | literal | Exempt | 0 is the unset sentinel, not a size. | n/a |
+| `pptrf_blk_nb` | delegates | Derived | unset, the panel is the whole matrix (nb = n, table above); a pin caps the panel width and so the scratch. | n/a |
+| `pptrf_spr_min` | delegates | Derived | unset, the cutoff is `2 * _vwidth(T)` per element type; a pin replaces it for every type. | n/a |
 
 ## LAPACK · pstrf
 
@@ -231,7 +224,6 @@ Every `@load_preference` key in `src/` — 177 of them.
 
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
-| `cgemm_3m` | flag | Exempt | boolean switch (path on/off), not a tuned size. | — |
 | `cgemm_3m_kmin` | literal | Literal | 3M needs min(m,n,k) >= this or the Karatsuba overhead dominates a thin gemm. | candidate |
 | `cgemm_3m_max` | literal | Literal | upper edge of the 3M window; above it the extra passes cost more than the flop cut. | candidate |
 | `cgemm_3m_min` | literal | Literal | lower edge of the 3M window on max(m,n,k). | candidate |
@@ -251,7 +243,7 @@ Every `@load_preference` key in `src/` — 177 of them.
 | `gemm_nr` | formula | Derived | formula over detected consts: `_at_gemm_nr(_HW)` | — |
 | `gemm_split_max` | formula | Derived | formula over detected consts: `_at_gemm_split_max(_HW)` | — |
 | `gemm_unpack_max` | formula | Derived | formula over detected consts: `_at_gemm_unpack_max(_HW)` | — |
-| `strassen` | formula | Exempt | capability flag; Strassen's flop cut is ISA-independent. | n/a |
+| `strassen` | formula | Derived | on exactly the detected vector widths (`_W64` 4 or 8) whose packing path implements Strassen; the flop cut itself is ISA-independent. | n/a |
 | `strassen_base` | literal | Measured | the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_gemm_mt_work()` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | none — orphaned; the threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048 |
 | `strassen_maxdepth` | literal | Literal | accuracy budget (~3x error per level, type-independent); the performance side is | — |
 | `strassen_min` | formula | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
@@ -318,13 +310,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-36 `const _X = <literal>` values in `src/` with no `@load_preference`.
+34 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 30 Literal · 3 Exempt · 3 Unaudited.
+**Tier:** 31 Literal · 3 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -355,7 +347,6 @@ on these, not on knobs.
 |---|---|---|---|
 | `_GEMM_SPLIT_S` | 2 | Literal | split-reduction factor, measured crossover ~n=56 on Zen4. TUNABLE. |
 | `_ILP_TARGET` | 16 | Literal | 2 x FMA latency(4) x FMA ports(2); an architectural assumption, and neither latency nor port count is detectable. |
-| `_TUNE_NKNOBS` | 12 | Exempt | a COUNT of Measure-tier knobs (the Bonferroni denominator), not a tuning value. |
 
 ### LAPACK · eigen_dc
 
@@ -373,6 +364,7 @@ on these, not on knobs.
 
 | Const | Value | Tier | Why |
 |---|---|---|---|
+| `_CHOL_TILE` | 4 | Literal | the column count the fused Cholesky base kernels are hand-unrolled for; a structural invariant of that code. |
 | `_TR_TB` | 32 | Literal | residency-INVARIANT: two 32^2 F64 tiles = 16 KB, under any real L1. Deriving it would change nothing. |
 
 ### LAPACK · laqr
@@ -410,7 +402,6 @@ on these, not on knobs.
 | Const | Value | Tier | Why |
 |---|---|---|---|
 | `_BRD_NB` | 8 | Literal | machine-INVARIANT 8 on three boxes and two ISAs. |
-| `_SVD_DC_CROSS` | 1 | Exempt | a CORRECTNESS override, not a perf choice: bdsqr fails on clustered sigma, so all with-vectors SVD routes to D&C. |
 
 ### LAPACK · svd_dc
 
@@ -418,12 +409,6 @@ on these, not on knobs.
 |---|---|---|---|
 | `_DC_THRESHOLD` | 64 | Literal | divide-and-conquer cut. TUNABLE, algorithm-intrinsic so no formula. |
 | `_SEC_BISECT_CAP` | 0 | Literal | secular-equation bisection cap; 0 disables. TUNABLE. |
-
-### arena
-
-| Const | Value | Tier | Why |
-|---|---|---|---|
-| `_ARENA_FENCE_QUARANTINE` | 4096 | Exempt | a debug sanitizer's retention depth, not hardware tuning; no host property favours one value. |
 
 ### gemm (BLAS-3)
 

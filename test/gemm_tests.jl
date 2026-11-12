@@ -956,7 +956,7 @@ end
 # are `BlasReal`, so the complex cases below cannot thread and verify trivially. That is stated rather
 # than hidden: the real cases carry the liveness witness, and the complex cases fire the moment anyone
 # admits complex. The three mechanisms they are aimed at, each measured on Zen4 before the revert:
-#   * `_CGEMM_3M`'s window reads `min(m, nrt, k)` with `m` the band's ROW count, so a band narrower
+#   * the complex-gemm 3M window reads `min(m, nrt, k)` with `m` the band's ROW count, so a band narrower
 #     than kmin declines Karatsuba while the unsplit solve takes it. B 48x512 at alpha=1 diverged.
 #   * `_trsm_cmplx_small_R!` routes on `size(B, 1)`, not `mrt`; the last band can be one row.
 #   * `_scal_all!` applies a complex alpha flat or per column, and its vector body uses an fma where

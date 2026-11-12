@@ -302,17 +302,12 @@ const _QR_UNBLK_MAX = 32
 # PDM: Literal — complex QR panel; the Zen4 sweet spot, keyed per box via Preferences. | tune: candidate
 const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
 @inline _fh_qr_nb_c() = (f = _FKR_qr_nb_c[]; f >= 0 ? f : _QR_NB_C)
-# ⚠ THIS USED TO READ `_CGEMM_3M ? … : …` AND MEANT "is this the AVX2 box?". That was a hidden coupling,
-# not a derivation: `_CGEMM_3M` is a *complex-gemm algorithm* switch, and it happened to be `_W64 == 4`,
-# so it doubled as an ISA discriminator here. When the 3M default was flipped ON for AVX-512 on
-# 2026-08-09 (it wins 1.17–1.29× there), this line silently changed complex QR's crossover on Zen4 AND
-# Zen5 from ½·L3 to 2·L2 — contradicting the Zen5 measurement recorded right below, and reachable by no
-# test or gate row that the 3M change ran. Decoupled to the predicate it actually meant.
+# `_NARROW_SIMD` asks "is this the AVX2-class complex path?" — a datapath question, and NOT "does
+# complex gemm take the 3M route", which it does at every width. Keying the crossover below on the 3M
+# route instead moves it from ½·L3 to 2·L2 on AVX-512, against the Zen5 measurement recorded there.
 #
-# Honest tiering: `_NARROW_SIMD` is a datapath-gated literal, i.e. Measure-tier debt by req#8b — but it
-# is PRE-EXISTING debt that was previously INVISIBLE behind `_CGEMM_3M`. Naming it neither creates nor
-# discharges it; it makes it auditable, and it keeps this line's behaviour byte-identical to what the
-# Zen5/Zen3 numbers below were measured against.
+# Honest tiering: `_NARROW_SIMD` is a datapath-gated literal, i.e. Measure-tier debt by req#8b. It is
+# the predicate the Zen5/Zen3 numbers below were measured against.
 const _NARROW_SIMD = _W64 == 4      # AVX2-class complex path — NOT "3M is enabled"
 #
 # Unblocked→blocked crossover (COMPLEX). The SIMD rank-2 unblocked panel (qr_unblocked!) is BLAS-2 but
@@ -385,21 +380,17 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
                     Tv[r, c] = s
                 end
             end
-            # nc-CHUNK the trailing update over columns. On the AVX2-complex path (_CGEMM_3M) the two trailing
-            # gemms route through Karatsuba-3M, which materializes O(mp·nt) real split/product scratch (~3× the
+            # nc-CHUNK the trailing update over columns. The two trailing complex gemms route through
+            # Karatsuba-3M, which materializes O(mp·nt) real split/product scratch (~3× the
             # trailing matrix) — for nt≈mp≈n that spills L3 exactly when the matrix ITSELF fits L3 (the Zen3
             # n≈768–1100 dip band). Chunking columns bounds that scratch to ≤½L3 AND fuses each Cj's V·W downdate
-            # while its Vᴴ·C is still L3-hot (read+write once vs ~5–6 matrix passes). ncb = nt (single chunk,
-            # bit-identical) when 3M is off. req#8: ncb from the 3M live-set residency ≤ ½·L3,
+            # while its Vᴴ·C is still L3-hot (read+write once vs ~5–6 matrix passes).
+            # req#8: ncb from the 3M live-set residency ≤ ½·L3,
             # live set ≈ (sizeof(T) + 3·sizeof(real(T)))·mp·ncb (C chunk + its real split/product buffers).
             #
-            # ⚠ UNLIKE `_zqr_unblk_max` above, this `_CGEMM_3M` test is CORRECT and stays: it asks "is 3M
-            # live?", and the scratch it bounds exists exactly when 3M runs. But that makes it a live
-            # BEHAVIOUR CHANGE on AVX-512 as of the 2026-08-09 default flip — chunking now activates on
-            # Zen4/Zen5, where `ncb = nt` (single chunk) before. It is the right shape by the argument
-            # above and is UNMEASURED on those boxes; zgeqrf must be re-gated there before the flip is
-            # trusted. (The old comment said "when 3M is off (Zen5)" — stale, 3M is on there now.)
-            ncb = _CGEMM_3M ? clamp(((_L3_BYTES ÷ 2) ÷ ((sizeof(T) + 3 * sizeof(real(T))) * mp)) & ~7, min(4 * _CNR, nt), nt) : nt
+            # The chunking is the right shape on every width by the argument above, but it is MEASURED
+            # only on AVX2 (Zen3); zgeqrf on AVX-512 (Zen4/Zen5) has not been gated with it.
+            ncb = clamp(((_L3_BYTES ÷ 2) ÷ ((sizeof(T) + 3 * sizeof(real(T))) * mp)) & ~7, min(4 * _CNR, nt), nt)
             jj = jt0
             while jj <= n
                 cw = min(ncb, n - jj + 1)

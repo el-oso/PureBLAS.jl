@@ -1707,8 +1707,6 @@ const _CGEMM_UNPACK_MAX = @load_preference("cgemm_unpack_max", _W64 == 4 ? 40 : 
 # NOTE Zen5 is also W=8 and inherits this by formula, but is OFFLINE and therefore UNVALIDATED; the
 # `_EXP12`/`_EXP11` arms below are kept INVERTED (set true to DISABLE) so the old path stays A/B-able
 # in-process when it returns.
-# PDM: Exempt — boolean switch (path on/off), not a tuned size.
-const _CGEMM_3M = @load_preference("cgemm_3m", true)::Bool
 # PDM: Literal — lower edge of the 3M window on max(m,n,k). | tune: candidate
 const _CGEMM_3M_MIN = @load_preference("cgemm_3m_min", 48)::Int    # max(m,n,k) ≥ this
 @inline _fh_cgemm_3m_min() = (f = _FKR_cgemm_3m_min[]; f >= 0 ? f : _CGEMM_3M_MIN)
@@ -1725,9 +1723,7 @@ const _CGEMM_3M_KMIN = @load_preference("cgemm_3m_kmin", 16)::Int  # min(m,n,k) 
 # 1.26× at 4096). Split while min(m,n,k) ≥ _STRASSEN_MIN (base stays ≥ ~min/2), capped at _MAXDEPTH.
 # NN + real α/β only (trans/complex fall back). Default ON for W=4/8 (real gemm is throughput-bound on
 # both AVX2 and AVX-512 — Strassen's flop cut is ISA-independent); per-box threshold via Preferences.
-# PDM: Exempt — capability flag; Strassen's flop cut is ISA-independent. | tune: n/a
-# CUT, which is ISA-independent, and real gemm is throughput-bound on both AVX2 and AVX-512; the guard
-# exists only to exclude widths the packing path does not implement. | tune: n/a — capability, not tuning
+# PDM: Derived — on exactly the detected vector widths (`_W64` 4 or 8) whose packing path implements Strassen; the flop cut itself is ISA-independent. | tune: n/a
 const _STRASSEN = @load_preference("strassen", _W64 == 4 || _W64 == 8)::Bool
 # GATE-VALIDATED 2026-08-22, and the candidate 512 was REJECTED. Controlled A/B, both arms forced (so
 # neither could write the cache), back-to-back in one methodology, freq-locked, `arms=pb`:
@@ -3915,7 +3911,7 @@ end
                 # overhead share is ~1/k ≈ 3% against an ALGEBRAIC 25% multiply cut. This is the last
                 # untested mechanism for the tiny-n complex cluster (routing, entry overhead and NR
                 # width are all measured-dead — see the note below and zgemm32_nr_ab.jl).
-                if _CGEMM_3M && !_EXPFLAG[_EXP12] &&
+                if !_EXPFLAG[_EXP12] &&
                         (@inbounds(_EXPINT[7]) > 0 ? @inbounds(_EXPINT[7]) : _fh_cgemm_3m_min()) <= max(m, nrt, k) <= _fh_cgemm_3m_max() &&
                         min(m, nrt, k) >= _fh_cgemm_3m_kmin()
                     _gemm_3m!(tA, tB, cA, cB, m, n, k, alpha, _pm(A), _pm(B), beta, _pm(C), nrt)
@@ -5362,7 +5358,8 @@ end
 # covers gaps up to about W + 2 ms. 10 ms covers the serial panel phases a blocked factorization runs
 # between threaded trailing updates. Back-to-back calls are unchanged at every window, so arriving work
 # is not delayed, and after the window the worker sleeps and an idle process costs its host nothing.
-const _MT_KEEPAWAKE_NS = 10_000_000   # PDM: Exempt — politeness window, measured in the comment above
+# PDM: Measured — the window sweep above: flat from 3 ms on both kernels, 10 ms covers the panel gaps.
+const _MT_KEEPAWAKE_NS = 10_000_000   # req8-ok: politeness window measured in the sweep above, not a perf tuning
 
 @inline function _mt_keepawake_ns()
     o = @inbounds _EXPINT[16]

@@ -443,6 +443,40 @@ end
     end
 end
 
+# The quarantine depth is the fence's own high-water mark of simultaneously live borrows. Two
+# consequences are checked: everything one scope releases is still quarantined (so still poisoned)
+# when the scope returns, and the quarantine never grows past that mark however many scopes follow.
+# Nothing here touches a released handle, so it is safe in-process; mmap flags make it Linux-only.
+@testitem "arena: fence quarantine keeps one scope's releases and stays bounded" begin
+    using PureBLAS
+    const P = PureBLAS
+    if !Sys.islinux()
+        @test_skip "the electric fence is Linux-only"
+    else
+        function three()
+            P.@fenced_scope s begin
+                a = P.borrow!(s, Float64, 8); b = P.borrow!(s, Float64, 8); c = P.borrow!(s, Float64, 8)
+                (UInt(pointer(a)), UInt(pointer(b)), UInt(pointer(c)))
+            end
+        end
+        function one()
+            P.@fenced_scope s begin
+                UInt(pointer(P.borrow!(s, Float64, 8)))
+            end
+        end
+        quarantined(p) = any(
+            i -> UInt(P._ARENA_QUAR_PTR[i]) <= p < UInt(P._ARENA_QUAR_PTR[i]) + P._ARENA_QUAR_LEN[i],
+            eachindex(P._ARENA_QUAR_PTR))
+        ptrs = three()
+        @test P._ARENA_FENCE_PEAK[] >= 3
+        @test all(quarantined, ptrs)
+        foreach(_ -> one(), 1:50)
+        @test length(P._ARENA_QUAR_PTR) <= P._ARENA_FENCE_PEAK[]
+        @test isempty(P._ARENA_FENCE_PTR)
+        @test quarantined(one())
+    end
+end
+
 # PER-THREAD OWNERSHIP. Every buffer a routine writes during a call — the arena and the eleven pools /
 # workspaces (`_l3ws`, trmm pack, symm scratch, LU/complex-LU pads, QR, SVD, SVD-DC, tridiagonal,
 # eigen-DC, generalized-eigen, trsv reciprocals) — is one per THREAD. Two callers sharing one arena would

@@ -101,8 +101,8 @@ int main(void) {
         }
     printf("dgesvd recon max|err| = %.2e\n", rerr); /* ~1e-15 */
 
-    /* larger SVD (n=160) — exercises the divide-and-conquer singular-VECTOR path (n > _SVD_DC_CROSS=96,
-     * the crossover just retuned). Deterministic diagonally-dominant matrix; verify full reconstruction
+    /* larger SVD (n=160) — exercises the divide-and-conquer singular-VECTOR path at a
+     * size past its base case. Deterministic diagonally-dominant matrix; verify full reconstruction
      * U*diag(S)*VT ≈ A and orthonormality of U (max|UᵀU − I|). This is the real drop-in SVD path. */
     {
         int64_t Ng = 160, ldn = 160;
