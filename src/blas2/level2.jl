@@ -919,7 +919,9 @@ end
 # pay depends on 512-bit FMA throughput vs latency, which inverts between double-pumped and native-512
 # silicon and is not derivable (the `_ger_np` shape). See the routing note in `_gemv_t_simd!` for why
 # the existing Zen4 NC sweep does not settle this.
-const _GEMVT_NC_CANDIDATES = Tuple(c for c in (4, 8, 16) if c + 2 <= _NVREG)::Tuple{Vararg{Int}}
+# The column-group widths the sweep in `_gemv_t_simd!` has an arm for; its `Val` ladder spells the same three.
+const _GEMVT_NC_ARMS = (4, 8, 16)   # req8-ok: the kernel arms that exist, not a tuning value
+const _GEMVT_NC_CANDIDATES = Tuple(c for c in _GEMVT_NC_ARMS if c + 2 <= _NVREG)::Tuple{Vararg{Int}}
 # m-unroll for the blocked gemv-T kernel. DERIVED cap: NC·U accumulators + U x-vectors + ~2 temps must
 # fit `_NVREG`. At the shipped NC=4 that gives U ≤ 4 on AVX-512 (24 regs) and U ≤ 2 on AVX2 (14).
 @inline _gemvt_u_max(nc::Int) = (

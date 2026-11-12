@@ -130,4 +130,15 @@ using PrecompileTools: @setup_workload, @compile_workload
     end
 end
 
+# The threaded setup path runs only in a process with more than one thread, which a precompile process
+# never is, so the workload above cannot reach it. These directives compile it without running it: the
+# pool's creation and host measurement, and the worker loop with every chunk body it dispatches to.
+precompile(set_num_threads, (Int,))
+precompile(Tuple{XferJob})
+precompile(Tuple{AffinityJob})
+precompile(Tuple{YieldJob})
+for T in (Float64, Float32, ComplexF64, ComplexF32)
+    precompile(Tuple{PoolWorkerJob{T}})
+end
+
 end # module

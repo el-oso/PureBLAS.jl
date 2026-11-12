@@ -233,12 +233,12 @@ end
         #
         # The warm-up covers both paths the measured call can take. The route is one; the pool's
         # sleep/wake handoff is the other, and the shapes above miss it because they run back-to-back
-        # and leave the workers inside their `_MT_SPINS` window rather than parked.
+        # and leave the workers inside their polling window rather than parked.
         gemm1(Cx, Ax, Bx) = @allocated P.gemm!(Cx, Ax, Bx)
         A = randn(512, 512); B = randn(512, 512); C = zeros(512, 512)
         @test P._gemm_workers(512, 512, 512) > 1
         P.gemm!(C, A, B)                 # the route
-        sleep(0.05); P.gemm!(C, A, B)    # and a wake from a real park, not from the spin window
+        sleep(0.05); P.gemm!(C, A, B)    # and a wake from a real park, not from the polling window
         @test minimum(gemm1(C, A, B) for _ in 1:8) == 0
         P.set_num_threads(1)                      # leave the process as we found it
         @test P.get_num_threads() == 1
@@ -682,7 +682,7 @@ end
         # pass by never threading at all.
         #
         # The witness is that SOME size in the ladder threads, not that every one does. The predicate
-        # prices the fork-join against `_GEMM_MT_WORK`, which scales with the host's FMA rate, and at
+        # prices the fork-join against `_gemm_mt_work()`, which scales with the host's flop rate, and at
         # n=512 the work clears that floor by only ~4% — so a machine with a wider datapath answers 1
         # there and reddens the item without anything being wrong. n=2048 clears it by more than an
         # order of magnitude on any host, so the ladder as a whole cannot pass vacuously.
@@ -1110,5 +1110,45 @@ end
         # A ladder on which nothing threads would pass every assertion above by checking none of them.
         @test found[] >= 4
         P.set_num_threads(1)
+    end
+end
+
+# What the pool measures when it is created. The cut that finds cache groups is checked on readings
+# stated by hand, because a host with one group never produces a split; the rest is that a created
+# pool has a polling span and a floor at all.
+@testitem "threaded pool: host measurement" tags = [:checks] begin
+    using PureBLAS
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    # Two sets further apart than either is wide (Zen3's readings: near 1.36-1.48, far 4.02-4.86).
+    # Two sets with a clear gap (Zen3's readings: near 1.36-1.48, far 4.02-4.86). Each worker has one
+    # reading taken across an interrupt, which its median ignores.
+    @test P._mt_cut([[1.36, 1.41, 9.0], [4.02, 4.5, 0.9], [1.48, 1.4, 7.0], [4.86, 4.3, 30.0]]) == [false, true, false, true]
+    # One set: workers of one group differ by a few percent.
+    @test !any(P._mt_cut([[1.42, 1.5, 1.41], [1.44, 1.4, 1.47], [1.48, 1.43, 1.4], [1.52, 1.5, 1.55]]))
+    # A gap that is real but below the margin.
+    @test !any(P._mt_cut([[1.0, 1.05, 1.02], [1.5, 1.9, 1.6]]))
+    @test P._mt_settled(() -> 3.0, typemax(UInt64)) == 3.0
+    # A deadline already past: the rule stops at its first chance, on the three readings it has.
+    let k = Ref(0)
+        @test P._mt_settled(() -> Float64(k[] += 1), UInt64(0)) == 2.0
+    end
+    @test P._mt_clock_step() > 0
+    @test P._mt_affinity_count() >= 0
+    if nthreads() < 2
+        @test_skip "needs >= 2 julia threads: there is no pool to measure without one"
+    else
+        P.set_num_threads(nthreads())
+        try
+            @test P._MT_POLL_NS[] >= 1 && P._MT_POLL_NS_HOME[] >= 1
+            @test 0 < P._gemm_mt_work() < typemax(Int)
+            if isnothing(P._GEMM_MT_WORK_PREF)
+                h = P._MT_HOST
+                @test h.join_ns > 0 && h.flops_per_ns > 0
+                @test P._gemm_mt_work() == P._mt_floor()
+            end
+        finally
+            P.set_num_threads(1)
+        end
     end
 end

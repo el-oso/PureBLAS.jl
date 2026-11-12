@@ -238,13 +238,13 @@ Every `@load_preference` key in `src/` — 170 of them.
 | `gemm_kc` | formula | Derived | formula over detected consts: `_at_gemm_kc(_HW)` | — |
 | `gemm_mr` | formula | Derived | formula over detected consts: `_at_gemm_mr(_HW)` | — |
 | `gemm_mr1_max` | formula | Derived | formula over detected consts: `_at_gemm_mr1_max(_HW)` | — |
-| `gemm_mt_work` | delegates | Measured | the join is an uncore latency and the clock pricing it in flops is not detected; only the FMA rate in the product is derived. Default = the one recorded measurement (Zen4, 616 ns @ 2796 MHz). | calibrate_gemm_mt_work measures the fork-join round trip on host and applies the same formula; DECLINES on a single-threaded process, and reports rather than pins a result outside the ¼×…4× bracket |
+| `gemm_mt_work` | delegates | Measured | the join is an uncore latency and the flop rate needs a clock Julia does not report; both are measured on the host when the pool is created, and their product with `_MT_AMORTISE` is the floor. A pin replaces the measured floor. | calibrate_gemm_mt_work measures the fork-join round trip with its own pool and applies the same formula; DECLINES on a single-threaded process, and reports rather than pins a result outside ¼×…4× of the floor the library measured |
 | `gemm_nc` | formula | Derived | formula over detected consts: `_at_gemm_nc(_HW)` | — |
 | `gemm_nr` | formula | Derived | formula over detected consts: `_at_gemm_nr(_HW)` | — |
 | `gemm_split_max` | formula | Derived | formula over detected consts: `_at_gemm_split_max(_HW)` | — |
 | `gemm_unpack_max` | formula | Derived | formula over detected consts: `_at_gemm_unpack_max(_HW)` | — |
 | `strassen` | formula | Derived | on exactly the detected vector widths (`_W64` 4 or 8) whose packing path implements Strassen; the flop cut itself is ISA-independent. | n/a |
-| `strassen_base` | literal | Measured | the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_GEMM_MT_WORK` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | none — orphaned; the threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048 |
+| `strassen_base` | literal | Measured | the criterion is the column splits efficiency at a given blocks-per-worker, a scheduling-and-bandwidth property no detected const predicts, and the measured curve has no knee (5.3 blocks/worker 36%, 10.7 54%, 21 66%). `_gemm_mt_work()` gives only leaf >= 138, i.e. "is threading worth it at all", not "is it efficient". | none — orphaned; the threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048 |
 | `strassen_maxdepth` | literal | Literal | accuracy budget (~3x error per level, type-independent); the performance side is | — |
 | `strassen_min` | formula | Literal | split while min(m,n,k) >= this; the base stays >= ~min/2. | 512 GATE-REJECTED (Zen4-only, one cell, no miss to fix; table above) |
 | `strassen_nopad` | literal | Literal | prefer depth-reduction over an O(n^2) pad; fleet table above, no-op off native AVX-512. | candidate |
@@ -310,13 +310,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-68 `const _X = <literal>` values in `src/` with no `@load_preference`.
+34 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 32 Literal · 34 Unaudited.
+**Tier:** 31 Literal · 3 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -415,41 +415,7 @@ on these, not on knobs.
 | Const | Value | Tier | Why |
 |---|---|---|---|
 | `_GEMM_TINY` | 6 | Literal | below this the naive loop beats the packed path. TUNABLE. |
-| `_GEMVT_BAND` | 16 | Unaudited | — |
 | `_MT_AMORTISE` | 8 | Unaudited | — |
-| `_MT_GROUP_PASSES` | 3 | Unaudited | — |
-| `_MT_GROUP_ROUNDS` | 8 | Unaudited | — |
-| `_MT_JOIN_CLOCK_MHZ_MEASURED` | 2796 | Measured | the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) |
-| `_MT_JOIN_NS_MEASURED` | 616 | Measured | recorded fork-join round trip on Zen4 (ns); feeds gemm_mt_work's shipped default |
-| `_MT_KIND_ASUM` | 8 | Unaudited | — |
-| `_MT_KIND_AXPY` | 6 | Unaudited | — |
-| `_MT_KIND_COPY` | 11 | Unaudited | — |
-| `_MT_KIND_COPY2D` | 23 | Unaudited | — |
-| `_MT_KIND_DOT` | 7 | Unaudited | — |
-| `_MT_KIND_ELEM` | 19 | Unaudited | — |
-| `_MT_KIND_GBMVN` | 18 | Unaudited | — |
-| `_MT_KIND_GEMM` | 0 | Unaudited | — |
-| `_MT_KIND_GEMVN` | 15 | Unaudited | — |
-| `_MT_KIND_GEMVT` | 16 | Unaudited | — |
-| `_MT_KIND_GER` | 14 | Unaudited | — |
-| `_MT_KIND_IAMAX` | 13 | Unaudited | — |
-| `_MT_KIND_LASWP` | 22 | Unaudited | — |
-| `_MT_KIND_LUAHEAD` | 3 | Unaudited | — |
-| `_MT_KIND_LUSTEP` | 24 | Unaudited | — |
-| `_MT_KIND_SCAL` | 10 | Unaudited | — |
-| `_MT_KIND_SUMSQ` | 9 | Unaudited | — |
-| `_MT_KIND_SWAP` | 12 | Unaudited | — |
-| `_MT_KIND_SYMM` | 21 | Unaudited | — |
-| `_MT_KIND_SYMV` | 17 | Unaudited | — |
-| `_MT_KIND_SYRK` | 1 | Unaudited | — |
-| `_MT_KIND_TRMM` | 20 | Unaudited | — |
-| `_MT_KIND_TRMMR` | 5 | Unaudited | — |
-| `_MT_KIND_TRSM` | 2 | Unaudited | — |
-| `_MT_KIND_TRSMR` | 4 | Unaudited | — |
-| `_MT_SPINS` | 2048 | Literal | how long an idle worker keeps spinning before it sleeps, in fence iterations. This is |
-| `_STR_FLOOR` | 1 | Unaudited | — |
-| `_STR_LVL1` | 2 | Unaudited | — |
-| `_STR_OFF` | 0 | Unaudited | — |
 
 ### sme_kernel
 

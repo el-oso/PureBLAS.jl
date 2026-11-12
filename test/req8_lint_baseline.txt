@@ -75,8 +75,8 @@ svd_dc.jl  const _DC_THRESHOLD = 64
 # or src/lapack/ was ever scanned. The 32 lines below are what those directories contained the day the
 # scan was fixed. None has been derived, annotated or classified: they are named here so the lint could
 # be made recursive without either hiding them or blocking the branch that found them, and every one is
-# open req#8 debt to whittle down exactly like the block above. (The three M4 literals the same branch
-# introduced — `_MT_JOIN_*`, `_MT_AMORTISE`, `_MT_SPINS` — are NOT here; they carry `# req8-ok:`.)
+# open req#8 debt to whittle down exactly like the block above. (`_MT_AMORTISE`, which the same
+# branch introduced, is NOT here; it carries `# req8-ok:`.)
 gemm.jl  Val(12)
 gemm.jl  Val(6)
 gemm.jl  Val(8)
