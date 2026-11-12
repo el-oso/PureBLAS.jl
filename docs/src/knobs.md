@@ -5,7 +5,7 @@
     or its `# PDM:` marker and regenerate. `test/knob_registry_tests.jl` fails if this
     file is out of date.
 
-Every `@load_preference` key in `src/` — 176 of them.
+Every `@load_preference` key in `src/` — 177 of them.
 
 | Tier | Meaning |
 |---|---|
@@ -15,8 +15,8 @@ Every `@load_preference` key in `src/` — 176 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 | **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |
 
-**Tier:** 80 Derived · 24 Measured (15 calibrated · 9 orphaned) · 52 Literal · 20 Exempt.
-**Default form** (mechanical): 70 formula · 22 delegates · 8 sibling · 65 literal · 5 flag · 6 other.
+**Tier:** 80 Derived · 24 Measured (15 calibrated · 9 orphaned) · 52 Literal · 21 Exempt.
+**Default form** (mechanical): 70 formula · 22 delegates · 8 sibling · 65 literal · 5 flag · 7 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -140,6 +140,7 @@ Every `@load_preference` key in `src/` — 176 of them.
 | Knob | Default | Tier | Why | `tune!()` |
 |---|---|---|---|---|
 | `cpu_family` | other | Exempt | the detected CPU display family itself; the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `fast_cores` | other | Exempt | the detected core count itself (`hw.perflevelN.physicalcpu`); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `force_hooks` | flag | Exempt | boolean switch (path on/off), not a tuned size. | — |
 | `fp_datapath_bytes` | formula | Exempt | a detected hardware fact like `_SIMD_BYTES`; the preference exists for cross-compile and | — |
 | `l1d_assoc` | other | Exempt | the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | n/a |
