@@ -30,7 +30,8 @@ demonstrated.
   `Pkg.build`; `PUREBLAS_SKIP_BUILD_TUNE=1` skips it. Zen3: onset 1.4-4 ms over five builds,
   window 8-10.6 ms, syrk/trmm n=2048 after a 5 ms gap unchanged against 10 ms. Zen5: no gap
   slows the probe, window 0, and syrk/trmm after a 5 ms gap within 0.3% of the 10 ms window, so its
-  idle workers now sleep at once.
+  idle workers now sleep at once. Zen4 (laptop part): the onset varies between builds (window 0,
+  6.3 or 10.6 ms); syrk/trmm after a 5 ms gap are within 0.4% of the 10 ms window even with none.
 
 - The threaded pool measures its host when `set_num_threads` creates it, in place of constants
   recorded on one machine. The size below which a call stays on one thread is now
