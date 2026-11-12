@@ -155,6 +155,13 @@ Both modes share ONE set of low-level kernels. Source map:
    across the size ladder, because the SHAPE of the curve is the diagnosis (a ratio that FALLS with n
    means the routine is not amortising — see `geqrf` below).
 
+   **AND PREDICT IT BEFORE YOU MEASURE IT: write down the value you expect and why.** A measurement
+   taken without a prediction cannot disappoint, so every result looks informative and the next probe
+   always feels justified — which is how measuring becomes a substitute for thinking rather than a
+   check on it. Predict first and two things follow: a prediction that is confident and dull means
+   the measurement should not run at all, and a prediction that is WRONG is the finding, named on the
+   spot instead of reconstructed afterwards.
+
    **The rule exists because it was violated, and the violation shipped.** 2026-09-13: `_syev!` was a
    `MethodError` on `ForwardDiff.Dual` because `_trdws` had no generic fallback. I added the fallback,
    verified eigenvalues to 1.7e-13 and derivatives to 1.7e-12 against `ForwardDiff.derivative`, checked
@@ -280,6 +287,15 @@ Both modes share ONE set of low-level kernels. Source map:
     reach, by what mechanism, and why the rest cannot move. A group survives that argument only if a
     source file the change touched is on its call path.
 
+    **AND STATE WHAT IT COSTS AND WHAT IT DECIDES.** Scope alone bounds *which* cells are measured,
+    not *whether* measuring them is worth anything, and that is the half that gets skipped. So the
+    launch message also carries: the expected wall-clock, and the decision the result changes —
+    naming what will be done for each outcome. A measurement whose outcomes lead to the same next
+    action does not run, however correctly scoped it is. This is not a formality: 2026-11-07's
+    reference repair measured all four arms where only the two vendor arms were damaged (2x the
+    cost), queued a box that needed no repair at all, and re-ran an op whose first run was still
+    alive — none of which a scope argument catches, and all of which this question does.
+
     **The cheap proof already exists in the cache.** Every arm record carries its raw samples, so a
     damaged regime is visible as a sample SPREAD the comparison arm does not have. Query the cache
     before deciding, not after:
@@ -302,6 +318,16 @@ Both modes share ONE set of low-level kernels. Source map:
     part of a cache leaves the rest at an older machine state, and a partial refresh has twice left
     most of a cache anchor-mismatched. When that is the reason for a wider scope, say so at launch
     and name the cells it protects — it does not license a full sweep by default.
+
+13. **PURE JULIA, PORTABLE, HARDWARE-AGNOSTIC. (HARD RULE.)** Every detection, tuning and
+    scheduling method must work on every CPU and OS Julia runs on — x86 and ARM; Linux, macOS and
+    Windows — not only on the machines we have. Order of preference: (a) Julia itself, or a measurement
+    in pure Julia of the effect that matters; (b) a `ccall` into a stable system API (e.g. `sysctl`),
+    behind a quiet fallback; (c) when Julia lacks it, propose adding it where it belongs (e.g.
+    CPUSummary.jl, HostCPUFeatures.jl, or Julia itself) rather than working around the gap. Never read `/sys`, `/proc` or other OS files, and never parse text. A
+    method that covers only some platforms (CPUID is x86 only) may refine a portable one, never
+    replace it, and what the fleet or CI lacks is never a reason to accept a gap. Where no method
+    exists for a platform, the code must fall back to today's behavior there, and the gap is stated.
 
 ## ABI conventions (Mode 1)
 

@@ -20,6 +20,13 @@ demonstrated.
 
 ## [Unreleased]
 
+### Changed
+
+- Threaded `potrf!` (lower, real): the copy into and out of the de-aliasing pad runs on the worker
+  pool in area-balanced column bands instead of on the calling thread. On Zen4 at four workers,
+  power-of-two leading dimension: n=256 0.102 → 0.080 ms, n=1024 2.75 → 2.31 ms, n=2048 19.7 → 18.2 ms.
+  Results are bit-identical; single-threaded timings are unchanged.
+
 ## [0.1.2] — "Reachable" — 2026-08-29
 
 The name is the theme: the fast paths existed, and applications could not reach them. A BLAS-2 SIMD

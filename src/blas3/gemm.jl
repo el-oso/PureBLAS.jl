@@ -4488,6 +4488,7 @@ const _MT_KIND_SYMM = 21
 # changes is that a quarter to a third of the threaded call stops running on one thread — measured
 # on Zen4 at three workers, n=1024: pad copy 1.3 ms, trailing swaps 0.9 ms, deferred left swaps
 # 1.2 ms, of a 9.6 ms call whose ideal is 6.0 ms. Both reuse `C`/`A` as (destination, source).
+# potrf's pad round-trip rides `_MT_KIND_COPY2D` as well, with `unit` set to move one triangle.
 # PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
 # req8-ok: enum discriminant, host-invariant by construction
 const _MT_KIND_LASWP = 22
@@ -4836,7 +4837,14 @@ end
 end
 
 # `C[:, band] .= A[:, band]`, column by column, each column one contiguous run of `m` elements.
+# With `p.unit` the block is square and only its `p.up` triangle moves (potrf's pad round-trip); the
+# bands then come from `_tri_chunk`, which deals out equal areas where `_gemm_chunk` deals equal widths.
 @noinline function _copy2d_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    if p.unit
+        j0, len = _tri_chunk(p.n, nw, i, p.up)
+        len > 0 && _tricopy!(p.Cp, p.ldc, p.Ap, p.lda, p.n, p.up, j0, j0 + len)
+        return nothing
+    end
     j0, len = _gemm_chunk(p.n, nw, _mt_band(nw, i))
     len > 0 || return nothing
     _copy2d!(p.Cp + j0 * p.ldc * sizeof(T), p.ldc, p.Ap + j0 * p.lda * sizeof(T), p.lda, p.m, len)
@@ -4845,6 +4853,18 @@ end
 @inline function _copy2d!(dst::Ptr{T}, ldd::Int, src::Ptr{T}, lds::Int, m::Int, n::Int) where {T}
     for j in 0:(n - 1)
         unsafe_copyto!(dst + j * ldd * sizeof(T), src + j * lds * sizeof(T), m)
+    end
+    return nothing
+end
+# Columns `j0:j1-1` (zero-based) of one triangle of an n×n block, diagonal included: rows `j:n-1` of
+# column `j` for the lower triangle, rows `0:j` for the upper. Each column is one contiguous run.
+@inline function _tricopy!(
+        dst::Ptr{T}, ldd::Int, src::Ptr{T}, lds::Int, n::Int, up::Bool, j0::Int, j1::Int
+    ) where {T}
+    sz = sizeof(T)
+    for j in j0:(j1 - 1)
+        o = up ? 0 : j
+        unsafe_copyto!(dst + (j * ldd + o) * sz, src + (j * lds + o) * sz, up ? j + 1 : n - j)
     end
     return nothing
 end
@@ -5716,6 +5736,8 @@ Use at most `n` threads inside PureBLAS's threaded kernels, and return the value
 turns threading off. Capped at `Threads.nthreads()`, because the workers are Julia tasks and there is
 nothing to run them on beyond that, and at the number of physical cores the process may run on: a
 second worker on an SMT sibling adds no arithmetic and makes the pool's hand-offs fragile under load.
+On a part with a slower Efficiency tier (Apple silicon) only the cores outside that tier count: the
+pool splits a job into equal chunks, so one chunk on an Efficiency core sets the time of the job.
 Setting the environment variable `PUREBLAS_MT_ALL_THREADS=1` (exactly `"1"`) lifts the core cap; it is
 read on every call.
 
@@ -5770,10 +5792,14 @@ function _mt_physical_cores()
     return clamp(cld(Sys.EFFECTIVE_CPU_THREADS, tpc), 1, cores)
 end
 
+# The core cap: physical cores, and of those only the ones outside a slower Efficiency tier where the
+# part has one (`_FAST_CORES`, see cpuinfo.jl; 0 elsewhere).
+_mt_core_cap() = _FAST_CORES > 0 ? min(_mt_physical_cores(), _FAST_CORES) : _mt_physical_cores()
+
 # `PUREBLAS_MT_ALL_THREADS=1` lifts the core cap so every Julia thread can be a worker. The test suite
 # sets it: req#11's bit-identity items must run more workers than a small CI runner has cores.
 function set_num_threads(n::Integer)
-    cores = get(ENV, "PUREBLAS_MT_ALL_THREADS", "") == "1" ? typemax(Int) : _mt_physical_cores()
+    cores = get(ENV, "PUREBLAS_MT_ALL_THREADS", "") == "1" ? typemax(Int) : _mt_core_cap()
     nt = clamp(Int(n), 1, min(Threads.nthreads(), cores, _MT_NW_MASK))
     if nt > 1
         lock(_MT_SETUP_LOCK) do
@@ -5921,7 +5947,9 @@ end
             # did not get changes nothing but who does the work.
             _laswp!(C, PtrVector{Int}(lup.ipiv, lup.ioff + lup.nb), lup.ioff + 1, lup.ioff + lup.nb, 1, C.n)
         elseif kind == _MT_KIND_COPY2D
-            _copy2d!(C.ptr, C.ld, A.ptr, A.ld, C.m, C.n)
+            # `unit` marks the triangle form; a loser moves the same elements its bands would have.
+            unit ? _tricopy!(C.ptr, C.ld, A.ptr, A.ld, C.n, up, 0, C.n) :
+                _copy2d!(C.ptr, C.ld, A.ptr, A.ld, C.m, C.n)
         elseif kind == _MT_KIND_LUSTEP
             # A loser runs the whole step itself, band by band in the serial order, and hands the
             # next panel's `info` back in the return value: the pool's `lainfo` is the winner's.

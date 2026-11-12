@@ -299,6 +299,22 @@ end
     sb % q == 0 && (sb % (q << 1) == 0 || n * n * sizeof(eltype(A)) <= _L2_BYTES)
 end
 
+# One triangle (diagonal included) of an n×n block, `src` → `dst`, each column one contiguous run.
+# This is the pad round-trip of `_potrf_f64_lower!`. It is pure data movement, so run serially it
+# is a fixed cost beside a factorization that threads: measured on Zen4, four workers, at a
+# power-of-two leading dimension, the two serial copies were 0.57 ms of a 2.75 ms call at n=1024 and
+# 3.9 ms of 19.7 ms at n=2048. Real types go through the pool in area-balanced column bands
+# (`_MT_KIND_COPY2D` with its triangle flag) when `_lu_move_workers` admits the bytes moved —
+# `(n+1)÷2` is the triangle's mean column height. No arithmetic, so no bit can change.
+function _tricopy_mt!(dst::Ptr{T}, ldd::Int, src::Ptr{T}, lds::Int, n::Int, up::Bool) where {T <: BlasReal}
+    nw = _lu_move_workers((n + 1) ÷ 2, n, T)
+    nw > 1 || return _tricopy!(dst, ldd, src, lds, n, up, 0, n)
+    S = PtrMatrix{T}(src, n, n, lds)
+    _gemm_threaded!(PtrMatrix{T}(dst, n, n, ldd), S, S, one(T), zero(T), false, false, false, false,
+        nw, _MT_KIND_COPY2D, up, false, true)
+    return nothing
+end
+
 # PDM: Exempt — boolean switch (path on/off), not a tuned size.
 const _POTRF_PAD = @load_preference("potrf_pad", true)::Bool   # disable to A/B the pad's benefit per µarch
 
@@ -1558,14 +1574,10 @@ function _potrf_f64_lower!(A, base::Int = _chol_rl_max(eltype(A)))
                 # (base kernel loads rows ≥ j, cols < j), and the scratch upper is never-read workspace. Copying
                 # column j from its diagonal down (n-j elts) halves the copy — the copy is the WHOLE pad overhead
                 # (~16 MB at n=1024), so this lifts the po2-input gate directly (2n²→n² moved).
-                @inbounds for j in 0:(n - 1)
-                    unsafe_copyto!(pb + (j * ldb + j) * sizeof(T), pa + (j * lda + j) * sizeof(T), n - j)
-                end
+                _tricopy_mt!(pb, ldb, pa, lda, n, false)
                 f = _chol_hyb_f64!(Mw, n, base)
                 f == 0 || throw(PosDefException(f))        # throw BEFORE copy-back: A stays untouched
-                @inbounds for j in 0:(n - 1)
-                    unsafe_copyto!(pa + (j * lda + j) * sizeof(T), pb + (j * ldb + j) * sizeof(T), n - j)
-                end
+                _tricopy_mt!(pa, lda, pb, ldb, n, false)
             end
         end
     else
