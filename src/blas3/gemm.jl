@@ -1029,7 +1029,13 @@ const _GEMM_UNPACK_MAX = @load_preference("gemm_unpack_max", _at_gemm_unpack_max
 # off-diagonal sub-gemms are SKEWED — at n=449 the shape is 449×~224×~224 and this `max()` sends every one
 # of them to the blocked path because ONE dim crossed. Suspected half of the 448 < n <= 480 gate cliff,
 # which appears on exactly the two boxes where this constant is 448 and on neither where it is 96.
-@inline _use_unpacked(m, n, k) = max(m, n, k) <= _GEMM_UNPACK_MAX + @inbounds(_EXPINT[2])
+#
+# A row extent below one full tile (`_GEMM_MR1_MAX` = the tile height) takes the unpacked path whatever
+# n and k are: packing op(B) costs O(n·k) and each packed element is then used by fewer than a tile
+# height of rows, so the pack is never amortized, while the unpacked kernel reads A (m×k, tiny) from
+# cache. Measured on Zen4, one thread, β=0: 2×553×988 539 → 103 µs, 2×988×553 'T' 568 → 170 µs,
+# and still ahead at m=12 and 16 (537 → 342, 338 → 328 µs); at m=24 the two routes tie.
+@inline _use_unpacked(m, n, k) = m <= _GEMM_MR1_MAX || max(m, n, k) <= _GEMM_UNPACK_MAX + @inbounds(_EXPINT[2])
 
 # Unpacked microkernel: full mr×nr tile, reading A (tA='N') and op(B) directly. alpha applied at
 # store (C already beta-scaled). TB selects op(B); a compile-time Val so the address folds.
