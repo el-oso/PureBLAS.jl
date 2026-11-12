@@ -76,6 +76,33 @@ end
     end
 end
 
+# A C with fewer rows than one tile never amortizes packing op(B), so it takes the unpacked kernel
+# whatever n and k are. Each column of C accumulates its k chain on its own, so computing the columns
+# in two halves must give the same bits as one call, as a column-split pool does.
+@testitem "GEMM with few rows of C takes the unpacked route" setup = [GemmOracle] begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    big = 4 * P._GEMM_UNPACK_MAX
+    for m in (1, 2, P._GEMM_MR1_MAX)
+        @test P._use_unpacked(m, big, big)
+    end
+    @test !P._use_unpacked(P._GEMM_MR1_MAX + 1, big, big)
+    k, n = 988, 553
+    for T in (Float32, Float64), tB in ('N', 'T'), m in (2, 5)
+        A = randn(T, m, k)
+        B = tB == 'N' ? randn(T, k, n) : randn(T, n, k)
+        C = zeros(T, m, n)
+        P.gemm!(C, A, B; transB = tB)
+        @test C ≈ A * (tB == 'N' ? B : B') rtol = 100 * eps(T) * k
+        h = n ÷ 2
+        Bl = tB == 'N' ? B[:, 1:h] : B[1:h, :]
+        Br = tB == 'N' ? B[:, (h + 1):n] : B[(h + 1):n, :]
+        Cl = zeros(T, m, h); Cr = zeros(T, m, n - h)
+        P.gemm!(Cl, A, Bl; transB = tB); P.gemm!(Cr, A, Br; transB = tB)
+        @test C == hcat(Cl, Cr)
+    end
+end
+
 @testitem "GEMM beta=0 ignores NaN in C (BLAS semantics)" setup = [GemmOracle] begin
     using PureBLAS
     A = randn(64, 48); B = randn(48, 32)
