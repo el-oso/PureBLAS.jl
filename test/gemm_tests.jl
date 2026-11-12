@@ -1128,14 +1128,19 @@ end
     @test !any(P._mt_cut([[1.42, 1.5, 1.41], [1.44, 1.4, 1.47], [1.48, 1.43, 1.4], [1.52, 1.5, 1.55]]))
     # A gap that is real but below the margin.
     @test !any(P._mt_cut([[1.0, 1.05, 1.02], [1.5, 1.9, 1.6]]))
-    @test P._mt_settled(() -> 3.0) == 3.0
+    @test P._mt_settled(() -> 3.0, typemax(UInt64)) == 3.0
+    # A deadline already past: the rule stops at its first chance, on the three readings it has.
+    let k = Ref(0)
+        @test P._mt_settled(() -> Float64(k[] += 1), UInt64(0)) == 2.0
+    end
+    @test P._mt_clock_step() > 0
     @test P._mt_affinity_count() >= 0
     if nthreads() < 2
         @test_skip "needs >= 2 julia threads: there is no pool to measure without one"
     else
         P.set_num_threads(nthreads())
         try
-            @test P._MT_POLLS[] >= 1
+            @test P._MT_POLLS[] >= 1 && P._MT_POLLS_HOME[] >= 1
             @test 0 < P._gemm_mt_work() < typemax(Int)
             if isnothing(P._GEMM_MT_WORK_PREF)
                 h = P._MT_HOST
