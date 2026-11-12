@@ -86,6 +86,11 @@ const _ARM_PB_MT = "pb_mt"
 const _MT_NT = let i = findfirst(a -> startswith(a, "mt="), ARGS)
     isnothing(i) ? 6 : parse(Int, ARGS[i][4:end])
 end
+# The mask above holds ONE CPU per physical core. PureBLAS's core cap divides the CPUs it may use by the
+# machine's threads per core, so on an SMT part it reads that mask as half as many cores (6 CPUs → 3
+# workers on Zen4) and `pb_mt` would measure half the pool. The mask already guarantees one worker per
+# core, which is what the cap exists to enforce, so the cap is lifted here.
+ENV["PUREBLAS_MT_ALL_THREADS"] = "1"
 # Is this arm a VENDOR reference — i.e. may it appear on the other side of a gate comparison? `pb` and
 # `pb_mt` are both PureBLAS, and `generic` is LinearAlgebra's own fallback. Everything that adjudicates
 # or audits a PB-vs-reference pair must ask THIS, never `a != "pb"`.
