@@ -6133,11 +6133,23 @@ end
 
 # Fill `_MT_PINNED_CORES`. Called once, under `_MT_SETUP_LOCK`, before the pools exist, by the thread
 # that will create them.
+#
+# k distinct CPUs on a machine of `cores` cores with `tpc` threads each lie on at least cld(k, tpc)
+# and at most min(k, cores) cores. Where the two agree — every CPU of the machine bound, for one —
+# that is the count and nothing is measured; the cache groups (`_mt_group_order!`) then keep the
+# whole budget, which they need at -t 24 on Zen3 (7.9-8.4 ms of the 10). Elsewhere a count outside
+# them is readings that do not agree with the machine, and is reported unknown.
 function _mt_pinned_cores!(deadline::UInt64)
     tids = filter(!=(Threads.threadid()), Threads.threadpooltids(:default))
     cpu = _mt_bound_cpus(tids)
+    cores = max(1, Int(num_cores()))
+    tpc = max(1, Sys.CPU_THREADS ÷ cores)
+    k = length(unique(cpu))
+    lo, hi = cld(k, tpc), min(k, cores)
     c = 0
-    if !isempty(cpu)
+    if !isempty(cpu) && lo == hi
+        c = hi
+    elseif !isempty(cpu)
         p = L1Product()
         s = SmtState(length(cpu), _mt_batch(p, _mt_clock_step(), deadline), deadline)
         ts = [_mt_on_thread(SmtJob(s, w + 1), tid) for (w, tid) in pairs(tids)]
@@ -6148,7 +6160,7 @@ function _mt_pinned_cores!(deadline::UInt64)
             s.go[] = -1
             foreach(wait, ts)
         end
-        time_ns() < deadline || (c = 0)
+        (time_ns() < deadline && lo <= c <= hi) || (c = 0)
     end
     _MT_PINNED_CORES[] = c
     return nothing
