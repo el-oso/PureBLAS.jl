@@ -4570,15 +4570,13 @@ end
 end
 @inline _gemm_chunk(n::Int, nw::Int, i::Int) = _gemm_chunk(n, nw, i, _NR)
 
-# The band granularity gemv-T needs: a multiple of every NC its sweep can select. `_gemvt_cols!` is
-# called with `Val(16)`, `Val(8)` or `Val(4)` — whatever `_gemvt_nc()` resolves to is snapped to one
-# of those three — and the deep arm always takes `_GEMVT_NC_DEEP`, so 16 covers the lot and is also a
-# multiple of `_NR` on every width this library builds for.
+# The band granularity gemv-T needs: a multiple of every column-group width its sweep can run, so
+# that no band boundary moves a column between two groupings (req#11). The sweep takes one of
+# `_GEMVT_NC_ARMS` and the deep arm always takes `_GEMVT_NC_DEEP`; their least common multiple covers
+# the lot.
 # ponytail: one constant for all arms; compute the exact NC in the driver if small-`n` gemv-T ever
-# needs the finer split that a 16-column granularity denies it.
-# PDM: Exempt — not a performance value. It is the least common multiple of the column-group widths `_gemvt_cols!` can be called with (4, 8, 16), so it is fixed by the kernel's own shape and tuning it would break req#11.
-# req8-ok: req#11 granularity, lcm of the NC values `_gemvt_cols!` dispatches to — not a tuning literal
-const _GEMVT_BAND = 16
+# needs the finer split that this granularity denies it.
+const _GEMVT_BAND = lcm(_GEMVT_NC_ARMS..., _GEMVT_NC_DEEP)
 
 # ── FLOP-BALANCED COLUMN SPLIT FOR A TRIANGULAR OUTPUT (syrk / syr2k / herk / her2k) ────────────────
 # `_gemm_chunk`'s equal-WIDTH split is wrong for a triangle. Column j of a lower-triangular C has n − j

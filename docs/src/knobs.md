@@ -318,13 +318,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-37 `const _X = <literal>` values in `src/` with no `@load_preference`.
+36 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 30 Literal · 4 Exempt · 3 Unaudited.
+**Tier:** 30 Literal · 3 Exempt · 3 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -430,7 +430,6 @@ on these, not on knobs.
 | Const | Value | Tier | Why |
 |---|---|---|---|
 | `_GEMM_TINY` | 6 | Literal | below this the naive loop beats the packed path. TUNABLE. |
-| `_GEMVT_BAND` | 16 | Exempt | not a performance value. It is the least common multiple of the column-group widths `_gemvt_cols!` can be called with (4, 8, 16), so it is fixed by the kernel's own shape and tuning it would break req#11. |
 | `_MT_AMORTISE` | 8 | Unaudited | — |
 
 ### sme_kernel
