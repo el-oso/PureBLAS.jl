@@ -2147,8 +2147,22 @@ send the result back, so that we see CPUs we do not own. The function:
 The file holds no personal data and nothing outside that list, and sending it is the user's choice.
 Still to decide:
 - the submission channel (for example a GitHub issue template the file is attached to);
-- how submitted results feed the gate and the tuning (directional only, since a user's clock is not
-  locked).
+- how submitted results feed the gate and the tuning.
+
+**It must give usable numbers on an unlocked CPU,** because users cannot lock their clocks (no root,
+laptops, boost, thermal limits). The repo already measures this way in `tune!(unlocked = true)`; the
+user benchmark reuses that method rather than inventing one:
+- **Report ratios, not absolute times.** PureBLAS and the reference BLAS are timed alternately in one
+  process (ABBA order), so both see the same clock state, and the result is their ratio.
+- **Count cycles where the platform allows it.** A cycle count does not change with boost, so the ratio
+  holds when the clock moves.
+- **Detect drift and drop the cell, never average it in.** Record the clock state before and after each
+  cell; a cell whose arms ran at different clocks beyond a tolerance is marked unusable, not reported.
+- **Tighter rules than the locked fleet:** more rounds, a smaller allowed drift, and a larger margin
+  before a difference counts. Each result is stamped as unlocked.
+
+The file then reports which cells were usable, so a noisy machine sends fewer cells rather than wrong
+ones.
 
 ### Sweeps — measure less, in the right places
 
