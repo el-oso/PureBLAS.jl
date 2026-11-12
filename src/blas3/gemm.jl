@@ -4494,6 +4494,12 @@ const _MT_KIND_LASWP = 22
 # PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
 # req8-ok: enum discriminant, host-invariant by construction
 const _MT_KIND_COPY2D = 23
+# One whole getrf panel step with the workers in two sets, so that a column band is swapped, solved
+# and updated by one worker and the data a step produces stays in the cache group that produced it
+# (`_lustep_run_chunk` in lu.jl).
+# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
+# req8-ok: enum discriminant, host-invariant by construction
+const _MT_KIND_LUSTEP = 24
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
@@ -4699,6 +4705,7 @@ end
     p.kind == _MT_KIND_SYMM && return _symm_run_chunk(p, nw, i)
     p.kind == _MT_KIND_LASWP && return _laswp_run_chunk(p, nw, i)
     p.kind == _MT_KIND_COPY2D && return _copy2d_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_LUSTEP && return _lustep_run_chunk(p, nw, i)
     p.kind == _MT_KIND_AXPY && return _axpy_run_chunk(p, nw, i)
     p.kind == _MT_KIND_DOT && return _dot_run_chunk(p, nw, i)
     p.kind == _MT_KIND_ASUM && return _asum_run_chunk(p, nw, i)
@@ -4713,7 +4720,7 @@ end
     p.kind == _MT_KIND_SYMV && return _symv_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GBMVN && return _gbmvn_run_chunk(p, nw, i)
     p.kind == _MT_KIND_ELEM && return _elem_run_chunk(p, nw, i)
-    j0, len = _gemm_chunk(p.n, nw, i)
+    j0, len = _gemm_chunk(p.n, nw, _mt_band(nw, i))
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
     Ac = PtrMatrix{T}(p.Ap, p.tA ? p.k : p.m, p.tA ? p.m : p.k, p.lda)
@@ -4783,8 +4790,9 @@ end
         )
         return nothing
     end
-    # `nw - 1` workers over the columns past `c1`, and `i - 1` is this worker's index among them.
-    j0, len = _gemm_chunk(p.n - c1, nw - 1, i - 1)
+    # `nw - 1` workers over the columns past `c1`. This worker's band among them is its band among
+    # all `nw` less the one worker 1 holds — which is band 1 unless the driver is alone in its group.
+    j0, len = _gemm_chunk(p.n - c1, nw - 1, (_MT_G0[] > 1 ? _mt_band(nw, i) : i) - 1)
     len > 0 || return nothing
     j0 += c1
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -4820,7 +4828,7 @@ end
 # so the bands are independent and the order across bands cannot matter. `_laswp!` lives in lu.jl,
 # included after this file; the call resolves when it first runs, as `_trsm_run_chunk`'s does.
 @noinline function _laswp_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
-    j0, len = _gemm_chunk(p.n, nw, i)
+    j0, len = _gemm_chunk(p.n, nw, _mt_band(nw, i))
     len > 0 || return nothing
     V = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
     _laswp!(V, PtrVector{Int}(p.laipiv, p.laioff + p.lanb), p.laioff + 1, p.laioff + p.lanb, 1, len)
@@ -4829,7 +4837,7 @@ end
 
 # `C[:, band] .= A[:, band]`, column by column, each column one contiguous run of `m` elements.
 @noinline function _copy2d_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
-    j0, len = _gemm_chunk(p.n, nw, i)
+    j0, len = _gemm_chunk(p.n, nw, _mt_band(nw, i))
     len > 0 || return nothing
     _copy2d!(p.Cp + j0 * p.ldc * sizeof(T), p.ldc, p.Ap + j0 * p.lda * sizeof(T), p.lda, p.m, len)
     return nothing
@@ -5484,7 +5492,9 @@ end
     nwmax = max(1, Threads.nthreads() - 1)
     # The default pool minus the creating thread has at least `nthreads() - 1` threads, so every worker
     # gets a thread of its own.
-    tids = filter(!=(Threads.threadid()), Threads.threadpooltids(:default))
+    # `_MT_TIDS` is that thread list as `_mt_group_order!` ordered it. `set_num_threads` fills it before
+    # the first pool exists, so the four pools agree on which worker index is which thread.
+    tids = _MT_TIDS
     length(tids) >= nwmax ||
         error("PureBLAS: $nwmax pool workers but only $(length(tids)) threads to bind them to: $tids")
     p = GemmPool{T}(
@@ -5535,6 +5545,160 @@ const _MT_LOST = Threads.Atomic{Int}(0)
 # to land on a free thread. Bumped once per such job, on a path that is about to run a whole chunk.
 const _MT_SKIPPED = Threads.Atomic{Int}(0)
 
+# ── CACHE GROUPS ───────────────────────────────────────────────────────────────────────────────────
+# Cores that share a last-level cache hand each other a freshly written line cheaply; cores that do not
+# pay several times more for it. Measured on Zen3 (two groups of six cores, 32 MiB L3 each), ns per
+# byte for one thread reading a buffer another has just written: 0.013 own write, 0.015 a core in the
+# same group, 0.048 a core in the other group. A blocked LU hands such data between workers at every
+# step, so `getrf!` keeps the hand-offs inside a group where it can (`_lustep_try!` in lu.jl), and for
+# that the pool has to know which workers share a group with the thread that drives it.
+#
+# THE GROUPS ARE MEASURED, NOT LOOKED UP: the thread that creates the pool writes a buffer, each
+# worker thread in turn times a read of it against a read of a buffer it wrote itself. Both reads
+# are on the SAME core, back to back, so a slower core or a lower clock cancels in their ratio, and
+# the workers are split only when those ratios fall into two sets with a clear gap between them —
+# they are compared with each other, never with a fixed cost. (When every worker is in another group
+# than the creator there is no gap to see, and the pool stays ungrouped.) Nothing here asks the
+# operating system or the CPU where a thread runs, so it works on any machine Julia does; it is
+# measured on x86-64 only (Zen3, Zen4). It is right for exactly as long as the threads
+# stay where they were — which is the pinned case. The measurement is therefore taken several times
+# with every thread loaded in between, and threads that float, whose readings change, leave the pool
+# ungrouped, as does a machine with one group (`_mt_group_order!`). It is taken once, when the pool
+# is created: threads pinned after that are not seen.
+#
+# `_MT_TIDS` lists the worker threads with the creator's group first. `_MT_G0` is how many
+# participants of a job belong to that group when the driver is the creator — its workers plus the
+# driver itself — or `typemax(Int)` when no split is known; a job with at most that many workers
+# never leaves the group. `_MT_HOME` is the creator's thread, the only driver the count is true for.
+const _MT_TIDS = Int[]
+const _MT_G0 = Threads.Atomic{Int}(typemax(Int))
+const _MT_HOME = Threads.Atomic{Int}(0)
+
+# The band a chunk takes in a job that splits columns left to right. The driver runs chunk `nw` but
+# sits in the first group, so when the workers span groups it takes the band beside that group's
+# instead of the last one: each group then holds one contiguous run of columns, in the same place
+# from job to job. Which worker computes a band never changes the band's arithmetic. Measured on
+# Zen3, three workers in each of two groups, getrf n=2048: 26.99 ms with this order, 27.46 without;
+# n=512 to 1024 are unchanged by it.
+@inline function _mt_band(nw::Int, i::Int)
+    g0 = _MT_G0[]
+    nw > g0 || return i
+    return i < g0 ? i : (i == nw ? g0 : i + 1)
+end
+
+# How many whole-step getrf jobs were published. A test witness, like `_MT_SKIPPED`: the bit
+# comparison that covers the grouped step passes without it whenever the step is not taken.
+const _MT_LUSTEPS = Threads.Atomic{Int}(0)
+
+# PDM: Exempt — the sample count behind each worker's reading, not a tuning value.
+# A worker's reading is the median of this many rounds.
+# req8-ok: sample count of a median; no hardware fact places it
+const _MT_GROUP_ROUNDS = 8
+# PDM: Exempt — how many times the whole classification is taken, not a tuning value.
+# The passes are separated by a busy burst and must agree; see `_mt_group_order!`.
+# req8-ok: repeat count of a consistency check; no hardware fact places it
+const _MT_GROUP_PASSES = 3
+# PDM: Literal — how clear the separation must be before the workers are split in two: the lowest
+# reading of the far set over the highest of the near set. The readings are compared with each other
+# and never with a fixed cost, so a machine on which every worker reads alike has one group whatever
+# that reading is. Zen3, two groups: 1.36-1.48 near and 4.02-4.86 far, a gap of 2.7; six workers
+# inside one group read 1.42-1.48, a widest gap of 1.04.
+const _MT_GROUP_GAP = 2.0   # req8-ok: separation margin between two measured clusters (gap 2.7 against 1.04), not a perf tuning
+# PDM: Literal — how long every thread is kept busy between two passes, so that a scheduler free to
+# move a thread gets the chance to. A property of the host's scheduler, not of the hardware: on
+# Linux, with unpinned threads on a two-group Zen3, the classification changed across one 20 ms
+# burst in 14 of 14 trials that had a thread in each group.
+const _MT_GROUP_BURST_NS = 20_000_000   # req8-ok: scheduler-reaction window measured on the host OS, not a perf tuning
+
+# One round on the calling thread: time a read of `shared`, which another thread has just written,
+# against a read of `own`, written here first. The sum is returned so neither read can be dropped.
+function _mt_xfer_ratio(shared::Vector{UInt64}, own::Vector{UInt64}, r::Int)
+    t0 = time_ns()
+    s = sum(shared)
+    t1 = time_ns()
+    fill!(own, r % UInt64)
+    t2 = time_ns()
+    s += sum(own)
+    t3 = time_ns()
+    return (t1 - t0) / max(1, t3 - t2), s
+end
+
+# A task bound to thread `tid`, the placement `_gemm_pool_start!` gives a worker.
+function _mt_on_thread(f, tid::Int)
+    t = Task(f)
+    t.sticky = true
+    isone(ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1)) ||
+        error("PureBLAS: could not bind a task to thread $tid")
+    schedule(t)
+    return t
+end
+
+function _mt_busy(ns::Int)
+    t0 = time_ns()
+    x = 0
+    while time_ns() - t0 < ns
+        x += 1
+    end
+    return x
+end
+
+# One pass: which of `tids` read the calling thread's fresh lines at a clearly higher cost than the
+# rest. All false when the readings do not fall into two sets `_MT_GROUP_GAP` apart.
+function _mt_group_pass(tids::Vector{Int}, shared::Vector{UInt64})
+    med = Vector{Float64}(undef, length(tids))
+    rs = Vector{Float64}(undef, _MT_GROUP_ROUNDS)
+    ratio = Ref(0.0)
+    for (w, tid) in pairs(tids)
+        own = similar(shared)
+        for r in 0:_MT_GROUP_ROUNDS                     # round 0 compiles and warms; it is not kept
+            fill!(shared, r % UInt64)
+            wait(_mt_on_thread(() -> (ratio[] = _mt_xfer_ratio(shared, own, r)[1]; nothing), tid))
+            r > 0 && (rs[r] = ratio[])
+        end
+        med[w] = sort!(rs)[(_MT_GROUP_ROUNDS + 1) ÷ 2]
+    end
+    # Split at the widest gap between neighbouring readings, if it is wide enough.
+    p = sortperm(med)
+    gap = 1.0; cut = 0
+    for j in 1:(length(p) - 1)
+        g = med[p[j + 1]] / med[p[j]]
+        g > gap && (gap = g; cut = j)
+    end
+    far = falses(length(tids))
+    gap >= _MT_GROUP_GAP && (far[p[(cut + 1):end]] .= true)
+    return far
+end
+
+# Fill `_MT_TIDS`, `_MT_G0` and `_MT_HOME`. Called once, by the thread creating the pools, under
+# `_MT_SETUP_LOCK`; it allocates, like the rest of that setup path. A machine with one group
+# returns after the first pass; one with several pays the bursts as well.
+function _mt_group_order!()
+    tids = filter(!=(Threads.threadid()), Threads.threadpooltids(:default))
+    empty!(_MT_TIDS); append!(_MT_TIDS, tids)
+    _MT_G0[] = typemax(Int)
+    _MT_HOME[] = Threads.threadid()
+    length(tids) >= 2 || return nothing
+    # Half an L2: more than an L1, so the read is long against the clock's resolution, and small
+    # enough that the writer still holds every line in its own L2 when the reader asks for it.
+    shared = Vector{UInt64}(undef, max(1, (_L2_BYTES ÷ 2) ÷ sizeof(UInt64)))
+    far = _mt_group_pass(tids, shared)
+    any(far) || return nothing
+    # THREADS THAT ARE FREE TO MOVE MUST NOT BE GROUPED, and one pass cannot tell: an idle thread
+    # stays where it last ran, so it classifies as cleanly as a pinned one. Loading every thread at
+    # once is what makes a scheduler rebalance them, so the pass is repeated after a burst of exactly
+    # that, and any difference between passes leaves the pool ungrouped.
+    for _ in 2:_MT_GROUP_PASSES
+        ts = [_mt_on_thread(() -> (_mt_busy(_MT_GROUP_BURST_NS); nothing), tid) for tid in tids]
+        _mt_busy(_MT_GROUP_BURST_NS)
+        foreach(wait, ts)
+        _mt_group_pass(tids, shared) == far || return nothing
+    end
+    empty!(_MT_TIDS)
+    append!(_MT_TIDS, tids[.!far]); append!(_MT_TIDS, tids[far])
+    _MT_G0[] = count(!, far) + 1
+    return nothing
+end
+
 # The participating worker (index below `nw`) bound to the calling thread, or 0. `tids` never changes
 # after the pool starts, so this needs no claim.
 @inline function _mt_self_worker(p::GemmPool, nw::Int)
@@ -5558,6 +5722,11 @@ read on every call.
 Threading is **off until you call this**. That is deliberate: a BLAS that silently takes every thread
 in the process is a surprise to whatever else the process is doing, and the shape matches
 `openblas_set_num_threads`, which is what a host expects to find.
+
+That first call also measures which worker threads share a last-level cache with the calling thread,
+so that `getrf!` can keep a panel step's data inside one cache group on a machine that has several.
+The measurement describes the threads where they are at that moment: pin them first. Threads that are
+not pinned, and machines with a single group, are left ungrouped.
 
 The worker pool is created on the first call that asks for more than one thread, and lives for the rest
 of the process — upstream reports that adopted threads which come and go leak their thread storage and
@@ -5616,6 +5785,7 @@ function set_num_threads(n::Integer)
     nt = clamp(Int(n), 1, min(Threads.nthreads(), cores, _MT_NW_MASK))
     if nt > 1
         lock(_MT_SETUP_LOCK) do
+            isempty(_GEMM_POOL_F64) && _mt_group_order!()
             isempty(_GEMM_POOL_F64) && push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
             isempty(_GEMM_POOL_F32) && push!(_GEMM_POOL_F32, _gemm_pool_new(Float32))
             isempty(_GEMM_POOL_C64) && push!(_GEMM_POOL_C64, _gemm_pool_new(ComplexF64))
@@ -5760,6 +5930,10 @@ end
             _laswp!(C, PtrVector{Int}(lup.ipiv, lup.ioff + lup.nb), lup.ioff + 1, lup.ioff + lup.nb, 1, C.n)
         elseif kind == _MT_KIND_COPY2D
             _copy2d!(C.ptr, C.ld, A.ptr, A.ld, C.m, C.n)
+        elseif kind == _MT_KIND_LUSTEP
+            # A loser runs the whole step itself, band by band in the serial order, and hands the
+            # next panel's `info` back in the return value: the pool's `lainfo` is the winner's.
+            return T(_lustep_serial!(_lustep(C, A.n, lup)))
         elseif kind == _MT_KIND_TRSM
             # `nroute` stays -1 for the same reason as gemm's: a loser solves the whole of B, so its
             # own column count IS the routing width. `C` and `B` are the same matrix here.
@@ -6040,6 +6214,9 @@ end
             joined = true
         end
         (@atomic p.failed) && _throw_gemm_worker()
+        # The next panel's `info`, read inside the claim for the reason the folds below are: once
+        # `busy` is released the next job's publish clears the field.
+        kind == _MT_KIND_LUSTEP && (red = T(p.lainfo))
         # FOLD A REDUCTION HERE, INSIDE THE CLAIM. It cannot wait until after the `finally` below: that
         # releases `busy`, and the next caller's driver resizes and rewrites the very slots this fold
         # reads. Here the job is joined (no worker is writing) and the claim is still held (no other
