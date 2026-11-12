@@ -601,7 +601,7 @@ end
 #
 # The partials buffer legitimately grows on the FIRST threaded call of a given block count, so the
 # warm-up has to cover that as well as both handoffs — a back-to-back call leaves the workers inside
-# their spin window, which is not the same path as a wake from a real park.
+# their polling window, which is not the same path as a wake from a real park.
 @testitem "L1 real: threaded entries are allocation-free at steady state" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
