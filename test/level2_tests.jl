@@ -958,7 +958,7 @@ end
 # `@allocated` goes through a CONCRETELY TYPED function, never at testitem scope, where the
 # measurement reports phantom bytes for boxing the return value. Two warm-up passes with a sleep
 # between them: the first covers buffer growth on the first call at a given grid, the second wakes the
-# workers from a real park rather than from inside their spin window.
+# workers from a real park rather than from inside their polling window.
 @testitem "L2 real: threaded entries are allocation-free at steady state" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads

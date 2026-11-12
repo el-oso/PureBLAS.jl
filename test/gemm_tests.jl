@@ -233,12 +233,12 @@ end
         #
         # The warm-up covers both paths the measured call can take. The route is one; the pool's
         # sleep/wake handoff is the other, and the shapes above miss it because they run back-to-back
-        # and leave the workers inside their `_MT_SPINS` window rather than parked.
+        # and leave the workers inside their polling window rather than parked.
         gemm1(Cx, Ax, Bx) = @allocated P.gemm!(Cx, Ax, Bx)
         A = randn(512, 512); B = randn(512, 512); C = zeros(512, 512)
         @test P._gemm_workers(512, 512, 512) > 1
         P.gemm!(C, A, B)                 # the route
-        sleep(0.05); P.gemm!(C, A, B)    # and a wake from a real park, not from the spin window
+        sleep(0.05); P.gemm!(C, A, B)    # and a wake from a real park, not from the polling window
         @test minimum(gemm1(C, A, B) for _ in 1:8) == 0
         P.set_num_threads(1)                      # leave the process as we found it
         @test P.get_num_threads() == 1
@@ -1115,7 +1115,7 @@ end
 
 # What the pool measures when it is created. The cut that finds cache groups is checked on readings
 # stated by hand, because a host with one group never produces a split; the rest is that a created
-# pool has a floor at all.
+# pool has a poll count and a floor at all.
 @testitem "threaded pool: host measurement" tags = [:checks] begin
     using PureBLAS
     using Base.Threads: nthreads
@@ -1135,6 +1135,7 @@ end
     else
         P.set_num_threads(nthreads())
         try
+            @test P._MT_POLLS[] >= 1
             @test 0 < P._gemm_mt_work() < typemax(Int)
             if isnothing(P._GEMM_MT_WORK_PREF)
                 h = P._MT_HOST
