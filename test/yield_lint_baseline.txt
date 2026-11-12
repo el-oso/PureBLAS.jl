@@ -283,9 +283,3 @@ blas3/sme_kernel.jl:println(io, "  %$(nm)e$k = extractvalue $T4 %$v, $k")
 blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %$(nm)e0, <vscale x 2 x double> %$(nm)e1,")
 blas3/sme_kernel.jl:println(io, "    <vscale x 2 x double> %$(nm)e2, <vscale x 2 x double> %$(nm)e3)")
 blas3/gemm.jl:yield()
-# --- 2026-11-12, the pool's host measurement (`_mt_measure_host!`). It runs once, from
-#              `set_num_threads`, under `_MT_SETUP_LOCK` and before a thread count above one is
-#              published: the same cold construction path as the `lock` entry above, never reached
-#              from a kernel and holding no `@scope`. The `wait` is the creating thread waiting for a
-#              short task it bound to one worker's thread to time that thread's own yields.
-blas3/gemm.jl:wait(_mt_on_thread(PollJob(polls, p, step, deadline), maximum(_MT_TIDS)))

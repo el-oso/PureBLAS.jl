@@ -5323,7 +5323,9 @@ end
 
 # The number of polls that take as long as `_MT_AMORTISE` yields on the calling thread. The poll
 # block is doubled until it is at least that long and long against the clock (`_mt_batch` gives the
-# same margin), and only that last block is read more than once.
+# same margin). Both times are medians of settled medians: the first yields of a thread cost
+# several times what later ones do (Zen4: the count came out 3.7 times too high from one settled
+# run of readings), and one run can be made of those alone.
 function _mt_poll_count(p::GemmPool, step::Int, deadline::UInt64)
     yields = function ()
         for _ in 1:_MT_AMORTISE
@@ -5331,14 +5333,14 @@ function _mt_poll_count(p::GemmPool, step::Int, deadline::UInt64)
         end
         return nothing
     end
-    b = _mt_batch(yields, step)
-    ty = _mt_settled(() -> _mt_time(yields, b), deadline)
+    b = _mt_batch(yields, step, deadline)
+    ty = _mt_settled(() -> _mt_settled(() -> _mt_time(yields, b), deadline), deadline)
     n = 1
     while _mt_poll_ns(p, n) < max(ty, _MT_AMORTISE^2 * step)
         n *= 2
     end
     block = n
-    tp = _mt_settled(() -> _mt_poll_ns(p, block), deadline)
+    tp = _mt_settled(() -> _mt_settled(() -> _mt_poll_ns(p, block), deadline), deadline)
     return max(1, unsafe_trunc(Int, block * ty / tp + 0.5))
 end
 
@@ -5648,7 +5650,7 @@ struct AffinityJob
 end
 (j::AffinityJob)() = (j.cnt[j.w] = _mt_affinity_count(); nothing)
 struct PollJob{T}
-    out::Base.RefValue{Int}
+    out::Threads.Atomic{Int}             # 0 until the count is in
     p::GemmPool{T}
     step::Int
     deadline::UInt64
@@ -5792,9 +5794,17 @@ end
 # `_MT_AMORTISE`² clock steps. A reading a few steps long moves by a whole step at a time — an
 # empty fork-join on Apple silicon reads 4, 5 or 6 steps, ±20% — and the floor is built from 1/
 # `_MT_AMORTISE` shares, so the clock is allowed 1/`_MT_AMORTISE` of one such share.
-function _mt_batch(f, step::Int)
+#
+# Each size is judged on a SETTLED reading, not on one call: the first call of anything here is
+# slow — a worker has to be woken, code and data are cold — and a single slow call looks long
+# enough at a batch of one.
+function _mt_batch(f, step::Int, deadline::UInt64)
     b = 1
-    while _mt_time(f, b) * b < _MT_AMORTISE^2 * step
+    while time_ns() < deadline
+        t = let b = b                        # a fresh binding: the closure must not capture the loop's own
+            _mt_settled(() -> _mt_time(f, b), deadline)
+        end
+        t * b >= _MT_AMORTISE^2 * step && break
         b *= 2
     end
     return b
@@ -5830,7 +5840,7 @@ function _mt_flop_rate(step::Int, deadline::UInt64)
             _gemm_unpacked!(Val(false), Val(true), n, n, n, 1.0, pA, pB, 0.0, pC)
             return nothing
         end
-        b = _mt_batch(product, step)
+        b = _mt_batch(product, step, deadline)
         _mt_settled(() -> _mt_settled(() -> _mt_time(product, b), deadline), deadline)
     end
     return 2.0 * n^3 / ns
@@ -5846,7 +5856,7 @@ function _mt_join_cost(step::Int, deadline::UInt64)
         _gemm_threaded!(z, z, z, 1.0, 0.0, false, false, false, false, 2, _MT_KIND_COPY)
         return nothing
     end
-    b = _mt_batch(trip, step)
+    b = _mt_batch(trip, step, deadline)
     reading = function ()
         while true
             lost = _MT_LOST[]
@@ -5860,18 +5870,23 @@ end
 
 # Measure the poll counts and what the amortisation floor is built from. Called once, under
 # `_MT_SETUP_LOCK`, after the pools exist and before a thread count above one is published: the
-# workers are all asleep, so a worker's thread is free to time its own yields. A worker polls for
-# a job only while it is inside the published count, so that count is raised to two for the join
-# readings: one worker polls and the rest sleep. `_MT_FLOOR` still refuses every Level-3 call
-# meanwhile, and a byte-floored call that takes the pool is seen through `_MT_LOST`. A pinned
-# floor is not measured.
+# workers are all asleep, so a worker's thread is free to time its own yields. The creating thread
+# polls for that count instead of blocking on the task, so that it is doing what a driver does
+# while a worker idles: running, not asleep. A worker polls for a job only while it is inside the published count, so that
+# count is raised to two for the join readings: one worker polls and the rest sleep. `_MT_FLOOR`
+# still refuses every Level-3 call meanwhile, and a byte-floored call that takes the pool is seen
+# through `_MT_LOST`. A pinned floor is not measured.
 function _mt_measure_host!(deadline::UInt64)
     h = _MT_HOST
     step = _mt_clock_step()
     p = _gemm_pool(Float64)
     _MT_POLLS_HOME[] = _mt_poll_count(p, step, deadline)
-    polls = Ref(0)
-    wait(_mt_on_thread(PollJob(polls, p, step, deadline), maximum(_MT_TIDS)))
+    polls = Threads.Atomic{Int}(0)
+    _mt_on_thread(PollJob(polls, p, step, deadline), maximum(_MT_TIDS))
+    while iszero(polls[])
+        Base.Threads.atomic_fence()
+        GC.safepoint()
+    end
     _MT_POLLS[] = polls[]
     @static if isnothing(_GEMM_MT_WORK_PREF)
         h.flops_per_ns = _mt_flop_rate(step, deadline)
