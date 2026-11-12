@@ -582,7 +582,7 @@ end
 # PDM: Literal — machine-INVARIANT 8 on three boxes and two ISAs.
 const _BRD_NB = 8   # req8-ok: machine-invariant, gate-measured on all three boxes (table above)
 
-# Back-transform (compact-WY dlarfb) block. PDM Exempt (register-invariant), NOT a fake formula: 32 is the
+# Back-transform (compact-WY dlarfb) block. A register-invariant literal, NOT a fake formula: 32 is the
 # register-invariant compact-WY panel cap — the SAME value `_qr_nb` caps at (its comment: cap 32,
 # "µarch-invariant: floor·(_NVREG÷8) = 32 both ISAs"). The panel is deep enough to amortize the rank-nb
 # trailing gemm while the T-factor (nb²) stays L1-resident; that balance is 32 on AVX2 (16 regs) and AVX-512
@@ -592,22 +592,19 @@ const _BRD_NB = 8   # req8-ok: machine-invariant, gate-measured on all three box
 # PDM: Literal — back-transform block, measured invariant; confirm on a very-wide-register box before deriving. | tune: candidate
 const _BT_NB = @load_preference("bt_nb", 32)::Int
 @inline _fh_bt_nb() = (f = _FKR_bt_nb[]; f >= 0 ? f : _BT_NB)
-# PDM: Exempt — a CORRECTNESS override, not a perf choice: bdsqr fails on clustered sigma, so all with-vectors SVD routes to D&C.
-const _SVD_DC_CROSS = 1     # vectors: bdsqr (QR) only at n≤1 (trivial, no sweep), divide-and-conquer for n≥2.
-# CORRECTNESS OVERRIDE (2026-07-19, Fable adversarial review): the bdsqr! QR sweep
-# FAILS on near-degenerate singular-value clusters (two σ agreeing to relative spread
-# in ~(3e-15,1e-7)) — it either exhausts maxit ("failed to converge", a hard crash on
-# any clustered/rank-deficient input — reachable via gelsd/ggsvd, whose inputs have
-# clustered/zero σ BY DEFINITION) or, worse, SILENTLY drops the largest σ on graded
-# bidiagonals (recon error ~1). The D&C solver (_dc_qr! base) has correct
-# Demmel–Kahan-style deflation and is machine-eps on all these inputs (verified n=2..50,
-# clustered+graded), so route ALL with-vectors SVD through it. bdsqr! is a simplified
-# port; fixing its convergence (proper relative-accuracy tests + direction-dependent
-# shift, per reference dbdsqr) restores the perf crossover below — until then, D&C.
-# PERF NOTE (pre-fix, boost-locked bench/gesvd_cross.jl): bdsqr won n≤96 (1.13-1.42 vs
-# OB gesdd) but that path was numerically UNSOUND; the small-n perf regression from
-# using D&C is the correctness-first tradeoff. (Algorithm-intrinsic crossover like
-# LAPACK gesdd's SMLSIZ — not a cache-derived block size.)
+# Which bidiagonal solver computes the singular VECTORS: `bdsqr!` only for the trivial bidiagonal
+# with no off-diagonal (n ≤ 1, where it runs no QR sweep), divide-and-conquer (`bdsdc!`) for every
+# n ≥ 2. This is a CORRECTNESS rule, not a size to tune: the `bdsqr!` QR sweep FAILS on
+# near-degenerate singular-value clusters (two σ agreeing to relative spread in ~(3e-15,1e-7)) —
+# it either exhausts maxit ("failed to converge", a hard crash on any clustered/rank-deficient
+# input — reachable via gelsd/ggsvd, whose inputs have clustered/zero σ BY DEFINITION) or, worse,
+# SILENTLY drops the largest σ on graded bidiagonals (recon error ~1). The D&C solver (_dc_qr!
+# base) has correct Demmel–Kahan-style deflation and is machine-eps on all these inputs (verified
+# n=2..50, clustered+graded). `bdsqr!` is a simplified port; a size crossover between the two
+# solvers is admissible only once its convergence is fixed (proper relative-accuracy tests +
+# direction-dependent shift, per reference dbdsqr). With the sweep live it measured faster than
+# D&C for n ≤ 96 (1.13-1.42 vs OB gesdd, bench/gesvd_cross.jl) and was numerically unsound there.
+@inline _svd_vectors_by_qr(n::Int) = n <= 1
 
 # ── SVD scratch: one owned workspace per element type (mirrors L3Workspace/workspace.jl) ────────────
 # Every internal SVD buffer — bidiag arrays, gebrd/labrd panels, bidiagonal singular-vector blocks, the
@@ -1519,10 +1516,10 @@ function _gesvd_core!(
     tauq = view(ws.tauq, 1:n); taup = view(ws.taup, 1:n)
     gebrd!(A, d, e, tauq, taup, ws)
     nb = _fh_bt_nb()
-    # B's left/right singular vectors (Lvec/Rvec, n×n): bdsqr below the crossover (less D&C overhead at
-    # small n, like LAPACK gesdd's QR-below-SMLSIZ), divide-and-conquer above. Both write svals into d.
+    # B's left/right singular vectors (Lvec/Rvec, n×n): bdsqr for the trivial n ≤ 1, divide-and-conquer
+    # otherwise (see `_svd_vectors_by_qr`). Both write svals into d.
     Lvec = view(ws.Lvec, 1:n, 1:n); Rvec = view(ws.Rvec, 1:n, 1:n)
-    if n <= _SVD_DC_CROSS
+    if _svd_vectors_by_qr(n)
         fill!(Lvec, 0.0); fill!(Rvec, 0.0)
         @inbounds for i in 1:n
             Lvec[i, i] = 1.0; Rvec[i, i] = 1.0
@@ -1819,10 +1816,10 @@ function _zgesvd_core!(
     # dead and an O(n) fill against an O(mn²) reduction is not worth the risk of finding out here.
     tauq = borrow!(arn, T, n); taup = borrow!(arn, T, n)
     gebrd!(A, d, e, tauq, taup, ws)                     # complex bidiagonalization (real d,e; complex τ)
-    # REAL bidiagonal SVD: B = Lvec·diag(d)·Rvecᵀ (bdsqr below the crossover, D&C above — mirror the real
+    # REAL bidiagonal SVD: B = Lvec·diag(d)·Rvecᵀ (bdsqr for the trivial n ≤ 1, D&C otherwise — mirror the real
     # core). Lvec/Rvec are REAL (B is real bidiagonal); the D&C reuses the Float64 global workspace.
     Lvec = borrow!(arn, Float64, n, n); Rvec = borrow!(arn, Float64, n, n)
-    if n <= _SVD_DC_CROSS
+    if _svd_vectors_by_qr(n)
         fill!(Lvec, 0.0); fill!(Rvec, 0.0)
         @inbounds for i in 1:n
             Lvec[i, i] = 1.0; Rvec[i, i] = 1.0

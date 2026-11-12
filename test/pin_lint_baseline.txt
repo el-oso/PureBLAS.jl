@@ -13,8 +13,9 @@
 #                 `_NVREG` derivation, so the pin overrides a formula and removes no tuner.
 # gemvt_nc        default `nothing`, and level2.jl runs a `OncePerProcess`, so the pin does remove a
 #                 tuner — but juliac/build.jl does not pin it, so the .so and the dogfood differ.
-# pptrf_spr_min   default `0`, documented as an unset SENTINEL rather than a size. Pinning it to 8
-#                 selects a route where 0 means "not selected".
+# pptrf_spr_min   default `nothing`, which delegates to the per-type derivation `2 * _vwidth(T)` — no
+#                 tuner. So the pin of 8 overrides a formula, like cgemvt_cfg; the OVERRIDE check keys
+#                 on a non-`nothing` default and cannot see it, which is why only DRIFT is listed.
 # cgemvn_nc_big   default `3 * _vwidth(Float64) ÷ 2` — a formula. Pinned in the build only; legitimate
 #                 for a cross-compile, which is a build-tier decision.
 # gbtrf_nb        default `nothing` with a live tuner. Pinned for the .so but NOT in the test env, so a
@@ -25,5 +26,4 @@ DRIFT    pptrf_spr_min  pinned in test/Project.toml, not in juliac/build.jl
 DRIFT    cgemvn_nc_big  pinned in juliac/build.jl, not in test/Project.toml
 DRIFT    gbtrf_nb  pinned in juliac/build.jl, not in test/Project.toml
 OVERRIDE cgemvt_cfg  pinned in test/Project.toml though its src default is a formula, not `nothing`
-OVERRIDE pptrf_spr_min  pinned in test/Project.toml though its src default is a formula, not `nothing`
 OVERRIDE cgemvn_nc_big  pinned in juliac/build.jl though its src default is a formula, not `nothing`

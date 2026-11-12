@@ -130,7 +130,7 @@
     @test P._at_pbtrf_ucross(zen3, Float64) != P._at_pbtrf_ucross(zen3)   # the two rules disagree
     # brd_nb is a formula on all three boxes, each stable 6/6.
     # brd_nb is NOT asserted here: it is machine-INVARIANT (8 on all three boxes, two ISAs) and so
-    # lives in svd.jl as `_BRD_NB`, PDM Exempt, not as an `_at_*` function of `hw`. It was briefly
+    # lives in svd.jl as `_BRD_NB`, a PDM Literal, not as an `_at_*` function of `hw`. It was briefly
     # `_at_brd_nb(hw) = 8` — a function taking a hardware descriptor and ignoring it, which is the fake
     # formula the PDM ladder forbids. This file asserts hardware DERIVATIONS; a constant belongs with
     # its kernel.
@@ -275,36 +275,29 @@ end
     A = randn(n, n) ./ (2n); for i in 1:n; A[i, i] = 1 + abs(A[i, i]); end
     B0 = randn(n, n)
     want = UpperTriangular(A) \ B0
-    if PureBLAS._FORCE_HOOKS
-        old = P._FK["trsm_base"][]
-        try
-            for v in (1, 2, 4096)              # a real pin lands inside these endpoints
-                P._FK["trsm_base"][] = v
-                @test P._trsm_base() <= P._L3_NB
-                B = copy(B0); P.trsm!(B, A; side = 'L', uplo = 'U')
-                @test norm(B - want, Inf) / max(1.0, norm(want, Inf)) < 1e-8
-            end
-        finally
-            P._FK["trsm_base"][] = old
+    old = P._FK["trsm_base"][]
+    try
+        for v in (1, 2, 4096)              # a real pin lands inside these endpoints
+            P._FK["trsm_base"][] = v
+            @test P._trsm_base() <= P._L3_NB
+            B = copy(B0); P.trsm!(B, A; side = 'L', uplo = 'U')
+            @test norm(B - want, Inf) / max(1.0, norm(want, Inf)) < 1e-8
         end
+    finally
+        P._FK["trsm_base"][] = old
     end
 end
 
-@testitem "chol_nb/chol_nc are structural, not tunable" tags = [:unit] begin
+@testitem "the Cholesky register tile is structural, not tunable" tags = [:unit] begin
     using PureBLAS, LinearAlgebra
     const P = PureBLAS
-    # The fused Cholesky base kernel is HAND-UNROLLED for exactly four columns (d0..d3, l10..l32,
-    # indices c0..c0+3); the knob appears only as the guard `nb == _fh_chol_nb()`. Any other value does
+    # The fused Cholesky base kernels are HAND-UNROLLED for exactly four columns (d0..d3, l10..l32,
+    # indices c0..c0+3); `_CHOL_TILE` appears only as their loop step and guard. Any other value does
     # not run slower, it runs WRONG — measured 2026-08-22 on an oracle-confirmed PD matrix:
-    #   chol_nb=3  -> SILENTLY wrong, rel err 1.0e-01      chol_nb=1,2,8,16,32 -> PosDefException
-    #   chol_nc=2,3,8..128 -> SILENTLY wrong, 9.0e-02 .. 2.4e-01 (no exception at all)
-    # Both were `@load_preference` with a `tune: candidate` marker, so a pin silently corrupted every
-    # Cholesky in the process. They now validate at load and carry NO force hook.
-    @test P._CHOL_NB == 4
-    @test P._CHOL_NC == 4
-    @test P._fh_chol_nb() == 4
-    @test P._fh_chol_nc() == 4
-    # Not sweepable: a probe must not be able to reintroduce the corruption.
+    #   trsm step 3 -> SILENTLY wrong, rel err 1.0e-01      trsm step 1,2,8,16,32 -> PosDefException
+    #   syrk step 2,3,8..128 -> SILENTLY wrong, 9.0e-02 .. 2.4e-01 (no exception at all)
+    # So the width has no preference and no force hook: nothing outside the source can change it.
+    @test P._CHOL_TILE == 4
     @test !haskey(P._FK, "chol_nb")
     @test !haskey(P._FK, "chol_nc")
     # And the shipped configuration factors correctly.
