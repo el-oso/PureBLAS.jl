@@ -5583,69 +5583,22 @@ const _MT_SETUP_LOCK = ReentrantLock()
 #
 # The count is over the CPUs this process may run on (`taskset`, cgroups), not the whole machine.
 #
-# ONE METHOD ON EVERY OS, ONE OPTIONAL REFINEMENT. `_mt_cores_portable` uses only what Julia and
-# CPUSummary report on every platform: the CPUs this process may use (libuv) and the machine's threads
-# per core. It is exact wherever the CPU set holds whole cores — the whole machine, any machine without
-# SMT (Apple silicon, most arm64), a container or `taskset` of whole cores. The one case it cannot see
-# is a set that takes one logical CPU from each core of an SMT machine (`taskset -c 0,2,4,…`, how the
-# benchmark fleet runs), where it halves the count. A per-OS refinement reads the real topology and is
-# used only when it answers, and only within [1, CPUs available]; anything else keeps the portable
-# value. Linux is the only OS with one: thread masks from /proc and sibling lists from sysfs. macOS has
-# no thread affinity, so the portable count is already exact there.
+# JULIA-ONLY, SO IT IS THE SAME CODE ON EVERY OS: the CPUs this process may use (`Sys.EFFECTIVE_CPU_THREADS`,
+# libuv's count, which honours affinity and on Linux a cgroup CPU quota) divided by the machine's threads
+# per core (`Sys.CPU_THREADS` over CPUSummary's core count). Both are read once at startup, so threads a
+# host pins afterwards (ThreadPinning.jl, bench/plots.jl's `_pin_threads!`) do not move it.
+#
+# Where it is exact: any CPU set made of whole cores — the whole machine, a container or `taskset` of
+# whole cores — and any machine without SMT (Apple silicon, most arm64). Where it is not, both measured:
+#   * one logical CPU taken from each core of an SMT machine (`taskset -c 0,2,4,…`, how the benchmark
+#     fleet runs): it halves the count — Zen4, 6 such CPUs, 3 instead of 6;
+#   * a virtual machine whose CPUID reports every vCPU as a core: it counts SMT siblings as cores —
+#     GitHub's Linux runners, 4 vCPUs on 2 cores, report 4.
+# Julia exposes no core-sibling topology, so neither can be corrected without going to the OS.
 function _mt_physical_cores()
-    portable = _mt_cores_portable()
-    refined = try
-        Sys.islinux() ? _mt_cores_linux() : 0
-    catch                                    # unexpected OS output: keep the portable count
-        0
-    end
-    # `EFFECTIVE_CPU_THREADS` also carries a cgroup CPU quota (`docker --cpus`), which affinity does not.
-    return 1 <= refined <= Sys.EFFECTIVE_CPU_THREADS ? refined : portable
-end
-
-# The OS-independent estimate: the CPUs this process may use (libuv's count, which honours affinity and
-# a cgroup quota on Linux) divided by the machine's threads per core. It needs no topology files, and it
-# undercounts exactly one case: a CPU set with one logical CPU per core on an SMT machine
-# (`taskset -c 0,2,4,…`), where it halves the count — the reason the Linux path is tried first.
-function _mt_cores_portable()
     cores = max(1, Int(num_cores()))
     tpc = max(1, Sys.CPU_THREADS ÷ cores)
     return clamp(cld(Sys.EFFECTIVE_CPU_THREADS, tpc), 1, cores)
-end
-
-# Linux refinement: distinct cores among the CPUs any thread of this process may use, or 0 when that
-# cannot be read. THE UNION OVER EVERY THREAD, not `/proc/self/status` alone: that file is the MAIN
-# thread's mask, and a host that pins each Julia thread to its own core (ThreadPinning.jl, or bench/
-# plots.jl's `_pin_threads!`) leaves the main thread one core wide — measured on Zen3, 6 threads pinned
-# one per core, the main thread's mask alone gave 1 worker.
-function _mt_cores_linux()
-    isdir("/proc/self/task") || return 0
-    cpus = Set{Int}()
-    for t in readdir("/proc/self/task")
-        f = "/proc/self/task/$t/status"
-        line = ""
-        try                                  # a thread can exit between `readdir` and the read
-            for l in eachline(f)
-                startswith(l, "Cpus_allowed_list:") && (line = l; break)
-            end
-        catch
-        end
-        isempty(line) && continue
-        for r in split(strip(split(line, ':')[2]), ',')
-            lo, hi = occursin('-', r) ? parse.(Int, split(r, '-')) : (parse(Int, r), parse(Int, r))
-            union!(cpus, lo:hi)
-        end
-    end
-    isempty(cpus) && return 0
-    # A core is identified by its sibling list, not by `core_id`: on arm64 described by a device tree,
-    # `core_id` restarts at 0 in every cluster. A listed CPU with no topology (possible but not present,
-    # or offline) is skipped.
-    cores = Set{String}()
-    for cpu in cpus
-        f = "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
-        isfile(f) && push!(cores, readchomp(f))
-    end
-    return length(cores)
 end
 
 # `PUREBLAS_MT_ALL_THREADS=1` lifts the core cap so every Julia thread can be a worker. The test suite
