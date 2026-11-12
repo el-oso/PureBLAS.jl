@@ -643,7 +643,7 @@ end
     _gemm_core!(
         PtrMatrix{T}(col + (s.jt0 - 1) * sz, mt, len, s.ld),
         PtrMatrix{T}(pan + (s.jt0 - 1) * sz, mt, s.pb, s.ld), U,
-        -one(T), one(T), false, false, false, false, (-1, wid, -1), false, 1, 1
+        -one(T), one(T), false, false, false, false, (-1, wid, -1), _STR_OFF, 1, 1
     )
     return nothing
 end
