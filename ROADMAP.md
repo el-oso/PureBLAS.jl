@@ -2135,6 +2135,38 @@ The work:
 - Add tall, wide and thin-k shapes to the gate ladder.
 - Treat a kernel that is correct but slow off the diagonal of shape space as a gate miss.
 
+### User-submitted results (needed by the first public release)
+
+Our fleet covers only a few CPUs. Users should be able to run one function on their own machine and
+send the result back, so that we see CPUs we do not own. The function:
+- runs a short, fixed benchmark subset against the BLAS their Julia already ships;
+- records the CPU model and features, the core count, the OS, the Julia version and the PureBLAS
+  version;
+- writes one file the user can inspect before sending.
+
+The file holds no personal data and nothing outside that list, and sending it is the user's choice.
+Still to decide:
+- the submission channel (for example a GitHub issue template the file is attached to);
+- how submitted results feed the gate and the tuning (directional only, since a user's clock is not
+  locked).
+
+### Sweeps — measure less, in the right places
+
+Today's sweeps spend the same effort everywhere. Two changes:
+1. **Sampling time follows the cell.** A small matrix needs many short samples and a short window; a
+   large one needs fewer, longer samples. The budget per cell should come from the call's own time
+   and spread, not one fixed setting.
+2. **Cells go where the behavior changes.** Most of a size ladder is smooth. The changes happen at
+   seams:
+   - routing crossovers;
+   - cache capacities;
+   - tile and vector-width multiples;
+   - power-of-two leading dimensions.
+
+   Sample densely on both sides of each seam and sparsely between them, so a sweep finds the kinks
+   with fewer cells. This extends the existing backlog item on selective re-gating and adaptive
+   rounds.
+
 ## Later
 
 ARM/aarch64 trim build for the Mac M5 (cross-compiled .so/.dylib). SparseArrays interop; CHOLMOD /
