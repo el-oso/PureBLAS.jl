@@ -5923,10 +5923,10 @@ second worker on an SMT sibling adds no arithmetic and makes the pool's hand-off
 When every thread is bound to a single CPU (ThreadPinning.jl, or any other pinning made before the
 first call asking for more than one thread), the cores among those CPUs are measured on that call,
 in a few milliseconds, by timing whether threads slow each other down; elsewhere the count comes
-from the process's CPU count and the machine's threads per core. On a part with a slower Efficiency tier (Apple silicon) only the cores outside that tier count: the
-pool splits a job into equal chunks, so one chunk on an Efficiency core sets the time of the job.
-Setting the environment variable `PUREBLAS_MT_ALL_THREADS=1` (exactly `"1"`) lifts the core cap; it is
-read on every call.
+from the process's CPU count and the machine's threads per core. On a part with a slower
+Efficiency tier (Apple silicon) only the cores outside that tier count: the pool splits a job into
+equal chunks, so one chunk on an Efficiency core sets the time of the job. Setting the environment
+variable `PUREBLAS_MT_ALL_THREADS=1` (exactly `"1"`) lifts the core cap; it is read on every call.
 
 Threading is **off until you call this**. That is deliberate: a BLAS that silently takes every thread
 in the process is a surprise to whatever else the process is doing, and the shape matches
@@ -6139,7 +6139,7 @@ end
 # k distinct CPUs on a machine of `cores` cores with `tpc` threads each lie on at least cld(k, tpc)
 # and at most min(k, cores) cores. Where the two agree — every CPU of the machine bound, for one —
 # that is the count and nothing is measured; the cache groups (`_mt_group_order!`) then keep the
-# whole budget, which they need at -t 24 on Zen3 (7.9-8.4 ms of the 10). Elsewhere a count outside
+# whole budget, which they need at -t 24 on Zen3 (7.6-8.4 ms of the 10). Elsewhere a count outside
 # them is readings that do not agree with the machine, and is reported unknown.
 function _mt_pinned_cores!(deadline::UInt64)
     tids = filter(!=(Threads.threadid()), Threads.threadpooltids(:default))
