@@ -1637,7 +1637,7 @@ function trmm!(
     #      262144   1.87 / 2.22 / 2.06
     #
     # trsm at the same 125000 flops LOSES, at 0.89x on Zen4 — so one floor cannot serve both, and
-    # `_GEMM_MT_WORK`'s 220416 refused a size at which trmm returns 1.6-1.9x on every box. Halving it
+    # The whole floor (about 220000 flops on Zen4) refused a size at which trmm returns 1.6-1.9x on every box. Halving it
     # admits 125000 and still refuses 64000, whose 1.11x on the weakest box is not worth six workers.
     # That is the same standard the shared floor is set to: the worst admitted cell returns about 1.8x.
     if !iszero(alpha) && _trmm_left_owns(A, B, transA, sl, k)
@@ -5184,7 +5184,7 @@ end
     nt = _MT_NTHREADS[]
     nt > 1 || return 1
     flops = k * k * n
-    (flops < _GEMM_MT_WORK || n < _NR) && return 1
+    (flops < _gemm_mt_work() || n < _NR) && return 1
     # Gate, not ration — the argument is at `_gemm_workers`.
     return max(1, min(nt, cld(n, _NR)))
 end
@@ -5211,7 +5211,7 @@ end
     nt = _MT_NTHREADS[]
     nt > 1 || return 1
     flops = k * k * n
-    (flops < _GEMM_MT_WORK ÷ 2 || n < _NR) && return 1
+    (flops < _gemm_mt_work() ÷ 2 || n < _NR) && return 1
     # Gate, not ration — the argument is at `_gemm_workers`.
     return max(1, min(nt, cld(n, _NR)))
 end
@@ -5240,7 +5240,7 @@ end
     nt = _MT_NTHREADS[]
     nt > 1 || return 1
     flops = k * k * m
-    (flops < _GEMM_MT_WORK || m < _MR * _vwidth(T)) && return 1
+    (flops < _gemm_mt_work() || m < _MR * _vwidth(T)) && return 1
     # Gate, not ration — the argument is at `_gemm_workers`.
     return max(1, min(nt, cld(m, _MR * _vwidth(T))))
 end
@@ -5261,7 +5261,7 @@ end
     nt = _MT_NTHREADS[]
     nt > 1 || return 1
     flops = k * k * m
-    (flops < _GEMM_MT_WORK ÷ 2 || m < _MR * _vwidth(T)) && return 1
+    (flops < _gemm_mt_work() ÷ 2 || m < _MR * _vwidth(T)) && return 1
     # Gate, not ration — the argument is at `_gemm_workers`.
     return max(1, min(nt, cld(m, _MR * _vwidth(T))))
 end
