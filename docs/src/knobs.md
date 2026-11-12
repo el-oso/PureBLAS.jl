@@ -318,13 +318,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-70 `const _X = <literal>` values in `src/` with no `@load_preference`.
+42 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 2 Measured · 31 Literal · 33 Exempt · 4 Unaudited.
+**Tier:** 2 Measured · 31 Literal · 6 Exempt · 3 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -436,35 +436,7 @@ on these, not on knobs.
 | `_MT_GROUP_ROUNDS` | 8 | Exempt | the sample count behind each worker's reading, not a tuning value. |
 | `_MT_JOIN_CLOCK_MHZ_MEASURED` | 2796 | Measured | the locked core clock that round trip was recorded under (bench/fleet_freqlock.sh) |
 | `_MT_JOIN_NS_MEASURED` | 616 | Measured | recorded fork-join round trip on Zen4 (ns); feeds gemm_mt_work's shipped default |
-| `_MT_KIND_ASUM` | 8 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_AXPY` | 6 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_COPY` | 11 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_COPY2D` | 23 | Exempt | job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above. |
-| `_MT_KIND_DOT` | 7 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_ELEM` | 19 | Unaudited | — |
-| `_MT_KIND_GBMVN` | 18 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_GEMM` | 0 | Exempt | job-kind TAGS, not hardware tuning. They name which body a chunk runs; nothing about |
-| `_MT_KIND_GEMVN` | 15 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_GEMVT` | 16 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_GER` | 14 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_IAMAX` | 13 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_LASWP` | 22 | Exempt | job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above. |
-| `_MT_KIND_LUAHEAD` | 3 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_LUSTEP` | 24 | Exempt | job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above. |
-| `_MT_KIND_SCAL` | 10 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_SUMSQ` | 9 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_SWAP` | 12 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_SYMM` | 21 | Exempt | job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above. |
-| `_MT_KIND_SYMV` | 17 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_SYRK` | 1 | Exempt | job-kind tag, not hardware tuning. (Repeated: the marker binds to the NEXT const only, |
-| `_MT_KIND_TRMM` | 20 | Exempt | job-kind tag, not hardware tuning. Nothing a machine reports could place it, and a |
-| `_MT_KIND_TRMMR` | 5 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_TRSM` | 2 | Exempt | job-kind tag, not hardware tuning. |
-| `_MT_KIND_TRSMR` | 4 | Exempt | job-kind tag, not hardware tuning. |
 | `_MT_SPINS` | 2048 | Literal | how long an idle worker keeps spinning before it sleeps, in fence iterations. This is |
-| `_STR_FLOOR` | 1 | Exempt | level-1-claim tag, not hardware tuning. |
-| `_STR_LVL1` | 2 | Exempt | level-1-claim tag, not hardware tuning. |
-| `_STR_OFF` | 0 | Exempt | level-1-claim TAGS, not hardware tuning. They name which depth rule a caller asks |
 
 ### sme_kernel
 

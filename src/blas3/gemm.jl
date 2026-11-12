@@ -1952,23 +1952,13 @@ const _STRASSEN_BASE = @load_preference("strassen_base", 1024)::Int
 # The criterion, in one sentence: drop the level-1 exemption where a classical threaded route exists;
 # keep it where the only alternative is serial. `2 * _STRASSEN_BASE` is the arithmetic of the first
 # half, not a second tuning constant — it is the leaf floor the deeper levels already obey.
-# PDM: Exempt — level-1-claim TAGS, not hardware tuning. They name which depth rule a caller asks
-# for; no cache size, vector width or µarch could place them, and a Preference over them would be
-# meaningless. (Repeated per const: the marker binds to the NEXT const only, so one comment above
-# the group would leave the rest listed as Unaudited in the knob registry.)
-# req8-ok: an enumeration value naming which level-1 rule a caller asks for; no hardware fact places it.
-const _STR_OFF = 0
-# PDM: Exempt — level-1-claim tag, not hardware tuning.
-# req8-ok: an enumeration value naming which level-1 rule a caller asks for; no hardware fact places it.
-const _STR_FLOOR = 1
-# PDM: Exempt — level-1-claim tag, not hardware tuning.
-# req8-ok: an enumeration value naming which level-1 rule a caller asks for; no hardware fact places it.
-const _STR_LVL1 = 2
+# Which depth rule a caller asks for. Labels only: nothing reads the underlying integer.
+@enum _StrMode::UInt8 _STR_OFF _STR_FLOOR _STR_LVL1
 
-@inline _strassen_owns(::Type{T}, m::Int, n::Int, k::Int, tA::Bool, A, B, mode::Integer) where {T} =
+@inline _strassen_owns(::Type{T}, m::Int, n::Int, k::Int, tA::Bool, A, B, mode::_StrMode) where {T} =
     T <: BlasReal && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k, mode) > 0
 
-@inline function _strassen_depth(m::Int, n::Int, k::Int, mode::Integer)
+@inline function _strassen_depth(m::Int, n::Int, k::Int, mode::_StrMode)
     d = 0; s = min(m, n, k)
     mode == _STR_OFF && return d
     # Under `_STR_LVL1`, `d == 0 ||` keeps level 1 on the `strassen_min` criterion alone, so every
@@ -3510,7 +3500,7 @@ function _strassen_rec!(C, A, Bm, depth::Int, level::Int, alpha::T, beta::T, nw:
     return C
 end
 # Entry: pick adaptive depth, pad m,n,k up to a multiple of 2^depth (odd-n) if needed, recurse.
-function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C, mode::Integer, nw::Int = 1)
+function _gemm_strassen!(m::Int, n::Int, k::Int, alpha, A, B, beta, C, mode::_StrMode, nw::Int = 1)
     T = eltype(C); D = _strassen_depth(m, n, k, mode)
     # PAD-VS-DEPTH. When a dimension is not a multiple of 2^D the else-branch below pads: three scratch
     # slots, two `fill!`s, two operand copies and a copy-back — three extra O(n^2) DRAM passes. Spending
@@ -3674,7 +3664,7 @@ end
 # the real one. The outlined entry gives the whole tree its own frame instead.
 @inline _gemm_core!(
     C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-    rt::NTuple{3, Int} = _RT_NONE, strassen::Integer = _STR_OFF, nw::Int = 1, wi::Int = 1
+    rt::NTuple{3, Int} = _RT_NONE, strassen::_StrMode = _STR_OFF, nw::Int = 1, wi::Int = 1
 ) where {T} =
     _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, rt, strassen, nw, wi)
 
@@ -3685,7 +3675,7 @@ end
 # single-product callers, where it is worth 8.2% at the smallest gate cell (gemm@8).
 @noinline _gemm_core_out!(
     C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-    rt::NTuple{3, Int} = _RT_NONE, strassen::Integer = _STR_OFF, nw::Int = 1, wi::Int = 1
+    rt::NTuple{3, Int} = _RT_NONE, strassen::_StrMode = _STR_OFF, nw::Int = 1, wi::Int = 1
 ) where {T} =
     _gemm_core_body!(C, A, B, alpha, beta, tA, tB, cA, cB, rt, strassen, nw, wi)
 
@@ -3741,7 +3731,7 @@ end
 
 @inline function _gemm_core_body!(
         C, A, B, alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool,
-        rt::NTuple{3, Int}, strassen::Integer, nw::Int, wi::Int
+        rt::NTuple{3, Int}, strassen::_StrMode, nw::Int, wi::Int
     ) where {T}
     m = size(C, 1); n = size(C, 2); k = tA ? size(A, 1) : size(A, 2)
     # EVERY SIZE-KEYED PREDICATE BELOW ROUTES FROM THE TOKEN, not from the local extents. A caller
@@ -4290,6 +4280,102 @@ const _MT_NW_SHIFT = 8 * sizeof(UInt16)      # low half-word holds nw; the count
 const _MT_NW_MASK = Int(typemax(UInt16))     # so `set_num_threads` clamps to what the word can carry
 @inline _mt_gen_next(g::Int, nw::Int) = (((g >> _MT_NW_SHIFT) + 1) << _MT_NW_SHIFT) | nw
 @inline _mt_gen_nw(g::Int) = g & _MT_NW_MASK
+# Which body a chunk runs. Labels only: nothing reads the underlying integer, so the order of the
+# members carries no meaning.
+@enum _MTKind::UInt8 begin
+    _MT_KIND_GEMM
+    _MT_KIND_SYRK
+    _MT_KIND_TRSM
+    _MT_KIND_LUAHEAD
+    _MT_KIND_TRSMR
+    _MT_KIND_TRMMR
+    # BLAS-1 elementwise: `y .+= a .* x` over a contiguous element range. `Cp` is y, `Ap` is x, `m` is
+    # the WHOLE vector length (which is also the route width) and `n` is 1.
+    _MT_KIND_AXPY
+    # BLAS-1 REDUCTION over a fixed block grid: `Ap` is x, `Bp` is y, `m` is the whole length. Each
+    # worker reduces a contiguous range of BLOCK INDICES and writes one partial per block; the driver
+    # folds them in index order afterwards. The fold is the driver's, not a worker's, which is what
+    # keeps the order fixed.
+    _MT_KIND_DOT
+    # Σ|xᵢ| over the same block grid. ONE operand: `Ap` is x, `Bp` is unused.
+    _MT_KIND_ASUM
+    # Σxᵢ² over the same block grid — `nrm2`'s fast path. `Ap` is x.
+    #
+    # THE OVERFLOW GUARD STILL WORKS, and blocking makes it fire LESS often rather than differently:
+    # `_nrm2` takes the scaled `lassq` path when the sum is not finite or is zero. A fold of finite
+    # block partials can still reach Inf, which the guard catches; and a block is smaller than the
+    # whole vector, so a value that overflowed one long accumulator may now stay finite and take the
+    # fast path. That is a more accurate answer, not a different contract. Crucially the grid is fixed,
+    # so WHICH path runs cannot vary with the worker count, which is what req#11 asks of it.
+    _MT_KIND_SUMSQ
+    # x .*= a — elementwise, one operand. `Cp` is x, `alpha` is a.
+    _MT_KIND_SCAL
+    # y .= x — elementwise, no arithmetic at all. `Ap` is x, `Cp` is y.
+    _MT_KIND_COPY
+    # x, y = y, x — elementwise, no arithmetic. `Ap` is x, `Cp` is y; both are read and written.
+    _MT_KIND_SWAP
+    # iamax — an ARGMAX, not a reduction: the chunks write block INDICES to `_REDI` and the driver's
+    # fold is a strict-`>` scan rather than a sum. `Ap` is x.
+    _MT_KIND_IAMAX
+    # ger — the first BLAS-2 kind. `Cp` is A, `Ap` is x, `Bp` is y. A column split, and the one op in
+    # the library where the split needs no correctness argument at all: there is no accumulation
+    # chain, each `A[i,j]` is written once, and both route arms fold α into `y[j]` identically.
+    _MT_KIND_GER
+    # gemv-N — a ROW-BAND split. The matrix goes in the `C` slot so that `m`, `n` and `ldc` land in
+    # their natural fields; `Ap` is x (handed over whole) and `Bp` is y (offset per band). `C` is read,
+    # not written, which is a slot convention and not a claim about the op.
+    _MT_KIND_GEMVN
+    # gemv-T — a COLUMN-BAND split, same slot convention as gemv-N: the matrix in `C`, x in `Ap`
+    # (whole), y in `Bp` (offset per band). `up` carries `B0`.
+    _MT_KIND_GEMVT
+    # symv — a COLUMN-BLOCK split with per-block private `y` ("notepads"). The matrix is in `C`, x in
+    # `Ap`, y in `Bp`, and `up` is the stored triangle (its original meaning, unlike the gemv kinds
+    # where it carries `B0`). The only kind whose chunks write to TWO different destinations: block 1
+    # goes straight into `y`, blocks 2..nblk into their notepad slot, and the driver folds in block
+    # order.
+    _MT_KIND_SYMV
+    # gbmv-N — a ROW-BAND split of the output, and the cheapest threaded kind in BLAS-2: a band of a
+    # BANDED matrix needs only the columns within `kl + ku` of its own rows, so there is no partial,
+    # no fold and no route token. `Cp` is the banded store AB, `Ap` is x, `Bp` is y, and the
+    # half-widths ride in the `A` slot's own dimensions (`A.n`, `A.ld`). β is already applied — the
+    # kernel accumulates.
+    _MT_KIND_GBMVN
+    # Strassen's combine passes: `C = α·(A ± B ± L) + β·C` over a block, elementwise. The one job kind
+    # in this list that carries a FOURTH operand, and it needs no new field for it — `lap`/`lald` are
+    # already on the pool for the getrf look-ahead panel, and a kind reinterpreting an existing slot is
+    # the same thing `gbmvN` does when it carries `kl`/`ku` in the A slot's own dimensions.
+    #
+    # The two signs and the presence of `L` ride in `up`, `sym2` and `unit` respectively, which that
+    # kind does not otherwise use. `α` and `β` are the pool's own.
+    _MT_KIND_ELEM
+    # Side-L trmm: a COLUMN band of B against the whole of A, run by `_trmm_left!`. Distinct from
+    # `_MT_KIND_TRMMR`, which splits ROWS for side R and packs op(A) per band.
+    _MT_KIND_TRMM
+    # Side-L symm with a PER-WORKER expansion of the symmetric operand: each worker expands A into its
+    # own buffer and then runs an ordinary product on its own column band of C, instead of the driver
+    # expanding once into one buffer that every worker then reads.
+    #
+    # WHY A SEPARATE KIND RATHER THAN THE GEMM KIND. The gemm job takes a dense A that already exists;
+    # here the expansion is part of the chunk, which is the entire point. Measured on Zen4, the
+    # driver-expands form costs 1.88x the SUM of its two phases at n=100, and exactly 1.00x of that sum
+    # at ONE worker — so the cost is not the expansion but the handoff of lines dirty in the driver's
+    # cache to five readers. Six concurrent expansions cost about one expansion's wall-clock, so moving
+    # it into the chunk removes the handoff without paying six times for the copy.
+    _MT_KIND_SYMM
+    # getrf's data movement, split by COLUMN BANDS: the row swaps a panel's pivots apply to the columns
+    # beside it (`_laswp_run_chunk`) and the strided copy into and out of the de-aliasing pad
+    # (`_copy2d_run_chunk`). Neither does arithmetic, so a band split cannot change a bit; what it
+    # changes is that a quarter to a third of the threaded call stops running on one thread — measured
+    # on Zen4 at three workers, n=1024: pad copy 1.3 ms, trailing swaps 0.9 ms, deferred left swaps
+    # 1.2 ms, of a 9.6 ms call whose ideal is 6.0 ms. Both reuse `C`/`A` as (destination, source).
+    # potrf's pad round-trip rides `_MT_KIND_COPY2D` as well, with `unit` set to move one triangle.
+    _MT_KIND_LASWP
+    _MT_KIND_COPY2D
+    # One whole getrf panel step with the workers in two sets, so that a column band is swapped, solved
+    # and updated by one worker and the data a step produces stays in the cache group that produced it
+    # (`_lustep_run_chunk` in lu.jl).
+    _MT_KIND_LUSTEP
+end
 mutable struct GemmPool{T}
     @atomic gen::Int                 # `counter << _MT_NW_SHIFT | nw`; bumped to publish a job (see above)
     @atomic done::Int                # workers that have finished the current job
@@ -4312,7 +4398,7 @@ mutable struct GemmPool{T}
     # generation is waiting on this worker's `done` and cannot let a field change. `kind` is exactly
     # such a field, so widening the word would add risk to the one thing that must not break, for no
     # safety we do not already have.
-    kind::Int                        # `_MT_KIND_GEMM` | `_MT_KIND_SYRK` | `_MT_KIND_TRSM`
+    kind::_MTKind                    # which body a chunk runs
     up::Bool                         # syrk/syr2k: which triangle of C is written; trsm: A's triangle
     sym2::Bool                       # syr2k/her2k: run BOTH rank-k passes in this chunk (see below)
     unit::Bool                       # trsm: A has an implicit unit diagonal
@@ -4353,170 +4439,22 @@ mutable struct GemmPool{T}
     # it. See `_pool_barrier` for why the resetting form deadlocks.
     @atomic bar::Int
 end
-# PDM: Exempt — job-kind TAGS, not hardware tuning. They name which body a chunk runs; nothing about
-# a cache size, a vector width or a µarch could change them, and a Preference over them would be
-# meaningless. Same class as a sentinel.
-const _MT_KIND_GEMM = 0
-# PDM: Exempt — job-kind tag, not hardware tuning. (Repeated: the marker binds to the NEXT const only,
-# so one comment above a pair leaves the second listed as Unaudited in the knob registry.)
-const _MT_KIND_SYRK = 1
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_TRSM = 2
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_LUAHEAD = 3
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_TRSMR = 4
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_TRMMR = 5
-# BLAS-1 elementwise: `y .+= a .* x` over a contiguous element range. `Cp` is y, `Ap` is x, `m` is the
-# WHOLE vector length (which is also the route width) and `n` is 1.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_AXPY = 6
-# BLAS-1 REDUCTION over a fixed block grid: `Ap` is x, `Bp` is y, `m` is the whole length. Each worker
-# reduces a contiguous range of BLOCK INDICES and writes one partial per block; the driver folds them in
-# index order afterwards. The fold is the driver's, not a worker's, which is what keeps the order fixed.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_DOT = 7
-# Σ|xᵢ| over the same block grid. ONE operand: `Ap` is x, `Bp` is unused.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_ASUM = 8
-# Σxᵢ² over the same block grid — `nrm2`'s fast path. `Ap` is x.
-#
-# THE OVERFLOW GUARD STILL WORKS, and blocking makes it fire LESS often rather than differently: `_nrm2`
-# takes the scaled `lassq` path when the sum is not finite or is zero. A fold of finite block partials can
-# still reach Inf, which the guard catches; and a block is smaller than the whole vector, so a value that
-# overflowed one long accumulator may now stay finite and take the fast path. That is a more accurate
-# answer, not a different contract. Crucially the grid is fixed, so WHICH path runs cannot vary with the
-# worker count, which is what req#11 asks of it.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_SUMSQ = 9
-# x .*= a — elementwise, one operand. `Cp` is x, `alpha` is a.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_SCAL = 10
-# y .= x — elementwise, no arithmetic at all. `Ap` is x, `Cp` is y.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_COPY = 11
-# x, y = y, x — elementwise, no arithmetic. `Ap` is x, `Cp` is y; both are read and written.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_SWAP = 12
-# iamax — an ARGMAX, not a reduction: the chunks write block INDICES to `_REDI` and the driver's fold
-# is a strict-`>` scan rather than a sum. `Ap` is x.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_IAMAX = 13
-# ger — the first BLAS-2 kind. `Cp` is A, `Ap` is x, `Bp` is y. A column split, and the one op in the
-# library where the split needs no correctness argument at all: there is no accumulation chain, each
-# `A[i,j]` is written once, and both route arms fold α into `y[j]` identically.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_GER = 14
-# gemv-N — a ROW-BAND split. The matrix goes in the `C` slot so that `m`, `n` and `ldc` land in their
-# natural fields; `Ap` is x (handed over whole) and `Bp` is y (offset per band). `C` is read, not
-# written, which is a slot convention and not a claim about the op.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_GEMVN = 15
-# gemv-T — a COLUMN-BAND split, same slot convention as gemv-N: the matrix in `C`, x in `Ap` (whole),
-# y in `Bp` (offset per band). `up` carries `B0`.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_GEMVT = 16
-# symv — a COLUMN-BLOCK split with per-block private `y` ("notepads"). The matrix is in `C`, x in
-# `Ap`, y in `Bp`, and `up` is the stored triangle (its original meaning, unlike the gemv kinds where
-# it carries `B0`). The only kind whose chunks write to TWO different destinations: block 1 goes
-# straight into `y`, blocks 2..nblk into their notepad slot, and the driver folds in block order.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_SYMV = 17
-# gbmv-N — a ROW-BAND split of the output, and the cheapest threaded kind in BLAS-2: a band of a
-# BANDED matrix needs only the columns within `kl + ku` of its own rows, so there is no partial, no
-# fold and no route token. `Cp` is the banded store AB, `Ap` is x, `Bp` is y, and the half-widths ride
-# in the `A` slot's own dimensions (`A.n`, `A.ld`). β is already applied — the kernel accumulates.
-# PDM: Exempt — job-kind tag, not hardware tuning.
-# req8-ok: an enumeration value naming which chunk body a worker runs; no hardware fact places it.
-const _MT_KIND_GBMVN = 18
-# Strassen's combine passes: `C = α·(A ± B ± L) + β·C` over a block, elementwise. The one job kind in
-# this list that carries a FOURTH operand, and it needs no new field for it — `lap`/`lald` are already
-# on the pool for the getrf look-ahead panel, and a kind reinterpreting an existing slot is the same
-# thing `gbmvN` does when it carries `kl`/`ku` in the A slot's own dimensions.
-#
-# The two signs and the presence of `L` ride in `up`, `sym2` and `unit` respectively, which that kind
-# does not otherwise use. `α` and `β` are the pool's own.
-# An enum discriminant, host-invariant by construction: nothing about the machine can make 19 a better
-# tag than 20, so there is no residency or latency criterion to derive it from and no candidate set to
-# measure. Same category as `_STEIN_SEED0`.
-# req8-ok: enum discriminant, host-invariant by construction — see the two lines above
-const _MT_KIND_ELEM = 19
-
-# Side-L trmm: a COLUMN band of B against the whole of A, run by `_trmm_left!`. Distinct from
-# `_MT_KIND_TRMMR`, which splits ROWS for side R and packs op(A) per band.
-# An enum discriminant, host-invariant by construction: nothing about the machine can make 20 a better
-# tag than 21, so there is no residency or latency criterion to derive it from and no candidate set to
-# measure. Same category as `_MT_KIND_ELEM` above.
-# PDM: Exempt — job-kind tag, not hardware tuning. Nothing a machine reports could place it, and a
-# Preference over it would be meaningless; same class as a sentinel.
-# req8-ok: enum discriminant, host-invariant by construction — see the two lines above
-const _MT_KIND_TRMM = 20
-
-# Side-L symm with a PER-WORKER expansion of the symmetric operand: each worker expands A into its own
-# buffer and then runs an ordinary product on its own column band of C, instead of the driver expanding
-# once into one buffer that every worker then reads.
-#
-# WHY A SEPARATE KIND RATHER THAN THE GEMM KIND. The gemm job takes a dense A that already exists; here
-# the expansion is part of the chunk, which is the entire point. Measured on Zen4, the driver-expands
-# form costs 1.88x the SUM of its two phases at n=100, and exactly 1.00x of that sum at ONE worker — so
-# the cost is not the expansion but the handoff of lines dirty in the driver's cache to five readers.
-# Six concurrent expansions cost about one expansion's wall-clock, so moving it into the chunk removes
-# the handoff without paying six times for the copy.
-# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
-# req8-ok: enum discriminant, host-invariant by construction
-const _MT_KIND_SYMM = 21
-# getrf's data movement, split by COLUMN BANDS: the row swaps a panel's pivots apply to the columns
-# beside it (`_laswp_run_chunk`) and the strided copy into and out of the de-aliasing pad
-# (`_copy2d_run_chunk`). Neither does arithmetic, so a band split cannot change a bit; what it
-# changes is that a quarter to a third of the threaded call stops running on one thread — measured
-# on Zen4 at three workers, n=1024: pad copy 1.3 ms, trailing swaps 0.9 ms, deferred left swaps
-# 1.2 ms, of a 9.6 ms call whose ideal is 6.0 ms. Both reuse `C`/`A` as (destination, source).
-# potrf's pad round-trip rides `_MT_KIND_COPY2D` as well, with `unit` set to move one triangle.
-# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
-# req8-ok: enum discriminant, host-invariant by construction
-const _MT_KIND_LASWP = 22
-# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
-# req8-ok: enum discriminant, host-invariant by construction
-const _MT_KIND_COPY2D = 23
-# One whole getrf panel step with the workers in two sets, so that a column band is swapped, solved
-# and updated by one worker and the data a step produces stays in the cache group that produced it
-# (`_lustep_run_chunk` in lu.jl).
-# PDM: Exempt — job-kind tag, not hardware tuning; same class as `_MT_KIND_TRMM` above.
-# req8-ok: enum discriminant, host-invariant by construction
-const _MT_KIND_LUSTEP = 24
 
 # The reduction kinds, which share the driver's post-join fold. Named rather than tested as a range so
 # adding an unrelated kind cannot silently join the set.
-@inline _is_reduction(kind::Int) =
+@inline _is_reduction(kind::_MTKind) =
     kind == _MT_KIND_DOT || kind == _MT_KIND_ASUM || kind == _MT_KIND_SUMSQ
 
 # The argmax kinds, which have their OWN post-join fold. Separate from `_is_reduction` because the two
 # folds share nothing: a sum accumulates every partial, an argmax selects one and must see the block
 # order to break ties. Keeping them apart also keeps `_is_reduction`'s buffer contract intact — that
 # one sizes `_red_partials`, this one sizes `_REDI`.
-@inline _is_argmax(kind::Int) = kind == _MT_KIND_IAMAX
+@inline _is_argmax(kind::_MTKind) = kind == _MT_KIND_IAMAX
 
 # symv's fold is its own again: a block-ordered accumulate of private `y` vectors into the real one,
 # over only the rows each block can reach. Named separately for the same reason as the two above —
 # the three folds share no code and each sizes a different buffer.
-@inline _is_symv(kind::Int) = kind == _MT_KIND_SYMV
+@inline _is_symv(kind::_MTKind) = kind == _MT_KIND_SYMV
 
 """
     _syrk_workers(n, k) -> Int
@@ -4736,7 +4674,7 @@ end
     # both must route from the full trailing width or the pair is not the single update it replaces.
     _gemm_core!(
         Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
-        (-1, p.lanroute >= 0 ? p.lanroute : p.n, -1), false, nw, i
+        (-1, p.lanroute >= 0 ? p.lanroute : p.n, -1), _STR_OFF, nw, i
     )
     return nothing
 end
@@ -4787,7 +4725,7 @@ end
         Cc = PtrMatrix{T}(p.Cp, p.m, c1, p.ldc)
         _gemm_core!(
             Cc, Ac, _gemm_bchunk(p, 0, c1), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
-            (-1, p.lanroute, -1), false, 1, 1
+            (-1, p.lanroute, -1), _STR_OFF, 1, 1
         )
         return nothing
     end
@@ -4800,7 +4738,7 @@ end
     # `p.n` is the whole update's width: route from the problem, compute on the slice.
     _gemm_core!(
         Cc, Ac, _gemm_bchunk(p, j0, len), p.alpha, p.beta, p.tA, p.tB, p.cA, p.cB,
-        (-1, p.lanroute, -1), false, nw - 1, i - 1
+        (-1, p.lanroute, -1), _STR_OFF, nw - 1, i - 1
     )
     return nothing
 end
@@ -5874,7 +5812,7 @@ end
 @noinline function _gemm_threaded!(
         C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T},
         alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, nw::Int,
-        kind::Int = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false, unit::Bool = false,
+        kind::_MTKind = _MT_KIND_GEMM, up::Bool = false, sym2::Bool = false, unit::Bool = false,
         lup::LuPanel{T} = _lupanel_none(T)
     ) where {T <: Union{BlasReal, BlasComplex}}
     p = _gemm_pool(T)
