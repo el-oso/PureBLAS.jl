@@ -5552,6 +5552,8 @@ Use at most `n` threads inside PureBLAS's threaded kernels, and return the value
 turns threading off. Capped at `Threads.nthreads()`, because the workers are Julia tasks and there is
 nothing to run them on beyond that, and at the number of physical cores the process may run on: a
 second worker on an SMT sibling adds no arithmetic and makes the pool's hand-offs fragile under load.
+On a part with a slower Efficiency tier (Apple silicon) only the cores outside that tier count: the
+pool splits a job into equal chunks, so one chunk on an Efficiency core sets the time of the job.
 Setting the environment variable `PUREBLAS_MT_ALL_THREADS=1` (exactly `"1"`) lifts the core cap; it is
 read on every call.
 
@@ -5609,10 +5611,14 @@ function _mt_physical_cores()
     return isempty(cores) ? fallback : clamp(length(cores), 1, Sys.EFFECTIVE_CPU_THREADS)
 end
 
+# The core cap: physical cores, and of those only the ones outside a slower Efficiency tier where the
+# part has one (`_FAST_CORES`, see cpuinfo.jl; 0 elsewhere).
+_mt_core_cap() = _FAST_CORES > 0 ? min(_mt_physical_cores(), _FAST_CORES) : _mt_physical_cores()
+
 # `PUREBLAS_MT_ALL_THREADS=1` lifts the core cap so every Julia thread can be a worker. The test suite
 # sets it: req#11's bit-identity items must run more workers than a small CI runner has cores.
 function set_num_threads(n::Integer)
-    cores = get(ENV, "PUREBLAS_MT_ALL_THREADS", "") == "1" ? typemax(Int) : _mt_physical_cores()
+    cores = get(ENV, "PUREBLAS_MT_ALL_THREADS", "") == "1" ? typemax(Int) : _mt_core_cap()
     nt = clamp(Int(n), 1, min(Threads.nthreads(), cores, _MT_NW_MASK))
     if nt > 1
         lock(_MT_SETUP_LOCK) do
