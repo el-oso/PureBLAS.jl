@@ -5750,32 +5750,24 @@ const _MT_SETUP_LOCK = ReentrantLock()
 # taken with floating workers; the remaining cost of the surplus Julia threads is what the sticky
 # placement in `_gemm_pool_start!` removes.
 #
-# The count is over the CPUs this process may run on (`taskset`, cgroups), not the whole machine: the
-# benchmark fleet runs one CPU per core, where every allowed CPU is its own core. On Linux it reads the
-# distinct sibling lists of the allowed CPUs from sysfs; elsewhere it is the detected core count
-# bounded by `Sys.EFFECTIVE_CPU_THREADS`. A hybrid part (SMT performance cores beside single-thread
-# efficiency cores) counts each core once, which is what the cap means.
+# The count is over the CPUs this process may run on (`taskset`, cgroups), not the whole machine.
+#
+# JULIA-ONLY, SO IT IS THE SAME CODE ON EVERY OS: the CPUs this process may use (`Sys.EFFECTIVE_CPU_THREADS`,
+# libuv's count, which honours affinity and on Linux a cgroup CPU quota) divided by the machine's threads
+# per core (`Sys.CPU_THREADS` over CPUSummary's core count). Both are read once at startup, so threads a
+# host pins afterwards (ThreadPinning.jl, bench/plots.jl's `_pin_threads!`) do not move it.
+#
+# Where it is exact: any CPU set made of whole cores — the whole machine, a container or `taskset` of
+# whole cores — and any machine without SMT (Apple silicon, most arm64). Where it is not, both measured:
+#   * one logical CPU taken from each core of an SMT machine (`taskset -c 0,2,4,…`, how the benchmark
+#     fleet runs): it halves the count — Zen4, 6 such CPUs, 3 instead of 6;
+#   * a virtual machine whose CPUID reports every vCPU as a core: it counts SMT siblings as cores —
+#     GitHub's Linux runners, 4 vCPUs on 2 cores, report 4.
+# Julia exposes no core-sibling topology, so neither can be corrected without going to the OS.
 function _mt_physical_cores()
-    fallback = clamp(Int(num_cores()), 1, Sys.EFFECTIVE_CPU_THREADS)
-    (Sys.islinux() && isfile("/proc/self/status")) || return fallback
-    line = ""
-    for l in eachline("/proc/self/status")
-        startswith(l, "Cpus_allowed_list:") && (line = l; break)
-    end
-    isempty(line) && return fallback
-    # A core is identified by its sibling list, not by `core_id`: on arm64 described by a device tree,
-    # `core_id` restarts at 0 in every cluster. A listed CPU with no topology (possible but not present,
-    # or offline) is skipped.
-    cores = Set{String}()
-    for r in split(strip(split(line, ':')[2]), ',')
-        lo, hi = occursin('-', r) ? parse.(Int, split(r, '-')) : (parse(Int, r), parse(Int, r))
-        for cpu in lo:hi
-            f = "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list"
-            isfile(f) && push!(cores, readchomp(f))
-        end
-    end
-    # `EFFECTIVE_CPU_THREADS` also carries a cgroup CPU quota (`docker --cpus`), which affinity does not.
-    return isempty(cores) ? fallback : clamp(length(cores), 1, Sys.EFFECTIVE_CPU_THREADS)
+    cores = max(1, Int(num_cores()))
+    tpc = max(1, Sys.CPU_THREADS ÷ cores)
+    return clamp(cld(Sys.EFFECTIVE_CPU_THREADS, tpc), 1, cores)
 end
 
 # `PUREBLAS_MT_ALL_THREADS=1` lifts the core cap so every Julia thread can be a worker. The test suite
