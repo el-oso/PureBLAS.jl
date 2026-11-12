@@ -17,8 +17,6 @@ gemm.jl  Val(3)
 gemm.jl  Val(2)
 lapack.jl  const _POTRF_BASE = @load_preference("potrf_base", 32)::Int
 lapack.jl  const _TR_TB = 32
-lapack.jl  const _CHOL_NB = 4
-lapack.jl  const _CHOL_NC = 4
 level2.jl  const _ZHEMV_PF_TILES = @load_preference("zhemv_pf_tiles", 8)::Int
 level2.jl  const _TRI_T_UNB = @load_preference("tri_t_unb", 512)::Int
 level2.jl  const _TRI_C_T_UNB = @load_preference("tri_c_t_unb", 1024)::Int
@@ -70,7 +68,6 @@ qr.jl  const _QR_NB_C = @load_preference("qr_nb_c", 32)::Int
 simd_kernels.jl  const _UNROLL = 4
 svd.jl  const _BRD_NB = 16
 svd.jl  const _BT_NB = 32
-svd.jl  const _SVD_DC_CROSS = 96
 svd_dc.jl  const _DC_THRESHOLD = 64
 #
 # ── SURFACED 2026-09-17 BY MAKING THE SCAN RECURSIVE — NOT REVIEWED ────────────────────────────────
@@ -84,8 +81,6 @@ gemm.jl  Val(12)
 gemm.jl  Val(6)
 gemm.jl  Val(8)
 hessenberg.jl  const _GEHRD_UNBLK_MAX = 128
-lapack.jl  const _CHOL_NB = @load_preference("chol_nb", 4)::Int
-lapack.jl  const _CHOL_NC = @load_preference("chol_nc", 4)::Int
 laqr.jl  const _LAQR_KEXNW = 5
 laqr.jl  const _LAQR_KEXSH = 6
 laqr.jl  const _LAQR_KNWSWP = 500
