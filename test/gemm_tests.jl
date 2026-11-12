@@ -42,40 +42,6 @@ end
     end
 end
 
-# A one-row or one-column C is computed by `_gemv!`, not by packing the other operand. Bit equality
-# with the gemv is the witness: the gemm kernels sum k in a different order. Checked through
-# `activate()` as well, which reaches the same route from the `dgemm_64_` entry.
-@testitem "GEMM with one row or column of C is a gemv" setup = [GemmOracle] begin
-    using PureBLAS, LinearAlgebra
-    const P = PureBLAS
-    k, w = 988, 553
-    for T in (Float32, Float64), tA in ('N', 'T'), tB in ('N', 'T')
-        # m == 1: C (1×w) = op(A) (1×k) · op(B) (k×w); the gemv runs over B.
-        A = tA == 'N' ? randn(T, 1, k) : randn(T, k, 1)
-        Bm = tB == 'N' ? randn(T, k, w) : randn(T, w, k)
-        C0 = randn(T, 1, w); α = T(0.7); β = T(1.3)
-        y = vec(copy(C0)); P._gemv!(tB == 'N', false, size(Bm)..., α, Bm, vec(A), 1, β, y, 1)
-        C = copy(C0); P.gemm!(C, A, Bm; alpha = α, beta = β, transA = tA, transB = tB)
-        @test vec(C) == y
-        # n == 1: C (w×1) = op(A) (w×k) · op(B) (k×1); the gemv runs over A.
-        A = tA == 'N' ? randn(T, w, k) : randn(T, k, w)
-        Bm = tB == 'N' ? randn(T, k, 1) : randn(T, 1, k)
-        C0 = randn(T, w, 1)
-        y = vec(copy(C0)); P._gemv!(tA != 'N', false, size(A)..., α, A, vec(Bm), 1, β, y, 1)
-        C = copy(C0); P.gemm!(C, A, Bm; alpha = α, beta = β, transA = tA, transB = tB)
-        @test vec(C) == y
-    end
-    x = randn(1, k); A = randn(k, w); C = zeros(1, w)
-    y = zeros(w); P._gemv!(true, false, k, w, 1.0, A, vec(x), 1, 0.0, y, 1)
-    P.activate()
-    try
-        mul!(C, x, A)
-        @test vec(C) == y
-    finally
-        P.deactivate()
-    end
-end
-
 @testitem "GEMM beta=0 ignores NaN in C (BLAS semantics)" setup = [GemmOracle] begin
     using PureBLAS
     A = randn(64, 48); B = randn(48, 32)

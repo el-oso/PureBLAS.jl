@@ -310,13 +310,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-34 `const _X = <literal>` values in `src/` with no `@load_preference`.
+36 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 31 Literal · 3 Unaudited.
+**Tier:** 1 Measured · 32 Literal · 3 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -416,6 +416,13 @@ on these, not on knobs.
 |---|---|---|---|
 | `_GEMM_TINY` | 6 | Literal | below this the naive loop beats the packed path. TUNABLE. |
 | `_MT_AMORTISE` | 8 | Unaudited | — |
+| `_MT_MEASURE_NS` | 10_000_000 | Literal | how long the pool may spend measuring its host when it is created. A limit on a |
+
+### keepawake
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_MT_KEEPAWAKE_NS` | 10_000_000 | Measured | when an idle core enters its deep state is host- and OS-dependent; deps/build.jl measures the onset at install and the window is derived from it. |
 
 ### sme_kernel
 
