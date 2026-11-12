@@ -6005,85 +6005,120 @@ const _MT_PINNED_CORES = Threads.Atomic{Int}(-1)
 const _MT_SMT_LO = 2.0^(1 / 4)   # req8-ok: margin around the 1x and 2x outcomes of a shared core, not a perf tuning
 const _MT_SMT_HI = 2.0^(3 / 4)   # req8-ok: margin around the 1x and 2x outcomes of a shared core, not a perf tuning
 
-# The two task bodies of the slowdown reading, as callables for the reason `PoolWorkerJob` gives. A
-# load runs the product on its thread, counting itself in `up` once warm, until `stop`. A probe waits
-# for `nload` loads to be up, times the product on its thread — a median of settled medians, for the
-# reason `_mt_flop_rate` gives — and then stops them.
-struct LoadJob
-    stop::Threads.Atomic{Bool}
+# EVERY THREAD WAITS ON A PAUSE LOOP FOR THE WHOLE COUNT. A Julia thread that has just finished a
+# task spins in the scheduler before it sleeps, and on Zen3 that spin slows the SMT sibling's product
+# by 1.27x (1830 to 2320 ns, -t 6 on three cores' siblings). Which threads are still spinning depends
+# on which ran last, so it inflated one reading of a pair and not the other: siblings read 1.45-1.50
+# and distinct cores up to 1.27, and the count came out unknown. With every thread held by its own
+# job from start to end, each one waiting on `jl_cpu_pause` when it has no part in a reading, a
+# thread's sibling does the same thing in both of its readings unless it is loaded, and the ratio
+# holds: 1.84-1.94 for siblings, 0.97-1.02 otherwise, measured with Julia's spin turned off.
+#
+# One reading: the worker `role` says what each does for this generation of `go` (-1 ends the
+# count) — 0 nothing, 1 load: run the product until `done`, counted in `up` once warm, 2 probe: wait
+# for every load to be up, time the product — a median of settled medians, for the reason
+# `_mt_flop_rate` gives — into `out`, then set `done`. Each worker counts itself in `fin` when its
+# part is over. Worker 1 is the calling thread, which runs its part inline.
+struct SmtState
+    go::Threads.Atomic{Int}
+    role::Vector{Int}
     up::Threads.Atomic{Int}
-end
-function (j::LoadJob)()
-    p = L1Product()
-    p()
-    Threads.atomic_add!(j.up, 1)
-    while !j.stop[]
-        p()
-        GC.safepoint()
-    end
-    return nothing
-end
-struct ProbeJob
-    stop::Threads.Atomic{Bool}
-    up::Threads.Atomic{Int}
-    nload::Int
+    done::Threads.Atomic{Bool}
+    fin::Threads.Atomic{Int}
+    out::Base.RefValue{Float64}
     b::Int
     deadline::UInt64
-    out::Base.RefValue{Float64}
 end
-function (j::ProbeJob)()
-    try
-        p = L1Product()
-        while j.up[] < j.nload
-            time_ns() < j.deadline || return nothing
-            Base.Threads.atomic_fence()
+SmtState(n::Int, b::Int, deadline::UInt64) = SmtState(
+    Threads.Atomic{Int}(0), zeros(Int, n), Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false),
+    Threads.Atomic{Int}(0), Ref(NaN), b, deadline
+)
+
+# A wait that leaves the SMT sibling its issue slots, and lets a collection through.
+_mt_pause() = (ccall(:jl_cpu_pause, Cvoid, ()); GC.safepoint())
+
+function _mt_smt_part(s::SmtState, w::Int, p::L1Product)
+    r = s.role[w]
+    if isone(r)
+        p()
+        Threads.atomic_add!(s.up, 1)
+        while !s.done[] && time_ns() < s.deadline
+            p()
             GC.safepoint()
         end
-        j.out[] = _mt_settled(() -> _mt_settled(() -> _mt_time(p, j.b), j.deadline), j.deadline)
-    finally
-        j.stop[] = true
+    elseif r == 2
+        try
+            nload = count(isone, s.role)
+            while s.up[] < nload
+                time_ns() < s.deadline || return nothing
+                _mt_pause()
+            end
+            s.out[] = _mt_settled(() -> _mt_settled(() -> _mt_time(p, s.b), s.deadline), s.deadline)
+        finally
+            s.done[] = true
+        end
     end
     return nothing
 end
 
-# ns per `b` products on thread `t` while every thread of `load` runs the product too; NaN when the
-# loads were not all up by `deadline`. The calling thread runs its own part — the probe, or a load —
-# rather than waiting: a thread left polling would take issue slots from its SMT sibling.
-function _mt_loaded_ns(t::Int, load::Vector{Int}, b::Int, deadline::UInt64)
-    stop = Threads.Atomic{Bool}(false)
-    up = Threads.Atomic{Int}(0)
-    out = Ref(NaN)
-    me = Threads.threadid()
-    probe = ProbeJob(stop, up, length(load), b, deadline, out)
-    ts = [_mt_on_thread(LoadJob(stop, up), u) for u in load if u != me]
-    if t == me
-        probe()
-    else
-        push!(ts, _mt_on_thread(probe, t))
-        me in load && LoadJob(stop, up)()
+# The task body of workers 2 and up, a callable for the reason `PoolWorkerJob` gives.
+struct SmtJob
+    s::SmtState
+    w::Int
+end
+function (j::SmtJob)()
+    s = j.s
+    p = L1Product()
+    seen = 0
+    while true
+        g = s.go[]
+        g < 0 && return nothing
+        if g != seen
+            seen = g
+            _mt_smt_part(s, j.w, p)
+            Threads.atomic_add!(s.fin, 1)
+        end
+        _mt_pause()
     end
-    foreach(wait, ts)
-    return out[]
+    return
 end
 
-# The number of distinct cores among the CPUs `cpu[i]` that thread `tids[i]` is bound to, or 0 when
-# the readings do not say. Threads are taken in order and a thread is kept when its slowdown —
-# `slowdown(t, keep)`, its time with the threads kept so far loaded over its time alone — reads as
-# no shared core; a thread on a CPU already seen shares that core without a reading. The kept
-# threads are then one per core, so their number is the count. Every reading is between a thread's
+# ns per `s.b` products on worker `w` while every worker of `load` runs the product too; NaN when the
+# reading did not finish by the deadline. `p` is the calling thread's product.
+function _mt_smt_reading(s::SmtState, p::L1Product, w::Int, load::Vector{Int})
+    fill!(s.role, 0)
+    s.role[load] .= 1
+    s.role[w] = 2
+    s.up[] = 0
+    s.done[] = false
+    s.fin[] = 0
+    s.out[] = NaN
+    Threads.atomic_add!(s.go, 1)
+    _mt_smt_part(s, 1, p)
+    Threads.atomic_add!(s.fin, 1)
+    while s.fin[] < length(s.role)
+        time_ns() < s.deadline || return NaN
+        _mt_pause()
+    end
+    return s.out[]
+end
+
+# The number of distinct cores among the CPUs `cpu[w]` that worker `w` is bound to, or 0 when the
+# readings do not say. Workers are taken in order and one is kept when its slowdown —
+# `slowdown(w, keep)`, its time with the workers kept so far loaded over its time alone — reads as
+# no shared core; a worker on a CPU already seen shares that core without a reading. The kept
+# workers are then one per core, so their number is the count. Every reading is between a worker's
 # own two times, so a core slower than another, or clocked lower, cancels.
-function _mt_core_count(tids::Vector{Int}, cpu::Vector{Int}, slowdown)
+function _mt_core_count(cpu::Vector{Int}, slowdown)
     keep = Int[]
-    seen = Int[]
-    for (t, c) in zip(tids, cpu)
-        c in seen && continue
-        push!(seen, c)
+    for (w, c) in pairs(cpu)
+        c in view(cpu, 1:(w - 1)) && continue
         if !isempty(keep)
-            s = slowdown(t, keep)
+            s = slowdown(w, keep)
             (s < _MT_SMT_LO || s > _MT_SMT_HI) || return 0      # unclear, or NaN
             s > _MT_SMT_HI && continue
         end
-        push!(keep, t)
+        push!(keep, w)
     end
     return length(keep)
 end
@@ -6091,14 +6126,20 @@ end
 # Fill `_MT_PINNED_CORES`. Called once, under `_MT_SETUP_LOCK`, before the pools exist, by the thread
 # that will create them.
 function _mt_pinned_cores!(deadline::UInt64)
-    me = Threads.threadid()
-    tids = filter(!=(me), Threads.threadpooltids(:default))
+    tids = filter(!=(Threads.threadid()), Threads.threadpooltids(:default))
     cpu = _mt_bound_cpus(tids)
     c = 0
     if !isempty(cpu)
-        b = _mt_batch(L1Product(), _mt_clock_step(), deadline)
-        slowdown = (t, keep) -> _mt_loaded_ns(t, keep, b, deadline) / _mt_loaded_ns(t, Int[], b, deadline)
-        c = _mt_core_count(pushfirst!(tids, me), cpu, slowdown)
+        p = L1Product()
+        s = SmtState(length(cpu), _mt_batch(p, _mt_clock_step(), deadline), deadline)
+        ts = [_mt_on_thread(SmtJob(s, w + 1), tid) for (w, tid) in pairs(tids)]
+        try
+            slowdown = (w, keep) -> _mt_smt_reading(s, p, w, keep) / _mt_smt_reading(s, p, w, Int[])
+            c = _mt_core_count(cpu, slowdown)
+        finally
+            s.go[] = -1
+            foreach(wait, ts)
+        end
         time_ns() < deadline || (c = 0)
     end
     _MT_PINNED_CORES[] = c
