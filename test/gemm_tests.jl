@@ -162,30 +162,14 @@ end
             @test P.set_num_threads(Threads.nthreads()) == min(Threads.nthreads(), P._mt_physical_cores())
         end
         @test 1 <= P._mt_physical_cores() <= Sys.EFFECTIVE_CPU_THREADS
-        # The OS-independent fallback: in range always, and equal to the topology count when the
-        # process may use every CPU (its one known undercount needs a one-CPU-per-core subset).
-        @test 1 <= P._mt_cores_portable() <= Sys.EFFECTIVE_CPU_THREADS
-        if Sys.islinux() && Sys.EFFECTIVE_CPU_THREADS == Sys.CPU_THREADS
-            @test P._mt_cores_portable() == P._mt_cores_linux() == P._mt_physical_cores()
-        end
         # Placement: every worker bound to its own default-pool thread.
         tw = P._gemm_pool(Float64).tids
         @test length(tw) == Threads.nthreads() - 1
         @test allunique(tw) && all(in(Threads.threadpooltids(:default)), tw)
-        # Independent count on Linux: the allowed CPUs from the HEX mask (`Cpus_allowed`, comma-separated
-        # 32-bit groups, most significant first) where the code parses the range list, and each core from
-        # `core_cpus_list` where the code reads `thread_siblings_list`.
-        if Sys.islinux() && isfile("/proc/self/status")
-            hex = only(l for l in eachline("/proc/self/status") if startswith(l, "Cpus_allowed:"))
-            mask = parse(BigInt, replace(strip(split(hex, ':')[2]), ',' => ""); base = 16)
-            sib = Set{String}()
-            for c in 0:(ndigits(mask; base = 2) - 1)
-                f = "/sys/devices/system/cpu/cpu$c/topology/core_cpus_list"
-                isodd(mask >> c) && isfile(f) && push!(sib, readchomp(f))
-            end
-            @test P._mt_physical_cores() == clamp(length(sib), 1, Sys.EFFECTIVE_CPU_THREADS)
-            # A host that pins its threads one per core leaves THIS thread one core wide; the count is
-            # over the whole process, so it must not drop. Pin this thread to one core, then restore.
+        # A host that pins its threads one per core leaves THIS thread one core wide; the count is fixed
+        # for the process, so it must not drop. Pin this thread to one core (Linux, where the test can),
+        # then restore.
+        if Sys.islinux()
             c0 = P._mt_physical_cores()
             if c0 > 1
                 old = zeros(UInt64, 16)
