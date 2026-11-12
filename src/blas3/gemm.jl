@@ -6002,9 +6002,11 @@ const _MT_PINNED_CORES = Threads.Atomic{Int}(-1)
 # core". The first outcome is 1 by construction: every thread is in the same state in both readings
 # except the loaded ones, none of which shares the core. The second is at most 2, the two threads
 # splitting the core's units, and less by what the waiting sibling already cost the reference: its
-# pause loop slows the product 1.20x on Zen3 and 1.09x on Zen5. Measured, -t 6 and -t 12/24 with
-# every thread bound, 20 readings or more each: no shared core 0.97-1.02 on both; shared core
-# 1.55-1.59 on Zen3, 1.77-1.85 on Zen5. A reading below 2^(1/4) counts as no shared core, above
+# pause loop slows the product 1.20x on Zen3 and 1.09x on Zen5. Measured with every thread bound,
+# -t 6, 12 and 24 on Zen3 and -t 6 and 12 on Zen5: no shared core 0.98-1.02 on both (over a hundred
+# readings); shared core 1.55-1.59 on Zen3 (12 readings), 1.77-1.85 on Zen5 (27). The count, one
+# fresh process each, one CPU per core and both siblings of some or all cores: right in 75 of 75 on
+# Zen3 and 50 of 50 on Zen5. A reading below 2^(1/4) counts as no shared core, above
 # 2^(1/2) as shared, and between them as neither, which reports the count unknown. No property of a
 # machine places these margins.
 const _MT_SMT_LO = 2.0^(1 / 4)   # req8-ok: margin between the 1x and shared-core outcomes, measured above, not a perf tuning
