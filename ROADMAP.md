@@ -2093,6 +2093,48 @@ Acceptable for bandwidth-bound L1/L2 if measured free; the tiling structure + te
 Metal/AMDGPU reuse later, not kernel code. GPU parallelism does not touch the CPU
 no-multithreading standing rule (that covers CPU threads).
 
+## Next — comparisons and shape audits (queued 2026-11-12)
+
+### Compare against faer (Rust)
+
+faer is the source of the Cholesky and QR base kernels PureBLAS ported, so it is the natural
+library-to-library reference for the LAPACK routines. Add it as a benchmark reference, alongside
+OpenBLAS, AOCL and Accelerate. Open questions:
+- How the bench reaches it. faer has no BLAS/LAPACK C ABI, so it needs a small shim library that
+  exports the routines the gate times.
+- Which routines it covers.
+- Whether it enters the gate (`max` over references) or is reported beside it.
+
+### Compare against Blaze (C++)
+
+Blaze is a header-only C++ library built on expression templates. The claim to check is that it
+avoids per-call overhead by compiling small kernels into the caller instead of calling a library
+entry point. Two parts:
+1. **Benchmark.** Add a Blaze arm through a C++ shim library, on the small and medium shapes where call
+   overhead matters.
+2. **Check our own call overhead.** Julia callers can inline PureBLAS entry points the same way. Measure
+   whether they do:
+   - per routine, the cost of the public entry against its kernel on small shapes;
+   - which frames stay un-inlined (the BLAS-1 entry-frame finding is one known case);
+   - the cost through `activate()`, where the C-ABI boundary rules inlining out.
+
+### Tall and wide shapes — audit square-matrix assumptions
+
+Some kernels and routing predicates appear to assume square operands. Examples:
+- a block size or crossover keyed on one dimension;
+- a ladder tested only at m = n = k.
+
+A square ladder cannot catch these, because every dimension tracks the others. Downstream solvers make
+exactly the shapes that expose them:
+- PureDAQP's gemv on 553 rows by 1–553 columns;
+- PureDAQP's gemm with 1–2 rows of C against a 988×553 operand;
+- PR #107, which fixed one such shape (a single row or column of C).
+
+The work:
+- Audit every size-keyed predicate and blocking parameter for m ≫ n, m ≪ n and k ≪ m, n.
+- Add tall, wide and thin-k shapes to the gate ladder.
+- Treat a kernel that is correct but slow off the diagonal of shape space as a gate miss.
+
 ## Later
 
 ARM/aarch64 trim build for the Mac M5 (cross-compiled .so/.dylib). SparseArrays interop; CHOLMOD /
