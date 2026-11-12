@@ -5596,26 +5596,26 @@ const _MT_SETUP_LOCK = ReentrantLock()
 # taken with floating workers; the remaining cost of the surplus Julia threads is what the sticky
 # placement in `_gemm_pool_start!` removes.
 #
-# The count is over the CPUs this process may run on (`taskset`, cgroups), not the whole machine: the
-# benchmark fleet runs one CPU per core, where every allowed CPU is its own core. On Linux it reads the
-# distinct sibling lists of the allowed CPUs from sysfs; elsewhere, and whenever that read fails or
-# returns something out of range, it is `_mt_cores_portable`. A hybrid part (SMT performance cores
-# beside single-thread efficiency cores) counts each core once, which is what the cap means.
+# The count is over the CPUs this process may run on (`taskset`, cgroups), not the whole machine.
 #
-# THE UNION OVER EVERY THREAD OF THE PROCESS, not `/proc/self/status` alone: that file is the MAIN
-# thread's mask, and a host that pins each Julia thread to its own core (ThreadPinning.jl, or bench/
-# plots.jl's `_pin_threads!`) leaves the main thread one core wide. Read from it alone, the cap fell
-# to 1 and turned threading off — measured on Zen3, 6 threads pinned one per core: 1 worker.
+# ONE METHOD ON EVERY OS, ONE OPTIONAL REFINEMENT. `_mt_cores_portable` uses only what Julia and
+# CPUSummary report on every platform: the CPUs this process may use (libuv) and the machine's threads
+# per core. It is exact wherever the CPU set holds whole cores — the whole machine, any machine without
+# SMT (Apple silicon, most arm64), a container or `taskset` of whole cores. The one case it cannot see
+# is a set that takes one logical CPU from each core of an SMT machine (`taskset -c 0,2,4,…`, how the
+# benchmark fleet runs), where it halves the count. A per-OS refinement reads the real topology and is
+# used only when it answers, and only within [1, CPUs available]; anything else keeps the portable
+# value. Linux is the only OS with one: thread masks from /proc and sibling lists from sysfs. macOS has
+# no thread affinity, so the portable count is already exact there.
 function _mt_physical_cores()
     portable = _mt_cores_portable()
-    Sys.islinux() || return portable
-    c = try
-        _mt_cores_linux()
-    catch                                    # any unexpected /proc or /sys content: do not guess from it
+    refined = try
+        Sys.islinux() ? _mt_cores_linux() : 0
+    catch                                    # unexpected OS output: keep the portable count
         0
     end
     # `EFFECTIVE_CPU_THREADS` also carries a cgroup CPU quota (`docker --cpus`), which affinity does not.
-    return 1 <= c <= Sys.EFFECTIVE_CPU_THREADS ? c : portable
+    return 1 <= refined <= Sys.EFFECTIVE_CPU_THREADS ? refined : portable
 end
 
 # The OS-independent estimate: the CPUs this process may use (libuv's count, which honours affinity and
@@ -5628,7 +5628,11 @@ function _mt_cores_portable()
     return clamp(cld(Sys.EFFECTIVE_CPU_THREADS, tpc), 1, cores)
 end
 
-# Distinct cores among the CPUs any thread of this process may use, or 0 when that cannot be read.
+# Linux refinement: distinct cores among the CPUs any thread of this process may use, or 0 when that
+# cannot be read. THE UNION OVER EVERY THREAD, not `/proc/self/status` alone: that file is the MAIN
+# thread's mask, and a host that pins each Julia thread to its own core (ThreadPinning.jl, or bench/
+# plots.jl's `_pin_threads!`) leaves the main thread one core wide — measured on Zen3, 6 threads pinned
+# one per core, the main thread's mask alone gave 1 worker.
 function _mt_cores_linux()
     masks = _mt_task_masks()
     isempty(masks) && return 0
