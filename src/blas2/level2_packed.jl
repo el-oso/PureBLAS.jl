@@ -52,8 +52,6 @@ end
 # prefix EVERY column (n·n/2 extra traffic → the large-n decline). BLASFEO's dsymv is this same fused
 # panel. `bc` = NB per-column base Ptrs with bc[c] + (panel-local row i)·sz = A[row, col_c]; that identity
 # is what makes packed's variable column spacing address-uniform in the row (mirrors `_symv_*panel!`).
-# PDM: Exempt — boolean switch (path on/off), not a tuned size.
-const _SPMV_PANEL = @load_preference("spmv_panel", true)::Bool   # ON: locked-fleet A/B win — flattens the decline on all 3 µarchs
 # The fused NB-column panel beats per-column at EVERY size where AP is streaming-bound — its real win is AP
 # STREAM PREFETCHABILITY (NB contiguous per-column bases → the HW prefetcher locks onto long sequential runs),
 # NOT x/y amortization. Measured Zen3/AVX2 (locked, direct A/B): the per-column path caps at ~33 GB/s (40%
@@ -239,7 +237,7 @@ function _spmv!(up::Bool, n::Integer, α::Number, AP, x, incx::Integer, β::Numb
     iszero(α) && return y
     if _pk2_simd_ok(AP, x, y, incx, incy)
         T = eltype(AP)                                        # panel once AP is streaming-bound (AP ≥ L1); tiny n stays per-column
-        return (_SPMV_PANEL && Int(n) * (Int(n) + 1) ÷ 2 * sizeof(T) >= _SPMV_PANEL_MINAP) ?
+        return (Int(n) * (Int(n) + 1) ÷ 2 * sizeof(T) >= _SPMV_PANEL_MINAP) ?
             _spmv_panel_driver!(up, Int(n), convert(T, α), AP, x, y) :
             _spmv_simd!(up, Int(n), convert(T, α), AP, x, y)
     end

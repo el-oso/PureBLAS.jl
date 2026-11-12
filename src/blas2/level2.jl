@@ -1423,8 +1423,10 @@ const _CGEMV_MR = @load_preference("cgemv_mr", 4)::Int
 # Complex gemv-T/C column-block width (cols/pass). NC=4 both ISAs: AVX2 via half-width Vec{W} accs (see
 # _CGEMVT_HALF below), AVX-512 via full-width Vec{2W}. Sharing xc + its swap across the block is the win
 # (1 shuffle feeds NC cols, x streamed once per block).
-# PDM: Exempt — legacy pin, superseded by _cgemvt_cfg; retained only so an old preference still parses. | tune: n/a, dead
-const _CGEMVT_NC = @load_preference("cgemvt_nc", 4)::Int   # legacy pin; superseded by _cgemvt_cfg()
+# LIVE: `_gemv_tc_cmplx!` runs this block width whenever A is L2-resident, and as its fall-through arm;
+# `_cgemvt_cfg` chooses the width only once A is past L2.
+# PDM: Literal — column block of the L2-resident complex gemv-T/C regime; 4 beats 8 there (table in `_gemv_tc_cmplx!`), measured on Zen4 ONLY. | tune: candidate
+const _CGEMVT_NC = @load_preference("cgemvt_nc", 4)::Int
 # AVX2: accumulate gemvT/C in native ymm (Vec{W}) so NC=4 columns fit → 4 concurrent load streams (see
 # _gemv_tc_block_cmplx!). AVX-512 keeps full-width Vec{2W} (32 zmm has room, already gates).
 # ⚠ MOVED UP from below `_cgemvt_cfg`: the config knob's default is `NC + (HALF ? 100 : 0)`, so both
@@ -5016,11 +5018,8 @@ end
 # which is exactly what converting a knob to Derive costs you (measured on axpy_band, 2026-08-19).
 function _init_force_knobs!()
     # The converted-knob overrides (cpuinfo.jl `_FK_NAMES`). One ENV read each, here and nowhere else.
-    # Compiles to nothing when `_FORCE_HOOKS` is false, which juliac/build.jl sets for the trim build.
-    @static if _FORCE_HOOKS
-        for n in _FK_NAMES
-            _FK[n][] = _force_knob(n)
-        end
+    for n in _FK_NAMES
+        _FK[n][] = _force_knob(n)
     end
     @static if isnothing(_GEMVN_MINNER_PREF)
         f = _force_knob("gemvn_minner")

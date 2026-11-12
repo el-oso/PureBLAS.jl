@@ -494,8 +494,8 @@ end
     @testset "$T rank-deficient / large-imag" for T in (ComplexF64, ComplexF32)
         A = randn(T, 32, 20); A[:, 12:20] .= 0                       # exact zero singular values
         r = chk(A); @test r[1] < 128 && r[2] < 128 && r[3] < 128
-        # Repeated/exact-clustered σ: routed through the D&C path (n>_SVD_DC_CROSS). The simplified
-        # forward-only bdsqr! (n≤96) does NOT converge on tightly-clustered σ — a PRE-EXISTING limitation
+        # Repeated/exact-clustered σ: routed through the D&C path (every n ≥ 2). The simplified
+        # forward-only bdsqr! does NOT converge on tightly-clustered σ — a PRE-EXISTING limitation
         # shared by the real Float64 gesvd path (bdsqr! is uarch-shared); D&C (bdsdc!) handles them.
         Q1 = Matrix(qr(randn(T, 128, 128)).Q); Q2 = Matrix(qr(randn(T, 128, 128)).Q)
         Arep = Q1 * Diagonal(T[fill(3.0, 40); fill(1.0, 48); fill(0.05, 40)]) * Q2'   # repeated σ

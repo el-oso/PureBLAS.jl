@@ -10,10 +10,8 @@
 # justification lives in the SOURCE, next to the knob, in a structured marker:
 #
 #     # PDM: Measured — <why it cannot be derived> | tune: <cost in tune!()>
-#     # PDM: Derived  — <the physical criterion>
-#     # PDM: Exempt   — <why it is not a hardware knob at all: algorithm-intrinsic, flag, sentinel>
-#
-#     # PDM: Literal   — <why no formula, and why one value suits every µarch>
+#     # PDM: Derived  — <the physical criterion, or the detection it reads>
+#     # PDM: Literal  — <why no formula, and why one value suits every µarch>
 #
 # placed on any comment line within 12 lines above the `@load_preference`. ALL 120 knobs carry one as
 # of 2026-08-21, and the suite FAILS if any knob loses its marker or a new one arrives without one —
@@ -41,8 +39,10 @@ function _kr_family(rel)
     return replace(f, ".jl" => "")
 end
 
-# THE ONLY TIERS. The PDM ladder asks one question — Derive, or Measure? — plus Exempt for knobs that
-# are not hardware tuning at all (sentinels, capability flags).
+# THE ONLY TIERS. The PDM ladder asks one question — Derive, or Measure? — and a Literal is a fixed
+# value that answers it with evidence. There is no tier for "not a knob": a label is an `@enum`, a
+# count is computed from what it counts, a switch with one live setting is deleted, and a detected
+# hardware fact is Derived. `test/exempt_lint.jl` fails on any `PDM: Exempt` marker in src/.
 #
 # ⚠ AN EARLIER VERSION OF THIS FILE CLASSIFIED KNOBS SYNTACTICALLY, from what the default EXPRESSION
 # looked like: Derived / Literal / Pref-gated / Predicate-keyed / Coupled / Flag / Other. That is not a
@@ -50,7 +50,7 @@ end
 # free-form marker labels (`Derived(sibling)`, `Literal(borrowed)`, `Measured(bounds)`, …) produced a
 # zoo that buried the actual question. The syntactic guess is gone; the tier is now exactly what a
 # human asserted in the marker, and nothing else.
-const _KR_TIERS = ("Derived", "Measured", "Literal", "Exempt")
+const _KR_TIERS = ("Derived", "Measured", "Literal")
 
 # What the default EXPRESSION reduces to. Mechanical, no judgement — and deliberately NOT called a
 # tier, which is the mistake that produced the zoo. It is reported because it is the best available
@@ -234,11 +234,10 @@ function knob_markdown()
     println(io)
     println(io, "| Tier | Meaning |")
     println(io, "|---|---|")
-    println(io, "| **Derived** | Default is a formula over detected hardware consts. |")
+    println(io, "| **Derived** | Default is a formula over detected hardware consts, or the detection itself. |")
     println(io, "| **Measured** | Not derivable — the optimum depends on something we cannot detect. Wants a `tune!()` pin. |")
     println(io, "| **Measured, orphaned** | Measured with no calibrator in `bench/calibrate.jl`, so `tune!()` can never set it and the pin it wants is unreachable. Its `tune!()` cell reads `none`. A missing tool, not a missing verdict — the tier says where the number came from and does not change when a calibrator arrives. |")
     println(io, "| **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |")
-    println(io, "| **Exempt** | Not hardware tuning at all — a sentinel or a capability flag. |")
     println(io)
     # summary
     tiers = Dict{String, Int}()
