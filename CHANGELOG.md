@@ -25,8 +25,8 @@ demonstrated.
 - The threaded pool measures its host when `set_num_threads` creates it, in place of constants
   recorded on one machine. The size below which a call stays on one thread is now
   `_MT_AMORTISE` × (the pool's own fork-join round trip with one worker) × (one core's flop rate in the
-  unpacked SIMD product), both timed at creation; the number of polls a waiting thread makes between
-  yields is the number that takes as long as `_MT_AMORTISE` yields on that thread. The floor comes
+  unpacked SIMD product), both timed at creation; a waiting thread polls, by the clock, for as
+  long as `_MT_AMORTISE` yields take on that thread before it yields. The floor comes
   out at 105-170k flops on Zen4 and 113-176k on Zen3 where it was 220416 on both, so calls just under the old floor now
   thread: Zen4, six workers, `gemm!` n=44 3.78 → 1.58 µs and `trsm!` (side L) n=56 10.9 → 4.5 µs.
   A `gemm_mt_work` preference still pins the floor.
