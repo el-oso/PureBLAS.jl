@@ -53,6 +53,28 @@ jobs:
           parallel: true
           fail-on-error: false
 
+  # Windows has no CPU-topology refinement, so the worker cap there is `_mt_cores_portable` alone; this is
+  # the only runner where that path is the one in use. Only the threading items run: the core-count
+  # assertions, the threaded-gemm items, and the `-t auto` speedup check (its no-`taskset` form). The
+  # Linux-only pinning item skips itself here.
+  windows-threading:
+    name: Julia 1.13 - Windows threading (core count, pool)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.13'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          # The action pastes this into a shell command unquoted: words split into separate ARGS, which
+          # test/runtests.jl joins as alternatives, and `.` stands in for the spaces inside a name.
+          test_args: 'same.answer.as.the.serial.path keeps.its.speedup pool.is.actually.used pinned.on.a.restricted'
+        env:
+          JULIA_NUM_THREADS: '4'
+
   coverage-finish:
     name: Coveralls finish
     needs: test
