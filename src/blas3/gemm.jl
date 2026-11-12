@@ -5997,22 +5997,30 @@ end
 # thread. Taken once, like the cache groups: threads pinned after it are not seen.
 const _MT_PINNED_CORES = Threads.Atomic{Int}(-1)
 
-# PDM: Derive — the two outcomes of a slowdown reading, the product's time on a thread while other
-# threads run it over its time alone: 1 when none of them shares its core, 2 when one does and the
-# two split that core's units. A reading counts as one or the other only within a factor 2^(1/4) of
-# it, the outer quarters of the interval between them on a log scale; a reading in the middle half
-# says neither, and the count is reported unknown. No property of a machine places that margin.
-const _MT_SMT_LO = 2.0^(1 / 4)   # req8-ok: margin around the 1x and 2x outcomes of a shared core, not a perf tuning
-const _MT_SMT_HI = 2.0^(3 / 4)   # req8-ok: margin around the 1x and 2x outcomes of a shared core, not a perf tuning
+# PDM: Literal — where a slowdown reading (the product's time on a thread while other threads run
+# it, over its time while they wait) stops reading as "no shared core" and starts reading as "shared
+# core". The first outcome is 1 by construction: every thread is in the same state in both readings
+# except the loaded ones, none of which shares the core. The second is at most 2, the two threads
+# splitting the core's units, and less by what the waiting sibling already cost the reference: its
+# pause loop slows the product 1.20x on Zen3 and 1.09x on Zen5. Measured, -t 6 and -t 12/24 with
+# every thread bound, 20 readings or more each: no shared core 0.97-1.02 on both; shared core
+# 1.55-1.59 on Zen3, 1.77-1.85 on Zen5. A reading below 2^(1/4) counts as no shared core, above
+# 2^(1/2) as shared, and between them as neither, which reports the count unknown. No property of a
+# machine places these margins.
+const _MT_SMT_LO = 2.0^(1 / 4)   # req8-ok: margin between the 1x and shared-core outcomes, measured above, not a perf tuning
+const _MT_SMT_HI = 2.0^(1 / 2)   # req8-ok: margin between the 1x and shared-core outcomes, measured above, not a perf tuning
 
-# EVERY THREAD WAITS ON A PAUSE LOOP FOR THE WHOLE COUNT. A Julia thread that has just finished a
-# task spins in the scheduler before it sleeps, and on Zen3 that spin slows the SMT sibling's product
-# by 1.27x (1830 to 2320 ns, -t 6 on three cores' siblings). Which threads are still spinning depends
-# on which ran last, so it inflated one reading of a pair and not the other: siblings read 1.45-1.50
-# and distinct cores up to 1.27, and the count came out unknown. With every thread held by its own
-# job from start to end, each one waiting on `jl_cpu_pause` when it has no part in a reading, a
-# thread's sibling does the same thing in both of its readings unless it is loaded, and the ratio
-# holds: 1.84-1.94 for siblings, 0.97-1.02 otherwise, measured with Julia's spin turned off.
+# EVERY THREAD WAITS ON A PAUSE LOOP FOR THE WHOLE COUNT. A waiting sibling is not idle to the core,
+# and what it costs depends on how it waits. Measured on Zen3, the product beside a sibling: asleep
+# in the OS 1830 ns, waiting on `jl_cpu_pause` 2200 ns (1.20x), spinning in Julia's scheduler — as a
+# thread does for a while after its task ends — 2320 ns (1.27x). Left to the scheduler, which threads
+# still spin depends on which ran last, so one reading of a pair is inflated and not the other: the
+# count came out unknown, siblings reading 1.45-1.50 and distinct cores up to 1.27. Held by one job
+# each from start to end, waiting on `jl_cpu_pause` when it has no part in a reading, a thread's
+# sibling does the same in both of its readings unless it is loaded, and distinct cores read 1.00
+# (see `_MT_SMT_LO`). Waiting in the OS instead (a short `Libc.systemsleep` per poll) was also
+# measured and is worse on both counts: each poll wakes the sibling, distinct cores read 0.91-1.09,
+# and -t 24 on Zen3 took 6.8-9.3 ms of the setup budget against 1.8-1.9 ms here.
 #
 # One reading: the worker `role` says what each does for this generation of `go` (-1 ends the
 # count) — 0 nothing, 1 load: run the product until `done`, counted in `up` once warm, 2 probe: wait
@@ -6034,7 +6042,7 @@ SmtState(n::Int, b::Int, deadline::UInt64) = SmtState(
     Threads.Atomic{Int}(0), Ref(NaN), b, deadline
 )
 
-# A wait that leaves the SMT sibling its issue slots, and lets a collection through.
+# A wait that costs the SMT sibling the same in every reading, and lets a collection through.
 _mt_pause() = (ccall(:jl_cpu_pause, Cvoid, ()); GC.safepoint())
 
 function _mt_smt_part(s::SmtState, w::Int, p::L1Product)
