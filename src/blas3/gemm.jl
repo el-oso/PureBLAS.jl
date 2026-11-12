@@ -6005,14 +6005,15 @@ const _MT_PINNED_CORES = Threads.Atomic{Int}(-1)
 const _MT_SMT_LO = 2.0^(1 / 4)   # req8-ok: margin around the 1x and 2x outcomes of a shared core, not a perf tuning
 const _MT_SMT_HI = 2.0^(3 / 4)   # req8-ok: margin around the 1x and 2x outcomes of a shared core, not a perf tuning
 
-# EVERY THREAD WAITS ON A PAUSE LOOP FOR THE WHOLE COUNT. A Julia thread that has just finished a
-# task spins in the scheduler before it sleeps, and on Zen3 that spin slows the SMT sibling's product
-# by 1.27x (1830 to 2320 ns, -t 6 on three cores' siblings). Which threads are still spinning depends
-# on which ran last, so it inflated one reading of a pair and not the other: siblings read 1.45-1.50
-# and distinct cores up to 1.27, and the count came out unknown. With every thread held by its own
-# job from start to end, each one waiting on `jl_cpu_pause` when it has no part in a reading, a
-# thread's sibling does the same thing in both of its readings unless it is loaded, and the ratio
-# holds: 1.84-1.94 for siblings, 0.97-1.02 otherwise, measured with Julia's spin turned off.
+# EVERY THREAD IS HELD FOR THE WHOLE COUNT, ASLEEP IN THE OS WHEN IT HAS NO PART IN A READING. A
+# sibling that is merely waiting is not idle to the core. Measured on Zen3, product time beside a
+# sibling asleep in the OS 1830 ns; spinning in Julia's scheduler, as a thread does for a while after
+# its task ends, 2320 ns (1.27x); waiting on `jl_cpu_pause`, 2200 ns (1.20x). Left to the scheduler,
+# which threads still spin depends on which ran last, so one reading of a pair was inflated and not
+# the other: siblings read 1.45-1.50 and distinct cores up to 1.27, an unknown count. A pause loop
+# held for the whole count is the same in both readings, so distinct cores read 1.00, but it is a
+# load of its own: siblings read 1.55-1.59. With waiting threads asleep in the OS (here, and in a
+# control with Julia's own spin turned off) siblings read SMTSIB and distinct cores SMTDIST.
 #
 # One reading: the worker `role` says what each does for this generation of `go` (-1 ends the
 # count) — 0 nothing, 1 load: run the product until `done`, counted in `up` once warm, 2 probe: wait
@@ -6027,15 +6028,20 @@ struct SmtState
     fin::Threads.Atomic{Int}
     out::Base.RefValue{Float64}
     b::Int
+    nap_s::Float64
     deadline::UInt64
 end
-SmtState(n::Int, b::Int, deadline::UInt64) = SmtState(
+SmtState(n::Int, b::Int, step::Int, deadline::UInt64) = SmtState(
     Threads.Atomic{Int}(0), zeros(Int, n), Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false),
-    Threads.Atomic{Int}(0), Ref(NaN), b, deadline
+    Threads.Atomic{Int}(0), Ref(NaN), b, _MT_AMORTISE^2 * step * 1.0e-9, deadline
 )
 
-# A wait that leaves the SMT sibling its issue slots, and lets a collection through.
-_mt_pause() = (ccall(:jl_cpu_pause, Cvoid, ()); GC.safepoint())
+# A wait that takes the thread off its CPU, so its SMT sibling has the core to itself, then lets a
+# collection through. The sleep asked for is one reading's length (`_mt_batch` makes a reading at
+# least `_MT_AMORTISE`² clock steps), so a worker joins a reading about one reading late, or the
+# shortest sleep the OS grants when that is longer. The OS's sleep does not let a collection run
+# while it lasts, so it is kept that short.
+_mt_nap(s::SmtState) = (Libc.systemsleep(s.nap_s); GC.safepoint())
 
 function _mt_smt_part(s::SmtState, w::Int, p::L1Product)
     r = s.role[w]
@@ -6051,7 +6057,7 @@ function _mt_smt_part(s::SmtState, w::Int, p::L1Product)
             nload = count(isone, s.role)
             while s.up[] < nload
                 time_ns() < s.deadline || return nothing
-                _mt_pause()
+                _mt_nap(s)
             end
             s.out[] = _mt_settled(() -> _mt_settled(() -> _mt_time(p, s.b), s.deadline), s.deadline)
         finally
@@ -6078,7 +6084,7 @@ function (j::SmtJob)()
             _mt_smt_part(s, j.w, p)
             Threads.atomic_add!(s.fin, 1)
         end
-        _mt_pause()
+        _mt_nap(s)
     end
     return
 end
@@ -6098,7 +6104,7 @@ function _mt_smt_reading(s::SmtState, p::L1Product, w::Int, load::Vector{Int})
     Threads.atomic_add!(s.fin, 1)
     while s.fin[] < length(s.role)
         time_ns() < s.deadline || return NaN
-        _mt_pause()
+        _mt_nap(s)
     end
     return s.out[]
 end
@@ -6131,7 +6137,8 @@ function _mt_pinned_cores!(deadline::UInt64)
     c = 0
     if !isempty(cpu)
         p = L1Product()
-        s = SmtState(length(cpu), _mt_batch(p, _mt_clock_step(), deadline), deadline)
+        step = _mt_clock_step()
+        s = SmtState(length(cpu), _mt_batch(p, step, deadline), step, deadline)
         ts = [_mt_on_thread(SmtJob(s, w + 1), tid) for (w, tid) in pairs(tids)]
         try
             slowdown = (w, keep) -> _mt_smt_reading(s, p, w, keep) / _mt_smt_reading(s, p, w, Int[])
