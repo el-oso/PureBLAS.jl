@@ -227,6 +227,7 @@ end
                 try
                     @test iszero(ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(one), one))
                     @test P._mt_physical_cores() == c0
+                    @test P._mt_bound_cpu() == cpu + 1                  # libuv's mask numbers from 1
                 finally
                     ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(old), old)
                 end
@@ -1169,6 +1170,18 @@ end
     end
     @test P._mt_clock_step() > 0
     @test P._mt_affinity_count() >= 0
+    # Cores among pinned CPUs, on slowdowns stated by hand: thread t is bound to CPU t, and CPUs 2k
+    # and 2k+1 share a core, so a thread slows (2.1x) when its sibling is loaded and not (1.05x) else.
+    smt = (t, keep) -> any(k -> k ÷ 2 == t ÷ 2, keep) ? 2.1 : 1.05
+    @test P._mt_core_count(collect(0:5), collect(0:5), smt) == 3          # both siblings of 3 cores
+    @test P._mt_core_count([0, 2, 4], [0, 2, 4], smt) == 3                # one CPU per core: no collapse
+    @test P._mt_core_count([0, 3, 4, 1], [0, 3, 4, 1], smt) == 3          # siblings out of order
+    @test P._mt_core_count(collect(0:5), collect(0:5), (t, keep) -> 1.05) == 6
+    # Two threads on one CPU share its core without a reading.
+    @test P._mt_core_count([1, 2, 3], [7, 7, 8], (t, keep) -> t == 2 ? error("read") : 1.0) == 2
+    # A reading between the two outcomes, or none at all, gives no count.
+    @test iszero(P._mt_core_count([0, 1], [0, 1], (t, keep) -> sqrt(2.0)))
+    @test iszero(P._mt_core_count([0, 1], [0, 1], (t, keep) -> NaN))
     if nthreads() < 2
         @test_skip "needs >= 2 julia threads: there is no pool to measure without one"
     else
