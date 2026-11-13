@@ -1541,12 +1541,12 @@ function _trmm_split_L!(up::Bool, tr::Bool, unit::Bool, A, B, mrv::Val)
     n = size(B, 2)
     if (up && !tr) || (!up && tr)              # top block carries the off-diagonal update → after Bt's solve
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
-        nwo = _strassen_owns(T, h, n, k - h, tr, off, Bb, _STR_LVL1) ? _gemm_workers(h, n, k - h) : 1
+        nwo = _strassen_owns(T, h, n, k - h, tr, false, off, Bb, _STR_LVL1) ? _gemm_workers(h, n, k - h) : 1
         _gemm_core!(Bt, off, Bb, o, o, tr, false, false, false, _RT_NONE, _STR_LVL1, nwo)
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
     else                                        # bottom block carries the update
         _trmm_split_L!(up, tr, unit, A22, Bb, mrv)
-        nwo = _strassen_owns(T, k - h, n, h, tr, off, Bt, _STR_LVL1) ? _gemm_workers(k - h, n, h) : 1
+        nwo = _strassen_owns(T, k - h, n, h, tr, false, off, Bt, _STR_LVL1) ? _gemm_workers(k - h, n, h) : 1
         _gemm_core!(Bb, off, Bt, o, o, tr, false, false, false, _RT_NONE, _STR_LVL1, nwo)
         _trmm_split_L!(up, tr, unit, A11, Bt, mrv)
     end
@@ -7887,7 +7887,10 @@ function _hemm_packed_L!(up::Bool, α, β, A, B, C, ::Val{HERM} = Val(true)) whe
                 ic = 0
                 while ic < n
                     mce = min(mc, n - ic); a_hi = ic + mce - 1; p_hi = pc + kce - 1
-                    stored = up ? (a_hi <= pc) : (ic >= p_hi)     # read A[i,gp] direct (SIMD)
+                    # Read A[i,gp] direct (SIMD) when the panel lies in the stored triangle. A panel that
+                    # touches the diagonal (a_hi == pc, or ic == p_hi) is excluded for Hermitian A: the
+                    # direct read would keep the diagonal's imaginary part, which hemm must ignore.
+                    stored = up ? (HERM ? a_hi < pc : a_hi <= pc) : (HERM ? ic > p_hi : ic >= p_hi)
                     stored ? _pack_A_cmplx!(ApR, ApI, A, ic, pc, mce, kce, false, mr) :
                         _pack_A_sym_cmplx!(ApR, ApI, A, ic, pc, mce, kce, up, mr, Val(HERM))
                     # B0/A1 were hardwired false here while `_gemm_cmplx_impl!` dispatches both. The gate
@@ -8042,7 +8045,7 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     # no-materialize 3M route above, and complex side R keeps this path.
     if side_left && T <: BlasReal && nw > 1 && _strided1(A) &&
             n <= _symm_perworker_max(T, nw) &&
-            !_strassen_owns(T, size(C, 1), size(C, 2), n, false, A, B, _STR_FLOOR)
+            !_strassen_owns(T, size(C, 1), size(C, 2), n, false, false, A, B, _STR_FLOOR)
         rA = _root(A); rB = _root(B); rC = _root(C)
         GC.@preserve rA rB rC _gemm_threaded!(
             _pm(C), _pm(A), _pm(B), convert(T, α), convert(T, β),
@@ -8081,7 +8084,7 @@ function _symm!(side_left::Bool, up::Bool, herm::Bool, α, β, A, B, C)
     # product threads inside the recursion instead of being column-split — see the same decision in
     # `gemm!`, and `_strassen_leaf!` for why that is still bit-identical.
     Xd, Yd = side_left ? (Ad, B) : (B, Ad)
-    if nw > 1 && !_strassen_owns(eltype(C), size(C, 1), size(C, 2), size(Yd, 1), false, Xd, Yd, _STR_FLOOR)
+    if nw > 1 && !_strassen_owns(eltype(C), size(C, 1), size(C, 2), size(Yd, 1), false, false, Xd, Yd, _STR_FLOOR)
         rA = _root(Ad); rB = _root(B); rC = _root(C)
         GC.@preserve rA rB rC begin
             side_left ?

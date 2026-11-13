@@ -473,7 +473,7 @@ end
         # about are not reached; the comparisons below still test the invariant, and only the witness
         # is skipped. Same shape as the big/thin witnesses further down.
         if P._STRASSEN
-            @test P._strassen_owns(Float64, ns, ns, ns, false, A, B, P._STR_FLOOR)
+            @test P._strassen_owns(Float64, ns, ns, ns, false, false, A, B, P._STR_FLOOR)
         else
             @test_skip "Strassen is off at _W64=$(PureBLAS._W64)"
         end
@@ -706,11 +706,11 @@ end
         # shape takes the column split like the thin one -- the bit-identity below is the same
         # property either way, so the invariant is still tested and only the witness is skipped.
         if P._STRASSEN
-            @test P._strassen_owns(Float64, nb, nb, nb, false, Abig, Bbig, P._STR_FLOOR)
+            @test P._strassen_owns(Float64, nb, nb, nb, false, false, Abig, Bbig, P._STR_FLOOR)
         else
             @test_skip "Strassen is off at _W64=$(PureBLAS._W64)"
         end
-        @test !P._strassen_owns(Float64, n, n, kthin, false, Athin, Bthin, P._STR_FLOOR)
+        @test !P._strassen_owns(Float64, n, n, kthin, false, false, Athin, Bthin, P._STR_FLOOR)
         @test P._gemm_workers(n, n, kthin) > 1
         # AND THAT THE COMBINES THEMSELVES SPLIT, which is a second witness and not a duplicate of the
         # one above. The recursion's leaves threading says nothing about its combine passes: those are

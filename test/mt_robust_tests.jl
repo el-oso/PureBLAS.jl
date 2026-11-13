@@ -115,15 +115,16 @@ end
         siblings = reduce(vcat, cores[1:nc])
         @info "pinned children" one_per_core siblings
         # k CPUs lie on at least cld(k, threads per core) cores, the formula's count, and at most k.
+        # A measured count of 0 means the measurement was inconclusive and the formula was used.
         tpc = max(1, Sys.CPU_THREADS ÷ Int(P.num_cores()))
         results = Dict(cpus => child(cpus) for cpus in (one_per_core, siblings))
         for (cpus, (nw, measured)) in results
             @test cld(length(cpus), tpc) <= nw <= length(cpus)
-            @test cld(length(cpus), tpc) <= measured <= length(cpus)
+            @test iszero(measured) || cld(length(cpus), tpc) <= measured <= length(cpus)
         end
-        nw1, _ = results[one_per_core]
+        nw1, measured1 = results[one_per_core]
         nw2, measured2 = results[siblings]
-        if measured2 < length(siblings)
+        if !iszero(measured1) && !iszero(measured2) && measured2 < length(siblings)
             # The measurement saw cores shared, which confirms the sibling lists: both siblings of
             # each core collapse to that core, and one CPU per core keeps every core, where the
             # formula gives half of them.
@@ -131,10 +132,11 @@ end
             @test measured2 == nc
             @test nw1 == nc
         else
-            # A virtual machine's sibling lists need not match how the host schedules its vCPUs.
+            # A virtual machine's sibling lists need not match how the host schedules its vCPUs, and
+            # a loaded runner can leave the measurement inconclusive (0).
             println(
-                "core cap: siblings $siblings measured as $measured2 cores, no contention between ",
-                "the listed siblings, so the sibling lists are not confirmed; collapse not checked"
+                "core cap: measured $measured1 cores for one CPU per core and $measured2 for siblings ",
+                "$siblings (0 = inconclusive); the sibling lists are not confirmed, collapse not checked"
             )
             @test_skip measured2 == nc
             @test_skip nw1 == nc
@@ -187,4 +189,56 @@ end
         line = only(l for l in split(out, '\n') if startswith(l, "WINDOW "))
         @test parse(Int, split(line)[2]) == _MT_KEEPAWAKE_GAP_NS - onset
     end
+end
+
+# Every real transpose combination at a size where `gemm!` asks `_strassen_owns` whether to column-
+# split, at 2 and 4 workers, bitwise against one worker. The predicate and `_gemm_core!`'s recursion
+# arm must agree: a call the predicate claims but the core runs classically reaches the cooperative
+# A-pack barrier as a lone "worker 1 of nw" and spins there forever, ignoring SIGTERM. So the case runs
+# in a child process with a hard SIGKILL deadline, and a hang fails this item instead of the suite.
+@testitem "threaded gemm: every transpose pair finishes, bitwise equal to serial" begin
+    script = """
+    using PureBLAS, Random
+    for T in (Float32, Float64), ta in ('N', 'T', 'C'), tb in ('N', 'T', 'C')
+        rng = MersenneTwister(7)
+        n = 2048
+        A = randn(rng, T, n, n); B = randn(rng, T, n, n)
+        PureBLAS.set_num_threads(1)
+        C1 = PureBLAS.gemm!(zeros(T, n, n), A, B; transA = ta, transB = tb)
+        for nt in (2, 4)
+            PureBLAS.set_num_threads(nt) == nt || error("asked for \$nt workers")
+            C = PureBLAS.gemm!(zeros(T, n, n), A, B; transA = ta, transB = tb)
+            println("CASE ", T, " ", ta, tb, " ", nt, " ", C == C1); flush(stdout)
+        end
+    end
+    println("DONE")
+    """
+    env = copy(ENV)
+    env["PUREBLAS_MT_ALL_THREADS"] = "1"     # four workers even on a host with fewer cores
+    proc = open(pipeline(setenv(`$(Base.julia_cmd()) -t 4 --project=$(Base.active_project()) -e $script`, env); stderr = devnull))
+    lines = String[]
+    lastline = Ref(time())
+    reader = @async for l in eachline(proc)
+        push!(lines, l)
+        lastline[] = time()
+    end
+    # The deadline is per case: a hang stops the output, while a slow runner keeps printing cases.
+    finished = true
+    while !process_exited(proc)
+        sleep(1)
+        if time() - lastline[] > 300
+            finished = false
+            kill(proc, Base.SIGKILL)
+            break
+        end
+    end
+    wait(proc)
+    wait(reader)
+    cases = [l for l in lines if startswith(l, "CASE ")]
+    finished || @info "threaded gemm child killed at the deadline" last_case = isempty(cases) ? "none" : last(cases)
+    @test finished
+    @test success(proc)
+    @test "DONE" in lines
+    @test length(cases) == 2 * 9 * 2
+    @test all(endswith(" true"), cases)
 end

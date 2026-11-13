@@ -706,3 +706,26 @@ end
         P.set_num_threads(1)
     end
 end
+
+# `_simd2` admits any two contiguous real vectors of one element type, whichever mix of Array, PtrVector
+# and raw Ptr carries them; the kernels read them through `_ptr`, so every pairing must agree with the
+# plain-Array result.
+@testitem "Level-1 SIMD kernels accept mixed Array/PtrVector/Ptr operands" begin
+    using PureBLAS
+    P = PureBLAS
+    carriers = (
+        v -> v, v -> P.PtrVector(pointer(v), length(v)), v -> pointer(v),
+    )
+    for T in (Float32, Float64), n in (1, 7, 64, 1000), cx in carriers, cy in carriers
+        x = randn(T, n); y = randn(T, n); a = T(1.5)
+        tol = 8 * eps(T) * (1 + maximum(abs, y) + abs(a) * maximum(abs, x))
+        y1 = copy(y); GC.@preserve x y1 P._axpy!(n, a, cx(x), 1, cy(y1), 1)
+        @test maximum(abs, y1 .- (y .+ a .* x)) <= tol
+        y2 = copy(y); GC.@preserve x y2 P._copy!(n, cx(x), 1, cy(y2), 1)
+        @test y2 == x
+        x3 = copy(x); y3 = copy(y); GC.@preserve x3 y3 P._swap!(n, cx(x3), 1, cy(y3), 1)
+        @test x3 == y && y3 == x
+        d = GC.@preserve x y P._dotu(n, cx(x), 1, cy(y), 1)
+        @test abs(d - sum(Float64.(x) .* Float64.(y))) <= 16 * eps(T) * n * (1 + maximum(abs, x) * maximum(abs, y))
+    end
+end
