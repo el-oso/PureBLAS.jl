@@ -59,3 +59,50 @@
         @test tp <= (hosted ? 8.0 : 1.5) * ts
     end
 end
+
+# The pool's keep-awake window comes from the onset `deps/build.jl` stored for this machine, and is
+# `_MT_KEEPAWAKE_NS` when there is no store or the store was written on other hardware.
+@testitem "keep-awake window: the stored onset on this host, else the default" begin
+    using PureBLAS: _mt_keepawake_read, _mt_host_fingerprint, _MT_KEEPAWAKE_NS, _MT_KEEPAWAKE_GAP_NS
+    fp = _mt_host_fingerprint()
+    onset = 3_000_000
+    mktempdir() do dir
+        f = joinpath(dir, "onset.txt")
+        @test _mt_keepawake_read(f, fp) == _MT_KEEPAWAKE_NS
+        write(f, fp, "\n", string(onset), "\n")
+        @test _mt_keepawake_read(f, fp) == _MT_KEEPAWAKE_GAP_NS - onset
+        # Positive control: the store moved the window off the default, so the equalities to the
+        # default above and below can fail.
+        @test _mt_keepawake_read(f, fp) != _MT_KEEPAWAKE_NS
+        @test _mt_keepawake_read(f, fp * "/other") == _MT_KEEPAWAKE_NS
+        write(f, fp, "\nnone\n")                   # no gap slowed the probe's job: sleep at once
+        @test _mt_keepawake_read(f, fp) == 0
+        write(f, fp, "\n0\n")                      # slower after any gap: cover the whole gap
+        @test _mt_keepawake_read(f, fp) == _MT_KEEPAWAKE_GAP_NS
+        write(f, fp, "\n", string(2 * _MT_KEEPAWAKE_GAP_NS), "\n")   # sleeps later than the gap
+        @test _mt_keepawake_read(f, fp) == 0
+        write(f, fp, "\nnot a number\n")
+        @test _mt_keepawake_read(f, fp) == _MT_KEEPAWAKE_NS
+        write(f, fp)
+        @test _mt_keepawake_read(f, fp) == _MT_KEEPAWAKE_NS
+    end
+
+    # End to end: a store in the first depot, where `deps/build.jl` writes it, sets the window of a
+    # pool created afterwards.
+    mktempdir() do depot
+        f = joinpath(PureBLAS.scratch_path(PureBLAS._MT_KEEPAWAKE_UUID, "mt_keepawake"; depot_path = depot), "onset.txt")
+        mkpath(dirname(f))
+        write(f, fp, "\n", string(onset), "\n")
+        script = """
+        using PureBLAS
+        PureBLAS.set_num_threads(2) == 2 || error("no pool")
+        println("WINDOW ", PureBLAS._MT_KEEPAWAKE_HOST[])
+        """
+        env = copy(ENV)
+        env["JULIA_DEPOT_PATH"] = join([depot; DEPOT_PATH], Sys.iswindows() ? ';' : ':')
+        env["PUREBLAS_MT_ALL_THREADS"] = "1"
+        out = read(setenv(`$(Base.julia_cmd()) -t 2 --project=$(Base.active_project()) -e $script`, env), String)
+        line = only(l for l in split(out, '\n') if startswith(l, "WINDOW "))
+        @test parse(Int, split(line)[2]) == _MT_KEEPAWAKE_GAP_NS - onset
+    end
+end
