@@ -1,7 +1,9 @@
 # BLAS Level-2: matrix-vector. gemv (y = α·op(A)·x + β·y) and ger (A += α·x·yᵀ). Both reduce to the
 # Level-1 column kernels: gemv-N and ger are column axpys (`_axpy_simd!`), gemv-T/C are column dots
 # (`_dot_simd`). Real dense unit-stride takes the SIMD path; complex / Dual / strided take a generic
-# scalar loop (AD-traceable). A is column-major; for the SIMD path A[:,j] is a contiguous segment.
+# scalar loop (AD-traceable), except that a gemv over BLAS floats with strided x or y packs the vectors
+# and runs the unit-stride kernels (`_gemv_packed!`). A is column-major; for the SIMD path A[:,j] is a
+# contiguous segment.
 
 # y .*= β, with β==0 → 0 (overwrite, ignoring NaN/Inf per BLAS) and β==1 → no-op.
 @inline function _scale_y!(n::Int, β::Number, y, incy::Integer)
@@ -1736,7 +1738,7 @@ function _gemv_n_ri_run!(
             end
         elseif !isone(β)
             βr, βi = _parts(β)
-            _scal_pair_simd!(_palg(P), m, βr, βi, y)
+            _scal_pair_simd!(_palg(P), m, βr, βi, _ptr(y))   # a Ptr: `_pairreal` has no view/PtrVector method
         end
         i0 = 0
         while i0 < m
@@ -2034,7 +2036,7 @@ function _gemv_tc_run!(
         @inbounds while j < n                                     # remainder columns: per-column dot
             colp = Ap + j * lda * csz
             s = _pair_coldot(P, m, colp, xp, Val(CJ))
-            yj = y[j + 1]; y[j + 1] = (z ? zero(yj) : β * yj) + α * s
+            yj = _ld(y, j + 1); _st!(y, j + 1, (z ? zero(yj) : β * yj) + α * s)   # y may be a raw Ptr (C-ABI)
             j += 1
         end
     end
@@ -2102,6 +2104,50 @@ end
     return _gemv_tc_run!(m, n, α, A, x, β, y, Val(CJ), Val(_CGEMVT_NC), Val(_CGEMVT_HALF))
 end
 
+# A BLAS-float gemv whose only obstacle to the unit-stride kernels is the vector layout: x or y is
+# strided (|inc| ≠ 1, negative inc) or a non-contiguous view. inc == 0 is excluded and keeps the scalar
+# loop, which is what it has always computed.
+@inline function _gemv_pack_ok(A, x, y, incx::Integer, incy::Integer)
+    T = eltype(A)
+    return T <: BlasFloat && eltype(x) === T && eltype(y) === T && _strided1(A) &&
+        !iszero(incx) && !iszero(incy) && !(incx == 1 && _dense1(x) && incy == 1 && _dense1(y))
+end
+
+"""
+    _gemv_packed!(trans, cj, m, n, α, A, x, incx, β, y, incy) -> y
+
+gemv through contiguous copies of the strided vectors, the way OpenBLAS's gemv driver handles a
+non-unit increment: a strided x is gathered into an arena buffer; a strided y is gathered (only when
+β ≠ 0, so β == 0 never reads y), updated by the unit-stride call with the caller's α and β, and
+scattered back. A vector that is already contiguous is passed through by pointer. The unit-stride
+call sees the same values, extents and β it would see for contiguous operands, so it takes the same
+route and produces the same bits, including at every thread count.
+"""
+@noinline function _gemv_packed!(
+        trans::Bool, cj::Bool, m::Int, n::Int, α::Number, A, x, incx::Integer,
+        β::Number, y, incy::Integer
+    )
+    T = eltype(A)
+    lx, ly = trans ? (m, n) : (n, m)
+    xd = incx == 1 && _dense1(x)
+    yd = incy == 1 && _dense1(y)
+    # NOTHING ESCAPES: the handles go down into `_copy!` and `_gemv!` and are dropped at block end.
+    GC.@preserve x y begin
+        @scope arn begin
+            xb = borrow!(arn, T, xd ? 0 : lx)
+            yb = borrow!(arn, T, yd ? 0 : ly)
+            xd || _copy!(lx, x, incx, xb, 1)
+            (yd || iszero(β)) || _copy!(ly, y, incy, yb, 1)
+            xv = xd ? PtrVector{T}(_ptr(x), lx) : xb
+            yv = yd ? PtrVector{T}(_ptr(y), ly) : yb
+            _gemv!(trans, cj, m, n, α, A, xv, 1, β, yv, 1)
+            yd || _copy!(ly, yb, 1, y, incy)
+            nothing
+        end
+    end
+    return y
+end
+
 function _gemv!(
         trans::Bool, cj::Bool, m::Integer, n::Integer, α::Number, A, x, incx::Integer,
         β::Number, y, incy::Integer
@@ -2131,6 +2177,9 @@ function _gemv!(
             αd = convert(eltype(A), α); βd = convert(eltype(A), β)
             return iszero(βd) ? _gemv_n_ri_cmplx!(Int(m), Int(n), αd, A, x, y, βd, Val(true)) :
                 _gemv_n_ri_cmplx!(Int(m), Int(n), αd, A, x, y, βd, Val(false))
+        end
+        if _gemv_pack_ok(A, x, y, incx, incy)
+            return _gemv_packed!(false, cj, Int(m), Int(n), α, A, x, incx, β, y, incy)
         end
         _scale_y!(Int(m), β, y, incy)
         ix = _start(n, incx)
@@ -2191,6 +2240,9 @@ function _gemv!(
         if _l2p_ok(A, x, y, incx, incy)                          # dual pairs: 'C' == 'T' (conj is the identity)
             αd = convert(eltype(A), α); βd = convert(eltype(A), β)
             return _gemv_tc_cmplx!(Int(m), Int(n), αd, A, x, βd, y, Val(false))
+        end
+        if _gemv_pack_ok(A, x, y, incx, incy)
+            return _gemv_packed!(true, cj, Int(m), Int(n), α, A, x, incx, β, y, incy)
         end
         s0 = zero(_et(A)) * zero(_et(x))
         iy = _start(n, incy)

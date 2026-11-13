@@ -91,6 +91,81 @@ end
     @test l2err(y, 2.0 .* (A * collect(x))) < l2tol(Float64)
 end
 
+# Strided x/y in every BLAS layout the entries accept: a raw buffer plus increment (`_gemv!`, the form
+# the C-ABI passes), a strided view natively, and the same view through `activate()`. The oracle is the
+# default BLAS on contiguous copies of the logical vectors. Elements of y's buffer between the strided
+# entries must survive untouched, and β = 0 must not read y (it holds NaN there). The packed native
+# result must equal PureBLAS on the contiguous copies BIT FOR BIT: it runs the same kernel on the same
+# values.
+@testitem "gemv strided x/y: native, raw increment and activate() vs default BLAS" tags = [:lbt] setup = [L2Oracle] begin
+    using PureBLAS, LinearAlgebra
+    import LinearAlgebra.BLAS as B
+    const P = PureBLAS
+    lidx(n, inc) = range(P._start(n, inc); step = inc, length = n)   # BLAS logical element order
+    buflen(n, inc) = 1 + (n - 1) * abs(inc)
+    cases = Any[]
+    for T in (Float32, Float64, ComplexF32, ComplexF64), tr in ('N', 'T', 'C'),
+            (m, n) in ((37, 23), (8, 70)), incx in (1, 2, -1, 3), incy in (1, 2, -1, 3),
+            (al, be) in ((one(T), zero(T)), (one(T), one(T)), (T(0.7), T(-1.3)), (zero(T), T(1.3)))
+
+        A = randn(T, m, n)
+        lx, ly = tr == 'N' ? (n, m) : (m, n)
+        xbuf = randn(T, buflen(lx, incx)); ybuf = randn(T, buflen(ly, incy))
+        ix = lidx(lx, incx); iy = lidx(ly, incy)
+        iszero(be) && (ybuf[iy] .= T(NaN))
+        yref = B.gemv!(tr, al, A, xbuf[ix], be, iszero(be) ? zeros(T, ly) : ybuf[iy])
+        ycon = P.gemv!(iszero(be) ? zeros(T, ly) : ybuf[iy], A, xbuf[ix]; alpha = al, beta = be, trans = tr)
+        push!(cases, (; T, tr, m, n, incx, incy, al, be, A, xbuf, ybuf, ix, iy, yref, ycon))
+    end
+    check(c, got) = l2err(got[c.iy], c.yref) < l2tol(c.T) &&
+        all(i -> i in c.iy || isequal(got[i], c.ybuf[i]), eachindex(got))
+    for c in cases
+        yv = copy(c.ybuf)
+        P.gemv!(view(yv, c.iy), c.A, view(c.xbuf, c.ix); alpha = c.al, beta = c.be, trans = c.tr)
+        @test check(c, yv)
+        @test reinterpret(UInt8, yv[c.iy]) == reinterpret(UInt8, c.ycon)
+        yr = copy(c.ybuf)
+        P._gemv!(c.tr != 'N', c.tr == 'C', c.m, c.n, c.al, c.A, c.xbuf, c.incx, c.be, yr, c.incy)
+        @test check(c, yr)
+    end
+    P.activate()
+    got = try
+        map(cases) do c
+            yv = copy(c.ybuf)
+            B.gemv!(c.tr, c.al, c.A, view(c.xbuf, c.ix), c.be, view(yv, c.iy))
+            yv
+        end
+    finally
+        P.deactivate()
+    end
+    for (c, yv) in zip(cases, got)
+        @test check(c, yv)
+    end
+end
+
+# req#10 on the packed path: the vector copies come from the arena, so a strided gemv is
+# allocation-free from the second call. Shaped like the threaded L2 item: `@allocated` inside a
+# function over named arguments, minimum over several windows (the counter is process-wide).
+@testitem "gemv strided x/y: allocation-free at steady state" begin
+    using PureBLAS
+    const P = PureBLAS
+    a_view(y, A, x, tr) = @allocated P.gemv!(y, A, x; alpha = 0.75, beta = 2.5, trans = tr)
+    a_inc(tr, m, n, A, x, incx, y, incy) = @allocated P._gemv!(tr, false, m, n, 0.75, A, x, incx, 2.5, y, incy)
+    for T in (Float32, Float64, ComplexF64), tr in ('N', 'T')
+        m, n = 300, 200
+        A = randn(T, m, n)
+        lx, ly = tr == 'N' ? (n, m) : (m, n)
+        xb = randn(T, 2lx); yb = randn(T, 3ly)
+        xv = view(xb, 1:2:2lx); yv = view(yb, 3ly:-3:1)
+        for _ in 1:2
+            P.gemv!(yv, A, xv; alpha = 0.75, beta = 2.5, trans = tr)
+            P._gemv!(tr != 'N', false, m, n, 0.75, A, xb, -2, 2.5, yb, 3)
+        end
+        @test minimum(a_view(yv, A, xv, tr) for _ in 1:5) == 0
+        @test minimum(a_inc(tr != 'N', m, n, A, xb, -2, yb, 3) for _ in 1:5) == 0
+    end
+end
+
 @testitem "gemv/ger AD-traceable (ForwardDiff)" begin
     using PureBLAS, ForwardDiff, LinearAlgebra
     A = randn(8, 5); x = randn(5); dx = randn(5)
