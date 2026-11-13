@@ -26,6 +26,8 @@ include("blas3/sme_kernel.jl")    # Level-3 GEMM: Apple SME Float64 path (Float6
 include("blas1/sme_l1.jl")      # BLAS-1 reductions on SME: dot/asum accumulate into ZA
 # MUST follow sme_l1.jl: a constant `@cfunction` binds its callee when the enclosing method is defined.
 include("blas1/sme_l1_cf.jl")   # @cfunction trampolines for the BLAS-1 SME kernels
+using Scratch: scratch_path        # where deps/build.jl stores the measured keep-awake onset
+include("blas3/keepawake.jl")     # pool keep-awake window + the on-host onset store deps/build.jl writes
 include("blas3/gemm.jl")          # Level-3 GEMM (BLIS 5-loop + SIMD microkernel; generic fallback)
 include("blas3/level3.jl")        # Level-3 trmm/trsm (recursive blocking, reuses gemm!)
 include("lapack/lapack.jl")        # LAPACK: Cholesky (potrf) on the gated L3

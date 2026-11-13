@@ -5407,12 +5407,21 @@ end
 # covers gaps up to about W + 2 ms. 10 ms covers the serial panel phases a blocked factorization runs
 # between threaded trailing updates. Back-to-back calls are unchanged at every window, so arriving work
 # is not delayed, and after the window the worker sleeps and an idle process costs its host nothing.
-# PDM: Measured — the window sweep above: flat from 3 ms on both kernels, 10 ms covers the panel gaps.
-const _MT_KEEPAWAKE_NS = 10_000_000   # req8-ok: politeness window measured in the sweep above, not a perf tuning
+#
+# WHEN THE CORE SLEEPS IS A PROPERTY OF THE HOST — its idle states and the OS governor choosing them —
+# and nothing PureBLAS detects predicts it. So `deps/build.jl`, which Pkg runs after installing or
+# updating the package, measures the onset once per machine, and the window is the gap the Zen3 window
+# covers minus that onset (`_mt_keepawake_window`, keepawake.jl). It is read when the pool is created;
+# an unmeasured host, or a store written on other hardware, keeps `_MT_KEEPAWAKE_NS`. The read sits
+# in `set_num_threads`, which no `@ccallable` reaches, so a trimmed library never compiles it and
+# keeps the default.
+#
+# The window in force, ns. Set once when the pool is created, before any worker reads it.
+const _MT_KEEPAWAKE_HOST = Threads.Atomic{Int}(_MT_KEEPAWAKE_NS)
 
 @inline function _mt_keepawake_ns()
     o = @inbounds _EXPINT[16]
-    return o > 0 ? o * 1000 : (o < 0 ? 0 : _MT_KEEPAWAKE_NS)
+    return o > 0 ? o * 1000 : (o < 0 ? 0 : _MT_KEEPAWAKE_HOST[])
 end
 
 @noinline _throw_gemm_worker() = error("PureBLAS: a threaded gemm worker failed; C is undefined")
@@ -6018,6 +6027,8 @@ function set_num_threads(n::Integer)
     nt = clamp(Int(n), 1, min(Threads.nthreads(), cores, _MT_NW_MASK))
     if nt > 1
         lock(_MT_SETUP_LOCK) do
+            isempty(_GEMM_POOL_F64) &&
+                (_MT_KEEPAWAKE_HOST[] = _mt_keepawake_read(_mt_keepawake_file(), _mt_host_fingerprint()))
             deadline = time_ns() + UInt64(_MT_MEASURE_NS)
             isempty(_GEMM_POOL_F64) && _mt_group_order!(deadline)
             isempty(_GEMM_POOL_F64) && push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
