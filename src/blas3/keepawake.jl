@@ -30,6 +30,9 @@ _mt_keepawake_window(onset::Integer) = max(0, _MT_KEEPAWAKE_GAP_NS - max(0, Int(
 
 # How the store spells "no gap slowed the job".
 const _MT_KEEPAWAKE_NONE = "none"
+# What the probe reports when its gaps neither show an onset nor all match the reference.
+# `deps/build.jl` then removes the store, so the host keeps `_MT_KEEPAWAKE_NS`.
+const _MT_KEEPAWAKE_UNCLEAR = "unclear"
 
 # The machine a stored onset is valid for. Only what Julia itself reports, because the writer cannot
 # load PureBLAS's own detection (`_tuning_fingerprint`) without precompiling the whole package. A

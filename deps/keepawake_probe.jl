@@ -1,6 +1,7 @@
 # Started by deps/build.jl with several threads. Finds the shortest idle gap after which a threaded
-# job runs slower than it does after the shortest gap, and prints that gap in ns as the last line of
-# stdout — `_MT_KEEPAWAKE_NONE` when no gap on the ladder slows it. The per-gap table goes to stderr, i.e. the build log.
+# job runs slower than after the reference gap, and prints, as the last line of stdout, that gap in
+# ns, `_MT_KEEPAWAKE_NONE` when every gap matches the reference, or `_MT_KEEPAWAKE_UNCLEAR` when
+# neither holds. The per-gap table goes to stderr, i.e. the build log.
 #
 # THE JOB is one read of a private buffer per thread, half that core's L2: resident while the core
 # stays awake, refetched when an idle state flushed the core's caches, and the exit latency of a
@@ -42,12 +43,19 @@ function idle(g)
     return nothing
 end
 
-# Gaps from 0.5 ms in steps of √2, up to the first above `_MT_KEEPAWAKE_GAP_NS`: any onset beyond
-# that gives window 0, as no onset does.
+# THE REFERENCE GAP. An idle Julia thread spins for `JULIA_THREAD_SLEEP_THRESHOLD` ns before it
+# sleeps, and deps/build.jl sets that for this process. Below it the workers never sleep and the
+# job runs faster than at any longer gap whatever the core does, so the reference is the first gap
+# clear of it: twice the threshold, where the workers have just gone to sleep and their cores have
+# idled for at most about the threshold. A host already slow there reads as slow at every longer
+# gap, which is an onset at the second rung and a window of nearly `_MT_KEEPAWAKE_GAP_NS`.
+# Gaps then rise in steps of √2 to the first above `_MT_KEEPAWAKE_GAP_NS`: an onset beyond that
+# gives window 0.
+const SLEEP_NS = parse(Int, ENV["JULIA_THREAD_SLEEP_THRESHOLD"])
 function ladder()
-    gs = [500_000]
+    gs = [2 * SLEEP_NS]
     while last(gs) <= _MT_KEEPAWAKE_GAP_NS
-        push!(gs, round(Int, 500_000 * 2^(length(gs) / 2)))
+        push!(gs, round(Int, 2 * SLEEP_NS * 2^(length(gs) / 2)))
     end
     return gs
 end
@@ -58,26 +66,39 @@ const SAMPLES = 31
 
 times(g) = [s.time for s in (@be idle(g) _ -> job() evals = 1 samples = SAMPLES seconds = Inf).samples]
 
+# Each gap compared with the reference by quartiles: `:slow` when the two interquartile ranges do
+# not overlap and the gap's is higher, `:same` when the gap's median is inside the reference's
+# range, `:unclear` otherwise.
+function classify(t, ref)
+    r1, r3 = quantile(ref, [0.25, 0.75])
+    q1, q2 = quantile(t, [0.25, 0.5])
+    q1 > r3 && return :slow
+    r1 <= q2 <= r3 && return :same
+    return :unclear
+end
+
+# The onset in ns; `_MT_KEEPAWAKE_NONE` only when every gap matched the reference, which is the
+# positive evidence of no penalty that window 0 needs; `nothing` when the evidence is mixed, so
+# that nothing is stored and the default window stays.
 function onset()
     gs = ladder()
+    times(gs[1])   # discarded: the first block after start-up reads slow and wide on every part measured
     ts = [times(g) for g in gs]
-    # The kernel's own noise: the upper quartile after the shortest gap. A gap is slow when its
-    # median is above that.
-    bound = quantile(ts[1], 0.75)
-    slow = [median(t) > bound for t in ts]
-    println(stderr, "threads $NT, buffer $(LEN * sizeof(Float64)) B per thread, bound $(round(bound * 1.0e6; digits = 1)) us")
-    for (g, t, s) in zip(gs, ts, slow)
+    cls = [classify(t, ts[1]) for t in ts]
+    println(stderr, "threads $NT, buffer $(LEN * sizeof(Float64)) B per thread, sleep threshold $SLEEP_NS ns")
+    for (g, t, c) in zip(gs, ts, cls)
         q1, q2, q3 = quantile(t, [0.25, 0.5, 0.75])
-        println(stderr, "gap $(round(g / 1.0e6; digits = 2)) ms: median $(round(q2 * 1.0e6; digits = 1)) us [$(round(q1 * 1.0e6; digits = 1)), $(round(q3 * 1.0e6; digits = 1))]", s ? "  slow" : "")
+        println(stderr, "gap $(round(g / 1.0e6; digits = 2)) ms: median $(round(q2 * 1.0e6; digits = 1)) us [$(round(q1 * 1.0e6; digits = 1)), $(round(q3 * 1.0e6; digits = 1))]  $c")
     end
-    # The onset is the shortest gap from which every longer gap is slow too, so one noisy gap does
-    # not count.
+    # The onset is the shortest gap from which every longer gap is slow, so one noisy gap does not
+    # make one.
     for i in 2:length(gs)
-        all(slow[i:end]) && return gs[i]
+        all(==(:slow), cls[i:end]) && return gs[i]
     end
+    all(==(:same), cls[2:end]) && return _MT_KEEPAWAKE_NONE
     return nothing
 end
 
 let o = onset()
-    println(isnothing(o) ? _MT_KEEPAWAKE_NONE : o)
+    println(isnothing(o) ? _MT_KEEPAWAKE_UNCLEAR : o)
 end
