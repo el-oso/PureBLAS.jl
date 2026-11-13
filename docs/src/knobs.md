@@ -14,8 +14,8 @@ Every `@load_preference` key in `src/` — 170 of them.
 | **Measured, orphaned** | Measured with no calibrator in `bench/calibrate.jl`, so `tune!()` can never set it and the pin it wants is unreachable. Its `tune!()` cell reads `none`. A missing tool, not a missing verdict — the tier says where the number came from and does not change when a calibrator arrives. |
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 
-**Tier:** 93 Derived · 24 Measured (15 calibrated · 9 orphaned) · 53 Literal.
-**Default form** (mechanical): 70 formula · 24 delegates · 8 sibling · 61 literal · 7 other.
+**Tier:** 92 Derived · 24 Measured (15 calibrated · 9 orphaned) · 54 Literal.
+**Default form** (mechanical): 69 formula · 24 delegates · 8 sibling · 62 literal · 7 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -46,7 +46,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | `gemvn_minner_maxa` | formula | Derived | formula over detected consts: `4 * _L3_BYTES` | — |
 | `gemvn_np_narrow` | formula | Derived | formula over detected consts: `max(2, _L1D_ASSOC - 2` | — |
 | `gemvn_np_wide` | formula | Derived | formula over detected consts: register-capped `min(12, _NVREG - U - 1)` on a 32-register ISA, associativity-capped `_L1D_ASSOC` on 16 (the "wide" regime above) | — |
-| `gemvn_rb` | formula | Derived | formula over detected consts: `_L2_BYTES ÷ (4 * 8 * _SIMD_BYTES)` | — |
+| `gemvn_rb` | literal | Literal | the quarter-L2 pass-footprint derivation overshoots to 512; measured crossover 384-448 on Zen4 | — |
 | `gemvt_deep` | delegates | Derived | NC=8 x U=4 gated on A <= L2 and the register budget; both detected consts. | n/a |
 | `gemvt_nc` | delegates | Literal | _ILP_TARGET predicts 8, every box measures 4; the derivation is falsified. | no, µarch-invariant |
 | `gemvt_percol_amin` | formula | Measured | window's lower edge; no formula places it (see gemvt_perscan). | candidate, cache-boundary set |
