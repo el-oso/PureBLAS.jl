@@ -444,8 +444,8 @@ end
 # and returns different bits from the undivided problem. The two "flip" sizes below sit JUST ABOVE
 # each threshold, so the whole problem is on one side and every band is on the other — which is
 # exactly the case that fails if the token is dropped. The row-block size is there because
-# `n <= _gemvn_rb()` is keyed on `n`, which a row split does NOT move: it must keep working, and
-# `_gemvn_rowblock_mr` picking a different block height per band must stay bit-neutral.
+# `_gemvn_rowblock_route` must read `mroute`, not a band's own rows, and `_gemvn_rowblock_mr`
+# picking a different block height per band must stay bit-neutral.
 #
 # β is swept because each band pre-scales its OWN rows. Two workers double-scaling, or a band
 # skipping the scale, shows up here and nowhere else.
@@ -463,20 +463,20 @@ end
             # Just past `2 * _L2_BYTES` with a modest `n`, so the undivided problem is WIDE and every
             # band is NARROW.
             #
-            # `n` MUST CLEAR `_gemvn_rb()` OR THIS COVERS NOTHING. `_gemvn_minner_np` lives on the
-            # column-PANEL path, and `n <= _gemvn_rb()` routes to row-block instead. The cut is 64 on
-            # AVX2 but 448 on AVX-512, so a fixed `n = 160` exercised the predicate on Zen3 and sent
-            # Zen4/Zen5 down a path that never reads it. Keyed off the cut, it lands on the panel path
-            # everywhere.
+            # THIS SHAPE MUST BE ON THE PANEL ROUTE OR IT COVERS NOTHING: `_gemvn_minner_np` lives on
+            # the column-panel path. `n` past `_gemvn_rb()` keeps it off the row-block on every part,
+            # and the assertion below says so rather than assuming it.
             n_np = P._gemvn_rb() + 32
             m_np = (5 * P._L2_BYTES) ÷ (2 * n_np * sz)
+            @test !P._gemvn_rowblock_route(m_np, n_np, m_np, T)
+            @test P._gemvn_rowblock_route(8192, 8, 8192, T)
             # Just past `_GEMVN_MINNER_MAXA` (= 4·L3), so the undivided problem leaves minner and
             # every band would re-enter it. One allocation of a little over 4·L3 is the price of
             # covering this predicate at all; there is no smaller shape that straddles it.
             n_mx = 1024
             m_mx = (P._GEMVN_MINNER_MAXA ÷ (n_mx * sz)) + 64
             cases = (
-                ("rowblock n<=rb", 8192, min(64, P._gemvn_rb())),
+                ("rowblock", 8192, 8),                     # n=8 is row-block on every part, rule (c)
                 ("np narrow/wide flip", m_np, n_np),
                 ("minner/paneldrv flip", m_mx, n_mx),
             )
@@ -1043,5 +1043,60 @@ end
         @test minimum(a_iamax(v) for _ in 1:8) == 0
 
         P.set_num_threads(1)
+    end
+end
+
+# The gemv-N route (`_gemvn_rowblock_route`, src/blas2/level2.jl) on shapes whose answer follows from
+# the detected constants alone, plus bit-identity between the two routes wherever they could be
+# chosen. The routes compute each `y[i]` as the same fma chain over j, so a route change must not move
+# a bit; that is what lets the route depend on `lda` and `_HW` without touching req#11.
+@testitem "gemv-N: route follows the formula, and both routes agree bitwise" begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    W = P._vwidth(Float64); sz = 8
+    line = P._CACHELINE; way = P._L1_WAY_BYTES
+    cs = P._gemvn_minner() ? 2 * P._GEMVN_NP_WIDE : P._GEMV_NP
+    big = 4 * P._L1_BYTES                                 # rows that keep A out of L1 at n > cs
+    route(m, n, lda = m) = P._gemvn_rowblock_route(m, n, lda, Float64)
+    @test P._FKR_gemvn_rb[] < 0                           # unforced, or this tests the force hook
+    # (a) L1-resident A
+    @test route(P._L1_BYTES ÷ (sz * 64), 64)
+    # (b) one row block spans the column
+    @test route(last(P._GEMVN_ROWBLOCK_MRS) * W, 4096)
+    # (c) n within the panel route's width
+    @test route(big, cs) && !route(big + 1, cs + 1, big + 1)
+    # (d) aligned, non-aliased columns up to the cap, double-pumped parts only
+    lda_al = cld(big, line ÷ sz) * (line ÷ sz) + line ÷ sz       # line-aligned
+    (lda_al * sz) % way == 0 && (lda_al += line ÷ sz)             # not a multiple of the L1 way
+    n_mid = cs + 1
+    @test route(lda_al, n_mid, lda_al) == P._double_pumped(P._HW)
+    @test !route(lda_al + 1, n_mid, lda_al + 1)                   # misaligned columns
+    @test !route(way ÷ sz * 4, n_mid, way ÷ sz * 4)               # stride aliases the L1 way
+    @test !route(lda_al, P._gemvn_rb() + 1, lda_al)               # past the cap
+    if isnothing(P.load_preference(P, "gemvn_rb"))
+        @test P._GEMVN_RB == P._L2_BYTES ÷ (4 * last(P._GEMVN_ROWBLOCK_MRS) * P._SIMD_BYTES)
+    end
+
+    # Both routes, forced, over shapes on each side of every clause; padded and misaligned lda.
+    bitsame(X, Y) = all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X, Y))
+    shapes = (
+        (553, 200, 553), (553, 200, 560), (768, 100, 769), (64, 300, 64), (1031, 9, 1040),
+        (300, 40, 300), (2048, 131, 2048),
+    )
+    try
+        @testset "$T m=$m n=$n lda=$lda" for T in (Float64, Float32), (m, n, lda) in shapes
+            A = view(randn(T, lda, n), 1:m, :); x = randn(T, n); y0 = randn(T, m)
+            for β in (zero(T), T(1.5))
+                ys = map((typemax(Int), 0)) do f
+                    P._FKR_gemvn_rb[] = f
+                    y = copy(y0); P.gemv!(y, A, x; alpha = T(0.75), beta = β); y
+                end
+                P._FKR_gemvn_rb[] = -1
+                @test bitsame(ys[1], ys[2])
+                @test ys[1] ≈ T(0.75) * (A * x) + β * y0
+            end
+        end
+    finally
+        P._FKR_gemvn_rb[] = -1
     end
 end
