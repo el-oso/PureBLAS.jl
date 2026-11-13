@@ -901,10 +901,8 @@
             P._CGEMM_NRSMALL_MAX > 0 && (mid(P._CGEMM_NRSMALL_MAX, 9, 9); mid(P._CGEMM_NRSMALL_MAX + 1, 9, 9))
             big(cu + 1, 17, P._CKC + 5)
         else
-            # Float32 with op(B) = Bᵀ takes the blocked driver here, which with more than one
-            # worker deadlocks in `_pool_barrier` (from `_blocked_pc_sweep!`), so it runs N/N only.
             s = 2 * P._fh_strassen_base()
-            big(s, s, s; fl = T === Float32 ? [('N', 'N')] : [('N', 'N'), ('N', 'T')])
+            big(s, s, s; fl = [('N', 'N'), ('N', 'T')])
         end
         f = mt_floor()
         isnothing(f) || (s = max(mt_side(f, 2), P._NR + 1); big(s, s, s))
