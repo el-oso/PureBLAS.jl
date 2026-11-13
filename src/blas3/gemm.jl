@@ -1970,9 +1970,12 @@ const _STRASSEN_BASE = @load_preference("strassen_base", 1024)::Int
 # with its own copy is how a threaded path silently starts running a different algorithm than the
 # serial one.
 #
-# `tB` is deliberately absent: the transB route materializes Bᵀ and runs the SAME recursion, so it
-# owns the call just as the NN route does. What it costs to be wrong here is not a slowdown but a
-# thread-count-dependent answer, so the predicate errs toward claiming the call.
+# `tB` must mirror `_gemm_core!`'s recursion arm exactly: that arm takes a transposed B for Float64
+# only (materializing Bᵀ and running the NN recursion), so a Float32 call with `tB` is classical.
+# Claiming a call the core then runs classically is a hang, not a slowdown: `gemm!` skips the column
+# split and hands its worker count to `_gemm_core!`, the classical route passes it to
+# `_gemm_blocked!` as "worker 1 of nw", and that worker waits at the cooperative A-pack barrier for
+# companions that were never dispatched.
 # HOW A CALLER ASKS FOR THE RECURSION — three values, carried unchanged from the public entry down to
 # every place the depth is re-asked (`_gemm_core!`, `_gemm_strassen!`), because a depth decided
 # differently at two of those places is a thread-count-dependent answer (req#11: `gemm!` declines
@@ -2000,8 +2003,9 @@ const _STRASSEN_BASE = @load_preference("strassen_base", 1024)::Int
 # Which depth rule a caller asks for. Labels only: nothing reads the underlying integer.
 @enum _StrMode::UInt8 _STR_OFF _STR_FLOOR _STR_LVL1
 
-@inline _strassen_owns(::Type{T}, m::Int, n::Int, k::Int, tA::Bool, A, B, mode::_StrMode) where {T} =
-    T <: BlasReal && _STRASSEN && !tA && _strided1(A) && _strided1(B) && _strassen_depth(m, n, k, mode) > 0
+@inline _strassen_owns(::Type{T}, m::Int, n::Int, k::Int, tA::Bool, tB::Bool, A, B, mode::_StrMode) where {T} =
+    T <: BlasReal && _STRASSEN && !tA && (!tB || T === Float64) && _strided1(A) && _strided1(B) &&
+    _strassen_depth(m, n, k, mode) > 0
 
 @inline function _strassen_depth(m::Int, n::Int, k::Int, mode::_StrMode)
     d = 0; s = min(m, n, k)
@@ -7261,7 +7265,7 @@ end
         _gemm_rows_bt!(C, A, B, α, β, tA, tB, m, n, k) && return C
         _gemm_rows_tail!(C, A, B, α, β, tA, tB, m, n, k) && return C
     end
-    if nw > 1 && !_strassen_owns(T, m, n, k, tA, A, B, _STR_FLOOR) && !_sme_owns(T, m, n, k, tA, tB, cA, cB, C, A, B)
+    if nw > 1 && !_strassen_owns(T, m, n, k, tA, tB, A, B, _STR_FLOOR) && !_sme_owns(T, m, n, k, tA, tB, cA, cB, C, A, B)
         rA = _root(A); rB = _root(B); rC = _root(C)
         GC.@preserve rA rB rC _gemm_threaded!(_pm(C), _pm(A), _pm(B), α, β, tA, tB, cA, cB, nw)
     else
