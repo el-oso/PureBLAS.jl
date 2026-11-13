@@ -7,6 +7,10 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+# deps/build.jl times the host's idle-state onset whenever Pkg builds PureBLAS. A shared runner's
+# reading describes nothing a user runs on, and the tests must not depend on it.
+env:
+  PUREBLAS_SKIP_BUILD_TUNE: '1'
 jobs:
   # Parallel jobs run DISJOINT slices of the suite (PUREBLAS_TEST_GROUP/SHARD, read by test/runtests.jl):
   # `test` shards the correctness suite across 2 runners (with coverage → Coveralls parallel build);

@@ -3,6 +3,8 @@ Manifest.toml
 *.jl.cov
 *.jl.*.cov
 *.jl.mem
+# Pkg.build output for a checkout tracked by path (deps/build.jl)
+deps/build.log
 # Machine-local Preferences: the trim build writes ger_panel_np here transiently (juliac/build.jl);
 # never ship it — the package's clean default is the runtime auto-calibration.
 LocalPreferences.toml
