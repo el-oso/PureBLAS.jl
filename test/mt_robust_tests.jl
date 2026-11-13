@@ -124,19 +124,32 @@ end
         for nt in (2, 4)
             PureBLAS.set_num_threads(nt) == nt || error("asked for \$nt workers")
             C = PureBLAS.gemm!(zeros(T, n, n), A, B; transA = ta, transB = tb)
-            println("CASE ", T, " ", ta, tb, " ", nt, " ", C == C1)
+            println("CASE ", T, " ", ta, tb, " ", nt, " ", C == C1); flush(stdout)
         end
     end
     println("DONE")
     """
     env = copy(ENV)
     env["PUREBLAS_MT_ALL_THREADS"] = "1"     # four workers even on a host with fewer cores
-    out = IOBuffer()
-    proc = run(pipeline(setenv(`$(Base.julia_cmd()) -t 4 --project=$(Base.active_project()) -e $script`, env); stdout = out, stderr = devnull); wait = false)
-    finished = timedwait(() -> process_exited(proc), 300.0) === :ok
-    finished || kill(proc, Base.SIGKILL)
+    proc = open(pipeline(setenv(`$(Base.julia_cmd()) -t 4 --project=$(Base.active_project()) -e $script`, env); stderr = devnull))
+    lines = String[]
+    lastline = Ref(time())
+    reader = @async for l in eachline(proc)
+        push!(lines, l)
+        lastline[] = time()
+    end
+    # The deadline is per case: a hang stops the output, while a slow runner keeps printing cases.
+    finished = true
+    while !process_exited(proc)
+        sleep(1)
+        if time() - lastline[] > 300
+            finished = false
+            kill(proc, Base.SIGKILL)
+            break
+        end
+    end
     wait(proc)
-    lines = split(String(take!(out)), '\n')
+    wait(reader)
     cases = [l for l in lines if startswith(l, "CASE ")]
     finished || @info "threaded gemm child killed at the deadline" last_case = isempty(cases) ? "none" : last(cases)
     @test finished
