@@ -5689,10 +5689,10 @@ function (j::XferJob)()
     end
 end
 struct AffinityJob
-    cnt::Vector{Int}
+    cpu::Vector{Int}
     w::Int
 end
-(j::AffinityJob)() = (j.cnt[j.w] = _mt_affinity_count(); nothing)
+(j::AffinityJob)() = (j.cpu[j.w] = _mt_bound_cpu(); nothing)
 struct YieldJob
     out::Threads.Atomic{UInt64}          # 0 until the time is in
     step::Int
@@ -5700,25 +5700,38 @@ struct YieldJob
 end
 (j::YieldJob)() = (j.out[] = max(1, unsafe_trunc(UInt64, _mt_yield_ns(j.step, j.deadline))); nothing)
 
-# How many CPUs the calling thread may run on, or 0 when the operating system does not say. libuv
-# answers on Linux, FreeBSD and Windows and reports "not supported" on macOS, which has no thread
-# affinity to report.
-function _mt_affinity_count()
+# The CPUs the calling thread may run on, one entry per CPU, nonzero where allowed; empty when the
+# operating system does not say. libuv answers on Linux, FreeBSD and Windows and reports "not
+# supported" on macOS, which has no thread affinity to report.
+function _mt_affinity_mask()
     n = Int(ccall(:uv_cpumask_size, Cint, ()))
-    n > 0 || return 0
-    mask = zeros(Cchar, n)                               # one entry per CPU
+    n > 0 || return Cchar[]
+    mask = zeros(Cchar, n)
     self = Ref(ccall(:uv_thread_self, UInt, ()))
-    iszero(ccall(:uv_thread_getaffinity, Cint, (Ptr{UInt}, Ptr{Cchar}, Csize_t), self, mask, n)) || return 0
-    return count(!iszero, mask)
+    iszero(ccall(:uv_thread_getaffinity, Cint, (Ptr{UInt}, Ptr{Cchar}, Csize_t), self, mask, n)) || return Cchar[]
+    return mask
 end
 
-# Whether the calling thread and every thread of `tids` is bound to exactly one CPU. The caller is
-# asked first: a process that pins nothing — the usual one — is answered without waking a thread.
-function _mt_all_bound(tids::Vector{Int})
-    isone(_mt_affinity_count()) || return false
-    cnt = zeros(Int, length(tids))
-    foreach(wait, [_mt_on_thread(AffinityJob(cnt, w), tid) for (w, tid) in pairs(tids)])
-    return all(isone, cnt)
+# How many CPUs the calling thread may run on, or 0 when the operating system does not say.
+_mt_affinity_count() = count(!iszero, _mt_affinity_mask())
+
+# The one CPU the calling thread is bound to, numbered from 1 in libuv's mask, or 0 when it may run
+# on more than one or the operating system does not say.
+function _mt_bound_cpu()
+    mask = _mt_affinity_mask()
+    return isone(count(!iszero, mask)) ? findfirst(!iszero, mask) : 0
+end
+
+# The CPU each thread is bound to — the calling thread first, then `tids` in order — or empty unless
+# every one of them is bound to exactly one CPU. The caller is asked first: a process that pins
+# nothing — the usual one — is answered without waking a thread.
+function _mt_bound_cpus(tids::Vector{Int})
+    c = _mt_bound_cpu()
+    iszero(c) && return Int[]
+    cpu = zeros(Int, length(tids))
+    foreach(wait, [_mt_on_thread(AffinityJob(cpu, w), tid) for (w, tid) in pairs(tids)])
+    any(iszero, cpu) && return Int[]
+    return pushfirst!(cpu, c)
 end
 
 # PDM: Literal — how far apart two sets of workers must read before they are called two groups: the
@@ -5790,7 +5803,7 @@ function _mt_group_order!(deadline::UInt64)
     empty!(_MT_TIDS); append!(_MT_TIDS, tids)
     _MT_G0[] = typemax(Int)
     _MT_HOME[] = Threads.threadid()
-    (length(tids) >= 2 && _mt_all_bound(tids)) || return nothing
+    (length(tids) >= 2 && !isempty(_mt_bound_cpus(tids))) || return nothing
     # Half an L2: more than an L1, so the read is long against the clock's resolution, and small
     # enough that the writer still holds every line in its own L2 when the reader asks for it.
     shared = Vector{UInt64}(undef, max(1, (_L2_BYTES ÷ 2) ÷ sizeof(UInt64)))
@@ -5875,18 +5888,26 @@ end
 # A median of settled medians: the first products of a process run on cold code and cold pages,
 # and one settled run of readings can be made of those alone.
 function _mt_flop_rate(step::Int, deadline::UInt64)
+    product = L1Product()
+    b = _mt_batch(product, step, deadline)
+    ns = _mt_settled(() -> _mt_settled(() -> _mt_time(product, b), deadline), deadline)
+    return 2.0 * product.n^3 / ns
+end
+
+# One call of that product, on operands of its own.
+struct L1Product
+    n::Int
+    A::Matrix{Float64}
+    B::Matrix{Float64}
+    C::Matrix{Float64}
+end
+function L1Product()
     n = max(_NR, min(isqrt(_L1_BYTES ÷ (3 * sizeof(Float64))), _GEMM_UNPACK_MAX))
-    A = fill(0.5, n, n); B = fill(0.25, n, n); C = zeros(n, n)
-    ns = GC.@preserve A B C begin
-        pA = _pm(A); pB = _pm(B); pC = _pm(C)
-        product = function ()
-            _gemm_unpacked!(Val(false), Val(true), n, n, n, 1.0, pA, pB, 0.0, pC)
-            return nothing
-        end
-        b = _mt_batch(product, step, deadline)
-        _mt_settled(() -> _mt_settled(() -> _mt_time(product, b), deadline), deadline)
-    end
-    return 2.0 * n^3 / ns
+    return L1Product(n, fill(0.5, n, n), fill(0.25, n, n), zeros(n, n))
+end
+function (p::L1Product)()
+    GC.@preserve p _gemm_unpacked!(Val(false), Val(true), p.n, p.n, p.n, 1.0, _pm(p.A), _pm(p.B), 0.0, _pm(p.C))
+    return nothing
 end
 
 # The round trip of the smallest threaded job there is — the driver and one worker, with nothing to
@@ -5957,10 +5978,13 @@ Use at most `n` threads inside PureBLAS's threaded kernels, and return the value
 turns threading off. Capped at `Threads.nthreads()`, because the workers are Julia tasks and there is
 nothing to run them on beyond that, and at the number of physical cores the process may run on: a
 second worker on an SMT sibling adds no arithmetic and makes the pool's hand-offs fragile under load.
-On a part with a slower Efficiency tier (Apple silicon) only the cores outside that tier count: the
-pool splits a job into equal chunks, so one chunk on an Efficiency core sets the time of the job.
-Setting the environment variable `PUREBLAS_MT_ALL_THREADS=1` (exactly `"1"`) lifts the core cap; it is
-read on every call.
+When every thread is bound to a single CPU (ThreadPinning.jl, or any other pinning made before the
+first call asking for more than one thread), the cores among those CPUs are measured on that call,
+in a few milliseconds, by timing whether threads slow each other down; elsewhere the count comes
+from the process's CPU count and the machine's threads per core. On a part with a slower
+Efficiency tier (Apple silicon) only the cores outside that tier count: the pool splits a job into
+equal chunks, so one chunk on an Efficiency core sets the time of the job. Setting the environment
+variable `PUREBLAS_MT_ALL_THREADS=1` (exactly `"1"`) lifts the core cap; it is read on every call.
 
 Threading is **off until you call this**. That is deliberate: a BLAS that silently takes every thread
 in the process is a surprise to whatever else the process is doing, and the shape matches
@@ -6009,11 +6033,197 @@ const _MT_SETUP_LOCK = ReentrantLock()
 #     fleet runs): it halves the count — Zen4, 6 such CPUs, 3 instead of 6;
 #   * a virtual machine whose CPUID reports every vCPU as a core: it counts SMT siblings as cores —
 #     GitHub's Linux runners, 4 vCPUs on 2 cores, report 4.
-# Julia exposes no core-sibling topology, so neither can be corrected without going to the OS.
+# Julia exposes no core-sibling topology. When every thread is bound to one CPU, the cores among
+# those CPUs are measured instead (`_mt_pinned_cores!`), which corrects the first case; the second,
+# and every process whose threads are not all bound, keeps this count.
 function _mt_physical_cores()
+    c = _MT_PINNED_CORES[]
+    c > 0 && return c
     cores = max(1, Int(num_cores()))
     tpc = max(1, Sys.CPU_THREADS ÷ cores)
     return clamp(cld(Sys.EFFECTIVE_CPU_THREADS, tpc), 1, cores)
+end
+
+# CORES AMONG PINNED CPUS, MEASURED. Two threads on SMT siblings share one core's FMA units and its
+# L1, so a product that fills both from one thread (`L1Product`) runs about half as fast on each when
+# both run it at once; on two cores neither slows. That slowdown is what is read, and nothing about
+# the CPU's numbering or topology is asked of the OS, so it runs wherever libuv reports thread
+# affinity (Linux, FreeBSD, Windows; not macOS, which has none and keeps the formula above).
+#
+# `_MT_PINNED_CORES` is the count once measured, 0 when it could not be (threads not all bound,
+# readings unclear, or out of time), and -1 before the first call that asks for more than one
+# thread. Taken once, like the cache groups: threads pinned after it are not seen.
+const _MT_PINNED_CORES = Threads.Atomic{Int}(-1)
+
+# PDM: Literal — where a slowdown reading (the product's time on a thread while other threads run
+# it, over its time while they wait) stops reading as "no shared core" and starts reading as "shared
+# core". The first outcome is 1 by construction: every thread is in the same state in both readings
+# except the loaded ones, none of which shares the core. The second is at most 2, the two threads
+# splitting the core's units, and less by what the waiting sibling already cost the reference: its
+# pause loop slows the product 1.20x on Zen3 and 1.09x on Zen5. Measured with every thread bound,
+# -t 6, 12 and 24 on Zen3 and -t 6 and 12 on Zen5: no shared core 0.98-1.02 on both (over a hundred
+# readings); shared core 1.55-1.59 on Zen3 (12 readings), 1.77-1.85 on Zen5 (27). The count, one
+# fresh process each, one CPU per core and both siblings of some or all cores: right in 75 of 75 on
+# Zen3 and 50 of 50 on Zen5. A reading below 2^(1/4) counts as no shared core, above
+# 2^(1/2) as shared, and between them as neither, which reports the count unknown. No property of a
+# machine places these margins.
+const _MT_SMT_LO = 2.0^(1 / 4)   # req8-ok: margin between the 1x and shared-core outcomes, measured above, not a perf tuning
+const _MT_SMT_HI = 2.0^(1 / 2)   # req8-ok: margin between the 1x and shared-core outcomes, measured above, not a perf tuning
+
+# EVERY THREAD WAITS ON A PAUSE LOOP FOR THE WHOLE COUNT. A waiting sibling is not idle to the core,
+# and what it costs depends on how it waits. Measured on Zen3, the product beside a sibling: asleep
+# in the OS 1830 ns, waiting on `jl_cpu_pause` 2200 ns (1.20x), spinning in Julia's scheduler — as a
+# thread does for a while after its task ends — 2320 ns (1.27x). Left to the scheduler, which threads
+# still spin depends on which ran last, so one reading of a pair is inflated and not the other: the
+# count came out unknown, siblings reading 1.45-1.50 and distinct cores up to 1.27. Held by one job
+# each from start to end, waiting on `jl_cpu_pause` when it has no part in a reading, a thread's
+# sibling does the same in both of its readings unless it is loaded, and distinct cores read 1.00
+# (see `_MT_SMT_LO`). Waiting in the OS instead (a short `Libc.systemsleep` per poll) was also
+# measured and is worse on both counts: each poll wakes the sibling, distinct cores read 0.91-1.09,
+# and -t 24 on Zen3 took 6.8-9.3 ms of the setup budget against 1.8-1.9 ms here.
+#
+# One reading: the worker `role` says what each does for this generation of `go` (-1 ends the
+# count) — 0 nothing, 1 load: run the product until `done`, counted in `up` once warm, 2 probe: wait
+# for every load to be up, time the product — a median of settled medians, for the reason
+# `_mt_flop_rate` gives — into `out`, then set `done`. Each worker counts itself in `fin` when its
+# part is over. Worker 1 is the calling thread, which runs its part inline.
+struct SmtState
+    go::Threads.Atomic{Int}
+    role::Vector{Int}
+    up::Threads.Atomic{Int}
+    done::Threads.Atomic{Bool}
+    fin::Threads.Atomic{Int}
+    out::Base.RefValue{Float64}
+    b::Int
+    deadline::UInt64
+end
+SmtState(n::Int, b::Int, deadline::UInt64) = SmtState(
+    Threads.Atomic{Int}(0), zeros(Int, n), Threads.Atomic{Int}(0), Threads.Atomic{Bool}(false),
+    Threads.Atomic{Int}(0), Ref(NaN), b, deadline
+)
+
+# A wait that costs the SMT sibling the same in every reading, and lets a collection through.
+_mt_pause() = (ccall(:jl_cpu_pause, Cvoid, ()); GC.safepoint())
+
+function _mt_smt_part(s::SmtState, w::Int, p::L1Product)
+    r = s.role[w]
+    if isone(r)
+        p()
+        Threads.atomic_add!(s.up, 1)
+        while !s.done[] && time_ns() < s.deadline
+            p()
+            GC.safepoint()
+        end
+    elseif r == 2
+        try
+            nload = count(isone, s.role)
+            while s.up[] < nload
+                time_ns() < s.deadline || return nothing
+                _mt_pause()
+            end
+            s.out[] = _mt_settled(() -> _mt_settled(() -> _mt_time(p, s.b), s.deadline), s.deadline)
+        finally
+            s.done[] = true
+        end
+    end
+    return nothing
+end
+
+# The task body of workers 2 and up, a callable for the reason `PoolWorkerJob` gives.
+struct SmtJob
+    s::SmtState
+    w::Int
+end
+function (j::SmtJob)()
+    s = j.s
+    p = L1Product()
+    seen = 0
+    while true
+        g = s.go[]
+        g < 0 && return nothing
+        if g != seen
+            seen = g
+            _mt_smt_part(s, j.w, p)
+            Threads.atomic_add!(s.fin, 1)
+        end
+        _mt_pause()
+    end
+    return
+end
+
+# ns per `s.b` products on worker `w` while every worker of `load` runs the product too; NaN when the
+# reading did not finish by the deadline. `p` is the calling thread's product.
+function _mt_smt_reading(s::SmtState, p::L1Product, w::Int, load::Vector{Int})
+    fill!(s.role, 0)
+    s.role[load] .= 1
+    s.role[w] = 2
+    s.up[] = 0
+    s.done[] = false
+    s.fin[] = 0
+    s.out[] = NaN
+    Threads.atomic_add!(s.go, 1)
+    _mt_smt_part(s, 1, p)
+    Threads.atomic_add!(s.fin, 1)
+    while s.fin[] < length(s.role)
+        time_ns() < s.deadline || return NaN
+        _mt_pause()
+    end
+    return s.out[]
+end
+
+# The number of distinct cores among the CPUs `cpu[w]` that worker `w` is bound to, or 0 when the
+# readings do not say. Workers are taken in order and one is kept when its slowdown —
+# `slowdown(w, keep)`, its time with the workers kept so far loaded over its time alone — reads as
+# no shared core; a worker on a CPU already seen shares that core without a reading. The kept
+# workers are then one per core, so their number is the count. Every reading is between a worker's
+# own two times, so a core slower than another, or clocked lower, cancels.
+function _mt_core_count(cpu::Vector{Int}, slowdown)
+    keep = Int[]
+    for (w, c) in pairs(cpu)
+        c in view(cpu, 1:(w - 1)) && continue
+        if !isempty(keep)
+            s = slowdown(w, keep)
+            (s < _MT_SMT_LO || s > _MT_SMT_HI) || return 0      # unclear, or NaN
+            s > _MT_SMT_HI && continue
+        end
+        push!(keep, w)
+    end
+    return length(keep)
+end
+
+# Fill `_MT_PINNED_CORES`. Called once, under `_MT_SETUP_LOCK`, before the pools exist, by the thread
+# that will create them.
+#
+# k distinct CPUs on a machine of `cores` cores with `tpc` threads each lie on at least cld(k, tpc)
+# and at most min(k, cores) cores. Where the two agree — every CPU of the machine bound, for one —
+# that is the count and nothing is measured; the cache groups (`_mt_group_order!`) then keep the
+# whole budget, which they need at -t 24 on Zen3 (7.6-8.4 ms of the 10). Elsewhere a count outside
+# them is readings that do not agree with the machine, and is reported unknown.
+function _mt_pinned_cores!(deadline::UInt64)
+    tids = filter(!=(Threads.threadid()), Threads.threadpooltids(:default))
+    cpu = _mt_bound_cpus(tids)
+    cores = max(1, Int(num_cores()))
+    tpc = max(1, Sys.CPU_THREADS ÷ cores)
+    k = length(unique(cpu))
+    lo, hi = cld(k, tpc), min(k, cores)
+    c = 0
+    if !isempty(cpu) && lo == hi
+        c = hi
+    elseif !isempty(cpu)
+        p = L1Product()
+        s = SmtState(length(cpu), _mt_batch(p, _mt_clock_step(), deadline), deadline)
+        ts = [_mt_on_thread(SmtJob(s, w + 1), tid) for (w, tid) in pairs(tids)]
+        try
+            slowdown = (w, keep) -> _mt_smt_reading(s, p, w, keep) / _mt_smt_reading(s, p, w, Int[])
+            c = _mt_core_count(cpu, slowdown)
+        finally
+            s.go[] = -1
+            foreach(wait, ts)
+        end
+        (time_ns() < deadline && lo <= c <= hi) || (c = 0)
+    end
+    _MT_PINNED_CORES[] = c
+    return nothing
 end
 
 # The core cap: physical cores, and of those only the ones outside a slower Efficiency tier where the
@@ -6023,20 +6233,24 @@ _mt_core_cap() = _FAST_CORES > 0 ? min(_mt_physical_cores(), _FAST_CORES) : _mt_
 # `PUREBLAS_MT_ALL_THREADS=1` lifts the core cap so every Julia thread can be a worker. The test suite
 # sets it: req#11's bit-identity items must run more workers than a small CI runner has cores.
 function set_num_threads(n::Integer)
-    cores = get(ENV, "PUREBLAS_MT_ALL_THREADS", "") == "1" ? typemax(Int) : _mt_core_cap()
-    nt = clamp(Int(n), 1, min(Threads.nthreads(), cores, _MT_NW_MASK))
+    capped = get(ENV, "PUREBLAS_MT_ALL_THREADS", "") != "1"
+    nt = clamp(Int(n), 1, min(Threads.nthreads(), _MT_NW_MASK))
     if nt > 1
-        lock(_MT_SETUP_LOCK) do
+        @lock _MT_SETUP_LOCK begin
             isempty(_GEMM_POOL_F64) &&
                 (_MT_KEEPAWAKE_HOST[] = _mt_keepawake_read(_mt_keepawake_file(), _mt_host_fingerprint()))
             deadline = time_ns() + UInt64(_MT_MEASURE_NS)
-            isempty(_GEMM_POOL_F64) && _mt_group_order!(deadline)
-            isempty(_GEMM_POOL_F64) && push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
-            isempty(_GEMM_POOL_F32) && push!(_GEMM_POOL_F32, _gemm_pool_new(Float32))
-            isempty(_GEMM_POOL_C64) && push!(_GEMM_POOL_C64, _gemm_pool_new(ComplexF64))
-            isempty(_GEMM_POOL_C32) && push!(_GEMM_POOL_C32, _gemm_pool_new(ComplexF32))
-            _MT_HOST.measured || _mt_measure_host!(deadline)
-            _MT_FLOOR[] = _mt_floor()
+            capped && _MT_PINNED_CORES[] < 0 && _mt_pinned_cores!(deadline)
+            capped && (nt = min(nt, _mt_core_cap()))
+            if nt > 1
+                isempty(_GEMM_POOL_F64) && _mt_group_order!(deadline)
+                isempty(_GEMM_POOL_F64) && push!(_GEMM_POOL_F64, _gemm_pool_new(Float64))
+                isempty(_GEMM_POOL_F32) && push!(_GEMM_POOL_F32, _gemm_pool_new(Float32))
+                isempty(_GEMM_POOL_C64) && push!(_GEMM_POOL_C64, _gemm_pool_new(ComplexF64))
+                isempty(_GEMM_POOL_C32) && push!(_GEMM_POOL_C32, _gemm_pool_new(ComplexF32))
+                _MT_HOST.measured || _mt_measure_host!(deadline)
+                _MT_FLOOR[] = _mt_floor()
+            end
         end
     end
     # The atomic store below is what publishes the pool: a reader that sees `nt > 1` here sees the
