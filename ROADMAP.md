@@ -2181,6 +2181,23 @@ Today's sweeps spend the same effort everywhere. Two changes:
    with fewer cells. This extends the existing backlog item on selective re-gating and adaptive
    rounds.
 
+### Prefetch policy — one derived distance rule
+
+Every kernel calls the one `_prefetch` helper, but each picks its own distance and its own on/off
+switch:
+- gemv-T chooses among measured candidates (`_GEMVT_PF`);
+- ger uses `_GER_PF_BYTES`;
+- complex gemv uses 3 × 2W elements, and zhemv uses `_ZHEMV_PF_TILES`;
+- the trsm/trmm panels use a literal 64 bytes per row, not `_CACHELINE`;
+- `_CGEMVT_PF`, `_CGEMVN_PF` and `_ZHEMV_PF` are `_vwidth(Float64) == 4`, which is a lookup on
+  vector width and not a physical criterion.
+
+Replace these with one function, e.g. `_pf_distance(bytes_per_iteration)`: far enough ahead to
+cover memory latency at the rate the loop consumes data, rounded to whole cache lines, and zero
+where the hardware prefetcher already keeps up. Memory latency is not a detected const today, so
+first establish whether the rule can be a Derive over detected consts or needs one measured value.
+Every kernel the change touches needs a gate check.
+
 ## Later
 
 ARM/aarch64 trim build for the Mac M5 (cross-compiled .so/.dylib). SparseArrays interop; CHOLMOD /
