@@ -23,15 +23,15 @@ demonstrated.
 ### Changed
 
 - The pool's keep-awake window is measured once per machine at install. `deps/build.jl`, which Pkg
-  runs after installing or updating PureBLAS, times a threaded read after idle gaps from 0.5 ms
-  upward and stores the shortest gap that slows it (the onset) in PureBLAS's scratch space;
-  `set_num_threads` sets the window to 12 ms minus the onset, or 0 when no gap slowed it. Without a
-  store, or with one written on other hardware, the window stays 10 ms. The probe adds 7-9 s to
-  `Pkg.build`; `PUREBLAS_SKIP_BUILD_TUNE=1` skips it. Zen3: onset 1.4-4 ms over five builds,
-  window 8-10.6 ms, syrk/trmm n=2048 after a 5 ms gap unchanged against 10 ms. Zen5: no gap
-  slows the probe, window 0, and syrk/trmm after a 5 ms gap within 0.3% of the 10 ms window, so its
-  idle workers now sleep at once. Zen4 (laptop part): the onset varies between builds (window 0,
-  6.3 or 10.6 ms); syrk/trmm after a 5 ms gap are within 0.4% of the 10 ms window even with none.
+  runs after installing or updating PureBLAS, times a threaded read after idle gaps from 0.2 ms
+  upward and stores the shortest gap from which every longer gap is slower than the 0.2 ms
+  reference (the onset) in PureBLAS's scratch space; `set_num_threads` sets the window to 12 ms
+  minus the onset. Window 0 needs every gap to read the same as the reference; mixed readings
+  remove the store. Without a store, or with one written on other hardware, the window stays
+  10 ms. The probe adds 6-9 s to `Pkg.build`; `PUREBLAS_SKIP_BUILD_TUNE=1` skips it. Over five
+  builds: Zen3 onset 3.2 ms four times and 0.57 ms once (window 8.8 or 11.4 ms), Zen5 1.6 ms four
+  times and 0.28 ms once (10.4 or 11.7 ms). syrk/trmm n=2048 after a 5 ms gap run at the speed of
+  the 10 ms window with any window from 0 up on Zen4 and Zen5, and lose 33-41% without one on Zen3.
 
 - The threaded pool measures its host when `set_num_threads` creates it, in place of constants
   recorded on one machine. The size below which a call stays on one thread is now
