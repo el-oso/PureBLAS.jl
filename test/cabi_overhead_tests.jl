@@ -119,3 +119,30 @@ end
     @test g_gemvT ≈ r_gemvT
     @test g_ger   ≈ r_ger
 end
+
+# trmv/trsv through activate(), every flag, at sizes on both sides of the blocked kernels' panel
+# width and with a strided x. The reference is the default BLAS, called before activate().
+@testitem "C-ABI trmv/trsv: activate() matches the default BLAS" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra
+    cases = Any[]
+    for T in (Float64, ComplexF64), n in (8, 629), inc in (1, 2), u in "UL", t in "NTC", d in "NU"
+        A = triu(randn(T, n, n)) + 4n * I
+        u == 'L' && (A = copy(transpose(A)))
+        x = randn(T, 1 + (n - 1) * inc)
+        for f in (BLAS.trmv!, BLAS.trsv!)
+            y = copy(x); f(u, t, d, A, view(y, 1:inc:length(y)))
+            push!(cases, (f, u, t, d, A, x, inc, y))
+        end
+    end
+    PureBLAS.activate()
+    got = try
+        map(cases) do (f, u, t, d, A, x, inc, _)
+            z = copy(x); f(u, t, d, A, view(z, 1:inc:length(z))); z
+        end
+    finally
+        PureBLAS.deactivate()
+    end
+    for (c, z) in zip(cases, got)
+        @test z ≈ c[8] rtol = 1e-10
+    end
+end
