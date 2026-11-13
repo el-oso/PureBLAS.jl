@@ -11,6 +11,9 @@ permissions:
   contents: write
   statuses: write
   pull-requests: write
+# deps/build.jl times the host's idle-state onset whenever Pkg builds PureBLAS; not wanted on a runner.
+env:
+  PUREBLAS_SKIP_BUILD_TUNE: '1'
 jobs:
   docs:
     runs-on: ubuntu-latest
