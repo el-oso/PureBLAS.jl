@@ -5,11 +5,10 @@
 # char arg (values ignored). Column-major, ILP64 (Int64). Char→flag conventions match the kernels:
 #   trans: op≠N ⇒ transpose,  'C' ⇒ conjugate ;  uplo: 'U' ⇒ upper ;  diag: 'U' ⇒ unit.
 #
-# Matrix args are bridged to a StridedMatrix view (like GEMM). VECTOR args (x/y) and the PACKED
-# vector (AP) are passed as the raw `Ptr` + inc straight into the low-level kernels — the kernels
-# take `(n, ptr, inc)` directly (see cabi.jl BLAS-1). Raw pointers are not `StridedVector`, so the
-# real-SIMD fast paths (which gate on `x isa StridedVector`) fall through to the generic scalar loop;
-# that is correct for all s/d/c/z (only the SIMD micro-opt is skipped at this boundary).
+# Matrix args are bridged to a `PtrMatrix` (like GEMM) and the packed triangle AP to a `PtrVector`.
+# VECTOR args (x/y) go in as the raw `Ptr` + inc — the kernels take `(n, ptr, inc)` directly (see
+# cabi.jl BLAS-1) — except where a kernel indexes the vector as an array (complex gemv,
+# trmv/trsv), which gets a unit-stride vector as a `PtrVector`.
 
 # Ptr→matrix bridge: isbits `PtrMatrix` (ptr, nr, nc, ld) — stride(1)==1, stride(2)==ld dense operand.
 # Trim-safe and 0-alloc (isbits ⇒ passes by value into the kernels with no heap box). A raw `Ptr`
@@ -18,6 +17,10 @@
 @inline function _cabi_mat(p::Ptr{T}, ld::Int64, nr::Int64, nc::Int64) where {T}
     return PtrMatrix(p, Int(nr), Int(nc), Int(ld))
 end
+
+# A packed triangle of order n as a `PtrVector` of its n(n+1)/2 entries: the packed SIMD kernels
+# take `pointer(AP)`, which a raw `Ptr` does not have.
+@inline _cabi_packed(p::Ptr, n::Int64) = PtrVector(p, Int(n) * (Int(n) + 1) ÷ 2)
 
 # ── gemv: y := α·op(A)·x + β·y  (1 char: trans) ──────────────────────────────────────────────────
 for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
@@ -28,10 +31,16 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         )::Cvoid
         tc = _cabi_char(trans); mm = unsafe_load(m); nn = unsafe_load(n)
         Am = _cabi_mat(A, unsafe_load(lda), mm, nn)          # A is always stored m×n
-        _gemv!(
-            tc != 'N', tc == 'C', mm, nn, unsafe_load(alpha), Am,
-            x, unsafe_load(incx), unsafe_load(beta), y, unsafe_load(incy)
-        )
+        ix = unsafe_load(incx); iy = unsafe_load(incy)
+        # The complex T/C kernel indexes y, so its unit-stride vectors go in as `PtrVector`s.
+        if $(T <: Complex) && tc != 'N' && isone(ix) && isone(iy)
+            _gemv!(
+                true, tc == 'C', mm, nn, unsafe_load(alpha), Am,
+                PtrVector(x, Int(mm)), ix, unsafe_load(beta), PtrVector(y, Int(nn)), iy
+            )
+        else
+            _gemv!(tc != 'N', tc == 'C', mm, nn, unsafe_load(alpha), Am, x, ix, unsafe_load(beta), y, iy)
+        end
         return
     end
 end
@@ -110,8 +119,9 @@ for (sym, T, kern) in (
             AP::Ptr{$T}, x::Ptr{$T}, incx::Ptr{Int64},
             beta::Ptr{$T}, y::Ptr{$T}, incy::Ptr{Int64}, len_uplo::Clong
         )::Cvoid
+        nn = unsafe_load(n)
         $kern(
-            _cabi_char(uplo) == 'U', unsafe_load(n), unsafe_load(alpha), AP,
+            _cabi_char(uplo) == 'U', nn, unsafe_load(alpha), _cabi_packed(AP, nn),
             x, unsafe_load(incx), unsafe_load(beta), y, unsafe_load(incy)
         )
         return
@@ -126,8 +136,8 @@ for (op, kern) in (("tpmv", :_tpmv!), ("tpsv", :_tpsv!))
                 AP::Ptr{$T}, x::Ptr{$T}, incx::Ptr{Int64},
                 len_u::Clong, len_t::Clong, len_d::Clong
             )::Cvoid
-            uc = _cabi_char(uplo); tc = _cabi_char(trans); dc = _cabi_char(diag)
-            $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', unsafe_load(n), AP, x, unsafe_load(incx))
+            uc = _cabi_char(uplo); tc = _cabi_char(trans); dc = _cabi_char(diag); nn = unsafe_load(n)
+            $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, _cabi_packed(AP, nn), x, unsafe_load(incx))
             return
         end
     end
@@ -143,7 +153,8 @@ for (sym, T, AT, kern) in (
             uplo::Ptr{UInt8}, n::Ptr{Int64}, alpha::Ptr{$AT},
             x::Ptr{$T}, incx::Ptr{Int64}, AP::Ptr{$T}, len_uplo::Clong
         )::Cvoid
-        $kern(_cabi_char(uplo) == 'U', unsafe_load(n), unsafe_load(alpha), x, unsafe_load(incx), AP)
+        nn = unsafe_load(n)
+        $kern(_cabi_char(uplo) == 'U', nn, unsafe_load(alpha), x, unsafe_load(incx), _cabi_packed(AP, nn))
         return
     end
 end
@@ -159,9 +170,10 @@ for (sym, T, kern) in (
             x::Ptr{$T}, incx::Ptr{Int64}, y::Ptr{$T}, incy::Ptr{Int64},
             AP::Ptr{$T}, len_uplo::Clong
         )::Cvoid
+        nn = unsafe_load(n)
         $kern(
-            _cabi_char(uplo) == 'U', unsafe_load(n), unsafe_load(alpha),
-            x, unsafe_load(incx), y, unsafe_load(incy), AP
+            _cabi_char(uplo) == 'U', nn, unsafe_load(alpha),
+            x, unsafe_load(incx), y, unsafe_load(incy), _cabi_packed(AP, nn)
         )
         return
     end
