@@ -761,3 +761,24 @@ end
         @test isapprox(pb, ob; rtol = T === ComplexF32 ? 1.0f-4 : 1e-12)
     end
 end
+
+# The packed hemm reads a panel straight from the stored triangle when the panel lies inside it. A
+# panel whose last row (upper) or first row (lower) sits on the diagonal element of the k-block's first
+# column must NOT take that direct read, because it would keep the diagonal's imaginary part. That
+# happens for every n = j*KC + 1: the final k-block is one column wide and its single entry is a diagonal
+# element. Odd junk in imag(A[i,i]) exposes it.
+@testitem "hemm! ignores diagonal imaginary part at n = j*KC + 1 (vs OpenBLAS)" begin
+    using PureBLAS, LinearAlgebra
+    kc = PureBLAS._CKC
+    for T in (ComplexF64, ComplexF32), uplo in ('L', 'U'), n in (kc, kc + 1, 2kc + 1)
+        A = randn(T, n, n)
+        for i in 1:n
+            A[i, i] += T(0, 0.5)
+        end
+        B = randn(T, n, 3)
+        pb = zeros(T, size(B)); ob = zeros(T, size(B))
+        PureBLAS.hemm!(pb, A, B; side = 'L', uplo, alpha = one(T), beta = zero(T))
+        BLAS.hemm!('L', uplo, one(T), A, B, zero(T), ob)
+        @test isapprox(pb, ob; rtol = T === ComplexF32 ? 1.0f-4 : 1e-12)
+    end
+end
