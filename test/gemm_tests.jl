@@ -153,6 +153,46 @@ end
     end
 end
 
+# The rank-1 (k = 1), transposed-B and row-tail routes for few rows of C, and the two-pass ragged row
+# block, compute every element by the unpacked kernel's own operations. The serial core is what each
+# slice of a column-split pool runs, so the routes must match it bit for bit at every shape they take.
+@testitem "GEMM few-row routes match the serial core bit for bit" setup = [GemmOracle] begin
+    using PureBLAS
+    const P = PureBLAS
+    # Witnesses: each route takes a shape of the sweep below.
+    Cw = zeros(4, 9)
+    @test P._gemm_rank1!(Cw, randn(4, 1), randn(1, 9), 1.0, 0.0, false, false, 4, 9, 1)
+    @test P._gemm_rows_bt!(Cw, randn(2, 8), randn(9, 8), 1.0, 0.0, false, true, 2, 9, 8)
+    @test P._gemm_rows_tail!(Cw, randn(4, 8), randn(8, 9), 1.0, 0.0, false, false, 4, 9, 8)
+    nbad = Ref(0)
+    for T in (Float32, Float64), tA in ('N', 'T'), tB in ('N', 'T'), m in 2:(P._GEMM_MR1_MAX + 1),
+            k in (1, 2, 3, 8, 50, 100), n in (5, 9, 17, 33, 70), β in (zero(T), T(0.7))
+        # The dot-product route sums along k in its own order; it has its own item above.
+        tB == 'N' && m <= P._rows_dot_max(T) && k >= P._rows_dot_kmin(T, m) && continue
+        A = tA == 'N' ? randn(T, m, k) : randn(T, k, m)
+        B = tB == 'N' ? randn(T, k, n) : randn(T, n, k)
+        C0 = randn(T, m, n); α = T(1.3)
+        C1 = copy(C0); P.gemm!(C1, A, B; alpha = α, beta = β, transA = tA, transB = tB)
+        C2 = copy(C0); P._gemm_core!(C2, A, B, α, β, tA != 'N', tB != 'N', false, false, P._RT_NONE, P._STR_FLOOR, 1)
+        nbad[] += C1 != C2
+    end
+    @test iszero(nbad[])
+    # k = 1 with a strided row of op(B) and a padded C.
+    for β in (0.0, 0.7)
+        A = randn(5, 1); Bp = randn(3, 40); C0 = randn(8, 40)
+        Cv = view(copy(C0), 1:5, :); P.gemm!(Cv, A, view(Bp, 2:2, :); alpha = 1.3, beta = β)
+        @test Cv ≈ 1.3 * A * Bp[2:2, :] + β * C0[1:5, :]
+        C2 = copy(C0[1:5, :]); P._gemm_core!(C2, A, Bp[2:2, :], 1.3, β, false, false, false, false, P._RT_NONE, P._STR_FLOOR, 1)
+        @test Cv == C2
+    end
+    # alpha == 0 scales C and reads neither A nor B.
+    for tB in ('N', 'T'), k in (1, 9)
+        A = fill(NaN, 3, k); B = fill(NaN, tB == 'N' ? (k, 9) : (9, k)); C = ones(3, 9)
+        P.gemm!(C, A, B; alpha = 0.0, beta = 2.0, transB = tB)
+        @test C == fill(2.0, 3, 9)
+    end
+end
+
 @testitem "GEMM beta=0 ignores NaN in C (BLAS semantics)" setup = [GemmOracle] begin
     using PureBLAS
     A = randn(64, 48); B = randn(48, 32)
