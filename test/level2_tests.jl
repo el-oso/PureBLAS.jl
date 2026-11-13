@@ -470,7 +470,7 @@ end
             m_np = (5 * P._L2_BYTES) ÷ (2 * n_np * sz)
             @test !P._gemvn_rowblock_route(m_np, n_np, m_np, UInt(0), T)
             # m = 8200, not 8192: a column stride that is a multiple of the L1 way is excluded from
-            # rule (c), and at W=4 rule (d) takes no columns.
+            # rule (c).
             @test P._gemvn_rowblock_route(8200, 8, 8200, UInt(0), T)
             # Just past `_GEMVN_MINNER_MAXA` (= 4·L3), so the undivided problem leaves minner and
             # every band would re-enter it. One allocation of a little over 4·L3 is the price of
@@ -1074,7 +1074,7 @@ end
     (lda_al * sz) % way == 0 && (lda_al += line ÷ sz)             # not a multiple of the L1 way
     lda_po2 = way ÷ sz * 64                                       # a multiple of the L1 way
     rb = P._gemvn_rb()
-    @test rb == something(P.load_preference(P, "gemvn_rb"), W == 4 ? 0 : 448)
+    @test rb == something(P.load_preference(P, "gemvn_rb"), W == 4 ? 64 : 448)
     @test route(lda_al, cs + 1, lda_al) == (rb > cs)
     @test route(lda_al, max(rb, cs + 1), lda_al) == (rb > cs) && !route(lda_al, max(rb, cs) + 1, lda_al)
     @test !route(lda_al + 1, cs + 1, lda_al + 1)                  # misaligned columns

@@ -14,7 +14,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | **Measured, orphaned** | Measured with no calibrator in `bench/calibrate.jl`, so `tune!()` can never set it and the pin it wants is unreachable. Its `tune!()` cell reads `none`. A missing tool, not a missing verdict — the tier says where the number came from and does not change when a calibrator arrives. |
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 
-**Tier:** 92 Derived · 25 Measured (15 calibrated · 10 orphaned) · 53 Literal.
+**Tier:** 93 Derived · 24 Measured (15 calibrated · 9 orphaned) · 53 Literal.
 **Default form** (mechanical): 70 formula · 24 delegates · 8 sibling · 61 literal · 7 other.
 
 
@@ -46,7 +46,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | `gemvn_minner_maxa` | formula | Derived | formula over detected consts: `4 * _L3_BYTES` | — |
 | `gemvn_np_narrow` | formula | Derived | formula over detected consts: `max(2, _L1D_ASSOC - 2` | — |
 | `gemvn_np_wide` | formula | Derived | formula over detected consts: register-capped `min(12, _NVREG - U - 1)` on a 32-register ISA, associativity-capped `_L1D_ASSOC` on 16 (the "wide" regime above) | — |
-| `gemvn_rb` | formula | Measured | the aligned crossover is not ordered by any detected const: equal W, registers, L2 and datapath give caps of 448 and 0, and L1 residency orders them backwards; default = the n-only cut's W=8 value, 0 at W=4. | none — orphaned; candidates (0, 112, 224, 448) |
+| `gemvn_rb` | formula | Derived | formula over detected consts: `_vwidth(Float64) == 4 ? 64 : 448` | — |
 | `gemvt_deep` | delegates | Derived | NC=8 x U=4 gated on A <= L2 and the register budget; both detected consts. | n/a |
 | `gemvt_nc` | delegates | Literal | _ILP_TARGET predicts 8, every box measures 4; the derivation is falsified. | no, µarch-invariant |
 | `gemvt_percol_amin` | formula | Measured | window's lower edge; no formula places it (see gemvt_perscan). | candidate, cache-boundary set |
@@ -290,7 +290,7 @@ and made this table too wide to read. The knob key is the identifier that matter
 
 ## Orphaned Measured knobs
 
-10 of the 25 Measured knobs have no entry in
+9 of the 24 Measured knobs have no entry in
 `bench/calibrate.jl`, so `tune!()` cannot set them however many times it runs. The tier is
 still correct — the value was reached by measurement — but the pin it asks for is
 unreachable until a calibrator exists. Each row's `tune!()` cell reads `none`, and the
@@ -298,7 +298,6 @@ handle after it is what a person would sweep by hand meanwhile.
 
 | Knob | Hand-sweep handle |
 |---|---|
-| `gemvn_rb` | candidates (0, 112, 224, 448) |
 | `symv_sme_min` | sweep n |
 | `strassen_base` | the threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048 |
 | `sme_ger_groups` | candidates (1,2,4,8) |

@@ -86,9 +86,8 @@ const _GEMV_MR = something(_GEMV_MR_PREF, 8)::Int
 # shipped kernel at each `Val(MR)`; round-to-round spread 0.1-0.6% on the AVX-512 boxes.
 #
 # The table was taken when the route was a cut at n <= 448 (W=8) or 64 (W=4), which is why AVX2 has
-# only two rows. `_gemvn_rowblock_route` now bounds the domain: on Zen3 and Zen5 this function sees only
-# L1-resident A, single-block columns and n at most the panel width; on Zen4 it also sees aligned
-# columns up to `_gemvn_rb()`.
+# only two rows. `_gemvn_rowblock_route` now bounds the domain: this function sees L1-resident A,
+# single-block columns, n at most the panel width, and line-aligned columns up to `_gemvn_rb()`.
 #
 #   (m, n)      op(A)     regime     law   Zen4     Zen5     Zen3
 #   (50, 50)     19 KiB   in L1       6    6 ✓      6 ✓      6 ✓
@@ -269,43 +268,10 @@ const _GEMVN_MINNER_MAXA = @load_preference("gemvn_minner_maxa", 4 * _L3_BYTES):
 # n≈100-200 at lda=1024/2048/4096 — the run-to-run spread of power-of-two strides, which move with
 # page placement — against n≈384-448 at lda=1032/2056/4104. The quarter takes the low end.
 #
-# (d)'S CAP IS MEASURE TIER. Over aligned strides the row-block wins to n≈384-448 on Zen4. Over the
-# 165 aligned, non-aliased cells with n=33-448, row-block / panel time is 0.87-1.53 on Zen5-mobile
-# (row-block faster in 33) and 1.03-1.57 on Zen3 (faster in none). Zen4 and Zen5-mobile share every
-# detected constant that could carry this — W=8, 32 vector registers, 1 MiB L2, a 256-bit datapath under 512-bit registers — and
-# differ only in L1 (32 vs 48 KiB) and family, the same inseparable pair `_GEMV_MR` records. Three
-# derivations were tried and falsified: a quarter-L2 pass footprint (n chunks of MRmax·_SIMD_BYTES)
-# gives 512, where the row-block measures 1.06-1.15x the panel's time at lda=200/768/2880 on Zen4; and
-# the m-inner panel's narrower width on an 8-way L1 (6 streams against 10 on Zen5-mobile) — forcing
-# the Zen5-mobile panel to Zen4's 6 streams moves it by at most 6% and leaves it ahead of the
-# row-block in 10 of 12 aligned shapes (`bench/probes/gemvn_np_vs_rb.jl`, m=640/768/2880, n=64-320).
-# L1 residency of one row-block pass orders the parts backwards: a pass touches at least one line per
-# column, so `n·_CACHELINE ≤ _L1_BYTES` gives 512 on Zen4 and 768 on Zen5-mobile, and four lines per
-# column (MR=4, W=8) gives 128 and 192 — larger on the part that wants 0. Below OB over the grid below
-# plus 21 m=lda=553 cells (453 per µarch), by cap: Zen4 0→69, 192→41, 384→24, 448→27, 512→28; Zen5-mobile 0→157, 448→226, 768→236; Zen3
-# (W=4) 0→38, 512→176.
-# The default reproduces the n-only cut where the grid shows it right: 448 at W=8, so no W=8
-# part routes an aligned shape differently from before, and 0 at W=4, where the row-block loses at
-# every aligned n past (c) on Zen3.
-#
-# FLEET, every (m, n) cell of `bench/gemvn_route_grid.jl` (m 64..4096, n 8..4096, lda = m plus padded
-# and po2-adjacent lda; 432 cells per µarch, hot operand, 1 thread, frequency-locked). "Below OB" counts
-# cells slower than OpenBLAS at two significant digits; "oracle" is the count if the faster of the two
-# routes were always taken, i.e. the misses routing cannot fix. Both routes and OpenBLAS are timed in
-# one run; the n-only column is from the same grid run under the n-only cut and the earlier height law:
-#                   below OB          oracle
-#                 n-only   this
-#   Zen4            108      27          19
-#   Zen3            102      38          34
-#   Zen5-mobile     263     223         140     (154 with a cap of 0)
-# Where the route is still the slower one on Zen4: m=lda=1420 (a stride half a line off) at n=33-160
-# and m=553 at n=33-48, where the row-block is 6-19% faster; on Zen5-mobile the cap (see below).
-#
-# Cap on (d). On Zen4 the aligned, non-aliased crossover sits at n≈384-448 (row-block / panel at
-# n=448: 0.99-1.06 over the seven strides where `_gemvn_rowblock_mr` picks MR ≥ 4; 1.07-1.22 where it
-# picks MR=2, a height-law cost). See (d) above for why this is not derivable.
-# PDM: Measured — the aligned crossover is not ordered by any detected const: equal W, registers, L2 and datapath give caps of 448 and 0, and L1 residency orders them backwards; default = the n-only cut's W=8 value, 0 at W=4. | tune: none — orphaned; candidates (0, 112, 224, 448)
-const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 0 : 448)::Int   # req8-ok: Measure-tier default, see (d)
+# The cap `_GEMVN_RB` on (d) is the plain n cut of the earlier route; deriving it from detected
+# constants is an open item.
+# PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 64 : 448`
+const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 64 : 448)::Int  # gemv-N: n ≤ this → row-block; larger → column-panel. AVX2 cut dropped 192→64: with _GEMV_MR=8 the sequential-streaming panel path now beats strided row-block for all n≥96 (128: 0.92→1.0); row-block only wins at n≤64 where panel's m<mr all-masked tail dominates. Zen4 1MB L2 → 448.
 @inline function _gemvn_rowblock_route(m::Int, n::Int, lda::Int, abase::UInt, ::Type{T}) where {T}
     f = _FKR_gemvn_rb[]
     f >= 0 && return n <= f                      # forced: the plain n cut, for A/B probes

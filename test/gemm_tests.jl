@@ -42,6 +42,157 @@ end
     end
 end
 
+# A one-row or one-column C is computed by `_gemv!`, not by packing the other operand. Bit equality
+# with the gemv is the witness: the gemm kernels sum k in a different order. Checked through
+# `activate()` as well, which reaches the same route from the `dgemm_64_` entry.
+@testitem "GEMM with one row or column of C is a gemv" setup = [GemmOracle] begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    k, w = 988, 553
+    for T in (Float32, Float64), tA in ('N', 'T'), tB in ('N', 'T')
+        # m == 1: C (1×w) = op(A) (1×k) · op(B) (k×w); the gemv runs over B.
+        A = tA == 'N' ? randn(T, 1, k) : randn(T, k, 1)
+        Bm = tB == 'N' ? randn(T, k, w) : randn(T, w, k)
+        C0 = randn(T, 1, w); α = T(0.7); β = T(1.3)
+        y = vec(copy(C0)); P._gemv!(tB == 'N', false, size(Bm)..., α, Bm, vec(A), 1, β, y, 1)
+        C = copy(C0); P.gemm!(C, A, Bm; alpha = α, beta = β, transA = tA, transB = tB)
+        @test vec(C) == y
+        # n == 1: C (w×1) = op(A) (w×k) · op(B) (k×1); the gemv runs over A.
+        A = tA == 'N' ? randn(T, w, k) : randn(T, k, w)
+        Bm = tB == 'N' ? randn(T, k, 1) : randn(T, 1, k)
+        C0 = randn(T, w, 1)
+        y = vec(copy(C0)); P._gemv!(tA != 'N', false, size(A)..., α, A, vec(Bm), 1, β, y, 1)
+        C = copy(C0); P.gemm!(C, A, Bm; alpha = α, beta = β, transA = tA, transB = tB)
+        @test vec(C) == y
+    end
+    x = randn(1, k); A = randn(k, w); C = zeros(1, w)
+    y = zeros(w); P._gemv!(true, false, k, w, 1.0, A, vec(x), 1, 0.0, y, 1)
+    P.activate()
+    try
+        mul!(C, x, A)
+        @test vec(C) == y
+    finally
+        P.deactivate()
+    end
+end
+
+# A C with fewer rows than one tile never amortizes packing op(B), so it takes the unpacked kernel
+# whatever n and k are. Each column of C accumulates its k chain on its own, so computing the columns
+# in two halves must give the same bits as one call, as a column-split pool does.
+@testitem "GEMM with few rows of C takes the unpacked route" setup = [GemmOracle] begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    big = 4 * P._GEMM_UNPACK_MAX
+    for m in (1, 2, P._GEMM_MR1_MAX)
+        @test P._use_unpacked(m, big, big)
+    end
+    @test !P._use_unpacked(P._GEMM_MR1_MAX + 1, big, big)
+    k, n = 988, 553
+    for T in (Float32, Float64), tB in ('N', 'T'), m in (2, 5)
+        A = randn(T, m, k)
+        B = tB == 'N' ? randn(T, k, n) : randn(T, n, k)
+        C = zeros(T, m, n)
+        P.gemm!(C, A, B; transB = tB)
+        @test C ≈ A * (tB == 'N' ? B : B') rtol = 100 * eps(T) * k
+        h = n ÷ 2
+        Bl = tB == 'N' ? B[:, 1:h] : B[1:h, :]
+        Br = tB == 'N' ? B[:, (h + 1):n] : B[(h + 1):n, :]
+        Cl = zeros(T, m, h); Cr = zeros(T, m, n - h)
+        P.gemm!(Cl, A, Bl; transB = tB); P.gemm!(Cr, A, Br; transB = tB)
+        @test C == hcat(Cl, Cr)
+    end
+end
+
+# Fewer rows of C than the datapath has lanes, with B not transposed, are dot products along k that read
+# each column of B once. Every C[i,j] is one accumulator chain whose order depends on k alone, so a row
+# or a column block of C has the same bits as the same entries of the whole product.
+@testitem "GEMM with few rows of C takes the dot-product route" setup = [GemmOracle] begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    for T in (Float32, Float64), tA in ('N', 'T'), β in (zero(T), T(0.5))
+        mmax = P._rows_dot_max(T)
+        @test mmax >= 2
+        n = 301
+        for m in 2:mmax
+            k = P._rows_dot_kmin(T, m) + 5
+            A = tA == 'N' ? randn(T, m, k) : randn(T, k, m)
+            B = randn(T, k, n); C0 = randn(T, m, n); α = T(1.3)
+            C = copy(C0); P.gemm!(C, A, B; alpha = α, beta = β, transA = tA)
+            ref = α * (tA == 'N' ? A : A') * B + β * C0
+            @test C ≈ ref rtol = 100 * eps(T) * k
+            # Columns in two halves, and each row on its own, give the same bits.
+            h = n ÷ 2
+            Cl = copy(C0[:, 1:h]); Cr = copy(C0[:, (h + 1):n])
+            P.gemm!(Cl, A, B[:, 1:h]; alpha = α, beta = β, transA = tA)
+            P.gemm!(Cr, A, B[:, (h + 1):n]; alpha = α, beta = β, transA = tA)
+            @test C == hcat(Cl, Cr)
+            if m > 2
+                A2 = tA == 'N' ? A[1:2, :] : A[:, 1:2]
+                C2 = copy(C0[1:2, :]); P.gemm!(C2, A2, B; alpha = α, beta = β, transA = tA)
+                @test C2 == C[1:2, :]
+            end
+        end
+    end
+    # alpha == 0 does not read A or B.
+    A = fill(NaN, 2, 64); B = fill(NaN, 64, 9); C = ones(2, 9)
+    P.gemm!(C, A, B; alpha = 0.0, beta = 2.0)
+    @test C == fill(2.0, 2, 9)
+end
+
+# A one-vector tile with beta != 0 loads every C column before storing any, so a C whose leading
+# dimension is below the vector width has the same bits as one padded to a wider leading dimension.
+@testitem "GEMM few-row tail with beta != 0 is independent of ldc" setup = [GemmOracle] begin
+    using PureBLAS
+    const P = PureBLAS
+    for m in (2, 3), k in (1, 7, 40)
+        A = randn(m, k); B = randn(553, k); C0 = randn(m, 553)
+        Cpad = zeros(8, 553); Cpad[1:m, :] = C0
+        C = copy(C0); P.gemm!(C, A, B; alpha = 0.7, beta = 1.3, transB = 'T')
+        Cv = view(Cpad, 1:m, :); P.gemm!(Cv, A, B; alpha = 0.7, beta = 1.3, transB = 'T')
+        @test C == Cv
+    end
+end
+
+# The rank-1 (k = 1), transposed-B and row-tail routes for few rows of C, and the two-pass ragged row
+# block, compute every element by the unpacked kernel's own operations. The serial core is what each
+# slice of a column-split pool runs, so the routes must match it bit for bit at every shape they take.
+@testitem "GEMM few-row routes match the serial core bit for bit" setup = [GemmOracle] begin
+    using PureBLAS
+    const P = PureBLAS
+    # Witnesses: each route takes a shape of the sweep below.
+    Cw = zeros(4, 9)
+    @test P._gemm_rank1!(Cw, randn(4, 1), randn(1, 9), 1.0, 0.0, false, false, 4, 9, 1)
+    @test P._gemm_rows_bt!(Cw, randn(2, 8), randn(9, 8), 1.0, 0.0, false, true, 2, 9, 8)
+    @test P._gemm_rows_tail!(Cw, randn(4, 8), randn(8, 9), 1.0, 0.0, false, false, 4, 9, 8)
+    nbad = Ref(0)
+    for T in (Float32, Float64), tA in ('N', 'T'), tB in ('N', 'T'), m in 2:(P._GEMM_MR1_MAX + 1),
+            k in (1, 2, 3, 8, 50, 100), n in (5, 9, 17, 33, 70), β in (zero(T), T(0.7))
+        # The dot-product route sums along k in its own order; it has its own item above.
+        tB == 'N' && m <= P._rows_dot_max(T) && k >= P._rows_dot_kmin(T, m) && continue
+        A = tA == 'N' ? randn(T, m, k) : randn(T, k, m)
+        B = tB == 'N' ? randn(T, k, n) : randn(T, n, k)
+        C0 = randn(T, m, n); α = T(1.3)
+        C1 = copy(C0); P.gemm!(C1, A, B; alpha = α, beta = β, transA = tA, transB = tB)
+        C2 = copy(C0); P._gemm_core!(C2, A, B, α, β, tA != 'N', tB != 'N', false, false, P._RT_NONE, P._STR_FLOOR, 1)
+        nbad[] += C1 != C2
+    end
+    @test iszero(nbad[])
+    # k = 1 with a strided row of op(B) and a padded C.
+    for β in (0.0, 0.7)
+        A = randn(5, 1); Bp = randn(3, 40); C0 = randn(8, 40)
+        Cv = view(copy(C0), 1:5, :); P.gemm!(Cv, A, view(Bp, 2:2, :); alpha = 1.3, beta = β)
+        @test Cv ≈ 1.3 * A * Bp[2:2, :] + β * C0[1:5, :]
+        C2 = copy(C0[1:5, :]); P._gemm_core!(C2, A, Bp[2:2, :], 1.3, β, false, false, false, false, P._RT_NONE, P._STR_FLOOR, 1)
+        @test Cv == C2
+    end
+    # alpha == 0 scales C and reads neither A nor B.
+    for tB in ('N', 'T'), k in (1, 9)
+        A = fill(NaN, 3, k); B = fill(NaN, tB == 'N' ? (k, 9) : (9, k)); C = ones(3, 9)
+        P.gemm!(C, A, B; alpha = 0.0, beta = 2.0, transB = tB)
+        @test C == fill(2.0, 3, 9)
+    end
+end
+
 @testitem "GEMM beta=0 ignores NaN in C (BLAS semantics)" setup = [GemmOracle] begin
     using PureBLAS
     A = randn(64, 48); B = randn(48, 32)
@@ -193,6 +344,7 @@ end
                 try
                     @test iszero(ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(one), one))
                     @test P._mt_physical_cores() == c0
+                    @test P._mt_bound_cpu() == cpu + 1                  # libuv's mask numbers from 1
                 finally
                     ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt64}), 0, sizeof(old), old)
                 end
@@ -892,20 +1044,31 @@ end
             end
         end
         # WITNESS THAT THE PAD COPIES ARE POOL JOBS INSIDE potrf: the same matrix factored at a
-        # way-aligned leading dimension makes exactly two more jobs than at one that is not. `n` is
-        # a whole number of L1 ways in bytes, so the pad predicate holds on any cache geometry, and
-        # it is far above the `_L1_MT_MIN` floor, so both copies are admitted.
+        # way-aligned leading dimension makes exactly two more jobs than at one that is not. The pad
+        # predicate fires when the byte stride is a multiple of twice its period `q = way ÷ 4`, so `n`
+        # is the smallest size >= 1024 whose byte stride is such a multiple: that holds for any way
+        # size, power of two or not. It is far above the `_L1_MT_MIN` floor, so both copies are admitted.
         P.set_num_threads(nthreads())
-        let n = max(1024, P._L1_WAY_BYTES ÷ sizeof(Float64))
-            @test n * n * sizeof(Float64) >= 8 * P._L1_MT_MIN
+        let q2 = (P._L1_WAY_BYTES >> 2) << 1, m = q2 ÷ gcd(q2, sizeof(Float64)), n = m * cld(1024, m)
+            geom = "L1 = $(P._L1_BYTES) B, $(P._L1D_ASSOC)-way, way = $(P._L1_WAY_BYTES) B, " *
+                "L2 = $(P._L2_BYTES) B, n = $n"
+            # Logs the detected geometry when a check fails, so a failure on another host explains itself.
+            chk(c) = (c || @error "pad witness check failed" geom; c)
+            @test chk(n * n * sizeof(Float64) >= 8 * P._L1_MT_MIN)
             G = randn(MersenneTwister(5), n, n); S = G * G' + n * I
-            @test P._chol_needs_pad(S, n)
+            @test chk(P._chol_needs_pad(S, n))
             Bq = zeros(n + 8, n); Xq = view(Bq, 1:n, 1:n)
-            @test !P._chol_needs_pad(Xq, n)
-            X = copy(S); j0 = jobs(); P.potrf!(X; uplo = 'L'); jp = jobs() - j0
-            copyto!(Xq, S); j0 = jobs(); P.potrf!(Xq; uplo = 'L'); jq = jobs() - j0
-            @test jp == jq + 2
-            @test bitsame(tril(X), tril(Xq))
+            if P._chol_needs_pad(Xq, n)
+                # The unpadded control needs a stride off the aliasing period, which no n + 8 gives
+                # when the period divides 64 B.
+                @test_skip P._chol_needs_pad(Xq, n)
+                @info "pad witness skipped: control stride also aliases" geom
+            else
+                X = copy(S); j0 = jobs(); P.potrf!(X; uplo = 'L'); jp = jobs() - j0
+                copyto!(Xq, S); j0 = jobs(); P.potrf!(Xq; uplo = 'L'); jq = jobs() - j0
+                @test chk(jp == jq + 2)
+                @test bitsame(tril(X), tril(Xq))
+            end
         end
         # Float32 takes the same padded driver and the same copy job.
         let n = 1024
@@ -1135,6 +1298,18 @@ end
     end
     @test P._mt_clock_step() > 0
     @test P._mt_affinity_count() >= 0
+    # Cores among pinned CPUs, on slowdowns stated by hand: CPUs 2k and 2k+1 share a core, so a
+    # worker slows (1.55x, Zen3's lowest) when a kept worker is its sibling and not (1.02x) otherwise.
+    count_smt(cpu) = P._mt_core_count(cpu, (w, keep) -> any(k -> cpu[k] ÷ 2 == cpu[w] ÷ 2, keep) ? 1.55 : 1.02)
+    @test count_smt(collect(0:5)) == 3            # both siblings of 3 cores
+    @test count_smt([0, 2, 4]) == 3               # one CPU per core: no collapse
+    @test count_smt([0, 3, 4, 1, 5]) == 3         # siblings out of order
+    @test P._mt_core_count(collect(0:5), (w, keep) -> 1.02) == 6
+    # Two workers on one CPU share its core without a reading.
+    @test P._mt_core_count([7, 7, 8], (w, keep) -> w == 2 ? error("read") : 1.0) == 2
+    # A reading between the two outcomes, or none at all, gives no count.
+    @test iszero(P._mt_core_count([0, 1], (w, keep) -> 1.3))
+    @test iszero(P._mt_core_count([0, 1], (w, keep) -> NaN))
     if nthreads() < 2
         @test_skip "needs >= 2 julia threads: there is no pool to measure without one"
     else

@@ -12,9 +12,9 @@
 # that is correct for all s/d/c/z (only the SIMD micro-opt is skipped at this boundary).
 
 # Ptr→matrix bridge: isbits `PtrMatrix` (ptr, nr, nc, ld) — stride(1)==1, stride(2)==ld dense operand.
-# Trim-safe and 0-alloc (isbits ⇒ passes by value into the kernels with no heap box). Vector args
-# (x/y) stay raw Ptr, so the real-SIMD L2 paths gate off (StridedVector) and take the generic loop —
-# which indexes PtrMatrix via unsafe_load, still 0-alloc.
+# Trim-safe and 0-alloc (isbits ⇒ passes by value into the kernels with no heap box). A raw `Ptr`
+# vector counts as dense (`_dense1(::Ptr)`), so it reaches the SIMD L2 kernels; a kernel that takes
+# views of its vector needs it wrapped as a `PtrVector` first.
 @inline function _cabi_mat(p::Ptr{T}, ld::Int64, nr::Int64, nc::Int64) where {T}
     return PtrMatrix(p, Int(nr), Int(nc), Int(ld))
 end
@@ -88,7 +88,13 @@ for (op, kern) in (("trmv", :_trmv!), ("trsv", :_trsv!))
             nn = unsafe_load(n)
             uc = _cabi_char(uplo); tc = _cabi_char(trans); dc = _cabi_char(diag)
             Am = _cabi_mat(A, unsafe_load(lda), nn, nn)
-            $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, Am, x, unsafe_load(incx))
+            inc = unsafe_load(incx)
+            # The blocked kernels take views of x, so a unit-stride x goes in as a `PtrVector`.
+            if isone(inc)
+                $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, Am, PtrVector(x, Int(nn)), inc)
+            else
+                $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, Am, x, inc)
+            end
             return
         end
     end
