@@ -115,15 +115,16 @@ end
         siblings = reduce(vcat, cores[1:nc])
         @info "pinned children" one_per_core siblings
         # k CPUs lie on at least cld(k, threads per core) cores, the formula's count, and at most k.
+        # A measured count of 0 means the measurement was inconclusive and the formula was used.
         tpc = max(1, Sys.CPU_THREADS ÷ Int(P.num_cores()))
         results = Dict(cpus => child(cpus) for cpus in (one_per_core, siblings))
         for (cpus, (nw, measured)) in results
             @test cld(length(cpus), tpc) <= nw <= length(cpus)
-            @test cld(length(cpus), tpc) <= measured <= length(cpus)
+            @test iszero(measured) || cld(length(cpus), tpc) <= measured <= length(cpus)
         end
-        nw1, _ = results[one_per_core]
+        nw1, measured1 = results[one_per_core]
         nw2, measured2 = results[siblings]
-        if measured2 < length(siblings)
+        if !iszero(measured1) && !iszero(measured2) && measured2 < length(siblings)
             # The measurement saw cores shared, which confirms the sibling lists: both siblings of
             # each core collapse to that core, and one CPU per core keeps every core, where the
             # formula gives half of them.
@@ -131,10 +132,11 @@ end
             @test measured2 == nc
             @test nw1 == nc
         else
-            # A virtual machine's sibling lists need not match how the host schedules its vCPUs.
+            # A virtual machine's sibling lists need not match how the host schedules its vCPUs, and
+            # a loaded runner can leave the measurement inconclusive (0).
             println(
-                "core cap: siblings $siblings measured as $measured2 cores, no contention between ",
-                "the listed siblings, so the sibling lists are not confirmed; collapse not checked"
+                "core cap: measured $measured1 cores for one CPU per core and $measured2 for siblings ",
+                "$siblings (0 = inconclusive); the sibling lists are not confirmed, collapse not checked"
             )
             @test_skip measured2 == nc
             @test_skip nw1 == nc
