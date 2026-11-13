@@ -67,24 +67,35 @@ const SAMPLES = 31
 times(g) = [s.time for s in (@be idle(g) _ -> job() evals = 1 samples = SAMPLES seconds = Inf).samples]
 
 # Each gap compared with the reference by quartiles: `:slow` when the two interquartile ranges do
-# not overlap and the gap's is higher, `:same` when the gap's median is inside the reference's
-# range, `:unclear` otherwise.
+# not overlap and the gap's is higher, `:same` when the gap's median is no higher than the
+# reference's upper quartile, `:unclear` otherwise.
 function classify(t, ref)
-    r1, r3 = quantile(ref, [0.25, 0.75])
+    r3 = quantile(ref, 0.75)
     q1, q2 = quantile(t, [0.25, 0.5])
     q1 > r3 && return :slow
-    r1 <= q2 <= r3 && return :same
+    q2 <= r3 && return :same
     return :unclear
 end
 
 # The onset in ns; `_MT_KEEPAWAKE_NONE` only when every gap matched the reference, which is the
 # positive evidence of no penalty that window 0 needs; `nothing` when the evidence is mixed, so
 # that nothing is stored and the default window stays.
+#
+# THE REFERENCE IS MEASURED TWICE, before and after the ladder, and the two blocks are pooled. One
+# block's quartiles describe only that block, and the reference moves by more than its own
+# interquartile range between two blocks of one run (Zen3: a second block's median of 47 us against
+# 38 us for both pooled), which made a few-percent shift at every later gap read as an onset.
+# Pooled, the reference's quartiles carry that drift.
 function onset()
     gs = ladder()
     times(gs[1])   # discarded: the first block after start-up reads slow and wide on every part measured
     ts = [times(g) for g in gs]
-    cls = [classify(t, ts[1]) for t in ts]
+    last_ref = times(gs[1])
+    ref = vcat(ts[1], last_ref)
+    cls = [classify(t, ref) for t in ts]
+    rq1, rq2, rq3 = quantile(ref, [0.25, 0.5, 0.75])
+    println(stderr, "reference, both blocks: median $(round(rq2 * 1.0e6; digits = 1)) us [$(round(rq1 * 1.0e6; digits = 1)), $(round(rq3 * 1.0e6; digits = 1))]; ",
+            "second block alone $(round(median(last_ref) * 1.0e6; digits = 1)) us")
     println(stderr, "threads $NT, buffer $(LEN * sizeof(Float64)) B per thread, sleep threshold $SLEEP_NS ns")
     for (g, t, c) in zip(gs, ts, cls)
         q1, q2, q3 = quantile(t, [0.25, 0.5, 0.75])
