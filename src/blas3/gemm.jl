@@ -1135,11 +1135,23 @@ end
     )
     push!(body.args, :(av = $V(alpha)))
     B0 || push!(body.args, :(bv = $V(beta)))
+    # A one-vector tile with β ≠ 0 reads every C column before storing any. When `ldc` is below the
+    # vector's byte width the masked vector of column j+1 overlaps the masked store of column j in
+    # address range only, and a load that follows such a store waits for it (~20 cycles per column,
+    # 4.3 against 0.9 µs at m = 2, ldc = 2).
+    preload = !B0 && MR == 1
+    if preload
+        for j in 1:NR
+            push!(body.args, :($(Symbol(:o_, j)) = vload($V, C + (ir + (jr + $(j - 1)) * ldc) * $sz, msk1)))
+        end
+    end
     for j in 1:NR
         push!(body.args, :(colp = C + (ir + (jr + $(j - 1)) * ldc) * $sz))
         for mi in 1:MR
             cs = Symbol(:c, mi, :_, j); mk = Symbol(:msk, mi)
-            st = B0 ? :(vstore(av * $cs, q, $mk)) : :(vstore(muladd(bv, vload($V, q, $mk), av * $cs), q, $mk))
+            st = B0 ? :(vstore(av * $cs, q, $mk)) :
+                preload ? :(vstore(muladd(bv, $(Symbol(:o_, j)), av * $cs), q, $mk)) :
+                :(vstore(muladd(bv, vload($V, q, $mk), av * $cs), q, $mk))
             push!(
                 body.args, :(
                     let q = colp + $((mi - 1) * W * sz)
@@ -6801,6 +6813,142 @@ end
     return true
 end
 
+# C (m×n) = op(A)·B for a few rows m, B not transposed: C[i,j] is the dot product of row i of op(A)
+# with column j of B, and both are contiguous once the rows of op(A) are. The kernel vectorizes
+# along k, reads each column of B once for all R rows, and keeps R·NC accumulators, so B is traversed
+# once however many rows C has. The unpacked gemm kernel vectorizes along m, so with m below a vector
+# it fills only m lanes of each FMA. Each C[i,j] is one accumulator chain in an order set by k and the
+# lane count alone, so the bits do not depend on R, on NC, or on which columns a call covers.
+@generated function _rows_dot_block!(
+        C::Ptr{T}, ldc::Int, X::Ptr{T}, ldx::Int, B::Ptr{T}, ldb::Int, j0::Int, k::Int,
+        alpha::T, beta::T, ::Val{R}, ::Val{NC}, ::Val{B0}
+    ) where {T, R, NC, B0}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
+    lanetuple = Expr(:tuple, (0:(W - 1))...)
+    body = quote end
+    for i in 1:R, j in 1:NC
+        push!(body.args, :($(Symbol(:c, i, :_, j)) = zero($V)))
+    end
+    function step(masked)
+        st = quote end
+        for i in 1:R
+            xi = Symbol(:x, i)
+            push!(
+                st.args, masked ? :($xi = vload($V, X + (p + $(i - 1) * ldx) * $sz, mk)) :
+                    :($xi = vload($V, X + (p + $(i - 1) * ldx) * $sz))
+            )
+        end
+        for j in 1:NC
+            bj = Symbol(:b, j)
+            addr = :(B + (p + (j0 + $(j - 1)) * ldb) * $sz)
+            push!(st.args, masked ? :($bj = vload($V, $addr, mk)) : :($bj = vload($V, $addr)))
+            for i in 1:R
+                c = Symbol(:c, i, :_, j)
+                push!(st.args, :($c = muladd($(Symbol(:x, i)), $bj, $c)))
+            end
+        end
+        return st
+    end
+    push!(body.args, :(p = 0))
+    push!(
+        body.args, :(
+            while p + $W <= k
+                $(step(false))
+                p += $W
+            end
+        )
+    )
+    push!(
+        body.args, :(
+            if p < k
+                mk = Vec{$W, Int}($lanetuple) < (k - p)
+                $(step(true))
+            end
+        )
+    )
+    for j in 1:NC, i in 1:R
+        c = Symbol(:c, i, :_, j)
+        q = :(C + ($(i - 1) + (j0 + $(j - 1)) * ldc) * $sz)
+        push!(
+            body.args, B0 ? :(unsafe_store!(Ptr{T}($q), alpha * sum($c))) :
+                :(unsafe_store!(Ptr{T}($q), muladd(beta, unsafe_load(Ptr{T}($q)), alpha * sum($c))))
+        )
+    end
+    push!(body.args, :(return nothing))
+    return Expr(:block, Expr(:meta, :inline), body)
+end
+
+# Columns per block: half the register file holds the R·NC accumulators.
+@inline _rows_dot_nc(::Type{T}, R::Int) where {T} = max(1, (_NVREG ÷ 2) ÷ R)
+
+# `R` rows of C (rows `i0+1 … i0+R`), all n columns.
+@inline function _rows_dot_cols!(C, ldc, X, ldx, B, ldb, n, k, α, β, ::Val{R}, ::Val{B0}) where {R, B0}
+    T = eltype(C)
+    nc = _rows_dot_nc(T, R)
+    j = 0
+    while j + nc <= n
+        _rows_dot_block!(C, ldc, X, ldx, B, ldb, j, k, α, β, Val(R), Val(_rows_dot_nc(T, R)), Val(B0))
+        j += nc
+    end
+    while j < n
+        _rows_dot_block!(C, ldc, X, ldx, B, ldb, j, k, α, β, Val(R), Val(1), Val(B0))
+        j += 1
+    end
+    return nothing
+end
+
+# One call per row count, so `R` is a compile-time constant of the kernel. The caller guarantees
+# 1 <= m <= MMAX; the last arm serves m == MMAX.
+@generated function _rows_dot_dispatch!(
+        C::Ptr{T}, ldc, X::Ptr{T}, ldx, B::Ptr{T}, ldb, m, n, k, α, β, ::Val{MMAX}, ::Val{B0}
+    ) where {T, MMAX, B0}
+    ex = :(return _rows_dot_cols!(C, ldc, X, ldx, B, ldb, n, k, α, β, Val($MMAX), Val(B0)))
+    for r in (MMAX - 1):-1:1
+        ex = :(
+            if m == $r
+                return _rows_dot_cols!(C, ldc, X, ldx, B, ldb, n, k, α, β, Val($r), Val(B0))
+            else
+                $ex
+            end
+        )
+    end
+    return ex
+end
+
+# Rows served: fewer than the datapath's lanes, where the unpacked kernel issues a full vector for m
+# live rows (measured equal at m = lanes on Zen4, slower below). Depth: each C element pays one
+# horizontal sum, so the dot form needs about m + 1 vector chunks of k to repay it.
+@inline _rows_dot_max(::Type{T}) where {T} = _at_tail_vw(_HW, T) - 1
+@inline _rows_dot_kmin(::Type{T}, m::Int) where {T} = (m + 1) * _vwidth(T)
+
+@inline function _gemm_rows_dot!(C, A, B, α::T, β::T, tA::Bool, tB::Bool, m::Int, n::Int, k::Int) where {T}
+    T <: BlasReal && !tB && n > 1 && 1 < m <= _rows_dot_max(T) && k >= _rows_dot_kmin(T, m) &&
+        eltype(A) === T && eltype(B) === T && _strided1(A) && _strided1(B) && _strided1(C) || return false
+    if iszero(α)
+        _scale_C!(C, m, n, β); return true
+    end
+    Cp = _pm(C); Ap = _pm(A); Bp = _pm(B)
+    rA = _root(A); rB = _root(B); rC = _root(C)
+    # Rows of op(A) must be contiguous: copy them out of a non-transposed A into the packing scratch.
+    Xs, _ = _gemm_scratch(T, tA ? 0 : m * k, 0)
+    GC.@preserve rA rB rC Xs begin
+        if tA
+            Xp = Ap.ptr; ldx = Ap.ld
+        else
+            Xp = pointer(Xs); ldx = k
+            for i in 1:m, l in 1:k
+                unsafe_store!(Xp, unsafe_load(Ap.ptr, (i - 1) + (l - 1) * Ap.ld + 1), l + (i - 1) * k)
+            end
+        end
+        if iszero(β)
+            _rows_dot_dispatch!(Cp.ptr, Cp.ld, Xp, ldx, Bp.ptr, Bp.ld, m, n, k, α, β, Val(_rows_dot_max(T)), Val(true))
+        else
+            _rows_dot_dispatch!(Cp.ptr, Cp.ld, Xp, ldx, Bp.ptr, Bp.ld, m, n, k, α, β, Val(_rows_dot_max(T)), Val(false))
+        end
+    end
+    return true
+end
+
 # `gemm!`'s route for a strided operand of a BLAS element type, shared with the `?gemm_64_` C-ABI entries
 # so that `A * B` after `activate()` runs the same algorithm as the native call: the column split when
 # `nw > 1` and neither Strassen nor SME owns the shape, else the serial core, whose Strassen recursion
@@ -6809,6 +6957,7 @@ end
         C, A, B, α::T, β::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::Int, nw::Int
     ) where {T}
     _gemm_as_gemv!(C, A, B, α, β, tA, tB, m, n, k) && return C
+    _gemm_rows_dot!(C, A, B, α, β, tA, tB, m, n, k) && return C
     if nw > 1 && !_strassen_owns(T, m, n, k, tA, A, B, _STR_FLOOR) && !_sme_owns(T, m, n, k, tA, tB, cA, cB, C, A, B)
         rA = _root(A); rB = _root(B); rC = _root(C)
         GC.@preserve rA rB rC _gemm_threaded!(_pm(C), _pm(A), _pm(B), α, β, tA, tB, cA, cB, nw)

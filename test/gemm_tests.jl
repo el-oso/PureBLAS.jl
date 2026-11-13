@@ -103,6 +103,56 @@ end
     end
 end
 
+# Fewer rows of C than the datapath has lanes, with B not transposed, are dot products along k that read
+# each column of B once. Every C[i,j] is one accumulator chain whose order depends on k alone, so a row
+# or a column block of C has the same bits as the same entries of the whole product.
+@testitem "GEMM with few rows of C takes the dot-product route" setup = [GemmOracle] begin
+    using PureBLAS, LinearAlgebra
+    const P = PureBLAS
+    for T in (Float32, Float64), tA in ('N', 'T'), β in (zero(T), T(0.5))
+        mmax = P._rows_dot_max(T)
+        @test mmax >= 2
+        n = 301
+        for m in 2:mmax
+            k = P._rows_dot_kmin(T, m) + 5
+            A = tA == 'N' ? randn(T, m, k) : randn(T, k, m)
+            B = randn(T, k, n); C0 = randn(T, m, n); α = T(1.3)
+            C = copy(C0); P.gemm!(C, A, B; alpha = α, beta = β, transA = tA)
+            ref = α * (tA == 'N' ? A : A') * B + β * C0
+            @test C ≈ ref rtol = 100 * eps(T) * k
+            # Columns in two halves, and each row on its own, give the same bits.
+            h = n ÷ 2
+            Cl = copy(C0[:, 1:h]); Cr = copy(C0[:, (h + 1):n])
+            P.gemm!(Cl, A, B[:, 1:h]; alpha = α, beta = β, transA = tA)
+            P.gemm!(Cr, A, B[:, (h + 1):n]; alpha = α, beta = β, transA = tA)
+            @test C == hcat(Cl, Cr)
+            if m > 2
+                A2 = tA == 'N' ? A[1:2, :] : A[:, 1:2]
+                C2 = copy(C0[1:2, :]); P.gemm!(C2, A2, B; alpha = α, beta = β, transA = tA)
+                @test C2 == C[1:2, :]
+            end
+        end
+    end
+    # alpha == 0 does not read A or B.
+    A = fill(NaN, 2, 64); B = fill(NaN, 64, 9); C = ones(2, 9)
+    P.gemm!(C, A, B; alpha = 0.0, beta = 2.0)
+    @test C == fill(2.0, 2, 9)
+end
+
+# A one-vector tile with beta != 0 loads every C column before storing any, so a C whose leading
+# dimension is below the vector width has the same bits as one padded to a wider leading dimension.
+@testitem "GEMM few-row tail with beta != 0 is independent of ldc" setup = [GemmOracle] begin
+    using PureBLAS
+    const P = PureBLAS
+    for m in (2, 3), k in (1, 7, 40)
+        A = randn(m, k); B = randn(553, k); C0 = randn(m, 553)
+        Cpad = zeros(8, 553); Cpad[1:m, :] = C0
+        C = copy(C0); P.gemm!(C, A, B; alpha = 0.7, beta = 1.3, transB = 'T')
+        Cv = view(Cpad, 1:m, :); P.gemm!(Cv, A, B; alpha = 0.7, beta = 1.3, transB = 'T')
+        @test C == Cv
+    end
+end
+
 @testitem "GEMM beta=0 ignores NaN in C (BLAS semantics)" setup = [GemmOracle] begin
     using PureBLAS
     A = randn(64, 48); B = randn(48, 32)
