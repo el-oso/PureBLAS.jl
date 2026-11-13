@@ -71,6 +71,11 @@ end
     unsafe_store!(v.ptr, convert(T, x), i)
     return x
 end
+@noinline function _seg_check(a::PtrVector, off::Integer, len::Integer)
+    len <= 0 && return nothing                                   # empty segment: nothing dereferenced
+    (off >= 0 && off + len <= a.n) || throw(BoundsError(a, (off + 1):(off + len)))
+    return nothing
+end
 @inline Base.pointer(v::PtrVector) = v.ptr
 @inline Base.pointer(v::PtrVector{T}, k::Integer) where {T} = v.ptr + (k - 1) * sizeof(T)
 @inline Base.strides(v::PtrVector) = (1,)
