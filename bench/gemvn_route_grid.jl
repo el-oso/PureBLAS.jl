@@ -33,7 +33,7 @@ arm!(a) = a === :rb ? (setrb(typemax(Int)); P._GEMVN_MINNER_REF[] = MINNER0) :
         P.gemv!(y, A, x; alpha = 1.0, beta = 0.0)
     end; y[1]
 )
-println("# minner_default=$MINNER0 rb_default=$(P._GEMVN_RB) L1=$(P._L1_BYTES) L2=$(P._L2_BYTES) L3=$(P._L3_BYTES) W=$(P._vwidth(Float64)) nvreg=$(P._NVREG)")
+println("# minner_default=$MINNER0 rb_default=$(P._gemvn_rb()) L1=$(P._L1_BYTES) L2=$(P._L2_BYTES) L3=$(P._L3_BYTES) W=$(P._vwidth(Float64)) nvreg=$(P._NVREG)")
 println(join(vcat(["m", "n", "lda"], string.(ARMS), ["bits", "route"]), '\t'))
 # LDAS (optional, same length as MS) gives each m its own lda; otherwise PAD applies.
 const LDAS = haskey(ENV, "LDAS") ? parse_list(ENV["LDAS"]) : [PAD >= 0 ? m + PAD : cld(m, -PAD) * (-PAD) for m in MS]

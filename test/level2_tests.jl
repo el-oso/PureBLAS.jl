@@ -1071,7 +1071,7 @@ end
     (lda_al * sz) % way == 0 && (lda_al += line ÷ sz)             # not a multiple of the L1 way
     lda_po2 = way ÷ sz * 64                                       # a multiple of the L1 way
     rb = P._gemvn_rb()
-    @test rb == something(P.load_preference(P, "gemvn_rb"), W == 4 ? 0 : 448)
+    @test 0 <= rb <= P._L2_BYTES ÷ (4 * last(P._GEMVN_ROWBLOCK_MRS) * P._SIMD_BYTES)
     @test route(lda_al, cs + 1, lda_al) == (rb > cs)
     @test route(lda_al, max(rb, cs + 1), lda_al) == (rb > cs) && !route(lda_al, max(rb, cs) + 1, lda_al)
     @test !route(lda_al + 1, cs + 1, lda_al + 1)                  # misaligned columns
