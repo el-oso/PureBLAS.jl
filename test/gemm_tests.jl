@@ -167,8 +167,12 @@ end
     nbad = Ref(0)
     for T in (Float32, Float64), tA in ('N', 'T'), tB in ('N', 'T'), m in 2:(P._GEMM_MR1_MAX + 1),
             k in (1, 2, 3, 8, 50, 100), n in (5, 9, 17, 33, 70), β in (zero(T), T(0.7))
-        # The dot-product route sums along k in its own order; it has its own item above.
+        # The dot-product route, alone or as the tail of a split, sums along k in its own order; it
+        # has its own items.
         tB == 'N' && m <= P._rows_dot_max(T) && k >= P._rows_dot_kmin(T, m) && continue
+        r = m % P._vwidth(T)
+        tB == 'N' && tA == 'N' && m > P._vwidth(T) && r > 0 && P._rows_dot_tail_ok(T, r) &&
+            k >= P._rows_dot_kmin(T, r) && continue
         A = tA == 'N' ? randn(T, m, k) : randn(T, k, m)
         B = tB == 'N' ? randn(T, k, n) : randn(T, n, k)
         C0 = randn(T, m, n); α = T(1.3)
@@ -191,6 +195,40 @@ end
         P.gemm!(C, A, B; alpha = 0.0, beta = 2.0, transB = tB)
         @test C == fill(2.0, 3, 9)
     end
+end
+
+# A C of W·q + r rows (r < W, up to `_GEMM_MR1_MAX`) runs its q full vectors through the unpacked kernel
+# and its r rows through the dot-product kernel (B not transposed) or the n-vectorized kernel (B
+# transposed), over blocks of columns. The top rows match the serial core bit for bit, and every
+# element is one chain whose order depends on k alone, so columns computed in two calls match one call.
+@testitem "GEMM few-row split: full vectors plus a tail" setup = [GemmOracle] begin
+    using PureBLAS
+    const P = PureBLAS
+    W = P._vwidth(Float64)
+    m = W + 1; k = 100; n = 70
+    @test P._gemm_rows_split!(zeros(m, n), randn(m, k), randn(k, n), 1.0, 0.0, false, false, m, n, k, 1)
+    @test P._gemm_rows_split!(zeros(m, n), randn(m, k), randn(n, k), 1.0, 0.0, false, true, m, n, k, 1)
+    nbad = Ref(0)
+    for T in (Float32, Float64), tB in ('N', 'T'), m in (P._vwidth(T) + 1):P._GEMM_MR1_MAX,
+            k in (2, 8, 33, 100), n in (5, 40, 300), β in (zero(T), T(0.7))
+        W = P._vwidth(T); r = m % W; q = m - r
+        A = randn(T, m, k); B = tB == 'N' ? randn(T, k, n) : randn(T, n, k)
+        C0 = randn(T, m, n); α = T(1.3)
+        C = copy(C0); P.gemm!(C, A, B; alpha = α, beta = β, transB = tB)
+        nbad[] += !(C ≈ α * A * (tB == 'N' ? B : B') + β * C0)
+        Cc = copy(C0); P._gemm_core!(Cc, A, B, α, β, false, tB != 'N', false, false, P._RT_NONE, P._STR_FLOOR, 1)
+        nbad[] += C[1:q, :] != Cc[1:q, :]
+        if tB == 'T' || r == 0
+            nbad[] += C != Cc
+        else
+            # Columns in two halves give the same bits.
+            h = n ÷ 2
+            Cl = copy(C0[:, 1:h]); Cr = copy(C0[:, (h + 1):n])
+            P.gemm!(Cl, A, B[:, 1:h]; alpha = α, beta = β); P.gemm!(Cr, A, B[:, (h + 1):n]; alpha = α, beta = β)
+            nbad[] += C != hcat(Cl, Cr)
+        end
+    end
+    @test iszero(nbad[])
 end
 
 @testitem "GEMM beta=0 ignores NaN in C (BLAS semantics)" setup = [GemmOracle] begin
