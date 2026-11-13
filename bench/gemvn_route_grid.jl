@@ -46,7 +46,7 @@ for (m, lda) in zip(MS, LDAS), n in NS
     yref = A * x * 1.3
     maximum(abs, ys[1] .- yref) <= 1.0e-9 * (1 + maximum(abs, yref)) || error("wrong at $m $n")
     bits = all(==(reinterpret(UInt64, ys[1])), (reinterpret(UInt64, ys[2]), reinterpret(UInt64, ys[3])))
-    route = isdefined(P, :_gemvn_rowblock_route) ? (P._gemvn_rowblock_route(m, n, lda, Float64) ? "rb" : "pan") :
+    route = isdefined(P, :_gemvn_rowblock_route) ? (P._gemvn_rowblock_route(m, n, lda, UInt(pointer(A)), Float64) ? "rb" : "pan") :
         (n <= P._gemvn_rb() ? "rb" : "pan")
     acc = Dict(a => Float64[] for a in ARMS)
     for r in 1:ROUNDS, a in circshift(ARMS, r - 1)
