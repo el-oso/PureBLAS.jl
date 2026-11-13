@@ -188,3 +188,55 @@ end
         @test parse(Int, split(line)[2]) == _MT_KEEPAWAKE_GAP_NS - onset
     end
 end
+
+# Every real transpose combination at a size where `gemm!` asks `_strassen_owns` whether to column-
+# split, at 2 and 4 workers, bitwise against one worker. The predicate and `_gemm_core!`'s recursion
+# arm must agree: a call the predicate claims but the core runs classically reaches the cooperative
+# A-pack barrier as a lone "worker 1 of nw" and spins there forever, ignoring SIGTERM. So the case runs
+# in a child process with a hard SIGKILL deadline, and a hang fails this item instead of the suite.
+@testitem "threaded gemm: every transpose pair finishes, bitwise equal to serial" begin
+    script = """
+    using PureBLAS, Random
+    for T in (Float32, Float64), ta in ('N', 'T', 'C'), tb in ('N', 'T', 'C')
+        rng = MersenneTwister(7)
+        n = 2048
+        A = randn(rng, T, n, n); B = randn(rng, T, n, n)
+        PureBLAS.set_num_threads(1)
+        C1 = PureBLAS.gemm!(zeros(T, n, n), A, B; transA = ta, transB = tb)
+        for nt in (2, 4)
+            PureBLAS.set_num_threads(nt) == nt || error("asked for \$nt workers")
+            C = PureBLAS.gemm!(zeros(T, n, n), A, B; transA = ta, transB = tb)
+            println("CASE ", T, " ", ta, tb, " ", nt, " ", C == C1); flush(stdout)
+        end
+    end
+    println("DONE")
+    """
+    env = copy(ENV)
+    env["PUREBLAS_MT_ALL_THREADS"] = "1"     # four workers even on a host with fewer cores
+    proc = open(pipeline(setenv(`$(Base.julia_cmd()) -t 4 --project=$(Base.active_project()) -e $script`, env); stderr = devnull))
+    lines = String[]
+    lastline = Ref(time())
+    reader = @async for l in eachline(proc)
+        push!(lines, l)
+        lastline[] = time()
+    end
+    # The deadline is per case: a hang stops the output, while a slow runner keeps printing cases.
+    finished = true
+    while !process_exited(proc)
+        sleep(1)
+        if time() - lastline[] > 300
+            finished = false
+            kill(proc, Base.SIGKILL)
+            break
+        end
+    end
+    wait(proc)
+    wait(reader)
+    cases = [l for l in lines if startswith(l, "CASE ")]
+    finished || @info "threaded gemm child killed at the deadline" last_case = isempty(cases) ? "none" : last(cases)
+    @test finished
+    @test success(proc)
+    @test "DONE" in lines
+    @test length(cases) == 2 * 9 * 2
+    @test all(endswith(" true"), cases)
+end
