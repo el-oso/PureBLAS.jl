@@ -116,24 +116,28 @@ end
         @info "pinned children" one_per_core siblings
         # k CPUs lie on at least cld(k, threads per core) cores, the formula's count, and at most k.
         tpc = max(1, Sys.CPU_THREADS ÷ Int(P.num_cores()))
-        for cpus in (one_per_core, siblings)
-            nw, measured = child(cpus)
+        results = Dict(cpus => child(cpus) for cpus in (one_per_core, siblings))
+        for (cpus, (nw, measured)) in results
             @test cld(length(cpus), tpc) <= nw <= length(cpus)
             @test cld(length(cpus), tpc) <= measured <= length(cpus)
-            cpus === siblings || continue
-            if measured < length(siblings)
-                # The measurement saw cores shared, which confirms the sibling lists: both siblings
-                # of each core collapse to that core.
-                @test nw == nc
-                @test measured == nc
-            else
-                # A virtual machine's sibling lists need not match how the host schedules its vCPUs.
-                println(
-                    "core cap: siblings $siblings measured as $measured cores, no contention between ",
-                    "the listed siblings, so the sibling lists are not confirmed; collapse not checked"
-                )
-                @test_skip measured == nc
-            end
+        end
+        nw1, _ = results[one_per_core]
+        nw2, measured2 = results[siblings]
+        if measured2 < length(siblings)
+            # The measurement saw cores shared, which confirms the sibling lists: both siblings of
+            # each core collapse to that core, and one CPU per core keeps every core, where the
+            # formula gives half of them.
+            @test nw2 == nc
+            @test measured2 == nc
+            @test nw1 == nc
+        else
+            # A virtual machine's sibling lists need not match how the host schedules its vCPUs.
+            println(
+                "core cap: siblings $siblings measured as $measured2 cores, no contention between ",
+                "the listed siblings, so the sibling lists are not confirmed; collapse not checked"
+            )
+            @test_skip measured2 == nc
+            @test_skip nw1 == nc
         end
     end
 end
