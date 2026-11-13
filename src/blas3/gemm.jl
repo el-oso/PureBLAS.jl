@@ -5110,9 +5110,9 @@ end
     Ab = PtrMatrix{T}(p.Cp + i0 * sz, len, p.n, p.ldc)
     yb = p.Bp + i0 * sz
     if p.up
-        _gemv_n_simd!(len, p.n, p.alpha, Ab, p.Ap, yb, p.beta, Val(true), p.m)
+        _gemv_n_simd!(len, p.n, p.alpha, Ab, p.Ap, yb, p.beta, Val(true), p.m, UInt(p.Cp))
     else
-        _gemv_n_simd!(len, p.n, p.alpha, Ab, p.Ap, yb, p.beta, Val(false), p.m)
+        _gemv_n_simd!(len, p.n, p.alpha, Ab, p.Ap, yb, p.beta, Val(false), p.m, UInt(p.Cp))
     end
     return nothing
 end
@@ -6433,8 +6433,8 @@ end
             # `C` is the matrix for this kind, hence its appearance in the operand position, and `up`
             # is `B0`, read here from the argument rather than the pool because nothing was published.
             up ?
-                _gemv_n_simd!(C.m, C.n, alpha, C, A.ptr, B.ptr, beta, Val(true), C.m) :
-                _gemv_n_simd!(C.m, C.n, alpha, C, A.ptr, B.ptr, beta, Val(false), C.m)
+                _gemv_n_simd!(C.m, C.n, alpha, C, A.ptr, B.ptr, beta, Val(true), C.m, UInt(C.ptr)) :
+                _gemv_n_simd!(C.m, C.n, alpha, C, A.ptr, B.ptr, beta, Val(false), C.m, UInt(C.ptr))
         elseif kind == _MT_KIND_GEMVT
             # As above, transposed: the loser's own column count IS the route width, and `blk` comes
             # from it for the same reason the chunks take theirs from `p.n`.
