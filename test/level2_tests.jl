@@ -1065,17 +1065,18 @@ end
     @test route(last(P._GEMVN_ROWBLOCK_MRS) * W, 4096)
     # (c) n within the panel route's width
     @test route(big, cs) && !route(big + 1, cs + 1, big + 1)
-    # (d) aligned, non-aliased columns up to the cap, double-pumped parts only
+    # (d) line-aligned columns up to the cap, half the cap when the stride aliases the L1 way,
+    # double-pumped parts only
+    dp = P._double_pumped(P._HW)
     lda_al = cld(big, line ÷ sz) * (line ÷ sz) + line ÷ sz       # line-aligned
     (lda_al * sz) % way == 0 && (lda_al += line ÷ sz)             # not a multiple of the L1 way
-    n_mid = cs + 1
-    @test route(lda_al, n_mid, lda_al) == P._double_pumped(P._HW)
-    @test !route(lda_al + 1, n_mid, lda_al + 1)                   # misaligned columns
-    @test !route(way ÷ sz * 4, n_mid, way ÷ sz * 4)               # stride aliases the L1 way
-    @test !route(lda_al, P._gemvn_rb() + 1, lda_al)               # past the cap
-    if isnothing(P.load_preference(P, "gemvn_rb"))
-        @test P._GEMVN_RB == P._L2_BYTES ÷ (4 * last(P._GEMVN_ROWBLOCK_MRS) * P._SIMD_BYTES)
-    end
+    lda_po2 = way ÷ sz * 64                                       # a multiple of the L1 way
+    rb = P._gemvn_rb()
+    @test route(lda_al, cs + 1, lda_al) == dp
+    @test route(lda_al, rb, lda_al) == dp && !route(lda_al, rb + 1, lda_al)
+    @test !route(lda_al + 1, cs + 1, lda_al + 1)                  # misaligned columns
+    @test !any(n -> route(553, n), 64:448)                        # 553·8 bytes is not a line multiple
+    @test route(lda_po2, rb ÷ 2, lda_po2) == dp && !route(lda_po2, rb ÷ 2 + 1, lda_po2)
 
     # Both routes, forced, over shapes on each side of every clause; padded and misaligned lda.
     bitsame(X, Y) = all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X, Y))
