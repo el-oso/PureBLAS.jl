@@ -296,8 +296,40 @@ const _GEMVN_MINNER_MAXA = @load_preference("gemvn_minner_maxa", 4 * _L3_BYTES):
 # Cap on (d). On Zen4 the aligned, non-aliased crossover sits at n≈384-448 (row-block / panel at
 # n=448: 0.99-1.06 over the seven strides where `_gemvn_rowblock_mr` picks MR ≥ 4; 1.07-1.22 where it
 # picks MR=2, a height-law cost). See (d) above for why this is not derivable.
-# PDM: Measured — Zen4 and Zen5-mobile share every detected const and want 448 vs 0; default = the n-only cut's W=8 value, 0 at W=4. | tune: none — orphaned; candidates (0, 112, 224, 448)
-const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 0 : 448)::Int   # req8-ok: Measure-tier default, see (d)
+# PDM: Measured — Zen4 and Zen5-mobile share every detected const and want 448 vs 0; on-host duel over a doubling ladder bounded by the quarter-L2 footprint. | tune: on first use
+const _GEMVN_RB_PREF = @load_preference("gemvn_rb", nothing)
+# ON-HOST, ONCE PER PROCESS, on the first gemv-N call that reaches (d). Duels the two routes at a
+# line-aligned stride that is not a multiple of the L1 way (lda·sz = 1.5 L1 ways) over the column
+# counts 2·cs, 4·cs, … up to the quarter-L2 pass footprint `_L2_BYTES ÷ (4·MRmax·_SIMD_BYTES)`, where cs
+# is rule (c)'s width, and returns the largest count at which the row-block wins every rung up to it
+# (`_tune_duel` supermajority, 2% regret floor); 0 when it loses the first. `@static`-gated on the
+# preference so a pinned build, and therefore the trim build, never compiles the measurement.
+@static if isnothing(_GEMVN_RB_PREF)
+    const _GEMVN_RB_ONCE = Base.OncePerProcess{Int}(() -> _measure_gemvn_rb())
+    @inline _gemvn_rb_value() = _GEMVN_RB_ONCE()
+else
+    @inline _gemvn_rb_value() = _GEMVN_RB_PREF::Int
+end
+@noinline function _measure_gemvn_rb()
+    T = Float64; sz = sizeof(T)
+    cs = _gemvn_minner() ? 2 * _GEMVN_NP_WIDE : _GEMV_NP
+    nmax = _L2_BYTES ÷ (4 * last(_GEMVN_ROWBLOCK_MRS) * _SIMD_BYTES)
+    m = 3 * _L1_WAY_BYTES ÷ (2 * sz)
+    ((m * sz) % _CACHELINE == 0 && 2 * cs <= nmax) || return 0
+    A = fill(T(0.5), m, nmax); x = fill(T(0.25), nmax); y = zeros(T, m)
+    UInt(pointer(A)) % _CACHELINE == 0 || return 0
+    cap = 0
+    n = 2 * cs
+    while n <= nmax
+        Av = view(A, :, 1:n); xv = view(x, 1:n)
+        pan = () -> _gemv_n_panroute!(m, n, one(T), Av, xv, y, zero(T), Val(true), m)
+        rb = () -> _gemv_n_rbroute!(m, n, one(T), Av, xv, y, zero(T), Val(true))
+        _tune_wins_it(_tune_duel(pan, rb)) || break
+        cap = n
+        n *= 2
+    end
+    return cap
+end
 @inline function _gemvn_rowblock_route(m::Int, n::Int, lda::Int, abase::UInt, ::Type{T}) where {T}
     f = _FKR_gemvn_rb[]
     f >= 0 && return n <= f                      # forced: the plain n cut, for A/B probes
@@ -315,7 +347,7 @@ end
 # while OpenBLAS's cold bandwidth is flat there, and n=1024 passing at 1.02 is the one size the po2
 # ladder happened to sample. These two knobs shape that regime and could not be A/B'd as load-time
 # consts. See kb `pureblas-zen5-gemvn-cold-band`.
-@inline _gemvn_rb() = (f = _FKR_gemvn_rb[]; f >= 0 ? f : _GEMVN_RB)
+@inline _gemvn_rb() = (f = _FKR_gemvn_rb[]; f >= 0 ? f : _gemvn_rb_value())
 @inline _gemvn_mb() = (f = _FKR_gemvn_mb[]; f >= 0 ? f : _GEMVN_MB)
 #                                unmasked full-block kernel, dominates per-column at every n ≥ 512,
 #                                incl. the n=512 power-of-2 / just-over-L2 case → 0.96×).
@@ -701,7 +733,14 @@ end
 @inline function _gemv_n_simd!(
         m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}, mroute::Int, abase::UInt
     ) where {T <: BlasReal, B0}
-    if _gemvn_rowblock_route(mroute, n, stride(A, 2), abase, T)
+    return _gemvn_rowblock_route(mroute, n, stride(A, 2), abase, T) ?
+        _gemv_n_rbroute!(m, n, α, A, x, y, β, Val(B0)) :
+        _gemv_n_panroute!(m, n, α, A, x, y, β, Val(B0), mroute)
+end
+
+# The two routes as callables, so `_measure_gemvn_rb` duels exactly what the dispatcher runs.
+@inline function _gemv_n_rbroute!(m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}) where {T <: BlasReal, B0}
+    begin
         # Per-call row-block height, always derived (see `_gemvn_rowblock_mr`). The branch runs once
         # per gemv! call against a driver that then loops over m — not in any inner loop.
         #
@@ -721,10 +760,17 @@ end
         else
             _gemv_n_rowblock!(m, n, α, A, x, y, β, Val(B0), Val(2))
         end
+    end
+    return y
+end
+
+@inline function _gemv_n_panroute!(
+        m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}, mroute::Int
+    ) where {T <: BlasReal, B0}
     # `mroute`, NOT `m`: this predicate selects between two drivers whose n-chunking differs — minner
     # uses `_gemvn_minner_np` columns per panel, the old path a flat `_GEMV_NP` — so a row band that
     # flipped it would accumulate `y[i]` in a different order. req#11, not tuning.
-    elseif _gemvn_minner() && mroute * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
+    if _gemvn_minner() && mroute * n * sizeof(T) <= _GEMVN_MINNER_MAXA   # mid-n/L3 regime; large-n DRAM → old path (already gates)
         _gemv_n_paneldrv_minner!(m, n, α, A, x, y, β, Val(B0), mroute)
     else
         _gemv_n_paneldrv!(m, n, α, A, x, y, β, Val(B0))
