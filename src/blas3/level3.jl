@@ -3722,7 +3722,7 @@ end
 #               only the rows the column block can reach). The surviving tiles are the same either
 #               way, so this arm changes work done and not results — it prices the discarded copying,
 #               which is nearly free on one thread and 7-19% of runtime on six.
-#   _EXPINT[16] pool KEEP-AWAKE window override, in microseconds (0 = `_MT_KEEPAWAKE_NS`, negative =
+#   _EXPINT[16] pool KEEP-AWAKE window override, in microseconds (0 = the host's window, negative =
 #               none): how long an idle worker keeps its core busy before it sleeps. See `_mt_keepawake_ns`.
 #
 # ⚠ EVERY CONSUMER READS THIS `@inbounds`. Adding a reader at index k WITHOUT growing this array is an
