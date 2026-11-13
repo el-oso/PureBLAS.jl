@@ -845,13 +845,14 @@
     # The pool's work floor (flops) once every thread is in it, or `nothing` with one thread.
     function mt_floor()
         Threads.nthreads() > 1 || return nothing
-        old = PureBLAS.get_num_threads()
+        old = PureBLAS.get_num_threads(); oldfloor = PureBLAS._MT_FLOOR[]
         try
             PureBLAS.set_num_threads(Threads.nthreads())
             f = PureBLAS._MT_FLOOR[]
             return f == typemax(Int) ? nothing : f
         finally
             PureBLAS.set_num_threads(old)
+            PureBLAS._MT_FLOOR[] = oldfloor     # raising the thread count sets the floor; leave it as found
         end
     end
     mt_side(flops, deg) = ceil(Int, (flops / deg)^(1 / 3)) + 1        # n with deg·n³ ≥ flops
@@ -1069,7 +1070,7 @@
         for name in sort!([k for (k, (l, _)) in BUILDERS if l == level])
             cases = BUILDERS[name][2](Xoshiro(hash(name)))
             for nt in nts
-                old = PureBLAS.get_num_threads()
+                old = PureBLAS.get_num_threads(); oldfloor = PureBLAS._MT_FLOOR[]
                 PureBLAS.set_num_threads(nt)
                 try
                     @testset "$name, $(length(cases)) cases, $nt thread(s)" begin
@@ -1077,6 +1078,7 @@
                     end
                 finally
                     PureBLAS.set_num_threads(old)
+                    PureBLAS._MT_FLOOR[] = oldfloor     # items that run later see the floor they would without this one
                 end
             end
         end
