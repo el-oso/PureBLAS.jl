@@ -5358,12 +5358,21 @@ end
 # covers gaps up to about W + 2 ms. 10 ms covers the serial panel phases a blocked factorization runs
 # between threaded trailing updates. Back-to-back calls are unchanged at every window, so arriving work
 # is not delayed, and after the window the worker sleeps and an idle process costs its host nothing.
-# PDM: Measured — the window sweep above: flat from 3 ms on both kernels, 10 ms covers the panel gaps.
-const _MT_KEEPAWAKE_NS = 10_000_000   # req8-ok: politeness window measured in the sweep above, not a perf tuning
+#
+# WHEN THE CORE SLEEPS IS A PROPERTY OF THE HOST — its idle states and the OS governor choosing them —
+# and nothing PureBLAS detects predicts it. So `deps/build.jl`, which Pkg runs after installing or
+# updating the package, measures the onset once per machine, and the window is the gap the Zen3 window
+# covers minus that onset (`_mt_keepawake_window`, keepawake.jl). It is read when the pool is created;
+# an unmeasured host, or a store written on other hardware, keeps `_MT_KEEPAWAKE_NS`. The read sits
+# in `set_num_threads`, which no `@ccallable` reaches, so a trimmed library never compiles it and
+# keeps the default.
+#
+# The window in force, ns. Set once when the pool is created, before any worker reads it.
+const _MT_KEEPAWAKE_HOST = Threads.Atomic{Int}(_MT_KEEPAWAKE_NS)
 
 @inline function _mt_keepawake_ns()
     o = @inbounds _EXPINT[16]
-    return o > 0 ? o * 1000 : (o < 0 ? 0 : _MT_KEEPAWAKE_NS)
+    return o > 0 ? o * 1000 : (o < 0 ? 0 : _MT_KEEPAWAKE_HOST[])
 end
 
 @noinline _throw_gemm_worker() = error("PureBLAS: a threaded gemm worker failed; C is undefined")
@@ -6179,6 +6188,8 @@ function set_num_threads(n::Integer)
     nt = clamp(Int(n), 1, min(Threads.nthreads(), _MT_NW_MASK))
     if nt > 1
         @lock _MT_SETUP_LOCK begin
+            isempty(_GEMM_POOL_F64) &&
+                (_MT_KEEPAWAKE_HOST[] = _mt_keepawake_read(_mt_keepawake_file(), _mt_host_fingerprint()))
             deadline = time_ns() + UInt64(_MT_MEASURE_NS)
             capped && _MT_PINNED_CORES[] < 0 && _mt_pinned_cores!(deadline)
             capped && (nt = min(nt, _mt_core_cap()))
@@ -6981,34 +6992,6 @@ end
     return nothing
 end
 
-# A gemm with one row or one column of C is a gemv: every element of C is one dot product over k, and
-# the gemm route packs all of op(B) (or op(A)) to compute it. Measured on Zen4, one thread, through
-# `activate()`: 1x553x988 ran 528 us against OpenBLAS's 57 us, which forwards these shapes to gemv.
-# Real types only, where 'C' is 'T'; a complex conjugate without a transpose has no gemv form. Only
-# unit-stride vectors of C's own element type, the case `_gemv!` takes its SIMD kernels for. The
-# choice reads the shape and nothing else, so it is the same at every thread count, and `_gemv!` is
-# reproducible across thread counts on its own.
-# Returns whether it computed C.
-@inline function _gemm_as_gemv!(C, A, B, α::T, β::T, tA::Bool, tB::Bool, m::Int, n::Int, k::Int) where {T}
-    T <: BlasReal && k > 0 && (isone(m) || isone(n)) && eltype(A) === T && eltype(B) === T &&
-        _strided1(A) && _strided1(B) || return false
-    Cp = _pm(C); Ap = _pm(A); Bp = _pm(B)
-    if isone(m)
-        # Cᵀ = op(B)ᵀ·x with x the one row of op(A).
-        incx = tA ? 1 : Ap.ld
-        isone(incx) && (isone(n) || isone(Cp.ld)) || return false
-        rA = _root(A); rB = _root(B); rC = _root(C)
-        GC.@preserve rA rB rC _gemv!(!tB, false, size(Bp, 1), size(Bp, 2), α, Bp, Ap.ptr, 1, β, Cp.ptr, 1)
-    else
-        # C = op(A)·x with x the one column of op(B).
-        incx = tB ? Bp.ld : 1
-        isone(incx) || return false
-        rA = _root(A); rB = _root(B); rC = _root(C)
-        GC.@preserve rA rB rC _gemv!(tA, false, size(Ap, 1), size(Ap, 2), α, Ap, Bp.ptr, 1, β, Cp.ptr, 1)
-    end
-    return true
-end
-
 # `gemm!`'s route for a strided operand of a BLAS element type, shared with the `?gemm_64_` C-ABI entries
 # so that `A * B` after `activate()` runs the same algorithm as the native call: the column split when
 # `nw > 1` and neither Strassen nor SME owns the shape, else the serial core, whose Strassen recursion
@@ -7016,7 +6999,6 @@ end
 @inline function _gemm_strided!(
         C, A, B, α::T, β::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, m::Int, n::Int, k::Int, nw::Int
     ) where {T}
-    _gemm_as_gemv!(C, A, B, α, β, tA, tB, m, n, k) && return C
     if nw > 1 && !_strassen_owns(T, m, n, k, tA, A, B, _STR_FLOOR) && !_sme_owns(T, m, n, k, tA, tB, cA, cB, C, A, B)
         rA = _root(A); rB = _root(B); rC = _root(C)
         GC.@preserve rA rB rC _gemm_threaded!(_pm(C), _pm(A), _pm(B), α, β, tA, tB, cA, cB, nw)

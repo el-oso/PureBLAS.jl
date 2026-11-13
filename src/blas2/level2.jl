@@ -604,22 +604,15 @@ end
 # anything else in blas2/level2.jl forks a task." Putting the pool in the paneldrv would make those
 # per-thread owners reachable across a fork and silently invalidate all four. The cost is that
 # trmv/trsv do NOT inherit gemv-N's threading; that is the trade, and it is deliberate.
-#
-# `b0` IS A `Bool`, NOT A `Val`. Through the pool's job dispatch, a gemm can reach `_gemv!` and so
-# this method again while it is already on the inference stack, and inference then widens the
-# repeated call's argument types: a `Val{true}` becomes `Val`, and the call below dispatches at run
-# time (the dual `gemm!` strict contract in test/dual_tests.jl catches it). A widened `Bool` is
-# still a `Bool`.
-@inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, b0::Bool) where {T <: BlasReal}
+@inline function _gemv_n_simd!(m::Int, n::Int, α::T, A, x, y, β::T, b0::Val{B0}) where {T <: BlasReal, B0}
     nw = _gemvn_workers(m, n, T)
     if nw > 1
         GC.@preserve A x y _gemvn_threaded!(
-            m, n, α, pointer(A), stride(A, 2), _ptr(x), _ptr(y), β, b0, nw
+            m, n, α, pointer(A), stride(A, 2), _ptr(x), _ptr(y), β, B0, nw
         )
         return y
     end
-    return b0 ? _gemv_n_simd!(m, n, α, A, x, y, β, Val(true), m) :
-        _gemv_n_simd!(m, n, α, A, x, y, β, Val(false), m)
+    return _gemv_n_simd!(m, n, α, A, x, y, β, b0, m)
 end
 
 @inline function _gemv_n_simd!(
@@ -2067,7 +2060,8 @@ function _gemv!(
         end
         if _l2_simd_ok(A, x, y, incx, incy)   # column-panel kernel handles all n; β folded in
             αT = convert(eltype(A), α); βT = convert(eltype(A), β)
-            return _gemv_n_simd!(Int(m), Int(n), αT, A, x, y, βT, iszero(β))
+            return iszero(β) ? _gemv_n_simd!(Int(m), Int(n), αT, A, x, y, βT, Val(true)) :
+                _gemv_n_simd!(Int(m), Int(n), αT, A, x, y, βT, Val(false))
         end
         if _l2c_ok(A, x, y, incx, incy)       # complex N → OB-structure ri kernel (column-streaming; measured
             αc = convert(eltype(A), α); βc = convert(eltype(A), β)   # ≥ the row-tile at every n on BOTH AVX2 and
