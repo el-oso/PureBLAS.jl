@@ -251,7 +251,9 @@ const _GEMVN_MINNER_MAXA = @load_preference("gemvn_minner_maxa", 4 * _L3_BYTES):
 #       row-block reads A as one contiguous stream with no y traffic.
 #   (c) `n` is at most the panel route's own width — `2·_GEMVN_NP_WIDE` for m-inner, whose column
 #       remainder runs as single-column panels that each re-stream y, and `_GEMV_NP` for the old panel
-#       driver, which below one panel IS a row-block that keeps y in memory instead of registers.
+#       driver, which below one panel IS a row-block that keeps y in memory instead of registers — and
+#       the stride is not a multiple of the L1 way (Zen3 1024/2048/4096 at n=16: row-block 1.07-1.20x
+#       the panel's time; Zen4 keeps the row-block there through (d)).
 #   (d) every column starts on a cache line — the base address AND the stride — up to `_gemvn_rb()`
 #       columns, or a quarter of that when the column stride is a multiple of the L1 way.
 #
@@ -282,16 +284,17 @@ const _GEMVN_MINNER_MAXA = @load_preference("gemvn_minner_maxa", 4 * _L3_BYTES):
 # every aligned n past (c) on Zen3.
 #
 # FLEET, every (m, n) cell of `bench/gemvn_route_grid.jl` (m 64..4096, n 8..4096, lda = m plus padded
-# and po2-adjacent lda; 432 cells per µarch, hot operand, 1 thread, frequency-locked). The route each
-# rule picks is timed in the same run, so before and after are paired. "Below OB" counts cells slower
-# than OpenBLAS at two significant digits; "oracle" is the count if the faster route were always
-# taken, i.e. the misses routing cannot fix:
-#                   below OB         oracle   cells faster / slower by >3%
+# and po2-adjacent lda; 432 cells per µarch, hot operand, 1 thread, frequency-locked). "Below OB" counts
+# cells slower than OpenBLAS at two significant digits; "oracle" is the count if the faster of the two
+# routes were always taken, i.e. the misses routing cannot fix. Both routes and OpenBLAS are timed in
+# one run; the n-only column is from the same grid run under the n-only cut and the earlier height law:
+#                   below OB          oracle
 #                 n-only   this
-#   Zen4            108      TBD4
-#   Zen3            102      TBD3
-#   Zen5-mobile     263      TBD5
-# TBDSLOW
+#   Zen4            108      27          19
+#   Zen3            102      38          34
+#   Zen5-mobile     263     223         140     (154 with a cap of 0)
+# Where the route is still the slower one on Zen4: m=lda=1420 (a stride half a line off) at n=33-160
+# and m=553 at n=33-48, where the row-block is 6-19% faster; on Zen5-mobile the cap (see below).
 #
 # Cap on (d). On Zen4 the aligned, non-aliased crossover sits at n≈384-448 (row-block / panel at
 # n=448: 0.99-1.06 over the seven strides where `_gemvn_rowblock_mr` picks MR ≥ 4; 1.07-1.22 where it
@@ -304,10 +307,11 @@ const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 0 : 448):
     sz = sizeof(T)
     m * n * sz <= _L1_BYTES && return true                                   # (a)
     m <= last(_GEMVN_ROWBLOCK_MRS) * _vwidth(T) && return true               # (b)
-    n <= (_gemvn_minner() ? 2 * _GEMVN_NP_WIDE : _GEMV_NP) && return true   # (c)
+    aliased = (lda * sz) % _L1_WAY_BYTES == 0
+    !aliased && n <= (_gemvn_minner() ? 2 * _GEMVN_NP_WIDE : _GEMV_NP) && return true   # (c)
     # (d): every column start `abase + j·lda·sz` on a line, i.e. the base AND the stride
     (abase % _CACHELINE == 0 && (lda * sz) % _CACHELINE == 0) || return false
-    return n <= ((lda * sz) % _L1_WAY_BYTES == 0 ? _gemvn_rb() ÷ 4 : _gemvn_rb())
+    return n <= (aliased ? _gemvn_rb() ÷ 4 : _gemvn_rb())
 end
 # Forceable accessors (the `_ger_np` shape: one const-resolved Ref load, folding to the const when
 # unforced — not a keyed lookup, so GKH-clean). Added 2026-08-27 to make the Zen5 COLD BAND testable:

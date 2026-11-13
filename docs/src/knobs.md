@@ -46,7 +46,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | `gemvn_minner_maxa` | formula | Derived | formula over detected consts: `4 * _L3_BYTES` | — |
 | `gemvn_np_narrow` | formula | Derived | formula over detected consts: `max(2, _L1D_ASSOC - 2` | — |
 | `gemvn_np_wide` | formula | Derived | formula over detected consts: register-capped `min(12, _NVREG - U - 1)` on a 32-register ISA, associativity-capped `_L1D_ASSOC` on 16 (the "wide" regime above) | — |
-| `gemvn_rb` | formula | Measured | Zen4 and Zen5-mobile share every detected const and want 448 vs 0; default = the n-only cut's W=8 value, 0 at W=4. | none — orphaned; candidates (0, 224, 448) |
+| `gemvn_rb` | formula | Measured | Zen4 and Zen5-mobile share every detected const and want 448 vs 0; default = the n-only cut's W=8 value, 0 at W=4. | none — orphaned; candidates (0, 112, 224, 448) |
 | `gemvt_deep` | delegates | Derived | NC=8 x U=4 gated on A <= L2 and the register budget; both detected consts. | n/a |
 | `gemvt_nc` | delegates | Literal | _ILP_TARGET predicts 8, every box measures 4; the derivation is falsified. | no, µarch-invariant |
 | `gemvt_percol_amin` | formula | Measured | window's lower edge; no formula places it (see gemvt_perscan). | candidate, cache-boundary set |
@@ -298,7 +298,7 @@ handle after it is what a person would sweep by hand meanwhile.
 
 | Knob | Hand-sweep handle |
 |---|---|
-| `gemvn_rb` | candidates (0, 224, 448) |
+| `gemvn_rb` | candidates (0, 112, 224, 448) |
 | `symv_sme_min` | sweep n |
 | `strassen_base` | the threaded-harness blocker is GONE (calibrate_gemm_mt_work runs threaded), but this knob needs a split-EFFICIENCY criterion and the measured curve has no knee, so there is nothing yet for a calibrator to decide on; candidates _NR*2^j over 128..2048 |
 | `sme_ger_groups` | candidates (1,2,4,8) |

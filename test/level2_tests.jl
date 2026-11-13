@@ -1064,8 +1064,9 @@ end
     @test route(P._L1_BYTES ÷ (sz * 64), 64)
     # (b) one row block spans the column
     @test route(last(P._GEMVN_ROWBLOCK_MRS) * W, 4096)
-    # (c) n within the panel route's width
-    @test route(big, cs) && !route(big + 1, cs + 1, big + 1)
+    # (c) n within the panel route's width, stride not a multiple of the L1 way (`big` is one)
+    @test route(big + 1, cs) && !route(big + 1, cs + 1, big + 1)
+    @test route(big, cs) == (P._gemvn_rb() ÷ 4 >= cs)
     # (d) line-aligned columns up to the cap, a quarter of it when the stride aliases the L1 way
     lda_al = cld(big, line ÷ sz) * (line ÷ sz) + line ÷ sz       # line-aligned
     (lda_al * sz) % way == 0 && (lda_al += line ÷ sz)             # not a multiple of the L1 way
