@@ -148,53 +148,51 @@ end
 end
 
 # STRIDED-VECTOR ROUTING. A gemv whose x or y is strided must reach the same unit-stride kernels as
-# the contiguous call (by packing the strided vector), natively and through `activate()`. Packing
-# costs O(m + n) against the O(m·n) product. Measured on Zen3 at this shape over 10 repeats of the
-# item: the packed route runs at 1.02-1.12x of contiguous, the scalar fallback at 2.76-3.13x (N,
-# strided y) and 7.2-8.0x (T). MAXRATIO sits near the geometric middle of 1.12 and 2.76. The N case
-# with only x strided is not a witness: its scalar fallback is a unit-stride column axpy and runs at
-# contiguous speed (0.95x), so no ratio separates the routes there. Same median-of-repeats timing as
-# the parity item above.
+# the contiguous call (by packing the strided vector), natively and through `activate()`. The witness
+# is structural, not a timing: at a shape the threaded gemv admits, the unit-stride kernels run on
+# the worker pool, and the scalar loop never does. So the pool's generation counter moving is proof
+# the strided call reached the unit-stride route, on any machine, under coverage or forced bounds
+# checks alike. The contiguous call is asserted first, so a shape that stopped threading fails here
+# instead of passing vacuously. The SME routes decline the pool (see the L2 allocation item), so the
+# expectation is `!sme` there.
 @testitem "C-ABI routing: strided gemv x/y reaches the unit-stride kernels" tags = [:lbt] begin
     using PureBLAS, LinearAlgebra
-
-    med_time(f, reps = 9) = begin
-        f()
-        ts = Float64[]
-        for _ in 1:reps
-            t0 = time_ns(); f(); push!(ts, (time_ns() - t0) * 1e-9)
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads: the witness is the worker pool"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        m, n = 2048, 512                     # the threaded L2 allocation item's shape: past the admission floor
+        A = randn(m, n)
+        xn = randn(n); ym = randn(m); xm = randn(m); yn = randn(n)
+        xn2 = randn(2n); ym2 = randn(2m); xm2 = randn(2m); yn2 = randn(2n)
+        sx(v) = view(v, 1:2:length(v))
+        sme_n = P._sme_gemv_eligible(Float64, m, n, false, false, A, xn, ym, 1, 1, 0.0)
+        sme_t = P._sme_gemvt_eligible(Float64, m, n, true, false, A, xm, yn, 1, 1)
+        @test ran(() -> P.gemv!(ym, A, xn)) == !sme_n
+        @test ran(() -> P.gemv!(yn, A, xm; trans = 'T')) == !sme_t
+        @test ran(() -> P.gemv!(sx(ym2), A, xn)) == !sme_n
+        @test ran(() -> P.gemv!(ym, A, sx(xn2))) == !sme_n
+        @test ran(() -> P.gemv!(sx(yn2), A, xm; trans = 'T')) == !sme_t
+        @test ran(() -> P.gemv!(yn, A, sx(xm2); trans = 'T')) == !sme_t
+        P.activate()
+        got = try
+            [
+                ran(() -> BLAS.gemv!('N', 1.0, A, xn, 0.0, sx(ym2))),
+                ran(() -> BLAS.gemv!('N', 1.0, A, sx(xn2), 0.0, ym)),
+                ran(() -> BLAS.gemv!('N', 1.0, A, xn, 0.0, view(ym2, 2m:-2:1))),
+                ran(() -> BLAS.gemv!('T', 1.0, A, xm, 0.0, sx(yn2))),
+                ran(() -> BLAS.gemv!('T', 1.0, A, sx(xm2), 0.0, yn)),
+                ran(() -> BLAS.gemv!('T', 1.0, A, view(xm2, 2m:-2:1), 0.0, yn)),
+            ]
+        finally
+            P.deactivate()
         end
-        sort!(ts)[(length(ts) + 1) ÷ 2]
-    end
-    MAXRATIO = 1.75
-
-    m, n = 400, 200
-    A = randn(m, n)
-    xn = randn(n); ym = randn(m); xm = randn(m); yn = randn(n)
-    xn2 = randn(2n); ym2 = randn(2m); xm2 = randn(2m); yn2 = randn(2n)
-    sx(v) = view(v, 1:2:length(v))
-    # (name, contiguous call, strided call) — each through LinearAlgebra.BLAS, rerouted by activate()
-    blas = [
-        ("gemv N, y stride 2", () -> BLAS.gemv!('N', 1.0, A, xn, 0.0, ym), () -> BLAS.gemv!('N', 1.0, A, xn, 0.0, sx(ym2))),
-        ("gemv N, x stride 2", () -> BLAS.gemv!('N', 1.0, A, xn, 0.0, ym), () -> BLAS.gemv!('N', 1.0, A, sx(xn2), 0.0, ym)),
-        ("gemv T, y stride 2", () -> BLAS.gemv!('T', 1.0, A, xm, 0.0, yn), () -> BLAS.gemv!('T', 1.0, A, xm, 0.0, sx(yn2))),
-        ("gemv T, x stride 2", () -> BLAS.gemv!('T', 1.0, A, xm, 0.0, yn), () -> BLAS.gemv!('T', 1.0, A, sx(xm2), 0.0, yn)),
-    ]
-    native = [
-        ("native gemv N, y stride 2", () -> PureBLAS.gemv!(ym, A, xn), () -> PureBLAS.gemv!(sx(ym2), A, xn)),
-        ("native gemv T, x stride 2", () -> PureBLAS.gemv!(yn, A, xm; trans = 'T'), () -> PureBLAS.gemv!(yn, A, sx(xm2); trans = 'T')),
-    ]
-    ratio(c, s) = med_time(s) / med_time(c)
-    rs = [(nm, ratio(c, s)) for (nm, c, s) in native]
-    PureBLAS.activate()
-    try
-        append!(rs, [(nm, ratio(c, s)) for (nm, c, s) in blas])
-    finally
-        PureBLAS.deactivate()
-    end
-    for (nm, r) in rs
-        r <= MAXRATIO || @error "strided route divergence: `$nm` is $(round(r; digits = 1))x slower than \
-            the contiguous call. The strided vector is not being packed — check `_gemv_pack_ok`."
-        @test r <= MAXRATIO
+        @test got == [!sme_n, !sme_n, !sme_n, !sme_t, !sme_t, !sme_t]
+        P.set_num_threads(1)
     end
 end
