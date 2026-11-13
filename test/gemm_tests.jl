@@ -926,20 +926,31 @@ end
             end
         end
         # WITNESS THAT THE PAD COPIES ARE POOL JOBS INSIDE potrf: the same matrix factored at a
-        # way-aligned leading dimension makes exactly two more jobs than at one that is not. `n` is
-        # a whole number of L1 ways in bytes, so the pad predicate holds on any cache geometry, and
-        # it is far above the `_L1_MT_MIN` floor, so both copies are admitted.
+        # way-aligned leading dimension makes exactly two more jobs than at one that is not. The pad
+        # predicate fires when the byte stride is a multiple of twice its period `q = way ÷ 4`, so `n`
+        # is the smallest size >= 1024 whose byte stride is such a multiple: that holds for any way
+        # size, power of two or not. It is far above the `_L1_MT_MIN` floor, so both copies are admitted.
         P.set_num_threads(nthreads())
-        let n = max(1024, P._L1_WAY_BYTES ÷ sizeof(Float64))
-            @test n * n * sizeof(Float64) >= 8 * P._L1_MT_MIN
+        let q2 = (P._L1_WAY_BYTES >> 2) << 1, m = q2 ÷ gcd(q2, sizeof(Float64)), n = m * cld(1024, m)
+            geom = "L1 = $(P._L1_BYTES) B, $(P._L1D_ASSOC)-way, way = $(P._L1_WAY_BYTES) B, " *
+                "L2 = $(P._L2_BYTES) B, n = $n"
+            # Logs the detected geometry when a check fails, so a failure on another host explains itself.
+            chk(c) = (c || @error "pad witness check failed" geom; c)
+            @test chk(n * n * sizeof(Float64) >= 8 * P._L1_MT_MIN)
             G = randn(MersenneTwister(5), n, n); S = G * G' + n * I
-            @test P._chol_needs_pad(S, n)
+            @test chk(P._chol_needs_pad(S, n))
             Bq = zeros(n + 8, n); Xq = view(Bq, 1:n, 1:n)
-            @test !P._chol_needs_pad(Xq, n)
-            X = copy(S); j0 = jobs(); P.potrf!(X; uplo = 'L'); jp = jobs() - j0
-            copyto!(Xq, S); j0 = jobs(); P.potrf!(Xq; uplo = 'L'); jq = jobs() - j0
-            @test jp == jq + 2
-            @test bitsame(tril(X), tril(Xq))
+            if P._chol_needs_pad(Xq, n)
+                # The unpadded control needs a stride off the aliasing period, which no n + 8 gives
+                # when the period divides 64 B.
+                @test_skip P._chol_needs_pad(Xq, n)
+                @info "pad witness skipped: control stride also aliases" geom
+            else
+                X = copy(S); j0 = jobs(); P.potrf!(X; uplo = 'L'); jp = jobs() - j0
+                copyto!(Xq, S); j0 = jobs(); P.potrf!(Xq; uplo = 'L'); jq = jobs() - j0
+                @test chk(jp == jq + 2)
+                @test bitsame(tril(X), tril(Xq))
+            end
         end
         # Float32 takes the same padded driver and the same copy job.
         let n = 1024
