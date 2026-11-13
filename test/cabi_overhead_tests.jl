@@ -146,3 +146,53 @@ end
         @test z ≈ c[8] rtol = 1e-10
     end
 end
+
+# STRIDED-VECTOR ROUTING. A gemv whose x or y is strided must reach the same unit-stride kernels as
+# the contiguous call (by packing the strided vector), natively and through `activate()`. The witness
+# is structural, not a timing: at a shape the threaded gemv admits, the unit-stride kernels run on
+# the worker pool, and the scalar loop never does. So the pool's generation counter moving is proof
+# the strided call reached the unit-stride route, on any machine, under coverage or forced bounds
+# checks alike. The contiguous call is asserted first, so a shape that stopped threading fails here
+# instead of passing vacuously. The SME routes decline the pool (see the L2 allocation item), so the
+# expectation is `!sme` there.
+@testitem "C-ABI routing: strided gemv x/y reaches the unit-stride kernels" tags = [:lbt] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads: the witness is the worker pool"
+    else
+        P.set_num_threads(nt)
+        p = P._gemm_pool(Float64)
+        ran(f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        m, n = 2048, 512                     # the threaded L2 allocation item's shape: past the admission floor
+        A = randn(m, n)
+        xn = randn(n); ym = randn(m); xm = randn(m); yn = randn(n)
+        xn2 = randn(2n); ym2 = randn(2m); xm2 = randn(2m); yn2 = randn(2n)
+        sx(v) = view(v, 1:2:length(v))
+        sme_n = P._sme_gemv_eligible(Float64, m, n, false, false, A, xn, ym, 1, 1, 0.0)
+        sme_t = P._sme_gemvt_eligible(Float64, m, n, true, false, A, xm, yn, 1, 1)
+        @test ran(() -> P.gemv!(ym, A, xn)) == !sme_n
+        @test ran(() -> P.gemv!(yn, A, xm; trans = 'T')) == !sme_t
+        @test ran(() -> P.gemv!(sx(ym2), A, xn)) == !sme_n
+        @test ran(() -> P.gemv!(ym, A, sx(xn2))) == !sme_n
+        @test ran(() -> P.gemv!(sx(yn2), A, xm; trans = 'T')) == !sme_t
+        @test ran(() -> P.gemv!(yn, A, sx(xm2); trans = 'T')) == !sme_t
+        P.activate()
+        got = try
+            [
+                ran(() -> BLAS.gemv!('N', 1.0, A, xn, 0.0, sx(ym2))),
+                ran(() -> BLAS.gemv!('N', 1.0, A, sx(xn2), 0.0, ym)),
+                ran(() -> BLAS.gemv!('N', 1.0, A, xn, 0.0, view(ym2, 2m:-2:1))),
+                ran(() -> BLAS.gemv!('T', 1.0, A, xm, 0.0, sx(yn2))),
+                ran(() -> BLAS.gemv!('T', 1.0, A, sx(xm2), 0.0, yn)),
+                ran(() -> BLAS.gemv!('T', 1.0, A, view(xm2, 2m:-2:1), 0.0, yn)),
+            ]
+        finally
+            P.deactivate()
+        end
+        @test got == [!sme_n, !sme_n, !sme_n, !sme_t, !sme_t, !sme_t]
+        P.set_num_threads(1)
+    end
+end
