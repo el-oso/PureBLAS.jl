@@ -22,6 +22,17 @@ demonstrated.
 
 ### Changed
 
+- The pool's keep-awake window is measured once per machine at install. `deps/build.jl`, which Pkg
+  runs after installing or updating PureBLAS, times a threaded read after idle gaps from 0.2 ms
+  upward and stores the shortest gap from which every longer gap is slower than the 0.2 ms
+  reference (the onset) in PureBLAS's scratch space; `set_num_threads` sets the window to 12 ms
+  minus the onset. Window 0 needs every gap to read the same as the reference; mixed readings
+  remove the store. Without a store, or with one written on other hardware, the window stays
+  10 ms. The probe adds 6-9 s to `Pkg.build`; `PUREBLAS_SKIP_BUILD_TUNE=1` skips it. Over five
+  builds: Zen3 onset 3.2 ms four times and 0.57 ms once (window 8.8 or 11.4 ms), Zen5 1.6 ms four
+  times and 0.28 ms once (10.4 or 11.7 ms). syrk/trmm n=2048 after a 5 ms gap run at the speed of
+  the 10 ms window with any window from 0 up on Zen4 and Zen5, and lose 33-41% without one on Zen3.
+
 - The threaded pool measures its host when `set_num_threads` creates it, in place of constants
   recorded on one machine. The size below which a call stays on one thread is now
   `_MT_AMORTISE` × (the pool's own fork-join round trip with one worker) × (one core's flop rate in the

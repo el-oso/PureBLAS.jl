@@ -171,7 +171,8 @@ function bare_rows()
                 pending_tier = String(mp.captures[1]); pending, pending_at = String(mp.captures[2]), i
                 continue
             end
-            m = match(r"^const (_[A-Z][A-Z_0-9]{2,})\s*=\s*(-?\d+|true|false)\s*(?:#.*)?$", ln)
+            # Digit separators included: `10_000_000` is as much a literal as `10000000`.
+            m = match(r"^const (_[A-Z][A-Z_0-9]{2,})\s*=\s*(-?\d+(?:_\d+)*|true|false)\s*(?:#.*)?$", ln)
             isnothing(m) && continue
             near = !isempty(pending) && i - pending_at <= 12
             push!(rows, (; name = String(m.captures[1]), value = String(m.captures[2]),
