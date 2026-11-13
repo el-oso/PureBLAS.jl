@@ -60,6 +60,88 @@
     end
 end
 
+# The core cap when every thread is bound to one CPU: the cores among those CPUs are measured by
+# `_mt_pinned_cores!`. Two children, each with every Julia thread bound to its own CPU of the same
+# cores, as the kernel's sibling lists give them: one CPU per core, where the formula over
+# `Sys.EFFECTIVE_CPU_THREADS` gives half the cores, and both SMT siblings of each core. Both counts
+# must lie between the formula's and the CPU count. The siblings must collapse to their cores when
+# the measurement saw any core shared; when it saw none, the sibling lists are unconfirmed (a virtual
+# machine's need not describe the host) and that check is skipped with the reason printed. Linux
+# only — `taskset` and the sibling lists; elsewhere the item is skipped.
+@testitem "core cap counts the cores of pinned CPUs" tags = [:checks] begin
+    using PureBLAS
+    const P = PureBLAS
+    # Cores whose SMT siblings are all in this process's mask, as lists of 0-based CPU numbers.
+    function smt_cores()
+        allowed = findall(!iszero, P._mt_affinity_mask()) .- 1
+        cores = Dict{String, Vector{Int}}()
+        for c in allowed
+            f = "/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list"
+            isfile(f) && push!(get!(cores, strip(read(f, String)), Int[]), c)
+        end
+        return sort([v for v in values(cores) if length(v) >= 2]; by = first)
+    end
+    cores = Sys.islinux() && !isnothing(Sys.which("taskset")) ? smt_cores() : Vector{Int}[]
+    if length(cores) < 2
+        @info "skipped: needs Linux, taskset, and two SMT cores in the process mask" Sys.KERNEL
+        @test_skip "core cap counts the cores of pinned CPUs"
+    else
+        nc = min(length(cores), 4)
+        script = """
+        using PureBLAS
+        const P = PureBLAS
+        const CPUS = parse.(Int, split(ENV["PB_PIN"], ','))
+        function pin(c)
+            n = Int(ccall(:uv_cpumask_size, Cint, ()))
+            m = zeros(Cchar, n); m[c + 1] = 1
+            self = Ref(ccall(:uv_thread_self, UInt, ()))
+            r = ccall(:uv_thread_setaffinity, Cint, (Ptr{UInt}, Ptr{Cchar}, Ptr{Cchar}, Csize_t), self, m, C_NULL, n)
+            iszero(r) || error("could not bind a thread to CPU \$c")
+        end
+        tids = Threads.threadpooltids(:default)
+        foreach(wait, [P._mt_on_thread(() -> pin(CPUS[i]), t) for (i, t) in pairs(tids) if t != Threads.threadid()])
+        pin(CPUS[findfirst(==(Threads.threadid()), tids)])
+        nw = P.set_num_threads(Threads.nthreads())
+        println("RESULT ", nw, " ", P._MT_PINNED_CORES[])
+        """
+        env = filter(kv -> kv.first != "PUREBLAS_MT_ALL_THREADS", ENV)
+        function child(cpus)
+            jl = `$(Base.julia_cmd()) -t $(length(cpus)),0 --project=$(Base.active_project()) -e $script`
+            cmd = setenv(`taskset -c $(join(cpus, ',')) $jl`, merge(env, Dict("PB_PIN" => join(cpus, ','))))
+            line = only(l for l in split(read(cmd, String), '\n') if startswith(l, "RESULT "))
+            return parse.(Int, split(line)[2:end])
+        end
+        one_per_core = [first(c) for c in cores[1:nc]]
+        siblings = reduce(vcat, cores[1:nc])
+        @info "pinned children" one_per_core siblings
+        # k CPUs lie on at least cld(k, threads per core) cores, the formula's count, and at most k.
+        tpc = max(1, Sys.CPU_THREADS ÷ Int(P.num_cores()))
+        results = Dict(cpus => child(cpus) for cpus in (one_per_core, siblings))
+        for (cpus, (nw, measured)) in results
+            @test cld(length(cpus), tpc) <= nw <= length(cpus)
+            @test cld(length(cpus), tpc) <= measured <= length(cpus)
+        end
+        nw1, _ = results[one_per_core]
+        nw2, measured2 = results[siblings]
+        if measured2 < length(siblings)
+            # The measurement saw cores shared, which confirms the sibling lists: both siblings of
+            # each core collapse to that core, and one CPU per core keeps every core, where the
+            # formula gives half of them.
+            @test nw2 == nc
+            @test measured2 == nc
+            @test nw1 == nc
+        else
+            # A virtual machine's sibling lists need not match how the host schedules its vCPUs.
+            println(
+                "core cap: siblings $siblings measured as $measured2 cores, no contention between ",
+                "the listed siblings, so the sibling lists are not confirmed; collapse not checked"
+            )
+            @test_skip measured2 == nc
+            @test_skip nw1 == nc
+        end
+    end
+end
+
 # The pool's keep-awake window comes from the onset `deps/build.jl` stored for this machine, and is
 # `_MT_KEEPAWAKE_NS` when there is no store or the store was written on other hardware.
 @testitem "keep-awake window: the stored onset on this host, else the default" begin
