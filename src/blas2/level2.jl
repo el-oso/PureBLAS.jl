@@ -63,75 +63,75 @@ const _GEMV_MR = something(_GEMV_MR_PREF, 8)::Int
 # so the cost of a given MR is set by TWO facts about the CALL, both known at run time:
 #   1. `MR*W > m` is DEGENERATE — the loop never executes, the whole call falls into the masked
 #      branch, and (mr-m)/mr of every lane is wasted. At W=8 that is every m < 64 under MR=8.
-#   2. otherwise the final block runs its full `h` lanes whatever it uses, and WHAT THAT COSTS DEPENDS
-#      ON WHERE op(A) SITS. The two regimes want opposite things, and both are measured below:
-#        * op(A) fits L1 — the wasted lanes are arithmetic on resident data and are nearly free, so
-#          what matters is getting as much of the work as possible into FULL blocks rather than into
-#          the masked one. Minimising `m mod h` does exactly that: it is the count of rows stranded in
-#          the final block, and the tie-to-taller then takes the tallest height that strands as few.
-#        * op(A) spills L1 — the wasted lanes are wasted memory traffic, so what matters is the
-#          lane-rows the call computes, `cld(m, h) * h`. Minimising the waste `(h - m mod h) mod h` is
-#          the same ordering.
-# The split is `m * n * sizeof(T)` against the DETECTED L1 size, so this stays a Derive over detected
-# constants rather than a Measure-tier literal: a fleet-minimax constant gets some m wrong on every
-# box, and pinning it per host cannot fix machines nobody has benchmarked (req#7/#8).
+#   2. otherwise the cost is the lanes the driver actually issues — the full blocks plus a masked tail
+#      of `nv = cld(m mod h, W)` vectors when `nv ≤ 3`, else of MR vectors (the tail kernel's dispatch)
+#      — times a LATENCY factor `max(1, MRsat/MR)`. A block's n-long fma chains are its MR accumulators;
+#      MRsat is the count that covers fma latency, `_ILP_TARGET ÷ 2` datapath-wide fmas in flight
+#      expressed in register-wide ops: `(_ILP_TARGET ÷ 2) · datapath ÷ SIMD bytes`, 4 where 512-bit
+#      registers run on a 256-bit datapath (Zen4, Zen5-mobile), 8 on Zen3.
+#   3. EXCEPT when A spills L1 and n is at most the panel width (rule (c) of `_gemvn_rowblock_route`):
+#      there the waste `(h - m mod h) mod h` decides, as before. Short chains overlap the next block's
+#      in the out-of-order window, so the latency factor overstates MR=2's cost, and Zen5-mobile and
+#      Zen3 both measure MR=2 fastest at some of these shapes (e.g. Zen5-mobile 2880x16: MR=2 1.00,
+#      MR=8 1.22; Zen3 1424x24: 1.00 vs 1.11).
+# Ties prefer the LARGER height.
 #
-# ⚠ `m mod h` IS THE WRONG METRIC ONCE op(A) SPILLS, and the difference is not cosmetic. It is bounded
-# by h, so comparing it structurally prefers SHORT heights whenever nothing divides m, and lands on the
-# right answer only when a tall height divides m exactly — which every power-of-two m does, so a
-# square power-of-two ladder cannot expose it. At m = 505, W = 8 it reads 9 for h = 16 against 57 for
-# h = 64 and picks MR=2, although both compute 512 lane-rows, and MR=2 then measures 18% slower on
-# Zen4 and 32% slower on Zen5.
-#
-# Ties prefer the LARGER height, because more accumulators hide more FMA latency when the metric is
-# equal — that is the one µarch-flavoured term, and it only breaks ties.
+# ⚠ `m mod h` and the bare waste both fail where the latency factor matters: the waste law picks MR=2
+# at m = 553, 560, 1032, 1420, 1424, 4104, where a 16-row height wastes least, and at n ≥ 100 MR=2 measures 5-15% behind MR=4 on Zen4 and 4-14% behind MR=8 on
+# Zen3; in L1-resident A the stranded-rows law picks MR=2 at m=200 on Zen3, 1.5-1.8x MR=8's time.
 #
 # FLEET TABLE — the (m, n) shapes this path actually receives at the gate, which is what it is
 # validated against: the square `gemvN` cells, where m == n, and the rectangular cells, where m is
 # fixed at 505 and n sweeps. Medians of 9 rounds with the arm order rotated, in-process A/B of the
 # shipped kernel at each `Val(MR)`; round-to-round spread 0.1-0.6% on the AVX-512 boxes.
 #
-# `rb` BOUNDS THE DOMAIN PER BOX, and that is why AVX2 appears in only two rows: `_gemvn_rb()` is 448
-# where W=8 and 64 where W=4, so on AVX2 every shape with n > 64 takes the PANEL path and never reaches
-# this function. A regression here is invisible on AVX2 except at the two smallest shapes — and those
-# two are where it bites hardest.
+# The table was taken when the route was a cut at n <= 448 (W=8) or 64 (W=4), which is why AVX2 has
+# only two rows. `_gemvn_rowblock_route` now bounds the domain: this function sees L1-resident A,
+# single-block columns, n at most the panel width, and line-aligned columns up to `_gemvn_rb()`.
 #
 #   (m, n)      op(A)     regime     law   Zen4     Zen5     Zen3
 #   (50, 50)     19 KiB   in L1       6    6 ✓      6 ✓      6 ✓
 #   (64, 64)     32 KiB   in L1       8    8 ✓      8 ✓      8 ✓
-#   (100, 100)   78 KiB   spilled     2    2 ✓      6 ✗      panel
+#   (100, 100)   78 KiB   spilled     6    2 ✗      6 ✓      panel
 #   (128, 128)  128 KiB   spilled     8    8 ✓      8 ✓      panel
 #   (256, 256)  512 KiB   spilled     8    8 ✓      8 ✓      panel
 #   (505, 131)  516 KiB   spilled     8    8 ✓      4 ✗      panel
 #   (505, 256) 1010 KiB   spilled     8    8 ✓      8 ✓      panel
 #   (505, 384) 1515 KiB   spilled     8    8 ✓      8 ✓      panel
 #   (505, 448) 1767 KiB   spilled     8    8 ✓      8 ✓      panel
-# Zen4 9/9, Zen5 8/9, Zen3 2/2 over the shapes it governs there; the two misses cost 2.8% and 2.2%.
+# (The law column is this function's answer; the ✓/✗ columns were measured under the earlier
+# stranded-rows/waste law, which agreed everywhere except (100, 100), where it picked 2.)
 #
-# WHY NOT ONE METRIC FOR BOTH REGIMES — each single-metric rule was measured and each has a wide miss:
-#   * `m mod h` everywhere      — 18% at (505,448) on Zen4, 32% on Zen5
-#   * waste everywhere          — 72% at (50,50) on Zen3, where it picks MR=2 (0.564 vs 0.327 µs)
-#   * tallest non-degenerate    — 26-32% at (100,100), one full block beside a 36/64-masked one
-#   * fewest blocks             — the same as tallest, same miss
+# MEASURED, MR forced through `_gemv_n_rowblock!` at each height, row-block time at the chosen MR over
+# the best MR, geo-mean (m 100..2880, n 8..448; `bench/probes/gemvn_mr_probe.jl`):
+#            waste law    this law     shapes
+#   Zen4       1.061        1.012      70
+#   Zen3       1.040        1.016      59
+#   Zen5m      1.057        1.069      53   (1.039 -> 1.015 over the 16 with n ≥ 128)
+# ⚠ Zen5-mobile at n = 25-64 and m ≥ 560 is NOT captured: MR=2 beats every taller height there by
+# 12-28% (1424x64: MR=2 1.00, MR=8 1.26) where Zen4 is level within 6% on the same shapes, and nothing
+# detected separates the two parts. At m=100, n ≥ 100 Zen4 wants MR=2 and this law picks 6 (5-6%).
 #
-# ONE SHAPE NEEDS A TERM THIS SIGNATURE DOES NOT CARRY: at (100, 100) Zen4 wants MR=2 and Zen5 wants
-# MR=6 — same width, same shape, opposite answers — so no function of the call can satisfy both. It
-# costs 2.8% on Zen5, and (505, 131) costs 2.2% there for the same reason.
-#
-# The PANEL path (n > `_gemvn_rb()`) is deliberately NOT covered: there the winner does not track the
+# The PANEL path is deliberately NOT covered: there the winner does not track the
 # waste (measured: Zen3 wants 8 almost everywhere, Zen4 and Zen5 disagree size by size) and the whole
 # spread is 0.90-1.19 because the kernel is bandwidth-bound. It keeps `_GEMV_MR`.
+@inline _gemvn_mr_latency() = (_ILP_TARGET ÷ 2) * _datapath_bytes(_HW) ÷ _SIMD_BYTES
+# Row-block heights `_gemv_n_rowblock!` is compiled for; `_gemvn_rowblock_mr` picks one per call.
+# PDM: Literal — the MR values the row-block driver dispatches to, not a tuning value
+const _GEMVN_ROWBLOCK_MRS = (2, 4, 6, 8)   # req8-ok: compiled kernel candidate set
 @inline function _gemvn_rowblock_mr(m::Int, n::Int, W::Int, ::Type{T}) where {T}
-    resident = m * n * sizeof(T) <= _L1_BYTES
+    short = m * n * sizeof(T) > _L1_BYTES && n <= (_gemvn_minner() ? 2 * _GEMVN_NP_WIDE : _GEMV_NP)
+    mrsat = _gemvn_mr_latency()
     best = 2
     bestcost = typemax(Int)
-    for mr in (2, 4, 6, 8)          # ascending + `<=` below ⇒ ties resolve to the LARGER height
+    for mr in _GEMVN_ROWBLOCK_MRS   # ascending + `<=` below ⇒ ties resolve to the LARGER height
         h = mr * W
         h > m && continue           # degenerate: no full block would run at all
-        # Resident: rows stranded in the masked block, so the full blocks carry as much as possible.
-        # Spilled: lanes the masked block computes and discards, which is wasted traffic. Both are 0
-        # when h divides m, which is why a power-of-two m cannot tell the two metrics apart.
-        cost = resident ? m % h : (h - m % h) % h
+        r = m % h
+        nv = cld(r, W)
+        lanes = (m - r) + W * (nv <= 3 ? nv : mr)        # what `_gemv_n_rowblock!` issues
+        cost = short ? (h - r) % h :                     # waste
+            lanes * max(mrsat, mr) * (lcm(_GEMVN_ROWBLOCK_MRS...) ÷ mr)   # exact lanes·max(1, MRsat/MR)
         if cost <= bestcost
             bestcost = cost
             best = mr
@@ -235,8 +235,55 @@ const _GEMVN_MB = @load_preference("gemvn_mb", max(_vwidth(Float64), _L1_BYTES �
 # A ≲ a few × L3 and fall back to the old panel path beyond. Crossover is unmeasured on locked HW → tune.
 # PDM: Derived — formula over detected consts: `4 * _L3_BYTES`
 const _GEMVN_MINNER_MAXA = @load_preference("gemvn_minner_maxa", 4 * _L3_BYTES)::Int  # max A bytes (m·n·sizeof) for minner
+# ── ROW-BLOCK OR COLUMN PANEL: THE ROUTE ────────────────────────────────────────────────────────────
+# The row-block driver holds one block of y in registers and visits all n columns per block, reading a
+# `h·sz`-byte chunk of each column and jumping `lda·sz` to the next. The panel drivers stream each column
+# contiguously and re-stream y once per panel. `_gemvn_rowblock_route` picks between them from the
+# UNDIVIDED call (`mroute`, `n`, `lda`), so a row-band worker takes the same route as the whole problem
+# (req#11). The routes also agree bitwise — each `y[i]` is the same fma chain over j in both — and
+# `test/level2_tests.jl` checks that.
+#
+# The row-block route is taken when any of these holds:
+#   (a) A is L1-resident, `m·n·sz ≤ _L1_BYTES`: nothing streams, and keeping y in registers beats any
+#       y re-stream.
+#   (b) one row block spans the column, `m ≤ MRmax·W`: the "chunks" are whole columns, so the
+#       row-block reads A as one contiguous stream with no y traffic.
+#   (c) `n` is at most the panel route's own width — `2·_GEMVN_NP_WIDE` for m-inner, whose column
+#       remainder runs as single-column panels that each re-stream y, and `_GEMV_NP` for the old panel
+#       driver, which below one panel IS a row-block that keeps y in memory instead of registers — and
+#       the stride is not a multiple of the L1 way (Zen3 1024/2048/4096 at n=16: row-block 1.07-1.20x
+#       the panel's time; Zen4 keeps the row-block there through (d)).
+#   (d) every column starts on a cache line — the base address AND the stride — up to `_gemvn_rb()`
+#       columns, or a quarter of that when the column stride is a multiple of the L1 way.
+#
+# (d)'S ALIGNMENT TEST IS WHAT THE OLD n-ONLY CUT COULD NOT SEE. When a column does not start on a
+# line, every row-block chunk straddles one extra line that the next row block re-reads, and its vector
+# loads split, while the panel streams through the same misalignment. Row-block / panel time on Zen4 at
+# n=200: lda=553 1.39, lda=560 0.97; lda=769 1.06, lda=768 0.87. The base matters as much as the
+# stride: a view starting at row 2 of a line-aligned matrix has every column one element off. The base
+# is the UNDIVIDED call's (`abase`), because a row band's own pointer moves by a multiple of W elements,
+# which is not a multiple of the line where W·sz < `_CACHELINE`.
+# A column stride that is a multiple of the L1 way puts every chunk of a pass in the same sets (the
+# predicate `_gemvn_minner_np` already uses), and the crossover drops: on Zen4 the row-block wins to
+# n≈100-200 at lda=1024/2048/4096 — the run-to-run spread of power-of-two strides, which move with
+# page placement — against n≈384-448 at lda=1032/2056/4104. The quarter takes the low end.
+#
+# The cap `_GEMVN_RB` on (d) is the plain n cut of the earlier route; deriving it from detected
+# constants is an open item.
 # PDM: Derived — formula over detected consts: `_vwidth(Float64) == 4 ? 64 : 448`
 const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 64 : 448)::Int  # gemv-N: n ≤ this → row-block; larger → column-panel. AVX2 cut dropped 192→64: with _GEMV_MR=8 the sequential-streaming panel path now beats strided row-block for all n≥96 (128: 0.92→1.0); row-block only wins at n≤64 where panel's m<mr all-masked tail dominates. Zen4 1MB L2 → 448.
+@inline function _gemvn_rowblock_route(m::Int, n::Int, lda::Int, abase::UInt, ::Type{T}) where {T}
+    f = _FKR_gemvn_rb[]
+    f >= 0 && return n <= f                      # forced: the plain n cut, for A/B probes
+    sz = sizeof(T)
+    m * n * sz <= _L1_BYTES && return true                                   # (a)
+    m <= last(_GEMVN_ROWBLOCK_MRS) * _vwidth(T) && return true               # (b)
+    aliased = (lda * sz) % _L1_WAY_BYTES == 0
+    !aliased && n <= (_gemvn_minner() ? 2 * _GEMVN_NP_WIDE : _GEMV_NP) && return true   # (c)
+    # (d): every column start `abase + j·lda·sz` on a line, i.e. the base AND the stride
+    (abase % _CACHELINE == 0 && (lda * sz) % _CACHELINE == 0) || return false
+    return n <= (aliased ? _gemvn_rb() ÷ 4 : _gemvn_rb())
+end
 # Forceable accessors (the `_ger_np` shape: one const-resolved Ref load, folding to the const when
 # unforced — not a keyed lookup, so GKH-clean). Added 2026-08-27 to make the Zen5 COLD BAND testable:
 # with a fresh operand per sample (the gate regime) PB/OB is 0.84-0.94 CONTINUOUSLY over n=768-1280
@@ -333,7 +380,7 @@ end
 
 # `MR` is a PARAMETER for the same reason `_gemv_n_paneldrv!` takes one: so a calibrator or probe can
 # A/B the row-block height against the REAL driver in ONE process. It matters MORE here than there,
-# because `_gemv_n_simd!` sends every `n <= _gemvn_rb()` (448 on Zen4) down THIS path — so a harness
+# because `_gemv_n_simd!` sends every shape `_gemvn_rowblock_route` accepts down THIS path — so a harness
 # that arms only the panel driver is measuring a path production does not take at small n. That is
 # exactly what `bench/calibrate.jl`'s first `calibrate_gemv_mr` did at n=100.
 @inline function _gemv_n_rowblock!(
@@ -618,14 +665,18 @@ end
         )
         return y
     end
-    return b0 ? _gemv_n_simd!(m, n, α, A, x, y, β, Val(true), m) :
-        _gemv_n_simd!(m, n, α, A, x, y, β, Val(false), m)
+    abase = UInt(pointer(A))
+    return b0 ? _gemv_n_simd!(m, n, α, A, x, y, β, Val(true), m, abase) :
+        _gemv_n_simd!(m, n, α, A, x, y, β, Val(false), m, abase)
 end
 
+# `mroute` and `abase` are the UNDIVIDED call's row count and A base address: a row band passes the
+# whole problem's, so `_gemvn_rowblock_route` answers the same for every band (req#11). A band's own
+# pointer is offset by a multiple of W elements, which is not a multiple of the line on every part.
 @inline function _gemv_n_simd!(
-        m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}, mroute::Int
+        m::Int, n::Int, α::T, A, x, y, β::T, ::Val{B0}, mroute::Int, abase::UInt
     ) where {T <: BlasReal, B0}
-    if n <= _gemvn_rb()
+    if _gemvn_rowblock_route(mroute, n, stride(A, 2), abase, T)
         # Per-call row-block height, always derived (see `_gemvn_rowblock_mr`). The branch runs once
         # per gemv! call against a driver that then loops over m — not in any inner loop.
         #
