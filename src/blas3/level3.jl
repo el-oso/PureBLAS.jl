@@ -7887,7 +7887,10 @@ function _hemm_packed_L!(up::Bool, α, β, A, B, C, ::Val{HERM} = Val(true)) whe
                 ic = 0
                 while ic < n
                     mce = min(mc, n - ic); a_hi = ic + mce - 1; p_hi = pc + kce - 1
-                    stored = up ? (a_hi <= pc) : (ic >= p_hi)     # read A[i,gp] direct (SIMD)
+                    # Read A[i,gp] direct (SIMD) when the panel lies in the stored triangle. A panel that
+                    # touches the diagonal (a_hi == pc, or ic == p_hi) is excluded for Hermitian A: the
+                    # direct read would keep the diagonal's imaginary part, which hemm must ignore.
+                    stored = up ? (HERM ? a_hi < pc : a_hi <= pc) : (HERM ? ic > p_hi : ic >= p_hi)
                     stored ? _pack_A_cmplx!(ApR, ApI, A, ic, pc, mce, kce, false, mr) :
                         _pack_A_sym_cmplx!(ApR, ApI, A, ic, pc, mce, kce, up, mr, Val(HERM))
                     # B0/A1 were hardwired false here while `_gemm_cmplx_impl!` dispatches both. The gate
