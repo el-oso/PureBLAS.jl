@@ -468,8 +468,8 @@ end
             # and the assertion below says so rather than assuming it.
             n_np = P._gemvn_rb() + 32
             m_np = (5 * P._L2_BYTES) ÷ (2 * n_np * sz)
-            @test !P._gemvn_rowblock_route(m_np, n_np, m_np, T)
-            @test P._gemvn_rowblock_route(8192, 8, 8192, T)
+            @test !P._gemvn_rowblock_route(m_np, n_np, m_np, UInt(0), T)
+            @test P._gemvn_rowblock_route(8192, 8, 8192, UInt(0), T)
             # Just past `_GEMVN_MINNER_MAXA` (= 4·L3), so the undivided problem leaves minner and
             # every band would re-enter it. One allocation of a little over 4·L3 is the price of
             # covering this predicate at all; there is no smaller shape that straddles it.
@@ -1057,7 +1057,8 @@ end
     line = P._CACHELINE; way = P._L1_WAY_BYTES
     cs = P._gemvn_minner() ? 2 * P._GEMVN_NP_WIDE : P._GEMV_NP
     big = 4 * P._L1_BYTES                                 # rows that keep A out of L1 at n > cs
-    route(m, n, lda = m) = P._gemvn_rowblock_route(m, n, lda, Float64)
+    base0 = UInt(64 * line)                               # a line-aligned base address
+    route(m, n, lda = m, base = base0) = P._gemvn_rowblock_route(m, n, lda, base, Float64)
     @test P._FKR_gemvn_rb[] < 0                           # unforced, or this tests the force hook
     # (a) L1-resident A
     @test route(P._L1_BYTES ÷ (sz * 64), 64)
@@ -1074,19 +1075,37 @@ end
     @test route(lda_al, cs + 1, lda_al) == (rb > cs)
     @test route(lda_al, max(rb, cs + 1), lda_al) == (rb > cs) && !route(lda_al, max(rb, cs) + 1, lda_al)
     @test !route(lda_al + 1, cs + 1, lda_al + 1)                  # misaligned columns
+    @test !route(lda_al, cs + 1, lda_al, base0 + sz)              # aligned stride, misaligned base
+    # The base the dispatcher sees is the matrix's own: a view starting at row 2 of a line-aligned
+    # matrix has every column misaligned.
+    Ab = Matrix{Float64}(undef, lda_al, cs + 1)
+    if UInt(pointer(Ab)) % line == 0
+        a1 = view(Ab, 1:lda_al - 1, :); a2 = view(Ab, 2:lda_al, :)
+        r(A) = P._gemvn_rowblock_route(size(A, 1), size(A, 2), stride(A, 2), UInt(pointer(A)), Float64)
+        @test r(a1) == (rb > cs)
+        @test !r(a2)
+    end
     @test !any(n -> route(553, n), 64:448)                        # 553·8 bytes is not a line multiple
     @test route(lda_po2, max(rb ÷ 2, cs + 1), lda_po2) == (rb ÷ 2 > cs)
     @test !route(lda_po2, max(rb ÷ 2, cs) + 1, lda_po2)
 
+    # Row-block height past the panel width: the latency term rules out MR=2 wherever a taller height
+    # fits, including the m whose waste is smallest at MR=2.
+    if P._gemvn_mr_latency() >= 4
+        @test all(m -> P._gemvn_rowblock_mr(m, 512, W, Float64) != 2, (560, 1032, 1424, 4104))
+    end
+
     # Both routes, forced, over shapes on each side of every clause; padded and misaligned lda.
     bitsame(X, Y) = all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X, Y))
+    # (m, n, lda, first row): the last two start the view at row 2, so the base is misaligned.
     shapes = (
-        (553, 200, 553), (553, 200, 560), (768, 100, 769), (64, 300, 64), (1031, 9, 1040),
-        (300, 40, 300), (2048, 131, 2048),
+        (553, 200, 553, 1), (553, 200, 560, 1), (768, 100, 769, 1), (64, 300, 64, 1),
+        (1031, 9, 1040, 1), (300, 40, 300, 1), (2048, 131, 2048, 1), (767, 100, 768, 2),
+        (2879, 300, 2880, 2),
     )
     try
-        @testset "$T m=$m n=$n lda=$lda" for T in (Float64, Float32), (m, n, lda) in shapes
-            A = view(randn(T, lda, n), 1:m, :); x = randn(T, n); y0 = randn(T, m)
+        @testset "$T m=$m n=$n lda=$lda r0=$r0" for T in (Float64, Float32), (m, n, lda, r0) in shapes
+            A = view(randn(T, lda, n), r0:(r0 + m - 1), :); x = randn(T, n); y0 = randn(T, m)
             for β in (zero(T), T(1.5))
                 ys = map((typemax(Int), 0)) do f
                     P._FKR_gemvn_rb[] = f
