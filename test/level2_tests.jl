@@ -469,14 +469,16 @@ end
             n_np = P._gemvn_rb() + 32
             m_np = (5 * P._L2_BYTES) ÷ (2 * n_np * sz)
             @test !P._gemvn_rowblock_route(m_np, n_np, m_np, UInt(0), T)
-            @test P._gemvn_rowblock_route(8192, 8, 8192, UInt(0), T)
+            # m = 8200, not 8192: a column stride that is a multiple of the L1 way is excluded from
+            # rule (c), and at W=4 rule (d) takes no columns.
+            @test P._gemvn_rowblock_route(8200, 8, 8200, UInt(0), T)
             # Just past `_GEMVN_MINNER_MAXA` (= 4·L3), so the undivided problem leaves minner and
             # every band would re-enter it. One allocation of a little over 4·L3 is the price of
             # covering this predicate at all; there is no smaller shape that straddles it.
             n_mx = 1024
             m_mx = (P._GEMVN_MINNER_MAXA ÷ (n_mx * sz)) + 64
             cases = (
-                ("rowblock", 8192, 8),                     # n=8 is row-block on every part, rule (c)
+                ("rowblock", 8200, 8),                     # n=8 is row-block on every part, rule (c)
                 ("np narrow/wide flip", m_np, n_np),
                 ("minner/paneldrv flip", m_mx, n_mx),
             )
