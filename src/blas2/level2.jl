@@ -273,12 +273,17 @@ const _GEMVN_MINNER_MAXA = @load_preference("gemvn_minner_maxa", 4 * _L3_BYTES):
 # 165 aligned, non-aliased cells with n=33-448, row-block / panel time is 0.87-1.53 on Zen5-mobile
 # (row-block faster in 33) and 1.03-1.57 on Zen3 (faster in none). Zen4 and Zen5-mobile share every
 # detected constant that could carry this — W=8, 32 vector registers, 1 MiB L2, a 256-bit datapath under 512-bit registers — and
-# differ only in L1 (32 vs 48 KiB) and family, the same inseparable pair `_GEMV_MR` records. Two
+# differ only in L1 (32 vs 48 KiB) and family, the same inseparable pair `_GEMV_MR` records. Three
 # derivations were tried and falsified: a quarter-L2 pass footprint (n chunks of MRmax·_SIMD_BYTES)
 # gives 512, where the row-block measures 1.06-1.15x the panel's time at lda=200/768/2880 on Zen4; and
 # the m-inner panel's narrower width on an 8-way L1 (6 streams against 10 on Zen5-mobile) — forcing
 # the Zen5-mobile panel to Zen4's 6 streams moves it by at most 6% and leaves it ahead of the
 # row-block in 10 of 12 aligned shapes (`bench/probes/gemvn_np_vs_rb.jl`, m=640/768/2880, n=64-320).
+# L1 residency of one row-block pass orders the parts backwards: a pass touches at least one line per
+# column, so `n·_CACHELINE ≤ _L1_BYTES` gives 512 on Zen4 and 768 on Zen5-mobile, and four lines per
+# column (MR=4, W=8) gives 128 and 192 — larger on the part that wants 0. Below OB over the grid below
+# plus 21 m=lda=553 cells (453 per µarch), by cap: Zen4 0→69, 192→41, 384→24, 448→27, 512→28; Zen5-mobile 0→157, 448→226, 768→236; Zen3
+# (W=4) 0→38, 512→176.
 # The default reproduces the n-only cut where the grid shows it right: 448 at W=8, so no W=8
 # part routes an aligned shape differently from before, and 0 at W=4, where the row-block loses at
 # every aligned n past (c) on Zen3.
@@ -299,7 +304,7 @@ const _GEMVN_MINNER_MAXA = @load_preference("gemvn_minner_maxa", 4 * _L3_BYTES):
 # Cap on (d). On Zen4 the aligned, non-aliased crossover sits at n≈384-448 (row-block / panel at
 # n=448: 0.99-1.06 over the seven strides where `_gemvn_rowblock_mr` picks MR ≥ 4; 1.07-1.22 where it
 # picks MR=2, a height-law cost). See (d) above for why this is not derivable.
-# PDM: Measured — Zen4 and Zen5-mobile share every detected const and want 448 vs 0; default = the n-only cut's W=8 value, 0 at W=4. | tune: none — orphaned; candidates (0, 112, 224, 448)
+# PDM: Measured — the aligned crossover is not ordered by any detected const: equal W, registers, L2 and datapath give caps of 448 and 0, and L1 residency orders them backwards; default = the n-only cut's W=8 value, 0 at W=4. | tune: none — orphaned; candidates (0, 112, 224, 448)
 const _GEMVN_RB = @load_preference("gemvn_rb", _vwidth(Float64) == 4 ? 0 : 448)::Int   # req8-ok: Measure-tier default, see (d)
 @inline function _gemvn_rowblock_route(m::Int, n::Int, lda::Int, abase::UInt, ::Type{T}) where {T}
     f = _FKR_gemvn_rb[]
