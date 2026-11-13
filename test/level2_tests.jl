@@ -1066,7 +1066,7 @@ end
     @test route(last(P._GEMVN_ROWBLOCK_MRS) * W, 4096)
     # (c) n within the panel route's width
     @test route(big, cs) && !route(big + 1, cs + 1, big + 1)
-    # (d) line-aligned columns up to the cap, half the cap when the stride aliases the L1 way
+    # (d) line-aligned columns up to the cap, a quarter of it when the stride aliases the L1 way
     lda_al = cld(big, line ÷ sz) * (line ÷ sz) + line ÷ sz       # line-aligned
     (lda_al * sz) % way == 0 && (lda_al += line ÷ sz)             # not a multiple of the L1 way
     lda_po2 = way ÷ sz * 64                                       # a multiple of the L1 way
@@ -1086,8 +1086,8 @@ end
         @test !r(a2)
     end
     @test !any(n -> route(553, n), 64:448)                        # 553·8 bytes is not a line multiple
-    @test route(lda_po2, max(rb ÷ 2, cs + 1), lda_po2) == (rb ÷ 2 > cs)
-    @test !route(lda_po2, max(rb ÷ 2, cs) + 1, lda_po2)
+    @test route(lda_po2, max(rb ÷ 4, cs + 1), lda_po2) == (rb ÷ 4 > cs)
+    @test !route(lda_po2, max(rb ÷ 4, cs) + 1, lda_po2)
 
     # Row-block height past the panel width: the latency term rules out MR=2 wherever a taller height
     # fits, including the m whose waste is smallest at MR=2.
