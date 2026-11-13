@@ -6,17 +6,20 @@
 #   trans: op≠N ⇒ transpose,  'C' ⇒ conjugate ;  uplo: 'U' ⇒ upper ;  diag: 'U' ⇒ unit.
 #
 # Matrix args are bridged to a `PtrMatrix` (like GEMM) and the packed triangle AP to a `PtrVector`.
-# VECTOR args (x/y) go in as the raw `Ptr` + inc — the kernels take `(n, ptr, inc)` directly (see
-# cabi.jl BLAS-1) — except where a kernel indexes the vector as an array (complex gemv,
-# trmv/trsv), which gets a unit-stride vector as a `PtrVector`.
+# VECTOR args (x/y) go in as a `PtrVector` (see `_cabi_vec`) plus inc, since the kernels index them.
 
 # Ptr→matrix bridge: isbits `PtrMatrix` (ptr, nr, nc, ld) — stride(1)==1, stride(2)==ld dense operand.
-# Trim-safe and 0-alloc (isbits ⇒ passes by value into the kernels with no heap box). A raw `Ptr`
-# vector counts as dense (`_dense1(::Ptr)`), so it reaches the SIMD L2 kernels; a kernel that takes
-# views of its vector needs it wrapped as a `PtrVector` first.
+# Trim-safe and 0-alloc (isbits ⇒ passes by value into the kernels with no heap box). A `PtrMatrix`
+# counts as dense, so it reaches the SIMD L2 kernels.
 @inline function _cabi_mat(p::Ptr{T}, ld::Int64, nr::Int64, nc::Int64) where {T}
     return PtrMatrix(p, Int(nr), Int(nc), Int(ld))
 end
+
+# A BLAS vector of n logical elements at stride `inc`, as a `PtrVector` over its 1+(n-1)|inc|
+# stored entries. Kernels index it as an array (a negative `inc` starts at the far end, so every
+# index stays inside this range), and the SIMD routes accept it at unit stride only.
+@inline _cabi_vec(p::Ptr, n::Integer, inc::Integer) =
+    PtrVector(p, n > 0 ? 1 + (Int(n) - 1) * abs(Int(inc)) : 0)
 
 # A packed triangle of order n as a `PtrVector` of its n(n+1)/2 entries: the packed SIMD kernels
 # take `pointer(AP)`, which a raw `Ptr` does not have.
@@ -32,15 +35,11 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         tc = _cabi_char(trans); mm = unsafe_load(m); nn = unsafe_load(n)
         Am = _cabi_mat(A, unsafe_load(lda), mm, nn)          # A is always stored m×n
         ix = unsafe_load(incx); iy = unsafe_load(incy)
-        # The complex T/C kernel indexes y, so its unit-stride vectors go in as `PtrVector`s.
-        if $(T <: Complex) && tc != 'N' && isone(ix) && isone(iy)
-            _gemv!(
-                true, tc == 'C', mm, nn, unsafe_load(alpha), Am,
-                PtrVector(x, Int(mm)), ix, unsafe_load(beta), PtrVector(y, Int(nn)), iy
-            )
-        else
-            _gemv!(tc != 'N', tc == 'C', mm, nn, unsafe_load(alpha), Am, x, ix, unsafe_load(beta), y, iy)
-        end
+        xl = tc == 'N' ? nn : mm; yl = tc == 'N' ? mm : nn
+        _gemv!(
+            tc != 'N', tc == 'C', mm, nn, unsafe_load(alpha), Am,
+            _cabi_vec(x, xl, ix), ix, unsafe_load(beta), _cabi_vec(y, yl, iy), iy
+        )
         return
     end
 end
@@ -58,9 +57,10 @@ for (sym, T, cj) in (
         )::Cvoid
         mm = unsafe_load(m); nn = unsafe_load(n)
         Am = _cabi_mat(A, unsafe_load(lda), mm, nn)
+        ix = unsafe_load(incx); iy = unsafe_load(incy)
         _ger!(
-            $cj, mm, nn, unsafe_load(alpha), x, unsafe_load(incx),
-            y, unsafe_load(incy), Am
+            $cj, mm, nn, unsafe_load(alpha), _cabi_vec(x, mm, ix), ix,
+            _cabi_vec(y, nn, iy), iy, Am
         )
         return
     end
@@ -78,9 +78,10 @@ for (sym, T, kern) in (
         )::Cvoid
         nn = unsafe_load(n)
         Am = _cabi_mat(A, unsafe_load(lda), nn, nn)
+        ix = unsafe_load(incx); iy = unsafe_load(incy)
         $kern(
             _cabi_char(uplo) == 'U', nn, unsafe_load(alpha), Am,
-            x, unsafe_load(incx), unsafe_load(beta), y, unsafe_load(incy)
+            _cabi_vec(x, nn, ix), ix, unsafe_load(beta), _cabi_vec(y, nn, iy), iy
         )
         return
     end
@@ -98,12 +99,7 @@ for (op, kern) in (("trmv", :_trmv!), ("trsv", :_trsv!))
             uc = _cabi_char(uplo); tc = _cabi_char(trans); dc = _cabi_char(diag)
             Am = _cabi_mat(A, unsafe_load(lda), nn, nn)
             inc = unsafe_load(incx)
-            # The blocked kernels take views of x, so a unit-stride x goes in as a `PtrVector`.
-            if isone(inc)
-                $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, Am, PtrVector(x, Int(nn)), inc)
-            else
-                $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, Am, x, inc)
-            end
+            $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, Am, _cabi_vec(x, nn, inc), inc)
             return
         end
     end
@@ -120,9 +116,10 @@ for (sym, T, kern) in (
             beta::Ptr{$T}, y::Ptr{$T}, incy::Ptr{Int64}, len_uplo::Clong
         )::Cvoid
         nn = unsafe_load(n)
+        ix = unsafe_load(incx); iy = unsafe_load(incy)
         $kern(
             _cabi_char(uplo) == 'U', nn, unsafe_load(alpha), _cabi_packed(AP, nn),
-            x, unsafe_load(incx), unsafe_load(beta), y, unsafe_load(incy)
+            _cabi_vec(x, nn, ix), ix, unsafe_load(beta), _cabi_vec(y, nn, iy), iy
         )
         return
     end
@@ -137,7 +134,8 @@ for (op, kern) in (("tpmv", :_tpmv!), ("tpsv", :_tpsv!))
                 len_u::Clong, len_t::Clong, len_d::Clong
             )::Cvoid
             uc = _cabi_char(uplo); tc = _cabi_char(trans); dc = _cabi_char(diag); nn = unsafe_load(n)
-            $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, _cabi_packed(AP, nn), x, unsafe_load(incx))
+            ix = unsafe_load(incx)
+            $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, _cabi_packed(AP, nn), _cabi_vec(x, nn, ix), ix)
             return
         end
     end
@@ -154,7 +152,8 @@ for (sym, T, AT, kern) in (
             x::Ptr{$T}, incx::Ptr{Int64}, AP::Ptr{$T}, len_uplo::Clong
         )::Cvoid
         nn = unsafe_load(n)
-        $kern(_cabi_char(uplo) == 'U', nn, unsafe_load(alpha), x, unsafe_load(incx), _cabi_packed(AP, nn))
+        ix = unsafe_load(incx)
+        $kern(_cabi_char(uplo) == 'U', nn, unsafe_load(alpha), _cabi_vec(x, nn, ix), ix, _cabi_packed(AP, nn))
         return
     end
 end
@@ -171,9 +170,10 @@ for (sym, T, kern) in (
             AP::Ptr{$T}, len_uplo::Clong
         )::Cvoid
         nn = unsafe_load(n)
+        ix = unsafe_load(incx); iy = unsafe_load(incy)
         $kern(
             _cabi_char(uplo) == 'U', nn, unsafe_load(alpha),
-            x, unsafe_load(incx), y, unsafe_load(incy), _cabi_packed(AP, nn)
+            _cabi_vec(x, nn, ix), ix, _cabi_vec(y, nn, iy), iy, _cabi_packed(AP, nn)
         )
         return
     end
@@ -189,9 +189,11 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         tc = _cabi_char(trans)
         mm = unsafe_load(m); nn = unsafe_load(n); klv = unsafe_load(kl); kuv = unsafe_load(ku)
         ABm = _cabi_mat(AB, unsafe_load(ldab), klv + kuv + 1, nn)   # band packed (kl+ku+1)×n
+        ix = unsafe_load(incx); iy = unsafe_load(incy)
+        xl = tc == 'N' ? nn : mm; yl = tc == 'N' ? mm : nn
         _gbmv!(
             tc != 'N', tc == 'C', mm, nn, klv, kuv, unsafe_load(alpha), ABm,
-            x, unsafe_load(incx), unsafe_load(beta), y, unsafe_load(incy)
+            _cabi_vec(x, xl, ix), ix, unsafe_load(beta), _cabi_vec(y, yl, iy), iy
         )
         return
     end
@@ -209,9 +211,10 @@ for (sym, T, kern) in (
         )::Cvoid
         nn = unsafe_load(n); kv = unsafe_load(k)
         ABm = _cabi_mat(AB, unsafe_load(ldab), kv + 1, nn)         # band packed (k+1)×n
+        ix = unsafe_load(incx); iy = unsafe_load(incy)
         $kern(
             _cabi_char(uplo) == 'U', nn, kv, unsafe_load(alpha), ABm,
-            x, unsafe_load(incx), unsafe_load(beta), y, unsafe_load(incy)
+            _cabi_vec(x, nn, ix), ix, unsafe_load(beta), _cabi_vec(y, nn, iy), iy
         )
         return
     end
@@ -228,7 +231,8 @@ for (op, kern) in (("tbmv", :_tbmv!), ("tbsv", :_tbsv!))
             nn = unsafe_load(n); kv = unsafe_load(k)
             uc = _cabi_char(uplo); tc = _cabi_char(trans); dc = _cabi_char(diag)
             ABm = _cabi_mat(AB, unsafe_load(ldab), kv + 1, nn)     # band packed (k+1)×n
-            $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, kv, ABm, x, unsafe_load(incx))
+            ix = unsafe_load(incx)
+            $kern(uc == 'U', tc != 'N', tc == 'C', dc == 'U', nn, kv, ABm, _cabi_vec(x, nn, ix), ix)
             return
         end
     end
