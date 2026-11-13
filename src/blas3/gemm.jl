@@ -1272,6 +1272,13 @@ end
                 Cp, ldc, Ap, lda, ir, Bp, ldb, jrc, k, alpha, beta,
                 Val(_MR), Val(_NR), Val(TB), Val(B0)
             )
+        elseif mre == W
+            # One full vector of rows: the unmasked kernel. A masked store costs about a cycle more
+            # than a plain one on Zen4 (m = 8, k = 8, n = 552: 5882 against 5356 cycles).
+            _microkernel_unpacked!(
+                Cp, ldc, Ap, lda, ir, Bp, ldb, jrc, k, alpha, beta,
+                Val(1), Val(_NR), Val(TB), Val(B0)
+            )
         elseif cld(mre, W) == 1
             _mrows_tail!(
                 Cp, ldc, Ap, lda, ir, Bp, ldb, jrc, k, alpha, beta,
@@ -6958,6 +6965,12 @@ end
     if iszero(α)
         _scale_C!(C, m, n, β); return true
     end
+    _rows_dot_run!(C, A, B, α, β, tA, m, n, k)
+    return true
+end
+
+# The dot-product kernel on `1 <= m <= _rows_dot_max(T)` rows, B not transposed, α ≠ 0.
+@inline function _rows_dot_run!(C, A, B, α::T, β::T, tA::Bool, m::Int, n::Int, k::Int) where {T}
     Cp = _pm(C); Ap = _pm(A); Bp = _pm(B)
     rA = _root(A); rB = _root(B); rC = _root(C)
     # Rows of op(A) must be contiguous: copy them out of a non-transposed A into the packing scratch.
@@ -6977,7 +6990,7 @@ end
             _rows_dot_dispatch!(Cp.ptr, Cp.ld, Xp, ldx, Bp.ptr, Bp.ld, m, n, k, α, β, Val(_rows_dot_max(T)), Val(false))
         end
     end
-    return true
+    return nothing
 end
 
 # C (m×n) = op(A)·Bᵀ for a few rows m, with B stored n×k: column l of B holds row l of op(B), so it
@@ -7220,6 +7233,12 @@ end
     if iszero(α)
         _scale_C!(C, m, n, β); return true
     end
+    _rows_bt_run!(C, A, B, α, β, tA, m, n, k)
+    return true
+end
+
+# The transposed-B kernel on `1 <= m < _vwidth(T)` rows, α ≠ 0.
+@inline function _rows_bt_run!(C, A, B, α::T, β::T, tA::Bool, m::Int, n::Int, k::Int) where {T}
     Cp = _pm(C); Ap = _pm(A); Bp = _pm(B)
     rA = _root(A); rB = _root(B); rC = _root(C)
     xi = tA ? Ap.ld : 1; xl = tA ? 1 : Ap.ld
@@ -7230,7 +7249,104 @@ end
             _rows_bt_dispatch!(Cp.ptr, Cp.ld, Ap.ptr, xi, xl, Bp.ptr, Bp.ld, m, n, k, α, β, Val(_vwidth(T) - 1), Val(false))
         end
     end
+    return nothing
+end
+
+# C with q = W·⌊m/W⌋ full vectors of rows plus r = m mod W more, up to `_GEMM_MR1_MAX` rows. The q rows
+# run the unpacked kernel unmasked; the r rows would cost a whole masked register per column and k
+# step, so they go to a kernel that vectorizes along k (B not transposed) or along n (B transposed)
+# and spends r/W of a register instead: the transposed-B tail under the rule `_gemm_rows_bt!` uses,
+# the dot-product tail under `_rows_dot_tail_ok` and the dot route's depth rule. OpenBLAS's small-matrix kernels for this part do the same: a dot-product form for a tail of at
+# most 4 rows with B not transposed and k >= 16, and an n-vectorized form with scatter stores for a
+# tail of 1 to 5 rows with B transposed.
+#
+# The transposed-B tail has the unpacked kernel's bits; the dot-product tail does not, so that split
+# is taken only where the column-split pool never runs (`_gemm_never_pooled`), which keeps the result
+# the same at every thread count.
+@inline _gemm_never_pooled(m::Int, n::Int, k::Int) = 2 * m * n * k < _gemm_mt_work() || n < _NR
+@inline function _gemm_rows_split!(C, A, B, α::T, β::T, tA::Bool, tB::Bool, m::Int, n::Int, k::Int, nw::Int) where {T}
+    W = _vwidth(T)
+    T <: BlasReal && !tA && W < m <= _GEMM_MR1_MAX && n > 1 && k > 1 &&
+        eltype(A) === T && eltype(B) === T && _strided1(A) && _strided1(B) && _strided1(C) || return false
+    r = m % W; q = m - r
+    iszero(r) && return false
+    # Tail kernel: 1 = n-vectorized (B transposed, bit-identical to the unpacked kernel, so only
+    # when the pool declines the call), 2 = dot product (B not transposed, only where the pool never
+    # runs). Otherwise the unpacked driver's own ragged handling is as fast (measured on Zen4).
+    if tB
+        nw == 1 && (r < _at_tail_vw(_HW, T) || k >= _rows_dot_kmin(T, r)) || return false
+        tk = 1
+    else
+        _rows_dot_tail_ok(T, r) && k >= _rows_dot_kmin(T, r) && _gemm_never_pooled(m, n, k) || return false
+        tk = 2
+    end
+    if iszero(α)
+        _scale_C!(C, m, n, β); return true
+    end
+    Cp = _pm(C); Ap = _pm(A); Bp = _pm(B)
+    rA = _root(A); rB = _root(B); rC = _root(C)
+    sz = sizeof(T)
+    Xs, _ = _gemm_scratch(T, tk == 2 ? r * k : 0, 0)
+    GC.@preserve rA rB rC Xs begin
+        # The dot-product tail reads its rows of A contiguous along k.
+        Xp = pointer(Xs)
+        if tk == 2
+            for i in 1:r, l in 1:k
+                unsafe_store!(Xp, unsafe_load(Ap.ptr, (q + i - 1) + (l - 1) * Ap.ld + 1), l + (i - 1) * k)
+            end
+        end
+        Atop = PtrMatrix(Ap.ptr, q, k, Ap.ld); Atl = PtrMatrix(Ap.ptr + q * sz, r, k, Ap.ld)
+        nb = _rows_split_nb(T, k, r, tk)
+        if iszero(β)
+            tB ? _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(true), Val(true)) :
+                _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(false), Val(true))
+        else
+            tB ? _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(true), Val(false)) :
+                _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(false), Val(false))
+        end
+    end
     return true
+end
+
+@inline function _rows_split_blocks!(
+        Cp::PtrMatrix{T}, Atop, Atl, Xp, Bp, α::T, β::T, q, r, n, k, nb, tk, ::Val{TB}, ::Val{B0}
+    ) where {T, TB, B0}
+    sz = sizeof(T)
+    j = 0
+    while j < n
+        w = min(nb, n - j)
+        Bb = TB ? PtrMatrix(Bp.ptr + j * sz, w, k, Bp.ld) : PtrMatrix(Bp.ptr + j * Bp.ld * sz, k, w, Bp.ld)
+        Cb = Cp.ptr + j * Cp.ld * sz
+        _gemm_unpacked!(Val(TB), Val(B0), q, w, k, α, Atop, Bb, β, PtrMatrix(Cb, q, w, Cp.ld))
+        if tk == 1
+            _rows_bt_dispatch!(Cb + q * sz, Cp.ld, Atl.ptr, 1, Atl.ld, Bb.ptr, Bp.ld, r, w, k, α, β, Val(_vwidth(T) - 1), Val(B0))
+        else
+            _rows_dot_dispatch!(Cb + q * sz, Cp.ld, Xp, k, Bb.ptr, Bp.ld, r, w, k, α, β, Val(_vwidth(T) - 1), Val(B0))
+        end
+        j += w
+    end
+    return nothing
+end
+
+# Columns per block of the split: both passes over a block of B find it in L1 when the block fills at
+# most half of L1 (`_L1_BYTES`), and a block is at least one column tile of the tail kernel and of the
+# unpacked kernel (`_NR`), so neither runs a narrower tile than it would unblocked.
+# A dot-product tail of r rows, against the unpacked driver's one vector for them: that vector is the
+# datapath width for r up to it and the register width above, so it leaves `lanes - r` lanes idle.
+# The dot form pays a horizontal sum per element, and it wins only where the vector wastes at least a
+# quarter of its lanes. The lane count derives from detected widths; the quarter does not: it is the
+# measured break-even on Zen4, a literal with its table (req8-ok), unvalidated on other parts:
+#   r   1     2     3     4     5     6     7      (k = 100, n = 553, against max(OpenBLAS, AOCL))
+#       1.02  1.00  1.03  0.92  1.07  0.98  0.91   dot tail
+#       0.78  0.85  0.99  0.99  0.96  0.96  0.96   vector tail
+@inline function _rows_dot_tail_ok(::Type{T}, r::Int) where {T}
+    lanes = r <= _at_tail_vw(_HW, T) ? _at_tail_vw(_HW, T) : _vwidth(T)
+    return 4 * (lanes - r) >= lanes
+end
+
+@inline function _rows_split_nb(::Type{T}, k::Int, r::Int, tk::Int) where {T}
+    tile = tk == 1 ? _rows_dot_nc(T, r) * _vwidth(T) : _rows_dot_nc(T, r)
+    return max(tile, _NR, ((_L1_BYTES ÷ 2) ÷ (k * sizeof(T)) ÷ _NR) * _NR)
 end
 
 # `gemm!`'s route for a strided operand of a BLAS element type, shared with the `?gemm_64_` C-ABI entries
@@ -7242,6 +7358,7 @@ end
     ) where {T}
     _gemm_as_gemv!(C, A, B, α, β, tA, tB, m, n, k) && return C
     _gemm_rows_dot!(C, A, B, α, β, tA, tB, m, n, k) && return C
+    _gemm_rows_split!(C, A, B, α, β, tA, tB, m, n, k, nw) && return C
     # The rank-1, transposed-B and row-tail routes compute every element by the unpacked kernel's
     # operations, so they agree bit for bit with the column split, which runs that kernel on each
     # slice. They take only the calls the pool declines and leave large calls to it.
