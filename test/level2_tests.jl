@@ -1147,7 +1147,10 @@ end
     # (d) line-aligned columns up to the cap, a quarter of it when the stride aliases the L1 way
     lda_al = cld(big, line ÷ sz) * (line ÷ sz) + line ÷ sz       # line-aligned
     (lda_al * sz) % way == 0 && (lda_al += line ÷ sz)             # not a multiple of the L1 way
-    lda_po2 = way ÷ sz * 64                                       # a multiple of the L1 way
+    # A line-aligned multiple of the L1 way. The detected way need not be a multiple of `sz` or of the
+    # line (it is `_L1_BYTES ÷ _L1D_ASSOC`, e.g. 32768 ÷ 12 = 2730), so build the stride from their lcm.
+    lda_way = lcm(way, line) ÷ sz * 64
+    @test (lda_way * sz) % way == 0 && (lda_way * sz) % line == 0
     rb = P._gemvn_rb()
     @test rb == something(P.load_preference(P, "gemvn_rb"), W == 4 ? 64 : 448)
     @test route(lda_al, cs + 1, lda_al) == (rb > cs)
@@ -1164,8 +1167,8 @@ end
         @test !r(a2)
     end
     @test !any(n -> route(553, n), 64:448)                        # 553·8 bytes is not a line multiple
-    @test route(lda_po2, max(rb ÷ 4, cs + 1), lda_po2) == (rb ÷ 4 > cs)
-    @test !route(lda_po2, max(rb ÷ 4, cs) + 1, lda_po2)
+    @test route(lda_way, max(rb ÷ 4, cs + 1), lda_way) == (rb ÷ 4 > cs)
+    @test !route(lda_way, max(rb ÷ 4, cs) + 1, lda_way)
 
     # Row-block height past the panel width: the latency term rules out MR=2 wherever a taller height
     # fits, including the m whose waste is smallest at MR=2.

@@ -9,23 +9,21 @@ using SIMD: Vec, vload, vstore, vifelse, shufflevector
 
 # Eligibility: unit-stride + dense + real. `Ptr` inputs come from the C ABI (already raw); dense
 # arrays expose a pointer. Complex deliberately excluded (interleaved re/im SIMD is M2 work).
-@inline _simd1(::Ptr{T}) where {T <: BlasReal} = true
-@inline _simd1(::DenseArray{T}) where {T <: BlasReal} = true
+const _RealArg{T} = Union{Ptr{T}, PtrVector{T}, DenseArray{T}}
+@inline _simd1(::_RealArg{T}) where {T <: BlasReal} = true
 @inline _simd1(@nospecialize(_)) = false
-@inline _simd2(::Ptr{T}, ::Ptr{T}) where {T <: BlasReal} = true
-@inline _simd2(::DenseArray{T}, ::DenseArray{T}) where {T <: BlasReal} = true
+@inline _simd2(::_RealArg{T}, ::_RealArg{T}) where {T <: BlasReal} = true
 @inline _simd2(@nospecialize(_), @nospecialize(_)) = false
 
 # Complex unit-stride dense/Ptr → the underlying interleaved [re im re im …] buffer IS a contiguous
 # 2n-real array. For the two reductions that are grouping-invariant — nrm2 (Σ|xᵢ|² = Σ over 2n reals r² )
 # and asum (dzasum = Σ|Re|+|Im| = Σ over 2n reals |r|) — a complex op reduces EXACTLY to the real SIMD
 # kernel over that reinterpreted buffer. `_reptr` gives the real Ptr (caller GC.@preserves the array).
-@inline _cplx_re(::Ptr{Complex{T}}) where {T <: BlasReal} = true
-@inline _cplx_re(::DenseArray{Complex{T}}) where {T <: BlasReal} = true
+const _CplxArg{T} = Union{Ptr{Complex{T}}, PtrVector{Complex{T}}, DenseArray{Complex{T}}}
+@inline _cplx_re(::_CplxArg{T}) where {T <: BlasReal} = true
 @inline _cplx_re(@nospecialize(_)) = false
 @inline _reptr(x::Ptr{Complex{T}}) where {T <: BlasReal} = Ptr{T}(x)
-@inline _reptr(x::DenseArray{Complex{T}}) where {T <: BlasReal} = Ptr{T}(pointer(x))
-const _CplxArg{T} = Union{Ptr{Complex{T}}, DenseArray{Complex{T}}}
+@inline _reptr(x::Union{PtrVector{Complex{T}}, DenseArray{Complex{T}}}) where {T <: BlasReal} = Ptr{T}(pointer(x))
 @inline _cplx2(::_CplxArg{T}, ::_CplxArg{T}) where {T <: BlasReal} = true      # both complex, same real T
 @inline _cplx2(@nospecialize(_), @nospecialize(_)) = false
 
