@@ -78,13 +78,25 @@ end
 
     # The live consts passed the same check at precompile time.
     @test isnothing(P._check_l1_geometry(P._L1_BYTES, P._L1D_ASSOC, P._CACHELINE))
+end
 
-    # On x86 the four values come from one CPUID pass and agree with the consts (no pin set).
-    g = P._cpuid_cache_geometry()
-    if g.l1 > 0 && isnothing(P.load_preference(P, "l1d_assoc", nothing))
-        @test P._L1_BYTES == g.l1
-        @test P._L2_BYTES == g.l2
-        @test P._L1D_ASSOC == g.assoc
-        @test P._CACHELINE == g.line
+@testitem "cpuinfo: L1 way is one memory page" tags = [:unit] begin
+    using PureBLAS
+    P = PureBLAS
+
+    # Only meaningful for the detected default: a pinned associativity overrides it by design.
+    if isnothing(P.load_preference(P, "l1d_assoc", nothing))
+        if Sys.iswindows()
+            # Sys.PAGESIZE is the 64 KiB allocation granularity there, above L1: one way spans all of L1.
+            @test P._L1D_ASSOC == 1
+            @test P._L1_WAY_BYTES == P._L1_BYTES
+        elseif Sys.PAGESIZE <= P._L1_BYTES
+            @test P._L1_WAY_BYTES == Sys.PAGESIZE
+            @test P._L1D_ASSOC == P._L1_BYTES ÷ Sys.PAGESIZE
+        end
     end
+    # The detected values pass the consistency check on every OS.
+    @test isnothing(P._check_l1_geometry(P._L1_BYTES, P._L1D_ASSOC, P._CACHELINE))
+    # Positive control: the check can fail.
+    @test_throws "inconsistent L1d cache geometry" P._check_l1_geometry(32768, 12, 64)
 end
