@@ -7,7 +7,7 @@
 # `# refblas-ok: <reason>` marker, so they are visible in review instead of accumulating silently.
 # (Run standalone: `julia test/probe_refblas_lint.jl`)
 const _PROBE_DIR = joinpath(@__DIR__, "..", "bench", "probes")
-const _PAT = r"AOCL_jll|aocl_blas_ilp64|aocl_lapack_ilp64|OpenBLAS_jll|libopenblas"
+const _PAT = r"AOCL_jll|libaocl64|aocl_blas_ilp64|aocl_lapack_ilp64|OpenBLAS_jll|libopenblas"
 const _BASELINE = Set(filter(l -> !isempty(l) && !startswith(l, "#"),
     strip.(readlines(joinpath(@__DIR__, "probe_refblas_baseline.txt")))))
 

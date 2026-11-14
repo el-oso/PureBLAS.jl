@@ -128,10 +128,10 @@ const _SELSIZE = let i = findfirst(a -> startswith(a, "size="), ARGS)   # `let` 
     isnothing(i) ? nothing : Set(parse(Int, s) for s in split(ARGS[i][6:end], ",") if !isempty(s))
 end
 # AOCL = AMD's Zen-tuned AOCL-BLIS + AOCL-libFLAME, shipped as the `AOCL_jll` artifact (AMD's own release,
-# NOT generic blis_jll/libflame_jll). We LBT-forward its artifact .so paths directly (BLAS→libblis-mt,
-# LAPACK→libflame), which is exactly what the AOCL.jl wrapper does — using the JLL keeps the dep to the
-# reproducible binary artifact. `libblis-mt` is a multi-thread build; pin to 1 thread for a fair
-# single-thread comparison (BLIS reads these at init; BLAS.set_num_threads(1) below re-enforces via LBT).
+# NOT generic blis_jll/libflame_jll). We LBT-forward its one ILP64 library, `libaocl64`, which holds
+# both BLAS and LAPACK — using the JLL keeps the dep to the reproducible binary artifact. It is an
+# OpenMP multi-thread build; pin to 1 thread for a fair single-thread comparison (BLIS reads these at
+# init; BLAS.set_num_threads(1) below re-enforces via LBT).
 
 # BLIS reads these at init, before any forward — so they are set HERE, above `using AOCL_jll`, and
 # cannot be changed afterwards by `BLAS.set_num_threads`.
@@ -244,11 +244,10 @@ function _use_ref!(name::AbstractString)
         return name
     end
     if name == "aocl"
-        LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_blas_ilp64; clear = true)   # BLAS   → libblis-mt.so
-        LinearAlgebra.BLAS.lbt_forward(AOCL_jll.aocl_lapack_ilp64)               # LAPACK → libflame.so
+        LinearAlgebra.BLAS.lbt_forward(AOCL_jll.libaocl64; clear = true)   # BLAS + LAPACK, ILP64
     elseif name == "accelerate"
         # ONE forward covers both BLAS and LAPACK — Accelerate ships them in the same umbrella binary,
-        # unlike AOCL's separate blis/flame .so files, and the suffix hint is what selects the ILP64
+        # as AOCL's `libaocl64` does, and the suffix hint is what selects the ILP64
         # interface. Forwarding vecLib's `libBLAS.dylib`/`libLAPACK.dylib` instead registers LP64 and
         # leaves the `_64_` slot empty, which returns ZEROS rather than raising — see the constants
         # above for the full account and why the leading \x1a byte is required.
