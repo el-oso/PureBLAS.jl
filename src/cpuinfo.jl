@@ -108,48 +108,11 @@ _sysctl_feature(name::String) = let (found, v) = _sysctl_probe(name)
     found && v == 1
 end
 
-# L1d size, L2 size, L1d associativity and L1d line size of the build machine, all decoded from the
-# x86 CPUID cache-descriptor leaf (4 on Intel, 0x8000001D on AMD) in ONE pass, so the four values
-# always describe the same chip: size = ways * partitions * line * sets, per subleaf. Mixing sources
-# fixed at different times (a cached CPUSummary image from another CPU with this CPUID read) can
-# yield a pair that describes no real cache. A field is 0 when unavailable (non-x86, masked leaf,
-# no level-1 data / level-2 entry); callers fall back to the portable detectors then (req #13).
-function _cpuid_cache_geometry()
-    z = (l1 = 0, l2 = 0, assoc = 0, line = 0)
-    (Sys.ARCH === :x86_64 || Sys.ARCH === :i686) || return z
-    return try
-        leaf = cpuvendor() === :AMD ? 0x8000_001d : 0x0000_0004
-        l1 = l2 = 0
-        assoc = line = 0
-        for sl in 0x0000_0000:0x0000_0007
-            eax, ebx, ecx, _ = cpuid(leaf, sl)
-            type = eax & 0x1f                    # 0 ends the list; 1 data, 2 instruction, 3 unified
-            type == 0 && break
-            (type == 1 || type == 3) || continue
-            level = Int((eax >> 5) & 0x07)
-            ways = Int(1 + (ebx >> 22) & 0x03ff)
-            parts = Int(1 + (ebx >> 12) & 0x03ff)
-            ln = Int(1 + ebx & 0x0fff)
-            bytes = ways * parts * ln * (Int(ecx) + 1)
-            if level == 1 && l1 == 0
-                l1, assoc, line = bytes, ways, ln
-            elseif level == 2 && l2 == 0
-                l2 = bytes
-            end
-        end
-        (l1 > 0 && l2 > 0 && assoc > 0 && line > 0) ? (; l1, l2, assoc, line) : z
-    catch
-        z
-    end
-end
-const _CPUID_CACHE = _cpuid_cache_geometry()
-
 # L1 data-cache size in bytes (folded to a const; fallback if a level reports 0). Unused by the
 # bandwidth-bound Level-1 kernels, but L2/L3 blocking for the M2 dgemm will read these.
-# x86: the CPUID descriptor (see `_cpuid_cache_geometry`). Darwin: prefer the fast-tier `perflevel0`
-# figure over CPUSummary (see `_sysctl_int` above).
+# Darwin: prefer the fast-tier `perflevel0` figure over CPUSummary (see `_sysctl_int` above).
 const _L1_BYTES = let d = _sysctl_int("hw.perflevel0.l1dcachesize")
-    s = _CPUID_CACHE.l1 > 0 ? _CPUID_CACHE.l1 : d > 0 ? d : Int(cache_size(Val(1)))
+    s = d > 0 ? d : Int(cache_size(Val(1)))
     s > 0 ? s : 32 * 1024
 end
 
@@ -166,7 +129,7 @@ end
 # Only prefetch density depends on this, so a wrong value costs tuning and never correctness.
 # `_L3_BYTES` (no SLC is queryable at all on M-series) and `_L1D_ASSOC` remain approximate on ARM for
 # the same reason — see docs/src/design.md: ARM is untested, not supported.
-const _CACHELINE = let s = _CPUID_CACHE.line > 0 ? _CPUID_CACHE.line : try
+const _CACHELINE = let s = try
         Int(cachelinesize())
     catch
         0
@@ -180,18 +143,22 @@ const _CACHELINE = let s = _CPUID_CACHE.line > 0 ? _CPUID_CACHE.line : try
     end
 end
 
-# L1d associativity (ways), CPUID leaf 4 (Intel) / 0x8000001D (AMD), ebx[22:31]+1, read together with
-# the L1d size and line size (`_cpuid_cache_geometry`). The derived way size (_L1_WAY_BYTES) is the address stride
-# at which parallel streams collide in ONE L1 set: gemvN column streams at lda·sizeof ≡ 0 (mod way) all
-# index the same set, so at most `ways` of them can coexist — the panel width selector keys on this.
-# Fallback 8 (Zen2–5 and most Intel L1d are 8-way; Ice-Lake-class 48K/12-way also yields 4K ways).
-# PDM: Derived — the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
-const _L1D_ASSOC = @load_preference("l1d_assoc", _CPUID_CACHE.assoc > 0 ? _CPUID_CACHE.assoc : 8)::Int
+# L1d associativity (ways). One way of an L1d indexed by page-offset bits is at most one memory page,
+# so ways = L1 bytes ÷ page size. Every known part has exactly one page per way:
+#   Zen3/Zen4 32 KiB 8-way, 4 KiB pages  -> 8     Zen5 48 KiB 12-way, 4 KiB pages -> 12
+#   Apple M 128 KiB 8-way, 16 KiB pages  -> 8
+# `Sys.PAGESIZE` is the OS allocation unit: the page size on Unix, the 64 KiB allocation granularity
+# on Windows, where it exceeds L1; the cap at `_L1_BYTES` then gives associativity 1 (one way spans
+# the whole L1). The way size (_L1_WAY_BYTES) is the address stride at which parallel streams collide in
+# ONE L1 set: gemvN column streams at lda·sizeof ≡ 0 (mod way) all index the same set, so at most
+# `ways` of them can coexist — the panel width selector keys on this.
+# PDM: Derived — one L1d way is one memory page (page-offset indexing); Sys.PAGESIZE, capped at L1; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+const _L1D_ASSOC = @load_preference("l1d_assoc", max(1, _L1_BYTES ÷ min(Sys.PAGESIZE, _L1_BYTES)))::Int
 
 # A way is a whole number of lines: L1 bytes = ways * sets * line. A triple that violates this
-# describes no real cache (typically geometry values taken from two different machines, or an
-# inconsistent preference pin), and every way-stride formula below would silently be wrong, so
-# precompilation stops here. Pure so it can be tested against geometries no host has.
+# describes no real cache (typically an inconsistent preference pin), and every way-stride formula
+# below would silently be wrong, so precompilation stops here. Pure so it can be tested against
+# geometries no host has.
 function _check_l1_geometry(l1::Int, assoc::Int, line::Int; assoc_pinned::Bool = false)
     (assoc > 0 && line > 0 && l1 > 0 && l1 % (assoc * line) == 0) && return nothing
     src = assoc_pinned ? "associativity $assoc comes from the \"l1d_assoc\" preference; fix or remove it" :
@@ -219,7 +186,7 @@ const _L1_WAY_BYTES = max(_CACHELINE, _L1_BYTES ÷ _L1D_ASSOC)
 # L2 data-cache size in bytes (folded to a const; fallback 512 KiB if unreported). Governs the
 # "operand fits L2 → one resident panel vs stream" thresholds (e.g. complex gemv _CGEMV_RB).
 const _L2_BYTES = let d = _sysctl_int("hw.perflevel0.l2cachesize")
-    s = _CPUID_CACHE.l2 > 0 ? _CPUID_CACHE.l2 : d > 0 ? d : Int(cache_size(Val(2)))
+    s = d > 0 ? d : Int(cache_size(Val(2)))
     s > 0 ? s : 512 * 1024
 end
 
