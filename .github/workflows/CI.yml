@@ -87,7 +87,7 @@ jobs:
         with:
           # The action pastes this into a shell command unquoted: words split into separate ARGS, which
           # test/runtests.jl joins as alternatives, and `.` stands in for the spaces inside a name.
-          test_args: 'same.answer.as.the.serial.path keeps.its.speedup pool.is.actually.used pinned.on.a.restricted'
+          test_args: 'same.answer.as.the.serial.path keeps.its.speedup pool.is.actually.used pinned.on.a.restricted L1.way.is.one.memory.page'
         env:
           JULIA_NUM_THREADS: '4'
 
