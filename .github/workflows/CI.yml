@@ -32,7 +32,11 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
+      - name: Record CPU model for the cache key
+        run: echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
       - uses: julia-actions/cache@v2
+        with:
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
       - uses: julia-actions/julia-buildpkg@v1
       # `-t 4`: any item that reaches a threaded kernel needs workers to reach it at all, and below two
       # threads the pool never forms. The bit-identity and threaded-correctness items are NOT here —
@@ -69,7 +73,14 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.13'
+      - name: Record CPU model for the cache key
+        shell: pwsh
+        run: |
+          $m = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name -replace '[^A-Za-z0-9]+', '-'
+          "CPU_MODEL=$m" >> $env:GITHUB_ENV
       - uses: julia-actions/cache@v2
+        with:
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
         with:
@@ -101,7 +112,11 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.13'
+      - name: Record CPU model for the cache key
+        run: echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
       - uses: julia-actions/cache@v2
+        with:
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
       - uses: julia-actions/julia-buildpkg@v1
       # Inference/trim-safety dogfood — no line coverage (these exercise the SAME kernels the `test` job
       # already covers functionally; they assert type-stability/no-alloc/trim-safety, not new surface).
@@ -149,14 +164,16 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.13'
+      - name: Record CPU model for the cache key
+        run: echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
       - uses: julia-actions/cache@v2
-        # THE DEPOT CACHE KEY MUST CARRY THE CPU TARGET. Precompiled images are stored per target, and
+        # THE DEPOT CACHE KEY MUST CARRY THE CPU TARGET AND THE RUNNER CPU MODEL. Precompiled images are stored per target, and
         # this job sets JULIA_CPU_TARGET while the action's default key covers only workflow, job and
         # OS — so a depot saved under a different target restores here and `using JuliaC` fails with
         # `Precompiled image ... not available with flags CacheFlags(...)`, before any compiling starts.
         # Naming the target in the prefix keeps one cache namespace per target.
         with:
-          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu=${{ env.JULIA_CPU_TARGET }}
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu=${{ env.JULIA_CPU_TARGET }};cpu_model=${{ env.CPU_MODEL }}
       - uses: julia-actions/julia-buildpkg@v1
       - name: Build libpureblas.so (juliac --trim=safe --compile-ccallable)
         run: julia --project=. juliac/build.jl
@@ -219,7 +236,11 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1'
+      - name: Record CPU model for the cache key
+        run: echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
       - uses: julia-actions/cache@v2
+        with:
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
       # Blocks the merge on a >25% slowdown vs the base branch (coarse: shared runners are noisy — see
       # benchmark/judge_ci.jl). Precise 0.96× OpenBLAS gating runs on a pinned self-hosted fleet runner.
       - name: Judge performance vs base branch

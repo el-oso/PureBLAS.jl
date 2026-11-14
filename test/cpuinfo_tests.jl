@@ -56,3 +56,35 @@
         @test !P._SME_F32_KEY_ABSENT
     end
 end
+
+@testitem "cpuinfo: L1 geometry must describe a real cache" tags = [:unit] begin
+    using PureBLAS
+    P = PureBLAS
+
+    # Real geometries: Zen4 / Zen3, Zen5, Apple perflevel0.
+    @test isnothing(P._check_l1_geometry(32 * 1024, 8, 64))
+    @test isnothing(P._check_l1_geometry(48 * 1024, 12, 64))
+    @test isnothing(P._check_l1_geometry(128 * 1024, 8, 128))
+
+    # 32 KiB / 12 ways = 2730.67 B: not a whole number of lines.
+    @test_throws "L1 size 32768 B is not a whole multiple of associativity 12 x line 64 B" P._check_l1_geometry(
+        32768, 12, 64
+    )
+    @test_throws "comes from the \"l1d_assoc\" preference" P._check_l1_geometry(
+        32768, 12, 64; assoc_pinned = true
+    )
+    @test_throws "come from detection" P._check_l1_geometry(32768, 12, 64)
+    @test_throws "inconsistent L1d cache geometry" P._check_l1_geometry(32768, 0, 64)
+
+    # The live consts passed the same check at precompile time.
+    @test isnothing(P._check_l1_geometry(P._L1_BYTES, P._L1D_ASSOC, P._CACHELINE))
+
+    # On x86 the four values come from one CPUID pass and agree with the consts (no pin set).
+    g = P._cpuid_cache_geometry()
+    if g.l1 > 0 && isnothing(P.load_preference(P, "l1d_assoc", nothing))
+        @test P._L1_BYTES == g.l1
+        @test P._L2_BYTES == g.l2
+        @test P._L1D_ASSOC == g.assoc
+        @test P._CACHELINE == g.line
+    end
+end
