@@ -150,10 +150,10 @@ const _GVDWS_F64 = Base.OncePerTask{_GVDWork{Float64, Float64}}(_GVDWork{Float64
 const _GVDWS_F32 = Base.OncePerTask{_GVDWork{Float32, Float32}}(_GVDWork{Float32, Float32})
 const _GVDWS_C64 = Base.OncePerTask{_GVDWork{ComplexF64, Float64}}(_GVDWork{ComplexF64, Float64})
 const _GVDWS_C32 = Base.OncePerTask{_GVDWork{ComplexF32, Float32}}(_GVDWork{ComplexF32, Float32})
-@inline _gvdws(::Type{Float64}) = _GVDWS_F64()
-@inline _gvdws(::Type{Float32}) = _GVDWS_F32()
-@inline _gvdws(::Type{ComplexF64}) = _GVDWS_C64()
-@inline _gvdws(::Type{ComplexF32}) = _GVDWS_C32()
+@inline _gvdws(::Type{Float64}) = _opt(_GVDWS_F64)
+@inline _gvdws(::Type{Float32}) = _opt(_GVDWS_F32)
+@inline _gvdws(::Type{ComplexF64}) = _opt(_GVDWS_C64)
+@inline _gvdws(::Type{ComplexF32}) = _opt(_GVDWS_C32)
 
 # Shared validation for every gvd entry.
 @inline function _gvd_check(itype, jobz, uplo, A, B)

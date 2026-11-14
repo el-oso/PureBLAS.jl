@@ -115,7 +115,7 @@ end
         # `_symm_scr_mt` is a `OncePerTask` accessor, and `Base.OncePerTask` is deliberately NOT
         # auto-recognized as a barrier, so it is registered explicitly the way `_m3ws` is.
         _POOLS = (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._arena_coalesce!,
-            P._m3ws, P._gpackws, P._strws, P._symm_scr_mt)
+            P._m3ws, P._gpackws, P._strws, P._symm_scr_mt, P._opt)
         for f in _POOLS
             StrictMode.register_alloc_barrier!(f)
         end

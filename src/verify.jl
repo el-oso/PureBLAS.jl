@@ -250,7 +250,17 @@ end
 # the value-free IR scan — the very heuristic the paragraph above says flags EVERY contracted LAPACK
 # member at a measured 0 B. Minutes of precompile spent producing verdicts this file already documents as
 # worthless. `proofs_loaded()` is the exact translation of "a real backend is present".
+# Functions whose allocations the static no-allocation proof treats as expected: each only grows an owned
+# workspace to a new high-water mark, or performs the first touch of a task-local owner. Each must be
+# `@noinline` and be the `:invoke` callee itself to be recognized.
+const _BARRIER_FUNCTIONS = (_ws_grow!, _ws_slot!, _arena_grow!, _arena_coalesce!, _m3ws, _gpackws, _strws,
+    _symm_scr_mt, _opt)
+
 if StrictMode.proofs_loaded()
+    # The registry is process-global and not part of the saved image, so this registration covers only the
+    # `@verify_strict` below, which runs while PureBLAS precompiles. test/strictmode_tests.jl registers
+    # (and removes) its own barriers around each proof it runs in the test process.
+    foreach(StrictMode.register_alloc_barrier!, _BARRIER_FUNCTIONS)
     let bk = DEFAULT_BACKEND, n = 1000, m = 64,
             xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n),
             Ad = ones(m, m), Az = ones(ComplexF64, m, m), um = ones(m), vm = ones(m),

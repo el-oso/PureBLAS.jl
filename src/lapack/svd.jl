@@ -645,17 +645,17 @@ end
 
 # One workspace per thread (written during the call) — see `_l3ws`.
 const _SVDWS = Base.OncePerTask{SVDWorkspace{Float64}}(SVDWorkspace{Float64})
-@inline _svdws() = _SVDWS()
+@inline _svdws() = _opt(_SVDWS)
 # Type-keyed form of the owner, so generic code can write `_svdws(T)` for real AND complex alike
 # (GKH ownership: resolved at compile time per type, never a runtime lookup).
-@inline _svdws(::Type{Float64}) = _SVDWS()
+@inline _svdws(::Type{Float64}) = _opt(_SVDWS)
 # Complex SVD values path: a separate owned workspace. Only the blocked-bidiag panels (gebrd_X/Y,
 # labrd_arow/tmp) are ever grown/used here — the singular-VECTOR buffers stay empty (vectors are the
 # follow-up). d,e stay real (local to the values entry), so they don't live in this complex workspace.
 const _SVDWS_C = Base.OncePerTask{SVDWorkspace{ComplexF64}}(SVDWorkspace{ComplexF64})
 const _SVDWS_C32 = Base.OncePerTask{SVDWorkspace{ComplexF32}}(SVDWorkspace{ComplexF32})
-@inline _svdws(::Type{ComplexF64}) = _SVDWS_C()
-@inline _svdws(::Type{ComplexF32}) = _SVDWS_C32()
+@inline _svdws(::Type{ComplexF64}) = _opt(_SVDWS_C)
+@inline _svdws(::Type{ComplexF32}) = _opt(_SVDWS_C32)
 
 # Grow only the blocked-bidiag panels (complex values path; vectors buffers untouched).
 function _svd_grow_bidiag!(ws::SVDWorkspace{T}, M::Int, N::Int) where {T}

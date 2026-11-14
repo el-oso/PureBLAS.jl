@@ -401,7 +401,7 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
     # short-circuits before any `stride` call, preserving the property the original guard was picked for.
     if T === Float64 && _strided1(A) && _lu_needs_pad(A, m)   # factor in a non-conflicting (ld=m+8) scratch
         R = m + 8
-        pad = _LU_PAD()
+        pad = _opt(_LU_PAD)
         b = pad[]
         (size(b, 1) < R || size(b, 2) < n) && (b = pad[] = Matrix{Float64}(undef, R, n))
         # The buffer is REUSED whenever it is already big enough, so after a larger call it is WIDER
@@ -795,8 +795,8 @@ end
 # ld=m+8 buffer (breaks the aliasing) and copy back. Per-type owned scratch (GKH ownership; trim-safe).
 const _CLU_PAD64 = Base.OncePerTask{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
 const _CLU_PAD32 = Base.OncePerTask{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
-@inline _clu_pad(::Type{ComplexF64}) = _CLU_PAD64()
-@inline _clu_pad(::Type{ComplexF32}) = _CLU_PAD32()
+@inline _clu_pad(::Type{ComplexF64}) = _opt(_CLU_PAD64)
+@inline _clu_pad(::Type{ComplexF32}) = _opt(_CLU_PAD32)
 @inline _clu_needs_pad(A, m, ::Type{T}) where {T} =
     m >= 256 && _strided1(A) && (stride(A, 2) * sizeof(T)) % 4096 == 0   # `_strided1`: see `_getf2!` above
 

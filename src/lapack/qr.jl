@@ -329,7 +329,7 @@ const _QR_WS_C = Base.OncePerTask{Base.RefValue{NTuple{5, Matrix{ComplexF64}}}}(
     () -> Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
 )
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}
-    r = _QR_WS_C()
+    r = _opt(_QR_WS_C)
     V, Tm, G, Wb, Yb = r[]
     if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n
         V = Matrix{T}(undef, m, nb); Tm = Matrix{T}(undef, nb, nb)
@@ -420,7 +420,7 @@ const _QR_WS = Base.OncePerTask{Base.RefValue{NTuple{4, Matrix{Float64}}}}(
     () -> Ref{NTuple{4, Matrix{Float64}}}(ntuple(_ -> Matrix{Float64}(undef, 0, 0), 4))
 )
 @inline function _qr_ws(m::Int, n::Int, nb::Int)
-    r = _QR_WS()
+    r = _opt(_QR_WS)
     V, Tm, G, Wb = r[]
     if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n
         V = Matrix{Float64}(undef, m, nb); Tm = Matrix{Float64}(undef, nb, nb)
