@@ -143,6 +143,16 @@ zero julia processes running and the 1-min average still read 2.69 (5-min 1.71, 
 cap therefore expired while the box was still "busy" by the very guard this exists to satisfy, and the
 next run refused. `below` sits just under calibrate.jl's threshold so satisfying this satisfies that.
 """
+# Why a calibration subprocess failed, from its exit code. The codes are `bench/calibrate.jl`'s refusals.
+function _calib_failure(e)
+    e isa ProcessFailedException || return sprint(showerror, e)
+    code = first(e.procs).exitcode
+    code == 3 && return "refused: machine busy (1-min load average above 1.5)"
+    code == 4 && return "refused: clock not frequency-locked; use `tune!(unlocked = true)`"
+    code == 5 && return "refused: achieved clock above the requested cpufreq cap"
+    return "exited with code $code; its output above has the error"
+end
+
 function _wait_idle(; below::Float64 = 1.4, maxsecs::Int = 600)
     t0 = time()
     while time() - t0 < maxsecs
@@ -234,25 +244,28 @@ function tune!(;
     # them is left at its in-code default and reported.
     @info "PureBLAS.tune!: $(repeats) independent calibration runs (minutes each)." project
     results = Dict{String, Any}[]
+    dropped = String[]
     mktempdir() do dir
         for k in 1:repeats
             f = joinpath(dir, "run$k.toml")
-            # LET THE BOX SETTLE FIRST. calibrate.jl refuses to measure on a busy machine (1-min
-            # loadavg > 1.5), and a run leaves its OWN load in that average — so back-to-back runs
-            # refuse themselves. Observed 2026-08-21: runs 2..N produced nothing on both fleet boxes
-            # while run 1 succeeded, and because a missing file was silently skipped, "unanimous
-            # agreement" was then satisfied by a SINGLE process. That is the exact failure the
-            # multi-process design exists to prevent, reintroduced by the guard it depends on.
-            k > 1 && _wait_idle()
+            # LET THE BOX SETTLE FIRST, before EVERY run. calibrate.jl refuses to measure on a busy
+            # machine (1-min loadavg > 1.5), and any earlier julia work leaves its load in that
+            # average: a previous run, a `tune!(dryrun = true)` just before this call, or the caller's
+            # own session. A run that refuses produces no file, and "unanimous agreement" then rests on
+            # fewer processes than asked for, which is the failure the multi-process design exists to
+            # prevent.
+            _wait_idle()
             try
                 run(`$jl --startup-file=no --project=$(project) $script emit=$f $extra`)
             catch e
-                @warn "tune!: calibration run $k failed; skipping it." e
+                why = _calib_failure(e)
+                push!(dropped, "run $k: $why")
+                @warn "tune!: calibration run $k failed ($why); skipping it."
                 continue
             end
             # Plain `key=value` lines, parsed here — deliberately NOT TOML, because TOML is not a
             # PureBLAS dependency and adding one to read three integers would be the wrong trade.
-            isfile(f) || continue
+            isfile(f) || (push!(dropped, "run $k: exited cleanly but wrote no result file"); continue)
             d = Dict{String, Any}()
             for ln in eachline(f)
                 kv = split(strip(ln), '='; limit = 2)
@@ -267,8 +280,8 @@ function tune!(;
     # "unanimous" on its own, which is a single sample wearing the costume of a quorum.
     if length(results) < repeats
         @warn "tune!: only $(length(results)) of $(repeats) calibration runs produced a result — a " *
-            "dropped run makes 'unanimous' meaningless, so NOTHING is pinned. Re-run on an idle, " *
-            "frequency-locked machine." got = length(results) want = repeats
+            "dropped run makes 'unanimous' meaningless, so NOTHING is pinned.\n  " *
+            join(dropped, "\n  ") got = length(results) want = repeats
         return nothing
     end
     isempty(results) && (@warn "tune!: no calibration run produced a result; defaults retained"; return nothing)
