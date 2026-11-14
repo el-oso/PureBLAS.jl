@@ -44,7 +44,7 @@ lbt.jl:print(io, " — LinearAlgebra uses the loaded BLAS; PureBLAS.activate() r
 tune.jl:sleep(5)
 tune.jl:@warn "tune!: machine still busy after $(maxsecs)s; the next run may refuse to measure."
 tune.jl:@info "PureBLAS.tune!: $(repeats) independent calibration runs (minutes each)." project
-tune.jl:@warn "tune!: calibration run $k failed; skipping it." e
+tune.jl:@warn "tune!: calibration run $k failed ($why); skipping it."
 tune.jl:@warn "tune!: only $(length(results)) of $(repeats) calibration runs produced a result — a " *
 tune.jl:isempty(results) && (@warn "tune!: no calibration run produced a result; defaults retained"; return nothing)
 tune.jl:@info "tune!: `$k` did not agree across runs $(vals) — leaving the default in place."

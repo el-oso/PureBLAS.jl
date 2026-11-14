@@ -175,3 +175,17 @@ end
         "tuned-state carve-out would refuse it." undeclared
     @test isempty(undeclared)
 end
+
+@testitem "tune!: a dropped calibration run reports its reason" tags = [:unit] begin
+    using PureBLAS
+    fail(code) = try
+        run(`$(Base.julia_cmd()) --startup-file=no -e "exit($code)"`)
+        nothing
+    catch e
+        e
+    end
+    @test occursin("machine busy", PureBLAS._calib_failure(fail(3)))
+    @test occursin("not frequency-locked", PureBLAS._calib_failure(fail(4)))
+    @test occursin("above the requested cpufreq cap", PureBLAS._calib_failure(fail(5)))
+    @test occursin("exited with code 7", PureBLAS._calib_failure(fail(7)))
+end
