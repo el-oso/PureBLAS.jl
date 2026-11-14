@@ -22,6 +22,26 @@
     return sfmin
 end
 
+# ── 3-element scratch vector for the bulge-chase reflectors ──────────────────────────────────────────
+# Three scalar fields behind the `AbstractVector` interface. A `Vector{R}` here would be heap-allocated
+# under `--check-bounds=yes`, because the vector escapes into `throw_boundserror`; this type has no
+# bounds-check branch to carry it there (an out-of-range index throws with a range, not with `v`), so
+# the scratch stays in registers or on the stack under every `--check-bounds` setting.
+mutable struct _Vec3{R <: Real} <: AbstractVector{R}
+    a::R
+    b::R
+    c::R
+    _Vec3{R}() where {R <: Real} = new{R}(zero(R), zero(R), zero(R))
+end
+Base.size(::_Vec3) = (3,)
+@inline Base.getindex(v::_Vec3, i::Int) =
+    i == 1 ? v.a : i == 2 ? v.b : i == 3 ? v.c : throw(BoundsError(Base.OneTo(3), i))
+@inline function Base.setindex!(v::_Vec3{R}, x, i::Int) where {R}
+    y = convert(R, x)
+    i == 1 ? (v.a = y) : i == 2 ? (v.b = y) : i == 3 ? (v.c = y) : throw(BoundsError(Base.OneTo(3), i))
+    return v
+end
+
 # ── DLARFG on a short (nr = 2 or 3) vector, REAL — the bulge-chase reflector generator ────────────────
 # Mirrors Reference-LAPACK DLARFG including the KNT rescale for a below-safmin β. On return v[1]=β,
 # v[2:nr] hold the essential reflector, and τ is returned (H = I − τ·v·vᵀ, v[1]≡1).
@@ -254,7 +274,7 @@ function _dlahqr!(
     i1 = 1; i2 = n
     itmax = 30 * max(10, nh)
     kdefl = 0
-    v = Vector{R}(undef, 3)
+    v = _Vec3{R}()
 
     i = ihi
     @inbounds while i >= ilo

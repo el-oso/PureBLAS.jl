@@ -800,7 +800,7 @@ end
 # window, so the minimum cannot hide one.
 #
 # Entries are the ones the strict-contract block in src/verify.jl reaches growth through: trsm!, trmm!,
-# symv!, trmv!, syr2k!, getrf!, geqrf!, gesvd!, sygvd!, plus gemm! and the complex 3M path. The threaded
+# symv!, trmv!, syr2k!, getrf!, geqrf!, gesvd!, sygvd!, geev!, gees!, plus gemm! and the complex 3M path. The threaded
 # arm re-runs the L3 entries and the vector kernels with the pool enabled, sleeping between the warm-up
 # calls so a wake from a real park is warmed too.
 @testitem "Pool growth is bounded: a warmed second call allocates 0 bytes" tags = [:checks] begin
@@ -819,6 +819,8 @@ end
     a_sygvd(A, A0, B, B0, w) = (copyto!(A, A0); copyto!(B, B0); @allocated P.sygvd!(1, 'V', 'L', A, B, w))
     a_hegvd(A, A0, B, B0, w) = (copyto!(A, A0); copyto!(B, B0); @allocated P.hegvd!(1, 'V', 'L', A, B, w))
     a_pocon(nrm, F) = @allocated P.pocon!(nrm, F; uplo = 'L')
+    a_geev(A, A0, wr, wi, VL, VR, sc) = (copyto!(A, A0); @allocated P.geev!('N', 'V', A, wr, wi, VL, VR, sc))
+    a_gees(A, A0, w, VS, sc) = (copyto!(A, A0); @allocated P.gees!('V', A, w, VS, sc))
 
     tri(T, s) = (M = tril(randn(T, s, s)); for i in 1:s
         M[i, i] += s
@@ -897,6 +899,16 @@ end
         F = copy(G0); P.potrf!(F; uplo = 'L')
         P.pocon!(opnorm(G0, 1), F; uplo = 'L')
         @test zero_after(a_pocon, opnorm(G0, 1), F)
+        # The Francis bulge-chase scratch (`_dlahqr!`, `_dlaqr5!`) must stay off the heap under
+        # `--check-bounds=yes`, which `Pkg.test` forces: n = 32 takes the unblocked sweep, n = 256 the multishift one.
+        for ne in (32, 256)
+            E0 = randn(ne, ne); E = similar(E0); ewr = zeros(ne); ewi = zeros(ne); EVL = zeros(ne, 0)
+            EVR = zeros(ne, ne); esc = zeros(ne); ew = Vector{ComplexF64}(undef, ne)
+            a_geev(E, E0, ewr, ewi, EVL, EVR, esc)
+            @test zero_after(a_geev, E, E0, ewr, ewi, EVL, EVR, esc)
+            a_gees(E, E0, ew, EVR, esc)
+            @test zero_after(a_gees, E, E0, ew, EVR, esc)
+        end
         # the open-type fallback owners: a Dual element type
         n = 32
         Ad = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n)); Bd = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n))
