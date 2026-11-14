@@ -243,6 +243,10 @@ function tune!(;
     # process cannot detect it; only separate processes can. A knob that does not agree across all of
     # them is left at its in-code default and reported.
     @info "PureBLAS.tune!: $(repeats) independent calibration runs (minutes each)." project
+    # PRECOMPILE BEFORE THE FIRST IDLE WAIT. A run that has to compile the environment does so after
+    # `_wait_idle` has returned, and the compile's own load then trips calibrate.jl's busy refusal:
+    # measured on Zen5 right after a source update, 1-min load 6.24 with nothing else running.
+    run(`$jl --startup-file=no --project=$(project) -e "import Pkg; Pkg.precompile()"`)
     results = Dict{String, Any}[]
     dropped = String[]
     mktempdir() do dir
