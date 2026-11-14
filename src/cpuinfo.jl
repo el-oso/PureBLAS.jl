@@ -203,7 +203,7 @@ function _check_l1_geometry(l1::Int, assoc::Int, line::Int; assoc_pinned::Bool =
     )
 end
 const _L1_GEOMETRY_CHECKED = _check_l1_geometry(
-    _L1_BYTES, _L1D_ASSOC, _CACHELINE; assoc_pinned = !isnothing(@load_preference("l1d_assoc", nothing))
+    _L1_BYTES, _L1D_ASSOC, _CACHELINE; assoc_pinned = !isnothing(load_preference(@__MODULE__, "l1d_assoc", nothing))
 )
 const _L1_WAY_BYTES = max(_CACHELINE, _L1_BYTES ÷ _L1D_ASSOC)
 # Doubles per L1 way, as a PURE FUNCTION of (L1 bytes, associativity) so it can be tested against cache
