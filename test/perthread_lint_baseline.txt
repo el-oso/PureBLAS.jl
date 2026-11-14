@@ -28,8 +28,9 @@
 #   blas2/level2.jl `_TRMV_ACC*` — the trmv-N accumulator. `_trmv_split!` holds it across its
 #               `_tri_scat!` and `_trmv_fused8!` calls, so the no-yield claim has to cover those too:
 #               `_tri_scat!` reaches `_sme_gemv!` or `_gemv_n_paneldrv!` DIRECTLY, not the public
-#               `gemv!`, and neither those kernels nor anything else in blas2/level2.jl forks a task.
+#               `gemv!`, and neither those kernels nor the rest of the trmv-N path forks a task.
 #               Level-2 throughout, no `gemm!`, so the buffer cannot be live across a threaded join.
+#               (trmv-T forks through `_trmvt_threaded!`, and nothing on that path touches this buffer.)
 #
 #   blas3/level3.jl `_TRMM_BPF*` — the packed-trmm B buffer. VERIFIED: `_trmm_packed!` and
 #               `_trmm_packedR!` contain ZERO public `gemm!` calls, so the buffer cannot be held across
