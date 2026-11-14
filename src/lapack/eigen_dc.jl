@@ -264,8 +264,8 @@ end
 const _EDCWS_F64 = Base.OncePerTask{_EDCWork{Float64}}(_EDCWork{Float64})
 const _EDCWS_F32 = Base.OncePerTask{_EDCWork{Float32}}(_EDCWork{Float32})
 const _EDCWS_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any})
-@inline _edcws(::Type{Float64}) = _EDCWS_F64()
-@inline _edcws(::Type{Float32}) = _EDCWS_F32()
+@inline _edcws(::Type{Float64}) = _opt(_EDCWS_F64)
+@inline _edcws(::Type{Float32}) = _opt(_EDCWS_F32)
 _edcws(::Type{T}) where {T} = get!(() -> _EDCWork{T}(), _EDCWS_OTHER(), T)::_EDCWork{T}
 
 # --- recursive D&C driver (dlaed0 recursion + dlaed1 merge + dlaed2 deflation + dlaed3 secular solve)

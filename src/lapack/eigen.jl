@@ -164,10 +164,10 @@ const _TRDWS_F64 = Base.OncePerTask{_TRDWork{Float64, Float64}}(_TRDWork{Float64
 const _TRDWS_F32 = Base.OncePerTask{_TRDWork{Float32, Float32}}(_TRDWork{Float32, Float32})
 const _TRDWS_C64 = Base.OncePerTask{_TRDWork{ComplexF64, Float64}}(_TRDWork{ComplexF64, Float64})
 const _TRDWS_C32 = Base.OncePerTask{_TRDWork{ComplexF32, Float32}}(_TRDWork{ComplexF32, Float32})
-@inline _trdws(::Type{Float64}) = _TRDWS_F64()
-@inline _trdws(::Type{Float32}) = _TRDWS_F32()
-@inline _trdws(::Type{ComplexF64}) = _TRDWS_C64()
-@inline _trdws(::Type{ComplexF32}) = _TRDWS_C32()
+@inline _trdws(::Type{Float64}) = _opt(_TRDWS_F64)
+@inline _trdws(::Type{Float32}) = _opt(_TRDWS_F32)
+@inline _trdws(::Type{ComplexF64}) = _opt(_TRDWS_C64)
+@inline _trdws(::Type{ComplexF32}) = _opt(_TRDWS_C32)
 # EVERY OTHER ELEMENT TYPE BORROWS FROM THE ARENA (inside `_sytrd_lower!`). The four consts above are
 # owned pools, one per BlasFloat (the GKH pattern); an open type set cannot have a const pool, so a
 # `ForwardDiff.Dual` once found no `_trdws` method at all (`_syev!` was a MethodError, commit c6a9ef19).

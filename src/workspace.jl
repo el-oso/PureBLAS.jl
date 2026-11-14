@@ -210,6 +210,13 @@ end
     return m
 end
 
+# Per-task owner lookup. `Base.OncePerTask`'s call is `@inline get!(init, task_local_storage(), once)`,
+# so an inlined `owner()` puts the task-local `IdDict` grow and lookup, plus the initializer's
+# allocations, into the caller's body, where the static no-allocation proof reports them per site. Behind
+# this `@noinline` function the first touch of a new task is attributable to one registered barrier
+# (`_BARRIER_FUNCTIONS`, verify.jl), and every later touch is the lookup alone.
+@noinline _opt(x::Base.OncePerTask) = x()
+
 # transB-Strassen Bᵀ buffer, k×n over a GROW-ONLY flat slot viewed at ld == k. `transpose!` needs an
 # exact-shape dest and the recursion's quadrant reads need contiguity, and a `PtrMatrix` over the first
 # k·n elements gives both — while a persistent max-sized MATRIX would not: it would hand a small-n call
