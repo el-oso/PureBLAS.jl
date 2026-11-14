@@ -22,7 +22,12 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1'
+      - name: Record CPU model for the cache key
+        run: |
+          echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
       - uses: julia-actions/cache@v2
+        with:
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
