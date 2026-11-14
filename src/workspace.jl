@@ -168,28 +168,21 @@ const _M3_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any})
 # W is re-zeroed every call: the kernels write only the in-band triangle and rely on the rest being
 # zero, and which part is "the rest" moves with ib/i3, so a reused buffer must not carry stale values.
 # ── THE ONE GROWTH POINT ────────────────────────────────────────────────────────────────────────────
-# Every L3 pool below grows through `_ws_grow!`/`_ws_slot!` and nothing else allocates on the L3 path,
-# so ONE pair of `StrictMode.register_alloc_barrier!` calls scopes the static-proof exemption to exactly
-# "a workspace reached a new high-water mark" — the same contract `docs/src/arena.md` states for the
-# arena. That narrowness is the point: the kb rejected registering `_str_fit!` as a barrier on two
-# grounds (`strictmode-04-static-only-noalloc`), and BOTH are answered here rather than waved away.
-#   (1) "the exemption is process-global, so it weakens every other proof" — it is, which is why the
-#       registered thing is a two-line function that does nothing but grow a pool. A call whose only
-#       allocation is a pool reaching a new high-water mark is exactly the class meant to be exempt; a
-#       call that allocates anything else still falls through to AllocCheck's honest per-site proof.
-#   (2) "the pool is not a one-time-init barrier — `_str_fit!` re-allocates on shape mismatch, so
-#       calling it a barrier is a claim that is not true" — correct, and that is FIXED below, not
-#       excused. `_str_fit!` is now grow-only like every sibling pool, so the claim became true first
-#       and the registration follows it.
+# Every L3 pool below grows through `_ws_grow!`/`_ws_slot!` and nothing else allocates on the L3 path.
+# These functions are NOT allocation barriers: a pool that reaches a new high-water mark allocates again
+# in the same process, thread and task, so there is no memoization scope whose initialization has
+# finished, and `StrictMode.register_alloc_barrier!` is for exactly that. They are excused from the
+# static `:noalloc` guarantee (`@strict_exempt` below), and the property they do have — finitely many
+# growths, then none — is asserted by measurement: test/strictmode_tests.jl warms each entry point and
+# checks that a second identical call allocates 0 bytes.
 #
-# `@noinline` is REQUIRED, not style: StrictModeTest recognizes a barrier only when the registered
-# function is ITSELF the `:invoke` callee, so an inlined one can never be registered.
+# `@noinline` keeps the growth out of the caller's body, so a report attributes it to this function.
 @noinline function _ws_grow!(v::Vector, n::Int)
     length(v) < n && resize!(v, n)
     return v
 end
 # Pool-slot variant: extend the slot vector, then grow slot `i` to `n`. Two entry points rather than one
-# because the pool extension is itself an allocation and must sit behind the barrier too.
+# because the pool extension is itself an allocation and belongs behind the same growth function.
 @noinline function _ws_slot!(pool::Vector{Vector{Tr}}, i::Int, n::Int) where {Tr}
     while length(pool) < i
         push!(pool, Tr[])
@@ -200,21 +193,29 @@ end
 end
 # Square-matrix owner variant: the pool holds an n×n `Matrix` behind a `Ref`, so a grow REPLACES the
 # buffer rather than resizing one. The claim is the same — grow-only on `size(m, 1) < n`, i.e. a pool
-# reaching a new high-water mark — so it belongs behind this same barrier. It has to live here and not
+# reaching a new high-water mark — so it belongs behind this same function. It has to live here and not
 # at the call site: an owner accessor is `@inline`d into its caller, which leaves a bare
-# `Matrix{T}(undef, n, n)` in the DRIVER's own body, where no barrier can be attributed to it and the
-# static all-paths proof falls through to reporting the growth per site.
+# `Matrix{T}(undef, n, n)` in the DRIVER's own body, where a report cannot attribute it to a growth
+# function.
 @noinline function _ws_grow!(r::Base.RefValue{Matrix{T}}, n::Int) where {T}
     m = r[]
     size(m, 1) < n && (m = Matrix{T}(undef, n, n); r[] = m)
     return m
 end
+# The growth functions of the workspaces and the arena (`_arena_grow!`/`_arena_coalesce!`: arena.jl).
+@strict_exempt _ws_grow! guarantees = (:noalloc,) reason = "grows a pool to a new high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
+@strict_exempt _ws_slot! guarantees = (:noalloc,) reason = "grows a pool slot to a new high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
+@strict_exempt _arena_grow! guarantees = (:noalloc,) reason = "adds a slab at a new arena high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
+@strict_exempt _arena_coalesce! guarantees = (:noalloc,) reason = "folds the slab chain after a call that grew; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # Per-task owner lookup. `Base.OncePerTask`'s call is `@inline get!(init, task_local_storage(), once)`,
 # so an inlined `owner()` puts the task-local `IdDict` grow and lookup, plus the initializer's
 # allocations, into the caller's body, where the static no-allocation proof reports them per site. Behind
 # this `@noinline` function the first touch of a new task is attributable to one registered barrier
-# (`_BARRIER_FUNCTIONS`, verify.jl), and every later touch is the lookup alone.
+# (`_BARRIER_FUNCTIONS`, verify.jl), and every later touch is the lookup alone. The barrier registration
+# is legitimate because this function only returns the task's owner: it allocates when the task first
+# touches `x` and reads thereafter. Growing the owner's contents is the caller's job, through a
+# growth function (`_ws_grow!` and the `@strict_exempt` growers beside each owner).
 @noinline _opt(x::Base.OncePerTask) = x()
 
 # transB-Strassen Bᵀ buffer, k×n over a GROW-ONLY flat slot viewed at ld == k. `transpose!` needs an
@@ -272,7 +273,7 @@ const _GPK_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any}
 
 function _gemm_scratch(::Type{T}, lenA::Int, lenB::Int) where {T}
     gA, gB = _gpackws(T)
-    _ws_grow!(gA, lenA)                           # through the one growth point, so ONE barrier covers it
+    _ws_grow!(gA, lenA)                           # through the one growth point
     _ws_grow!(gB, lenB)
     return gA, gB
 end
@@ -313,8 +314,8 @@ end
 #
 # GROW-ONLY FLAT SLOTS VIEWED AT EXACT ld, the `_gemm_3m_scratch` shape — was exact-sized `Matrix`
 # slots that re-allocated on any shape mismatch. Two things change and both are deliberate:
-#   * the re-allocation is gone, which is what makes "this pool is a high-water barrier" TRUE rather
-#     than a convenient description (see the growth-point note above);
+#   * the re-allocation is gone, so a warmed pool allocates nothing on a repeated shape or a smaller
+#     one (see the growth-point note above);
 #   * the handle is a `PtrMatrix`, isbits, so the whole recursion is ONE container world instead of
 #     two. That removes the `_str_like` bridge added in 9b8e8463 AND the boxing it worked around —
 #     a Matrix-scratch/PtrMatrix-operand mix made the seven recursive call sites' signature

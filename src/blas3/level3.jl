@@ -5640,7 +5640,13 @@ function trsm!(
     # Only side='L': side='R' is narrow in its ROWS, a different kernel question, not measured here.
     if sl && _fh_trsm_narrow_max() > 0 && size(B, 2) <= _fh_trsm_narrow_max() &&
             _strided1(B) && size(B, 1) == k
-        isone(alpha) || (B .*= alpha)          # trsv has no α; A⁻¹(αB) = α·A⁻¹B, so prescaling is exact
+        # trsv has no α; A⁻¹(αB) = α·A⁻¹B, so prescaling is exact. A loop, not `B .*= alpha`: the
+        # broadcast's alias check carries a `copy(B)` path.
+        if !isone(alpha)
+            for I in eachindex(B)
+                B[I] *= alpha
+            end
+        end
         @inbounds for j in 1:size(B, 2)
             trsv!(A, view(B, :, j); uplo = uplo, trans = transA, diag = diag)
         end
@@ -7584,16 +7590,14 @@ const _SYMM_SCR_C32 = Base.OncePerThread{Base.RefValue{Matrix{ComplexF32}}}(() -
 # never yields, so it keeps the cheap per-thread owner and pays nothing.
 const _SYMM_SCR_MT_F64 = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
 const _SYMM_SCR_MT_F32 = Base.OncePerTask{Base.RefValue{Matrix{Float32}}}(() -> Ref(Matrix{Float32}(undef, 0, 0)))
-# `@noinline`, AND REGISTERED AS AN ALLOCATION BARRIER, exactly as `_m3ws` is (workspace.jl states the
-# reason there). `Base.OncePerTask`'s call is `@inline get!(init, task_local_storage(), once)`, so an
-# inlined accessor puts the task-local `IdDict{Any,Any}` — its `Memory{Any}` grow, its `jl_eqtable_*`
-# lookups and the initializer's `Matrix` — in the DRIVER's own body. For `_symm!` that read as a bare
-# allocation, an abstract-eltype container (`Memory{Any}`) and a runtime dict lookup all at once, none
-# of them attributable to a barrier, so the static all-paths proof fell through to the per-site report.
-# Behind a call the first touch of a new task is attributable and the proof holds. Only a threaded symm
-# reaches these, which is by construction a call large enough for the extra call to be invisible.
-@noinline _symm_scr_mt(::Type{Float64}, n::Int) = _ws_grow!(_SYMM_SCR_MT_F64(), n)
-@noinline _symm_scr_mt(::Type{Float32}, n::Int) = _ws_grow!(_SYMM_SCR_MT_F32(), n)
+# The owner lookup goes through `_opt` (workspace.jl): `Base.OncePerTask`'s call is
+# `@inline get!(init, task_local_storage(), once)`, so an inlined lookup puts the task-local
+# `IdDict{Any,Any}` — its `Memory{Any}` grow, its `jl_eqtable_*` lookups and the initializer's `Matrix` —
+# in the DRIVER's own body. `_opt` is the registered first-touch barrier and the grow is `_ws_grow!`,
+# so the barrier covers only the task's first touch. Only a threaded symm reaches these, which is by
+# construction a call large enough for the extra call to be invisible.
+@inline _symm_scr_mt(::Type{Float64}, n::Int) = _ws_grow!(_opt(_SYMM_SCR_MT_F64), n)
+@inline _symm_scr_mt(::Type{Float32}, n::Int) = _ws_grow!(_opt(_SYMM_SCR_MT_F32), n)
 # THIS FALLBACK IS A PER-THREAD OWNER AND MUST NEVER BE REACHED FROM A THREADED CALL. `Ad` is handed
 # to the workers as an operand and so is held across the join; guarantee 3 puts such a buffer in the
 # `OncePerTask` tier, which the two methods above satisfy and this one does not. What keeps it safe is

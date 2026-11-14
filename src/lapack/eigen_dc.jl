@@ -243,7 +243,7 @@ _EDCWork{T}() where {T} = _EDCWork{T}(
 
 # Grow to fit a root problem of size n. Pure scratch — every slot is written before it is read on each
 # level, so growth just reallocates when too small and preserves nothing.
-function _edc_grow!(ws::_EDCWork{T}, n::Int) where {T}
+@noinline function _edc_grow!(ws::_EDCWork{T}, n::Int) where {T}
     ws.n >= n && return ws
     m = max(n, 1)
     fv() = Vector{T}(undef, m); iv() = Vector{Int}(undef, m)
@@ -259,6 +259,7 @@ function _edc_grow!(ws::_EDCWork{T}, n::Int) where {T}
     ws.n = m
     return ws
 end
+@strict_exempt _edc_grow! guarantees = (:noalloc,) reason = "grows the divide-and-conquer workspace to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # One workspace per thread (written during the call) — see `_l3ws`.
 const _EDCWS_F64 = Base.OncePerTask{_EDCWork{Float64}}(_EDCWork{Float64})
@@ -634,8 +635,14 @@ function _stedc!(
                 Ztmp[r, p] = Z[r, op]
             end
         end
-        copyto!(view(d, 1:n), dtmp)         # copyto!(view, X), not slice-assign (setindex_shape_check --trim-unsafe)
-        copyto!(view(Z, :, 1:n), Ztmp)
+        # Elementwise, not `copyto!(view, X)` (its alias check carries a `copy` path) and not slice-assign
+        # (setindex_shape_check --trim-unsafe).
+        for p in 1:n
+            d[p] = dtmp[p]
+        end
+        for p in 1:n, r in axes(Z, 1)
+            Z[r, p] = Ztmp[r, p]
+        end
     end
     return d, Z
 end

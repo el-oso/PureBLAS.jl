@@ -328,13 +328,18 @@ const _NARROW_SIMD = _W64 == 4      # AVX2-class complex path — NOT "3M is ena
 const _QR_WS_C = Base.OncePerTask{Base.RefValue{NTuple{5, Matrix{ComplexF64}}}}(
     () -> Ref{NTuple{5, Matrix{ComplexF64}}}(ntuple(_ -> Matrix{ComplexF64}(undef, 0, 0), 5))
 )
+@noinline function _qr_ws_c_grow!(r::Base.RefValue{NTuple{5, Matrix{ComplexF64}}}, ::Type{T}, m::Int, n::Int, nb::Int) where {T}
+    V = Matrix{T}(undef, m, nb); Tm = Matrix{T}(undef, nb, nb)
+    G = Matrix{T}(undef, nb, nb); Wb = Matrix{T}(undef, nb, n); Yb = Matrix{T}(undef, nb, n)
+    r[] = (V, Tm, G, Wb, Yb)
+    return V, Tm, G, Wb, Yb
+end
+@strict_exempt _qr_ws_c_grow! guarantees = (:noalloc,) reason = "replaces the owned complex QR workspace at a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}
     r = _opt(_QR_WS_C)
     V, Tm, G, Wb, Yb = r[]
     if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n
-        V = Matrix{T}(undef, m, nb); Tm = Matrix{T}(undef, nb, nb)
-        G = Matrix{T}(undef, nb, nb); Wb = Matrix{T}(undef, nb, n); Yb = Matrix{T}(undef, nb, n)
-        r[] = (V, Tm, G, Wb, Yb)
+        return _qr_ws_c_grow!(r, T, m, n, nb)
     end
     return V, Tm, G, Wb, Yb
 end
@@ -419,13 +424,18 @@ end
 const _QR_WS = Base.OncePerTask{Base.RefValue{NTuple{4, Matrix{Float64}}}}(
     () -> Ref{NTuple{4, Matrix{Float64}}}(ntuple(_ -> Matrix{Float64}(undef, 0, 0), 4))
 )
+@noinline function _qr_ws_grow!(r::Base.RefValue{NTuple{4, Matrix{Float64}}}, m::Int, n::Int, nb::Int)
+    V = Matrix{Float64}(undef, m, nb); Tm = Matrix{Float64}(undef, nb, nb)
+    G = Matrix{Float64}(undef, nb, nb); Wb = Matrix{Float64}(undef, nb, n)
+    r[] = (V, Tm, G, Wb)
+    return V, Tm, G, Wb
+end
+@strict_exempt _qr_ws_grow! guarantees = (:noalloc,) reason = "replaces the owned QR workspace at a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 @inline function _qr_ws(m::Int, n::Int, nb::Int)
     r = _opt(_QR_WS)
     V, Tm, G, Wb = r[]
     if size(V, 1) < m || size(V, 2) < nb || size(Tm, 1) < nb || size(Wb, 2) < n
-        V = Matrix{Float64}(undef, m, nb); Tm = Matrix{Float64}(undef, nb, nb)
-        G = Matrix{Float64}(undef, nb, nb); Wb = Matrix{Float64}(undef, nb, n)
-        r[] = (V, Tm, G, Wb)
+        return _qr_ws_grow!(r, m, n, nb)
     end
     return V, Tm, G, Wb
 end

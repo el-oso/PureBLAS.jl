@@ -261,11 +261,12 @@ end
 # the value-free IR scan — the very heuristic the paragraph above says flags EVERY contracted LAPACK
 # member at a measured 0 B. Minutes of precompile spent producing verdicts this file already documents as
 # worthless. `proofs_loaded()` is the exact translation of "a real backend is present".
-# Functions whose allocations the static no-allocation proof treats as expected: each only grows an owned
-# workspace to a new high-water mark, or performs the first touch of a task-local owner. Each must be
-# `@noinline` and be the `:invoke` callee itself to be recognized.
-const _BARRIER_FUNCTIONS = (_ws_grow!, _ws_slot!, _arena_grow!, _arena_coalesce!, _m3ws, _gpackws, _strws,
-    _symm_scr_mt, _opt)
+# Functions whose allocations the static no-allocation proof treats as expected: each only performs the
+# first touch of a task-local owner (the allocation is the one-time initialization of that task's slot,
+# and every later call is a lookup). Each must be `@noinline` and be the `:invoke` callee itself to be
+# recognized. Functions that grow a pool to a new high-water mark are not here — they allocate again at
+# each new mark, so they are `@strict_exempt :noalloc` (workspace.jl) and asserted by measurement.
+const _BARRIER_FUNCTIONS = (_m3ws, _gpackws, _strws, _opt)
 
 if StrictMode.proofs_loaded()
     # The registry is process-global and not part of the saved image, so this registration covers only the

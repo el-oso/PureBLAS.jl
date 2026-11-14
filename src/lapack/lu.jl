@@ -374,6 +374,8 @@ end
 # Cost is nil here: `_lu_needs_pad` requires m >= 512, so the extra ~13 ns lookup lands only on calls
 # already in the millisecond range.
 const _LU_PAD = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
+@noinline _lu_pad_grow!(pad::Base.RefValue{Matrix{Float64}}, R::Int, n::Int) = (pad[] = Matrix{Float64}(undef, R, n))
+@strict_exempt _lu_pad_grow! guarantees = (:noalloc,) reason = "replaces the LU pad scratch at a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 @inline _lu_needs_pad(A, m) = m >= 512 && stride(A, 2) % 512 == 0
 
 # Blocked right-looking LU (LAPACK dgetrf's algorithm — the reference, faster here than a recursive LU
@@ -403,7 +405,7 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
         R = m + 8
         pad = _opt(_LU_PAD)
         b = pad[]
-        (size(b, 1) < R || size(b, 2) < n) && (b = pad[] = Matrix{Float64}(undef, R, n))
+        (size(b, 1) < R || size(b, 2) < n) && (b = _lu_pad_grow!(pad, R, n))
         # The buffer is REUSED whenever it is already big enough, so after a larger call it is WIDER
         # than m+8 — and `Mw` below strides by `size(b, 1)`, not by `R`. Copying at stride `R` then
         # writes the columns to different addresses than `_getrf_core!` reads them from: a SILENT wrong
@@ -795,6 +797,8 @@ end
 # ld=m+8 buffer (breaks the aliasing) and copy back. Per-type owned scratch (GKH ownership; trim-safe).
 const _CLU_PAD64 = Base.OncePerTask{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
 const _CLU_PAD32 = Base.OncePerTask{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
+@noinline _clu_pad_grow!(pad::Base.RefValue{Matrix{T}}, R::Int, n::Int) where {T} = (pad[] = Matrix{T}(undef, R, n))
+@strict_exempt _clu_pad_grow! guarantees = (:noalloc,) reason = "replaces the complex LU pad scratch at a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 @inline _clu_pad(::Type{ComplexF64}) = _opt(_CLU_PAD64)
 @inline _clu_pad(::Type{ComplexF32}) = _opt(_CLU_PAD32)
 @inline _clu_needs_pad(A, m, ::Type{T}) where {T} =
@@ -851,7 +855,7 @@ function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int =
     if _clu_needs_pad(A, m, T)                            # factor in a non-conflicting scratch
         R = m + 8                                          # +8 breaks the set-aliasing (measured: offset ≥8 saturates)
         pref = _clu_pad(T); b = pref[]
-        (size(b, 1) < R || size(b, 2) < n) && (b = pref[] = Matrix{T}(undef, R, n))
+        (size(b, 1) < R || size(b, 2) < n) && (b = _clu_pad_grow!(pref, R, n))
         R = size(b, 1)                                     # true width of the REUSED buffer — see the real twin
         Mw = view(b, 1:m, 1:n)
         ld = stride(A, 2); sz = sizeof(T)
