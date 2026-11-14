@@ -623,6 +623,23 @@ end
         end
     end
 
+    # trmv-N's form: rows, with the roles of `up` swapped, on cache-line groups.
+    @testset "partition by rows (trmv-N)" begin
+        for T in (Float64, Float32), n in (8, 17, 63, 256, 629, 1000, 2049), nw in 1:8, up in (false, true)
+            g = P._trmvn_g(T)
+            cov = zeros(Int, n)
+            for i in 1:nw
+                r0, len = P._tri_chunk(n, nw, i, !up, g)
+                @test len >= 0 && r0 >= 0 && r0 + len <= n
+                len > 0 && @test iszero(r0 % g) && (r0 + len == n || iszero((r0 + len) % g))
+                for r in (r0 + 1):(r0 + len)
+                    cov[r] += 1
+                end
+            end
+            @test all(isone, cov)
+        end
+    end
+
     @testset "flops are balanced, and beat an equal-width split" begin
         for n in (512, 1024, 2048), nw in (2, 4, 6), up in (false, true)
             tot = tri_work(0, n, n, up)
