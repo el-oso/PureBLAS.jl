@@ -5,7 +5,7 @@ using LinearAlgebra, Chairmarks, Statistics, Printf
 const REF = "aocl" in ARGS ? "aocl" : "openblas"
 if REF == "aocl"
     @eval using AOCL_jll
-    BLAS.lbt_forward(AOCL_jll.aocl_blas_ilp64; clear = true); BLAS.lbt_forward(AOCL_jll.aocl_lapack_ilp64)
+    BLAS.lbt_forward(AOCL_jll.libaocl64; clear = true)
 end
 BLAS.set_num_threads(1); import PureBLAS
 const SIZES = (256, 384, 512, 768, 1024)
