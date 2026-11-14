@@ -135,7 +135,7 @@ end
 _GVDWork{T, R}() where {T, R} =
     _GVDWork{T, R}(0, R[], T[], Matrix{R}(undef, 0, 0), Matrix{T}(undef, 0, 0))
 
-function _gvd_grow!(ws::_GVDWork{T, R}, n::Int) where {T, R}
+@noinline function _gvd_grow!(ws::_GVDWork{T, R}, n::Int) where {T, R}
     ws.n >= n && return ws
     m = max(n, 1)
     ws.e = Vector{R}(undef, m); ws.tau = Vector{T}(undef, m)
@@ -144,6 +144,7 @@ function _gvd_grow!(ws::_GVDWork{T, R}, n::Int) where {T, R}
     ws.n = m
     return ws
 end
+@strict_exempt _gvd_grow! guarantees = (:noalloc,) reason = "grows the generalized-eigenproblem workspace to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # One workspace per thread (written during the call) — see `_l3ws`.
 const _GVDWS_F64 = Base.OncePerTask{_GVDWork{Float64, Float64}}(_GVDWork{Float64, Float64})
