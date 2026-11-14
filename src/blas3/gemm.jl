@@ -4382,6 +4382,9 @@ const _MT_NW_MASK = Int(typemax(UInt16))     # so `set_num_threads` clamps to wh
     # `C`, a copy of the original x in `Ap`, x itself in `Bp`; `up` is the stored triangle and `unit`
     # the implicit unit diagonal. Each column writes only its own x[j], so nothing is folded.
     _MT_KIND_TRMVT
+    # trmv, N forms — a ROW split of the output in cache-line groups. Slot convention as `_MT_KIND_TRMVT`
+    # (triangle in `C`, copy of the original x in `Ap`, x in `Bp`). Each row writes only its own x[i].
+    _MT_KIND_TRMVN
     # symv — a COLUMN-BLOCK split with per-block private `y` ("notepads"). The matrix is in `C`, x in
     # `Ap`, y in `Bp`, and `up` is the stored triangle (its original meaning, unlike the gemv kinds
     # where it carries `B0`). The only kind whose chunks write to TWO different destinations: block 1
@@ -4604,6 +4607,24 @@ unit `_tri_chunk` hands out.
     return max(1, min(nw, cld(n, _trmvt_g())))
 end
 
+"""
+    _trmvn_workers(n, ::Type{T}) -> Int
+
+Worker count for an N-form `trmv`, admitted on the stored triangle's bytes as `_trmvt_workers` is and
+capped by the number of `_trmvn_g` row groups.
+"""
+@inline function _trmvn_workers(n::Int, ::Type{T}) where {T}
+    _MT_NTHREADS[] > 1 || return 1
+    nw = _l1_workers((n * n * sizeof(T)) >> 1, n, T)
+    nw > 1 || return 1
+    return max(1, min(nw, cld(n, _trmvn_g(T))))
+end
+
+# Row granularity of trmv-N's split: one cache line of x, so two workers' writes to x never share a
+# line (given a line-aligned x). Not a req#11 parameter: a row's arithmetic does not depend on where a
+# range starts (see `_trmv_fusedF!`).
+@inline _trmvn_g(::Type{T}) where {T} = max(1, _CACHELINE ÷ sizeof(T))
+
 # The column granularity of trmv-T's split, a req#11 parameter and not a tuning one. A boundary must
 # sit on a multiple of `_GEMVT_BAND` measured from its `_TRI_NB` block's start, so that a block's
 # gemv-T slices group columns as the whole block does (see `_trmv_tcols!`). `_GEMVT_BAND` from column 0
@@ -4753,6 +4774,7 @@ end
     p.kind == _MT_KIND_GEMVN && return _gemvn_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GEMVT && return _gemvt_run_chunk(p, nw, i)
     p.kind == _MT_KIND_TRMVT && return _trmvt_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_TRMVN && return _trmvn_run_chunk(p, nw, i)
     p.kind == _MT_KIND_SYMV && return _symv_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GBMVN && return _gbmvn_run_chunk(p, nw, i)
     p.kind == _MT_KIND_ELEM && return _elem_run_chunk(p, nw, i)
@@ -5212,6 +5234,18 @@ end
     _trmv_tcols!(
         p.up, p.unit, p.n, PtrMatrix{T}(p.Cp, p.n, p.n, p.ldc),
         PtrVector{T}(p.Bp, p.n), PtrVector{T}(p.Ap, p.n), j0, len
+    )
+    return nothing
+end
+
+# trmv-N over this worker's flop-balanced row range. Row i of an upper triangle carries n − i columns of
+# work and of a lower one i + 1 — `_tri_chunk`'s convention with the roles of `up` swapped.
+@noinline function _trmvn_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    r0, len = _tri_chunk(p.n, nw, i, !p.up, _trmvn_g(T))
+    len > 0 || return nothing
+    _trmv_fused8!(
+        p.up, p.unit, p.n, PtrMatrix{T}(p.Cp, p.n, p.n, p.ldc),
+        PtrVector{T}(p.Bp, p.n), PtrVector{T}(p.Ap, p.n), r0, r0 + len
     )
     return nothing
 end
@@ -6524,6 +6558,10 @@ end
             # A loser runs every column itself, reading the caller's copy of x, through the same body
             # the winner's chunks run; each column's arithmetic is fixed by its block, not its range.
             _trmv_tcols!(up, unit, C.n, C, PtrVector{T}(B.ptr, C.n), PtrVector{T}(A.ptr, C.n), 0, C.n)
+        elseif kind == _MT_KIND_TRMVN
+            # A loser runs every row itself, reading the caller's copy of x, through the same body the
+            # winner's chunks run; each row's arithmetic is fixed by the panel grid, not its range.
+            _trmv_fused8!(up, unit, C.n, C, PtrVector{T}(B.ptr, C.n), PtrVector{T}(A.ptr, C.n), 0, C.n)
         elseif kind == _MT_KIND_SYMV
             # A loser runs the blocked form over the WHOLE grid with its OWN arena notepad, which is
             # the one case where the fallback must not reuse the pool buffer and also must not skip
@@ -6980,6 +7018,17 @@ end
     _gemm_threaded!(
         PtrMatrix{T}(Ap, n, n, lda), PtrMatrix{T}(x0p, n, 1, n), PtrMatrix{T}(xp, n, 1, n),
         one(T), zero(T), false, false, false, false, nw, _MT_KIND_TRMVT, up, false, unit
+    )
+    return nothing
+end
+
+# trmv, N forms: slots as `_trmvt_threaded!`.
+@noinline function _trmvn_threaded!(
+        n::Int, Ap::Ptr{T}, lda::Int, x0p::Ptr{T}, xp::Ptr{T}, up::Bool, unit::Bool, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(Ap, n, n, lda), PtrMatrix{T}(x0p, n, 1, n), PtrMatrix{T}(xp, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_TRMVN, up, false, unit
     )
     return nothing
 end

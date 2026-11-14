@@ -610,11 +610,12 @@ end
             @test P._gemvn_workers(m, n, T) > 1
             sme = P._sme_gemv_eligible(T, m, n, false, false, A, x, y0, 1, 1, β)
             @test ran(p, () -> P.gemv!(copy(y0), A, x; alpha = α, beta = β)) == !sme
-            # trmv over a matrix big enough that a threaded gemv-N WOULD have been admitted. If this
-            # ever reports true, the four per-thread baseline entries lost their justification.
+            # trmv-N over a matrix big enough that a threaded gemv-N WOULD have been admitted. It
+            # threads through its own job kind, and only below `_TRMV_SME_MIN`: above it the call
+            # takes `_trmv_split!`, which holds `_TRMV_ACC*` and never forks.
             Tri = randn(T, 2048, 2048) + 2048I
             v = randn(T, 2048)
-            @test !ran(p, () -> P.trmv!(Tri, copy(v)))
+            @test ran(p, () -> P.trmv!(Tri, copy(v))) == (2048 < P._TRMV_SME_MIN)
             y1 = copy(y0); P.gemv!(y1, A, x; alpha = α, beta = β)
             P.set_num_threads(1)
             y2 = copy(y0); P.gemv!(y2, A, x; alpha = α, beta = β)
@@ -765,9 +766,9 @@ end
 # trmv-T splits OUTPUT COLUMNS across the pool, in `_trmvt_g()`-wide groups that need not line up with
 # the `_TRI_NB` diagonal blocks, so a worker can hold part of a block. Each column's arithmetic must
 # still come from its whole block (the diagonal-block dot and the block's gemv-T route), which is what
-# this compares, bit for bit, against one thread. The N forms do not thread; they are in the sweep so
-# a future split of them is held to the same gate. Sizes straddle the admission floor (a size the pool
-# declines must also agree, trivially) and include odd n, n not a multiple of `_TRI_NB`, and 629.
+# this compares, bit for bit, against one thread. The N forms split rows (`_trmvn_g`-wide groups) and are
+# held to the same gate, with their own ladder in "trmv-N: bit-identical …" below. Sizes straddle the
+# admission floor (a size the pool declines must also agree, trivially) and include odd n, n not a multiple of `_TRI_NB`, and 629.
 @testitem "trmv: bit-identical at every thread count" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads
@@ -803,11 +804,9 @@ end
     end
 end
 
-# Liveness, the trmv-N exclusion, the lost-claim path, concurrency, the C-ABI entry and steady-state
-# allocation for the threaded trmv-T. `ran` reads the pool's generation counter: it moves only when a
-# job was published. trmv-N must stay out: `_trmv_split!` holds the per-thread `_TRMV_ACC*` buffer
-# across its kernel calls, which test/perthread_lint_baseline.txt justifies by that path never forking.
-@testitem "trmv-T: the pool runs, trmv-N stays out, losing the claim agrees" tags = [:checks] begin
+# Liveness, the lost-claim path, concurrency, the C-ABI entry and steady-state allocation for the
+# threaded trmv-T. `ran` reads the pool's generation counter: it moves only when a job was published.
+@testitem "trmv-T: the pool runs, losing the claim agrees" tags = [:checks] begin
     using PureBLAS, LinearAlgebra
     using Base.Threads: nthreads, @spawn
     const P = PureBLAS
@@ -827,7 +826,6 @@ end
             # An SME-eligible off-diagonal block declines the pool, as gemv-T does.
             sme = P._sme_gemvt_eligible(T, n, n, true, false, A, x0, x0, 1, 1)
             @test ran(p, () -> tmv!(A, copy(x0), ul)) == !sme
-            @test !ran(p, () -> P.trmv!(A, copy(x0); uplo = ul))
             P.set_num_threads(1)
             want = (t = copy(x0); tmv!(A, t, ul); t)
             P.set_num_threads(nt)
@@ -865,6 +863,119 @@ end
                 warm == 1 && sleep(0.05)      # second pass wakes the workers from a real park
             end
             @test minimum(a_tmv(A, xw, ul) for _ in 1:8) == 0
+        end
+        P.set_num_threads(1)
+    end
+end
+
+# ── trmv-N: rows split across the pool ────────────────────────────────────────────────────────────
+# Row i's chain is fixed by the panel grid of `_trmv_fusedF!`, a function of `(n, F)`. The ladder takes
+# n from the `_TRI_NB` boundaries, the `_trmvn_g` row-group boundaries and the panel remainder `n mod F`
+# (F = 8, and 4 where the triangle is DRAM-served), none of them a square power of two.
+@testitem "trmv-N: bit-identical at every thread count, and the ranged kernel at any cut" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X, Y))
+    # The ranged kernel alone: any partition of the rows, F = 8 and F = 4, reproduces the whole sweep
+    # bit for bit and matches the triangular product. Needs no threads.
+    @testset "ranged kernel $T F=$F" for T in (Float64, Float32), F in (8, 4)
+        for n in (1, 7, 8, 9, 31, 64, 100, 129, 257), up in (true, false), unit in (false, true)
+            A = randn(T, n, n); x0 = randn(T, n)
+            whole = copy(x0); P._trmv_fusedF!(Val(F), up, unit, n, A, whole)
+            Af = up ? triu(A) : tril(A)
+            unit && (Af = Af - Diagonal(Af) + I)
+            @test isapprox(whole, Af * x0; rtol = 100 * eps(T), atol = 100 * eps(T) * n)
+            for _ in 1:8
+                cuts = sort!(unique([0; rand(0:n, rand(1:5)); n]))
+                out = fill(T(NaN), n)
+                for k in 1:(length(cuts) - 1)
+                    P._trmv_fusedF!(Val(F), up, unit, n, A, out, x0, cuts[k], cuts[k + 1])
+                end
+                @test bitsame(out, whole)
+            end
+        end
+    end
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        @testset "threads $T" for T in (Float64, Float32)
+            P.set_num_threads(nt)
+            nb = P._TRI_NB; g = P._trmvn_g(T)
+            nbig = max(629, isqrt(4 * P._L1_MT_MIN ÷ sizeof(T)) + 1)
+            @test P._trmvn_workers(nbig, T) > 1         # the split runs, so the comparison is not vacuous
+            ladder = unique(sort([nbig, 629, 1001, 1024, nb + 1, 2nb - 1, 2nb + 3, 5nb, nbig + 3, nbig + g + 1]))
+            for n in ladder, ul in ('U', 'L'), dg in ('N', 'U')
+                n >= P._trmv_fused_min(T) || continue
+                A = randn(T, n, n) + n * I; x0 = randn(T, n)
+                P.set_num_threads(1)
+                want = (t = copy(x0); P.trmv!(A, t; uplo = ul, diag = dg); t)
+                for nw in unique((2, 3, nt))
+                    P.set_num_threads(nw)
+                    got = (t = copy(x0); P.trmv!(A, t; uplo = ul, diag = dg); t)
+                    @test bitsame(got, want)
+                end
+            end
+        end
+        P.set_num_threads(1)
+    end
+end
+
+# Liveness (the pool really ran), the lost-claim path, concurrency, the C-ABI entry and steady-state
+# allocation for the threaded trmv-N.
+@testitem "trmv-N: the pool runs, losing the claim agrees" tags = [:checks] begin
+    using PureBLAS, LinearAlgebra
+    using Base.Threads: nthreads, @spawn
+    const P = PureBLAS
+    nt = min(6, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        ran(p, f) = (g0 = @atomic p.gen; f(); (@atomic p.gen) != g0)
+        bitsame(X, Y) = length(X) == length(Y) && all(i -> bitstring(X[i]) == bitstring(Y[i]), eachindex(X, Y))
+        nmv!(A, x, ul, dg) = P.trmv!(A, x; uplo = ul, diag = dg)
+        @testset "$T $ul $dg" for T in (Float64, Float32), ul in ('U', 'L'), dg in ('N', 'U')
+            P.set_num_threads(nt)
+            p = P._gemm_pool(T)
+            n = max(1024, isqrt(4 * P._L1_MT_MIN ÷ sizeof(T)) + 1)
+            A = randn(T, n, n) + n * I; x0 = randn(T, n)
+            @test P._trmvn_workers(n, T) > 1
+            @test n < P._TRMV_SME_MIN
+            @test ran(p, () -> nmv!(A, copy(x0), ul, dg))
+            P.set_num_threads(1)
+            want = (t = copy(x0); nmv!(A, t, ul, dg); t)
+            P.set_num_threads(nt)
+            @test bitsame((t = copy(x0); nmv!(A, t, ul, dg); t), want)
+            # FORCE THE LOSS: the fallback must run the same row body the chunks run.
+            lost0 = P._MT_LOST[]
+            _, held = @atomicreplace p.busy false => true
+            @test held
+            xf = copy(x0); nmv!(A, xf, ul, dg)
+            @atomic p.busy = false
+            @test P._MT_LOST[] == lost0 + 1
+            @test bitsame(xf, want)
+            tasks = [@spawn (t = copy(x0); nmv!(A, t, ul, dg); t) for _ in 1:(2 * nt)]
+            for t in tasks
+                @test bitsame(fetch(t), want)
+            end
+            # The C-ABI entry, as LinearAlgebra reaches it after activate().
+            xa = copy(x0)
+            P.activate()
+            ranact = try
+                ran(p, () -> BLAS.trmv!(ul, 'N', dg, A, xa))
+            finally
+                P.deactivate()
+            end
+            @test ranact
+            @test bitsame(xa, want)
+            xw = copy(x0)
+            a_nmv(A, x, ul, dg) = @allocated P.trmv!(A, x; uplo = ul, diag = dg)
+            for warm in 1:2
+                a_nmv(A, xw, ul, dg)
+                warm == 1 && sleep(0.05)
+            end
+            @test minimum(a_nmv(A, xw, ul, dg) for _ in 1:8) == 0
         end
         P.set_num_threads(1)
     end
