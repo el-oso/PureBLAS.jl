@@ -666,8 +666,10 @@ const _SVDWS_C32 = Base.OncePerTask{SVDWorkspace{ComplexF32}}(SVDWorkspace{Compl
     return ws
 end
 
-@inline _gm(b::Matrix{T}, r::Int, c::Int) where {T} = (size(b, 1) < r || size(b, 2) < c) ? Matrix{T}(undef, r, c) : b
-@inline _gv(b::Vector{T}, n::Int) where {T} = length(b) < n ? Vector{T}(undef, n) : b
+@noinline _gm(b::Matrix{T}, r::Int, c::Int) where {T} = (size(b, 1) < r || size(b, 2) < c) ? Matrix{T}(undef, r, c) : b
+@noinline _gv(b::Vector{T}, n::Int) where {T} = length(b) < n ? Vector{T}(undef, n) : b
+@strict_exempt _gm guarantees = (:noalloc,) reason = "replaces a workspace matrix that is too small; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
+@strict_exempt _gv guarantees = (:noalloc,) reason = "replaces a workspace vector that is too small; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # Grow ONLY the divide-and-conquer staging buffers `bdsdc!` reads (`_svd_grow!` also grows them, but it
 # sizes the whole m≥n vector path — far more than the bidiagonal-SVD entry needs on its own).
