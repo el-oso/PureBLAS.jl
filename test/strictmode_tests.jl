@@ -990,3 +990,62 @@ end
     @test_broken isempty(specialization_report(PureBLAS;
         max_specializations = 1024, max_type_depth = typemax(Int)))
 end
+
+# RETURN ANNOTATIONS ON CONTRACT MEMBERS. `@verify` proves a member's declared return type from the
+# method's own `::T` annotation when it can read one, and falls back to inference of the abstract
+# signature when it cannot; for the 78 members of the SIMDBackend contracts that fallback costs
+# minutes of precompile time. This item fails when any mandatory member loses its annotation, or has
+# one that is not a subtype of the declared return type.
+#
+# It reads TypeContracts internals (`_contract_specs`, `_registry_key`, `_build_sig`,
+# `_resolve_rt_spec`, `_method_annotation`) because the annotation reader is not public. The invariant
+# those calls implement: every method applicable to a spec's signature has a return annotation `R`
+# with `R <: declared`; a spec whose declared type is `Any` constrains nothing and is skipped.
+@testitem "Contract members carry return annotations" tags = [:checks] begin
+    using StrictMode, StrictMode.TypeContracts, InteractiveUtils
+    const TC = StrictMode.TypeContracts
+
+    # Descriptions of the mandatory specs of `T` (over its supertype chain) that are not proven by annotation.
+    function unannotated_specs(T::Type)
+        bad = String[]
+        for S in supertypes(T)
+            for spec in TC._contract_specs(TC._registry_key(S))
+                spec.optional && continue
+                expected = TC._resolve_rt_spec(T, spec)
+                expected === Any && continue
+                sig = TC._build_sig(spec.arg_types, T)
+                ms = methods(spec.f, sig)
+                if isempty(ms)
+                    push!(bad, "$(spec.description): no method")
+                    continue
+                end
+                for m in ms
+                    ann = TC._method_annotation(m)
+                    (!isnothing(ann) && ann <: expected) || push!(bad, "$(spec.description): $m has annotation $ann")
+                end
+            end
+        end
+        return bad
+    end
+
+    # Positive control: the same check must report a missing annotation and a wrong one.
+    abstract type Toy end
+    function toyf end
+    @contract Toy begin
+        toyf(::Self)::Int => "toy member"
+    end
+    struct ToyAnnotated <: Toy end
+    struct ToyBare <: Toy end
+    struct ToyWrong <: Toy end
+    toyf(::ToyAnnotated)::Int = 1
+    toyf(::ToyBare) = 1
+    toyf(::ToyWrong)::Float64 = 1.0
+    @test isempty(unannotated_specs(ToyAnnotated))
+    @test length(unannotated_specs(ToyBare)) == 1
+    @test length(unannotated_specs(ToyWrong)) == 1
+
+    @test sum(S -> length(TC._contract_specs(TC._registry_key(S))), supertypes(PureBLAS.SIMDBackend)) > 70
+    bad = unannotated_specs(PureBLAS.SIMDBackend)
+    @test isempty(bad)
+    isempty(bad) || foreach(b -> @info(b), bad)
+end
