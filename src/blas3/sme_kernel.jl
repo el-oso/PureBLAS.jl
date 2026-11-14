@@ -2348,14 +2348,15 @@ end
 #
 # IT IS NEVER LIVE INSIDE A PUBLISHED JOB, AND THE REASON IS THE SME ROUTING INVARIANT: SME
 # eligibility is decided at the threaded entry and never inside a chunk, so every SME route declines
-# the worker pool before a worker exists. That is what makes all three paths to the `_ws_grow!` below
-# safe for ONE reason rather than three — `_gemv!` tests `_sme_gemvt_eligible` ahead of its thread
-# seam, `_symv_split!` is selected ahead of symv's, and `trmv`/`trsv` fork no task at all, which
+# the worker pool before a worker exists. That is what makes all four paths to the `_ws_grow!` below
+# safe for ONE reason rather than four — `_gemv!` tests `_sme_gemvt_eligible` ahead of its thread
+# seam, `_symv_split!` is selected ahead of symv's, trmv-T tests `_sme_gemvt_eligible` over the whole
+# triangle ahead of `_trmvt_threaded!`, and trsv and trmv-N fork no task at all, which
 # `test/level2_tests.jl` asserts and which the four `_TRMV_ACC*` / `_TRSV_*` entries in
 # `test/perthread_lint_baseline.txt` rest on. Measured: symv at n=2428 with four workers available
 # dispatches no pool.
 #
-# ⛔ THREADING `symv`, `trmv` OR `trsv` BREAKS THIS, AND SILENTLY. Growth inside a published job
+# ⛔ A THREADED PATH WHOSE CHUNKS CAN REACH THIS STRIP BREAKS THIS, AND SILENTLY. Growth inside a published job
 # allocates where the driver spins rather than yields, so it reaches no GC safepoint — a swallowed
 # worker exception or a silent hang, by interleaving. A chunk body that can reach this strip needs it
 # prefit by the driver and indexed by worker before publishing, the shape `_trmmr_prefit!` uses. A

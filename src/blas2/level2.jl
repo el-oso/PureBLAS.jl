@@ -650,9 +650,9 @@ end
 # dodge the row-block path and the kwarg layer. Four `test/perthread_lint_baseline.txt` entries
 # (`_TRSV_RRCP*`, `_TRSV_RCP*`, `_TRMV_ACC*`) are justified by exactly that: "`_tri_scat!` reaches
 # `_sme_gemv!` or `_gemv_n_paneldrv!` DIRECTLY, not the public `gemv!`, and neither those kernels nor
-# anything else in blas2/level2.jl forks a task." Putting the pool in the paneldrv would make those
+# the rest of the trmv-N path forks a task." Putting the pool in the paneldrv would make those
 # per-thread owners reachable across a fork and silently invalidate all four. The cost is that
-# trmv/trsv do NOT inherit gemv-N's threading; that is the trade, and it is deliberate.
+# trmv-N/trsv do NOT inherit gemv-N's threading; that is the trade, and it is deliberate.
 #
 # `b0` IS A `Bool`, NOT A `Val`. Through the pool's job dispatch, a gemm can reach `_gemv!` and so
 # this method again while it is already on the inference stack, and inference then widens the
@@ -2216,9 +2216,10 @@ function _gemv!(
             # paneldrv directly, so gemv-N could take the pool inside its dispatcher; `_tri_scatT!`
             # does NOT bypass `_gemv_t_simd!` — it calls that very entry (see its definition). The
             # four `_TRSV_*`/`_TRMV_ACC*` entries in `test/perthread_lint_baseline.txt` are justified
-            # by trmv/trsv never forking a task, so the pool has to go where only the public gemv
-            # reaches it. That is this branch: `_gemv!` is the public and C-ABI entry, and the trmv
-            # scatters never call it.
+            # by trsv and trmv-N never forking a task, so the pool has to go where only the public
+            # gemv reaches it. That is this branch: `_gemv!` is the public and C-ABI entry, and the
+            # trmv/trsv scatters never call it. (trmv-T threads by its own job kind, over whole
+            # output columns; see `_trmv_tcols!`.)
             nw = _gemvt_workers(Int(m), Int(n), eltype(A))
             if nw > 1
                 # `blk` decided ONCE here and carried, so the chunks, a lost claim and the serial arm
@@ -4040,21 +4041,90 @@ const _TRMV_SME_MIN = @load_preference("trmv_sme_min", _SME_F64 ? 4 * _TRI_NB : 
             _trmv_simd!(false, false, unit, nb, view(A, J, J), view(x, J))
             ib -= NB
         end
-    elseif tr && up                      # U,T: I descending; diag(ᵀ) then gemv-T (rows above)
-        ib = (cld(n, NB) - 1) * NB
-        while ib >= 0
-            nb = min(NB, n - ib); I = (ib + 1):(ib + nb)
-            _trmv_simd!(true, true, unit, nb, view(A, I, I), view(x, I))
-            ib > 0 && _tri_scatT!(view(x, I), view(A, 1:ib, I), view(x, 1:ib), one(eltype(A)))
-            ib -= NB
+    else
+        # T forms: every output element is a dot product against the ORIGINAL x, so with a copy of x
+        # any set of columns can be computed independently, and `_trmvt_threaded!` (gemm.jl) splits
+        # the columns across the pool. `n` here is the whole problem's: the `_TRI_NB` block grid and
+        # each block's gemv-T route come from it, never from a worker's share. An SME-eligible
+        # off-diagonal block declines the pool, as `_gemv!` does: the SME gemv-T scratch strip must
+        # never grow inside a published job (see `_SME_GEMVT_SCR`).
+        nw = _trmvt_workers(n, eltype(A))
+        if nw > 1 && !_sme_gemvt_eligible(eltype(A), n, n, true, false, A, x, x, 1, 1)
+            T = eltype(A)
+            GC.@preserve A x begin
+                @scope arn begin
+                    x0 = borrow!(arn, T, n)
+                    unsafe_copyto!(pointer(x0), _ptr(x), n)
+                    _trmvt_threaded!(n, pointer(A), stride(A, 2), pointer(x0), _ptr(x), up, unit, nw)
+                    nothing
+                end
+            end
+            return x
         end
-    else                                 # L,T: I ascending; diag(ᵀ) then gemv-T (rows below)
-        ib = 0
-        while ib < n
-            nb = min(NB, n - ib); I = (ib + 1):(ib + nb)
-            _trmv_simd!(false, true, unit, nb, view(A, I, I), view(x, I))
-            ib + nb < n && _tri_scatT!(view(x, I), view(A, (ib + nb + 1):n, I), view(x, (ib + nb + 1):n), one(eltype(A)))
-            ib += NB
+        _trmv_tcols!(up, unit, n, A, x, x, 0, n)
+    end
+    return x
+end
+
+# T forms over the output columns `[j0, j0+len)`, 0-based: x[j] := op(A)[:,j]ᵀ·x0. The arithmetic of
+# column j is fixed by the `_TRI_NB` block I that holds it and never by `[j0, j0+len)`: a dot over the
+# rows of A[I,I] on the far side of the diagonal (the `_trmv_simd!` expression, column by column), then
+# a gemv-T over the off-diagonal rows routed from the WHOLE block — `nroute = nb` and `blk` from
+# `(rows, nb)` — so a slice of a block folds exactly as the whole block does, provided `j0` and `len`
+# are multiples of `_GEMVT_BAND` (the property gemv-T's own column bands rely on) or reach `n`.
+#
+# With `x0 === x` this is the serial in-place sweep, which is why the direction is fixed: U descending
+# and L ascending, by block and by column, read every x[i] before it is overwritten. With `x0` a copy
+# of the original x, column ranges can run concurrently: a range writes only its own x[j] and reads x0.
+function _trmv_tcols!(up::Bool, unit::Bool, n::Int, A, x, x0, j0::Int, len::Int)
+    NB = _TRI_NB
+    len > 0 || return x
+    j1 = j0 + len
+    T = eltype(A); o = one(T)
+    GC.@preserve A x x0 begin
+        Ap = pointer(A); xp = _ptr(x); x0p = _ptr(x0); lda = stride(A, 2); sz = sizeof(T)
+        @inbounds if up                  # U,T: blocks descending; diag(ᵀ) then gemv-T (rows above)
+            ib = ((j1 - 1) ÷ NB) * NB
+            while ib + NB > j0 && ib >= 0
+                nb = min(NB, n - ib); c0 = max(ib, j0); c1 = min(ib + nb, j1)
+                for j in c1:-1:(c0 + 1)
+                    cp = Ap + (j - 1) * lda * sz; xj = unsafe_load(x0p, j)
+                    s = _dot_simd(j - 1 - ib, cp + ib * sz, x0p + ib * sz, T)
+                    unsafe_store!(xp, (unit ? xj : xj * unsafe_load(cp + (j - 1) * sz)) + s, j)
+                end
+                if ib > 0
+                    if c1 - c0 == nb             # the whole block: SME first, as `_tri_scatT!` does
+                        _tri_scatT!(view(x, (ib + 1):(ib + nb)), view(A, 1:ib, (ib + 1):(ib + nb)), view(x0, 1:ib), o)
+                    else
+                        _gemv_t_simd!(
+                            ib, c1 - c0, o, PtrMatrix{T}(Ap + c0 * lda * sz, ib, c1 - c0, lda), x0p, o,
+                            xp + c0 * sz, Val(false), !_gemvt_perscan(ib, nb, T), nb
+                        )
+                    end
+                end
+                ib -= NB
+            end
+        else                             # L,T: blocks ascending; diag(ᵀ) then gemv-T (rows below)
+            ib = (j0 ÷ NB) * NB
+            while ib < j1
+                nb = min(NB, n - ib); c0 = max(ib, j0); c1 = min(ib + nb, j1); be = ib + nb
+                for j in (c0 + 1):c1
+                    cp = Ap + (j - 1) * lda * sz; xj = unsafe_load(x0p, j)
+                    s = _dot_simd(be - j, cp + j * sz, x0p + j * sz, T)
+                    unsafe_store!(xp, (unit ? xj : xj * unsafe_load(cp + (j - 1) * sz)) + s, j)
+                end
+                if be < n
+                    if c1 - c0 == nb
+                        _tri_scatT!(view(x, (ib + 1):be), view(A, (be + 1):n, (ib + 1):be), view(x0, (be + 1):n), o)
+                    else
+                        _gemv_t_simd!(
+                            n - be, c1 - c0, o, PtrMatrix{T}(Ap + (c0 * lda + be) * sz, n - be, c1 - c0, lda),
+                            x0p + be * sz, o, xp + c0 * sz, Val(false), !_gemvt_perscan(n - be, nb, T), nb
+                        )
+                    end
+                end
+                ib += NB
+            end
         end
     end
     return x

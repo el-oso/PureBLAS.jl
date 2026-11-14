@@ -4378,6 +4378,10 @@ const _MT_NW_MASK = Int(typemax(UInt16))     # so `set_num_threads` clamps to wh
     # gemv-T — a COLUMN-BAND split, same slot convention as gemv-N: the matrix in `C`, x in `Ap`
     # (whole), y in `Bp` (offset per band). `up` carries `B0`.
     _MT_KIND_GEMVT
+    # trmv, T forms — a COLUMN split of the output in `_trmvt_g()`-wide groups. The triangle is in
+    # `C`, a copy of the original x in `Ap`, x itself in `Bp`; `up` is the stored triangle and `unit`
+    # the implicit unit diagonal. Each column writes only its own x[j], so nothing is folded.
+    _MT_KIND_TRMVT
     # symv — a COLUMN-BLOCK split with per-block private `y` ("notepads"). The matrix is in `C`, x in
     # `Ap`, y in `Bp`, and `up` is the stored triangle (its original meaning, unlike the gemv kinds
     # where it carries `B0`). The only kind whose chunks write to TWO different destinations: block 1
@@ -4586,6 +4590,41 @@ and the matching entries of y.
     return max(1, min(nw, cld(n, _GEMVT_BAND)))
 end
 
+"""
+    _trmvt_workers(n, ::Type{T}) -> Int
+
+Worker count for a T-form `trmv`. The stored triangle, `n^2 * sizeof(T) / 2`, is the traffic — the
+same admission input as `_symv_workers`. Capped by the number of `_trmvt_g()` column groups, the
+unit `_tri_chunk` hands out.
+"""
+@inline function _trmvt_workers(n::Int, ::Type{T}) where {T}
+    _MT_NTHREADS[] > 1 || return 1
+    nw = _l1_workers((n * n * sizeof(T)) >> 1, n, T)
+    nw > 1 || return 1
+    return max(1, min(nw, cld(n, _trmvt_g())))
+end
+
+# The column granularity of trmv-T's split, a req#11 parameter and not a tuning one. A boundary must
+# sit on a multiple of `_GEMVT_BAND` measured from its `_TRI_NB` block's start, so that a block's
+# gemv-T slices group columns as the whole block does (see `_trmv_tcols!`). `_GEMVT_BAND` from column 0
+# satisfies that whenever it divides `_TRI_NB` (always, unpinned: `_TRI_NB` is rounded to 16 and the
+# band is 16); otherwise whole blocks do.
+@inline _trmvt_g() = _TRI_NB % _GEMVT_BAND == 0 ? _GEMVT_BAND : _TRI_NB
+
+# The fixed cost of one trmv-T output column, in rows of streamed off-diagonal work, for
+# `_tri_chunk`'s balance. Each column pays a separate short dot over its diagonal block (length below
+# `_TRI_NB`) and a horizontal reduction, on top of the rows(j) it streams. Fitting t = a·cols + b·rows
+# to chunk bodies timed alone (4 workers, 6 U/L cases per chip) gives a/b, and the offsets whose
+# slowest chunk is within 3% of the best:
+#            fitted a/b   c=64 in range   c=96 in range
+#   Zen4       64-86         6 of 6          4 of 6
+#   Zen5       53-87         6 of 6          5 of 6
+#   Zen3       91-124        2 of 6          5 of 6
+# 96 is in range in 15 of 18 cases; its misses cost 3.6-6% on the slowest chunk, 64's cost 3-8%.
+# PDM: Literal — the per-chip optimum has no detected quantity it follows (`_TRI_NB` does not separate Zen3 from Zen4/5).
+# req8-ok: fleet table above
+@inline _trmvt_colcost() = 96
+
 # One notepad's stride, rounded UP to a whole cache line so block `b`'s tail and block `b+1`'s head
 # never share one. Unpadded it is only about two coherence misses per panel pass — measured
 # negligible — but the rounding costs at most one line per block and removes the question.
@@ -4662,14 +4701,23 @@ const _GEMVT_BAND = lcm(_GEMVT_NC_ARMS..., _GEMVT_NC_DEEP)
 #   * monotonicity     → `max` against the previous boundary, so a rounding wobble can never emit a
 #                        negative length or let two workers overlap. Overlap would be a WRITE RACE on C,
 #                        not merely a slow chunk, so this is a correctness guard and not tidiness.
-@inline function _tri_chunk(n::Int, nw::Int, i::Int, up::Bool)
+#
+# `g` replaces `_NR` as the rounding unit for a caller whose kernel groups columns differently, and `c`
+# adds a fixed per-column cost in units of rows: column j then weighs rows(j) + c, the area becomes
+# n²/2 + c·n, and the same quadratic solved with that offset gives, for target area W = t·(n²/2 + c·n),
+#     upper  j = sqrt(c² + 2W) − c          lower  j = (n + c) − sqrt((n + c)² − 2W)
+# both reducing to the forms above at c = 0. trmv-T passes `_trmvt_g()` and `_trmvt_colcost()`.
+@inline function _tri_chunk(n::Int, nw::Int, i::Int, up::Bool, g::Int, c::Int = 0)
     nw <= 1 && return 0, n
-    f(t) = up ? sqrt(t) : 1 - sqrt(1 - t)
-    b(t) = min(n, _NR * round(Int, (n * f(t)) / _NR))
+    tot = n * n / 2 + c * n
+    f(t) = iszero(c) ? n * (up ? sqrt(t) : 1 - sqrt(1 - t)) :
+        up ? sqrt(c^2 + 2t * tot) - c : (n + c) - sqrt(max(0.0, (n + c)^2 - 2t * tot))
+    b(t) = min(n, g * round(Int, f(t) / g))
     j0 = b((i - 1) / nw)
     j1 = i == nw ? n : max(j0, b(i / nw))      # last worker always closes the triangle exactly
     return j0, j1 - j0
 end
+@inline _tri_chunk(n::Int, nw::Int, i::Int, up::Bool) = _tri_chunk(n, nw, i, up, _NR)
 
 # op(B)'s column slice. With `tB`, B is stored n×k and op(B)[:,jr] is B[jr,:] — a ROW slice, which is
 # the same leading dimension at an element offset, not a column offset. Both cases are one PtrMatrix.
@@ -4704,6 +4752,7 @@ end
     p.kind == _MT_KIND_GER && return _ger_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GEMVN && return _gemvn_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GEMVT && return _gemvt_run_chunk(p, nw, i)
+    p.kind == _MT_KIND_TRMVT && return _trmvt_run_chunk(p, nw, i)
     p.kind == _MT_KIND_SYMV && return _symv_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GBMVN && return _gbmvn_run_chunk(p, nw, i)
     p.kind == _MT_KIND_ELEM && return _elem_run_chunk(p, nw, i)
@@ -5152,6 +5201,18 @@ end
     else
         _gemv_t_simd!(p.m, len, p.alpha, Ab, p.Ap, p.beta, yb, Val(false), blk, p.n)
     end
+    return nothing
+end
+
+# trmv-T over this worker's flop-balanced column range. Column j of an upper triangle carries j rows
+# of work and of a lower one n − j, which is `_tri_chunk`'s convention.
+@noinline function _trmvt_run_chunk(p::GemmPool{T}, nw::Int, i::Int)::Nothing where {T}
+    j0, len = _tri_chunk(p.n, nw, i, p.up, _trmvt_g(), _trmvt_colcost())
+    len > 0 || return nothing
+    _trmv_tcols!(
+        p.up, p.unit, p.n, PtrMatrix{T}(p.Cp, p.n, p.n, p.ldc),
+        PtrVector{T}(p.Bp, p.n), PtrVector{T}(p.Ap, p.n), j0, len
+    )
     return nothing
 end
 
@@ -6459,6 +6520,10 @@ end
             up ?
                 _gemv_t_simd!(C.m, C.n, alpha, C, A.ptr, beta, B.ptr, Val(true), blk, C.n) :
                 _gemv_t_simd!(C.m, C.n, alpha, C, A.ptr, beta, B.ptr, Val(false), blk, C.n)
+        elseif kind == _MT_KIND_TRMVT
+            # A loser runs every column itself, reading the caller's copy of x, through the same body
+            # the winner's chunks run; each column's arithmetic is fixed by its block, not its range.
+            _trmv_tcols!(up, unit, C.n, C, PtrVector{T}(B.ptr, C.n), PtrVector{T}(A.ptr, C.n), 0, C.n)
         elseif kind == _MT_KIND_SYMV
             # A loser runs the blocked form over the WHOLE grid with its OWN arena notepad, which is
             # the one case where the fallback must not reuse the pool buffer and also must not skip
@@ -6903,6 +6968,18 @@ end
     _gemm_threaded!(
         PtrMatrix{T}(Ap, m, n, lda), PtrMatrix{T}(xp, m, 1, m), PtrMatrix{T}(yp, n, 1, n),
         α, β, false, false, false, false, nw, _MT_KIND_GEMVT, b0, false, blk
+    )
+    return nothing
+end
+
+# trmv, T forms: the n×n triangle in `C`, the caller's copy of the original x in `A`, x in `B`.
+# `x0p` must stay valid until this returns; the chunks read it and write only x.
+@noinline function _trmvt_threaded!(
+        n::Int, Ap::Ptr{T}, lda::Int, x0p::Ptr{T}, xp::Ptr{T}, up::Bool, unit::Bool, nw::Int
+    ) where {T <: BlasReal}
+    _gemm_threaded!(
+        PtrMatrix{T}(Ap, n, n, lda), PtrMatrix{T}(x0p, n, 1, n), PtrMatrix{T}(xp, n, 1, n),
+        one(T), zero(T), false, false, false, false, nw, _MT_KIND_TRMVT, up, false, unit
     )
     return nothing
 end
