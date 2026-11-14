@@ -4016,6 +4016,22 @@ const _TRMV_SME_MIN = @load_preference("trmv_sme_min", _SME_F64 ? 4 * _TRI_NB : 
     # SME gemv it now asks for — was unreachable for exactly the form the gate measures. Witnessed
     # rather than reasoned: trmv-N made ZERO SME calls at every size while trmv-T made 4 to 60.
     if !tr && eltype(A) <: BlasReal && _strided1(A) && _dense1(x) && n < _TRMV_SME_MIN
+        # Rows are independent given a copy of the original x, so `_trmvn_threaded!` (gemm.jl) splits
+        # them across the pool; `n` and the panel grid are the whole problem's. No SME route is taken
+        # below `_TRMV_SME_MIN`, so nothing here needs the SME eligibility decline the T forms have.
+        nw = _trmvn_workers(n, eltype(A))
+        if nw > 1
+            T = eltype(A)
+            GC.@preserve A x begin
+                @scope arn begin
+                    x0 = borrow!(arn, T, n)
+                    unsafe_copyto!(pointer(x0), _ptr(x), n)
+                    _trmvn_threaded!(n, pointer(A), stride(A, 2), pointer(x0), _ptr(x), up, unit, nw)
+                    nothing
+                end
+            end
+            return x
+        end
         return _trmv_fused8!(up, unit, n, A, x)
     end
     # At and above that threshold the N form runs as two sweeps over a scratch accumulator rather
@@ -4219,7 +4235,7 @@ end
 # contain F=4 — and the honest response is then a Measure-tier auto-tune over the existing probe
 # (`bench/probes/l2_indep_streams.jl`), not a smaller literal. Both knobs are `@load_preference`-backed
 # so such a host can be pinned immediately without a release.
-@inline function _trmv_fused8!(up::Bool, unit::Bool, n::Int, A, x)
+@inline function _trmv_fused8!(up::Bool, unit::Bool, n::Int, A, x, x0 = x, r0::Int = 0, r1::Int = n)
     T = eltype(A)
     # Triangle bytes = n(n+1)/2 · sizeof(T). Past L3 the A stream comes from DRAM and the stream count
     # is what limits achieved bandwidth, so drop to the plateau; inside L3 the wider panel wins by
@@ -4239,8 +4255,8 @@ end
     # A majority criterion over a derived quantity, not a tuned multiplier: the 2 comes from the 1/2
     # and the fraction comes from cache capacity. Zen3 n=4096 sits exactly AT 2·L3 and keeps F=8,
     # where it measured 0.973 either way — indifferent, so the boundary costs nothing there.
-    return tri > _TRMV_F_SWITCH * _L3_BYTES ? _trmv_fusedF!(Val(_TRMV_F_DRAM), up, unit, n, A, x) :
-        _trmv_fusedF!(Val(8), up, unit, n, A, x)
+    return tri > _TRMV_F_SWITCH * _L3_BYTES ? _trmv_fusedF!(Val(_TRMV_F_DRAM), up, unit, n, A, x, x0, r0, r1) :
+        _trmv_fusedF!(Val(8), up, unit, n, A, x, x0, r0, r1)
 end
 # Largest power of two on the measured plateau (2-6). 4 rather than 6 because the panel arithmetic
 # uses `n & (F-1)` for the ragged first block, which needs F a power of two.
@@ -4249,80 +4265,94 @@ const _TRMV_F_DRAM = @load_preference("trmv_f_dram", 4)::Int          # req8-ok:
 # PDM: Derived — NOT Measure-tier debt, despite the label this line carried until 2026-08-21. It is a MAJORITY CRITERION over a derived quantity: switch to the narrow panel once more than half the triangle's stream is DRAM-served, i.e. `1 - L3/tri > 1/2` <=> `tri > 2*L3`. The 2 IS the 1/2 — it is not a tuned multiplier, and the cache term carries the hardware. Validated at the boundary: Zen3 n=4096 sits exactly AT 2*L3 and measured 0.973 either way, so the switch costs nothing where it fires. | tune: n/a — Derived
 const _TRMV_F_SWITCH = @load_preference("trmv_f_switch", 2)::Int      # req8-ok: see above
 
-@generated function _trmv_fusedF!(::Val{F}, up::Bool, unit::Bool, n::Int, A, x) where {F}
+# Rows `[r0, r1)` (0-based) of `x := op(A)·x`, N forms. `x0` holds the ORIGINAL x; `x` receives the
+# result for those rows only, and is read back only at rows it has already written. With `x0 === x`
+# and `[r0, r1) = [0, n)` this is the whole serial in-place sweep.
+#
+# THE ARITHMETIC OF ROW i DEPENDS ON THE PROBLEM AND NEVER ON `[r0, r1)`. Its chain is fixed by the
+# panel grid, a function of `(n, F)`: first its own panel's F×F triangle, then one fused
+# `muladd` chain of F terms per later panel (U) or earlier panel (L), in panel order. The vector body and
+# the scalar remainder both use `muladd`, so a row computes the same bits whether it falls in a full
+# vector chunk or in the remainder, and a range boundary may sit at any row.
+@inline _trmv_fusedF!(v::Val, up::Bool, unit::Bool, n::Int, A, x) = _trmv_fusedF!(v, up, unit, n, A, x, x, 0, n)
+
+@generated function _trmv_fusedF!(::Val{F}, up::Bool, unit::Bool, n::Int, A, x, x0, r0::Int, r1::Int) where {F}
     cs = [Symbol(:c, k) for k in 0:(F - 1)]
     bs = [Symbol(:b, k) for k in 0:(F - 1)]
-    # per-column bases and the F hoisted x values (the triangle overwrites x, so they are read first)
-    mkc(base) = Expr(
-        :block, :($(cs[1]) = $base),
+    # per-column bases and the F hoisted x values (read from the original x)
+    mkc = Expr(
+        :block, :($(cs[1]) = Ap + (lo - 1) * lda * sz),
         (:($(cs[k + 1]) = $(cs[k]) + lda * sz) for k in 1:(F - 1))...
     )
-    mkb = Expr(:block, (:($(bs[k + 1]) = V(unsafe_load(xp, lo + $k))) for k in 0:(F - 1))...)
-    fused(dst) = Expr(
+    mkb = Expr(:block, (:($(bs[k + 1]) = V(unsafe_load(x0p, lo + $k))) for k in 0:(F - 1))...)
+    fused = Expr(
         :block,
-        :(o = i * sz; acc = vload(V, $dst + o)),
+        :(o = i * sz; acc = vload(V, xp + o)),
         (:(acc = muladd($(bs[k + 1]), vload(V, $(cs[k + 1]) + o), acc)) for k in 0:(F - 1))...,
-        :(vstore(acc, $dst + o); i += W)
+        :(vstore(acc, xp + o); i += W)
+    )
+    # scalar remainder: the same muladd chain as one lane of `fused`
+    tail = Expr(
+        :block, :(s = unsafe_load(xp, i + 1)),
+        (:(s = muladd(unsafe_load(x0p, lo + $k), unsafe_load($(cs[k + 1]) + i * sz), s)) for k in 0:(F - 1))...,
+        :(unsafe_store!(xp, s, i + 1); i += 1)
     )
     return quote
         T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
-        GC.@preserve A x begin
-            Ap = pointer(A); xp = _ptr(x); lda = stride(A, 2)
+        GC.@preserve A x x0 begin
+            Ap = pointer(A); xp = _ptr(x); x0p = _ptr(x0); lda = stride(A, 2)
             r = n & $(F - 1); r = r == 0 ? $F : r      # ragged panel FIRST, where off-panel work is 0
-            if up                                     # U,N: panels forward from column 1
-                lo = 1
+            if up                                     # U,N: panels forward from the one holding row r0
+                lo = r0 < r ? 1 : r + 1 + ((r0 - r) ÷ $F) * $F
                 @inbounds while lo <= n
-                    hi = lo == 1 ? r : lo + $(F - 1); top = lo - 1
-                    if top > 0
-                        $(mkc(:(Ap + (lo - 1) * lda * sz)))
+                    hi = lo == 1 ? r : lo + $(F - 1)
+                    a = r0; b = min(r1, lo - 1)
+                    if a < b
+                        $mkc
                         $mkb
-                        i = 0
-                        while i + W <= top
-                            $(fused(:xp))
+                        i = a
+                        while i + W <= b
+                            $fused
                         end
-                        while i < top
-                            s = unsafe_load(xp, i + 1)
-                            for k in lo:hi
-                                s += unsafe_load(Ap + ((k - 1) * lda + i) * sz) * unsafe_load(xp, k)
-                            end
-                            unsafe_store!(xp, s, i + 1); i += 1
+                        while i < b
+                            $tail
                         end
                     end
                     for j in lo:hi                    # F×F triangle, in registers
-                        cp = Ap + (j - 1) * lda * sz; t = unsafe_load(xp, j)
-                        for i in lo:(j - 1)
+                        cp = Ap + (j - 1) * lda * sz; t = unsafe_load(x0p, j)
+                        for i in max(lo, r0 + 1):min(j - 1, r1)
                             unsafe_store!(xp, unsafe_load(xp, i) + t * unsafe_load(cp, i), i)
                         end
-                        unit || unsafe_store!(xp, t * unsafe_load(cp + (j - 1) * sz), j)
+                        if r0 < j <= r1
+                            unsafe_store!(xp, unit ? t : t * unsafe_load(cp + (j - 1) * sz), j)
+                        end
                     end
                     lo = hi + 1
                 end
-            else                                      # L,N: panels backward from column n
-                hi = n
+            else                                      # L,N: panels backward from the one holding row r1
+                hi = r1 > n - r ? n : n - r - ((n - r - r1) ÷ $F) * $F
                 @inbounds while hi > 0
-                    lo = hi == n ? n - r + 1 : hi - $(F - 1); rest = n - hi
-                    if rest > 0
-                        $(mkc(:(Ap + ((lo - 1) * lda + hi) * sz)))
+                    lo = hi == n ? n - r + 1 : hi - $(F - 1)
+                    a = max(r0, hi); b = r1
+                    if a < b
+                        $mkc
                         $mkb
-                        yp = xp + hi * sz
-                        i = 0
-                        while i + W <= rest
-                            $(fused(:yp))
+                        i = a
+                        while i + W <= b
+                            $fused
                         end
-                        while i < rest
-                            s = unsafe_load(yp, i + 1)
-                            for k in lo:hi
-                                s += unsafe_load(Ap + ((k - 1) * lda + hi + i) * sz) * unsafe_load(xp, k)
-                            end
-                            unsafe_store!(yp, s, i + 1); i += 1
+                        while i < b
+                            $tail
                         end
                     end
                     for j in hi:-1:lo
-                        cp = Ap + (j - 1) * lda * sz; t = unsafe_load(xp, j)
-                        for i in (j + 1):hi
+                        cp = Ap + (j - 1) * lda * sz; t = unsafe_load(x0p, j)
+                        for i in max(j + 1, r0 + 1):min(hi, r1)
                             unsafe_store!(xp, unsafe_load(xp, i) + t * unsafe_load(cp, i), i)
                         end
-                        unit || unsafe_store!(xp, t * unsafe_load(cp + (j - 1) * sz), j)
+                        if r0 < j <= r1
+                            unsafe_store!(xp, unit ? t : t * unsafe_load(cp + (j - 1) * sz), j)
+                        end
                     end
                     hi = lo - 1
                 end
