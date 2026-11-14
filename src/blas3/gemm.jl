@@ -4613,12 +4613,17 @@ end
 
 # The fixed cost of one trmv-T output column, in rows of streamed off-diagonal work, for
 # `_tri_chunk`'s balance. Each column pays a separate short dot over its diagonal block (length below
-# `_TRI_NB`) and a horizontal reduction, on top of the rows(j) it streams. A pure rows(j) split at
-# n=629 (Zen4, 4 workers, chunk bodies timed alone) left the column-rich chunk at 6.4-6.7 us against
-# 4.7-5.0 for the others; fitting t = a·cols + b·rows to those chunks gives a/b = 53 rows (U) and 66
-# (L), i.e. about one diagonal block.
-# PDM: Derived — the per-column overhead is one diagonal-block dot, `_TRI_NB` rows; fitted 53/66 on Zen4 only. | tune: candidate
-@inline _trmvt_colcost() = _TRI_NB
+# `_TRI_NB`) and a horizontal reduction, on top of the rows(j) it streams. Fitting t = a·cols + b·rows
+# to chunk bodies timed alone (4 workers, 6 U/L cases per chip) gives a/b, and the offsets whose
+# slowest chunk is within 3% of the best:
+#            fitted a/b   c=64 in range   c=96 in range
+#   Zen4       64-86         6 of 6          4 of 6
+#   Zen5       53-87         6 of 6          5 of 6
+#   Zen3       91-124        2 of 6          5 of 6
+# 96 is in range in 15 of 18 cases; its misses cost 3.6-6% on the slowest chunk, 64's cost 3-8%.
+# PDM: Literal — the per-chip optimum has no detected quantity it follows (`_TRI_NB` does not separate Zen3 from Zen4/5).
+# req8-ok: fleet table above
+@inline _trmvt_colcost() = 96
 
 # One notepad's stride, rounded UP to a whole cache line so block `b`'s tail and block `b+1`'s head
 # never share one. Unpadded it is only about two coherence misses per panel pass — measured
