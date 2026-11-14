@@ -33,7 +33,8 @@ jobs:
         with:
           version: ${{ matrix.version }}
       - name: Record CPU model for the cache key
-        run: echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
+        run: |
+          echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
       - uses: julia-actions/cache@v2
         with:
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
@@ -113,7 +114,8 @@ jobs:
         with:
           version: '1.13'
       - name: Record CPU model for the cache key
-        run: echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
+        run: |
+          echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
       - uses: julia-actions/cache@v2
         with:
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
@@ -165,7 +167,8 @@ jobs:
         with:
           version: '1.13'
       - name: Record CPU model for the cache key
-        run: echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
+        run: |
+          echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
       - uses: julia-actions/cache@v2
         # THE DEPOT CACHE KEY MUST CARRY THE CPU TARGET AND THE RUNNER CPU MODEL. Precompiled images are stored per target, and
         # this job sets JULIA_CPU_TARGET while the action's default key covers only workflow, job and
@@ -237,7 +240,8 @@ jobs:
         with:
           version: '1'
       - name: Record CPU model for the cache key
-        run: echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
+        run: |
+          echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
       - uses: julia-actions/cache@v2
         with:
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
