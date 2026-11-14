@@ -605,6 +605,24 @@ end
         end
     end
 
+    # trmv-T's form: its own rounding unit and a per-column cost offset. Boundaries off the `g` grid
+    # would regroup a gemv-T slice, so every interior boundary must sit on it.
+    @testset "partition with g and a column cost (trmv-T)" begin
+        g = P._trmvt_g(); c = P._trmvt_colcost()
+        for n in (8, 17, 63, 256, 629, 1000, 2049), nw in 1:8, up in (false, true)
+            cov = zeros(Int, n)
+            for i in 1:nw
+                j0, len = P._tri_chunk(n, nw, i, up, g, c)
+                @test len >= 0 && j0 >= 0 && j0 + len <= n
+                len > 0 && @test iszero(j0 % g) && (j0 + len == n || iszero((j0 + len) % g))
+                for j in (j0 + 1):(j0 + len)
+                    cov[j] += 1
+                end
+            end
+            @test all(isone, cov)
+        end
+    end
+
     @testset "flops are balanced, and beat an equal-width split" begin
         for n in (512, 1024, 2048), nw in (2, 4, 6), up in (false, true)
             tot = tri_work(0, n, n, up)
