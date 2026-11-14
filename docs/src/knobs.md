@@ -15,7 +15,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | **Literal** | A fixed value: a proven invariant, or a derivation that was tried and falsified. |
 
 **Tier:** 93 Derived · 24 Measured (15 calibrated · 9 orphaned) · 53 Literal.
-**Default form** (mechanical): 70 formula · 24 delegates · 8 sibling · 61 literal · 7 other.
+**Default form** (mechanical): 70 formula · 24 delegates · 9 sibling · 61 literal · 6 other.
 
 
 ## BLAS-1 SIMD kernels
@@ -140,7 +140,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | `cpu_family` | other | Derived | the detected CPU display family itself (CPUID, via `cpumodel()`); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `fast_cores` | other | Derived | the detected core count itself (`hw.perflevelN.physicalcpu`); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `fp_datapath_bytes` | formula | Derived | the detected FP datapath width itself (CPUID Fn8000_001A FP128/FP256/FP512, else the register width); the preference exists for cross-compile and trim builds. | n/a |
-| `l1d_assoc` | other | Derived | the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `l1d_assoc` | sibling | Derived | the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `l3_bytes` | formula | Derived | the detected L3 size itself (`cachesize()`, floored at L2 where no L3/SLC is queryable, see above); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `simd_bytes` | delegates | Derived | the detected SIMD width itself (`simdbytes()` on x86, the 16 B NEON floor elsewhere); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `sme_f32` | other | Derived | the detected FEAT_SME2 + SME_F32F32 pair itself (`sysctlbyname`); the override exists for cross-compile and trim builds, not tuning. | n/a |
