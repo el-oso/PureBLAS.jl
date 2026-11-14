@@ -437,7 +437,10 @@ function _dc_eigen!(
     # single assembly pass at the end: j>0 ⇒ R[:,j] (secular combine), 0 ⇒ Zsort[:,i] (deflated column).
     # This replaces the old `Qout = copy(Zsort)` + per-survivor scatter + `Qout[:,ord2]` resort — THREE
     # O(n²) Q-copies/allocs per merge — with ONE write pass into Z (LAPACK dlaed2/dlaed3 assemble-once).
-    Dout = view(ws.dout, 1:n); copyto!(Dout, dsort)
+    Dout = view(ws.dout, 1:n)
+    for i in 1:n        # elementwise: `copyto!(view, view)` carries an alias-check `copy` path
+        Dout[i] = dsort[i]
+    end
     srcmap = view(ws.srcmap, 1:n); fill!(srcmap, 0)
     R = view(ws.R, 1:n, 1:max(K, 0))       # survivor eigenvectors B·V (0 cols if none)
 
