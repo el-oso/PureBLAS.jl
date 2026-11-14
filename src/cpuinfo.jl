@@ -143,25 +143,35 @@ const _CACHELINE = let s = try
     end
 end
 
-# L1d associativity (ways), CPUID leaf 4 (Intel) / 0x8000001D (AMD) subleaf 0, ebx[22:31]+1 — the same
-# leaf CpuId's `cachesize` parses for sizes. The derived way size (_L1_WAY_BYTES) is the address stride
-# at which parallel streams collide in ONE L1 set: gemvN column streams at lda·sizeof ≡ 0 (mod way) all
-# index the same set, so at most `ways` of them can coexist — the panel width selector keys on this.
-# Fallback 8 (Zen2–5 and most Intel L1d are 8-way; Ice-Lake-class 48K/12-way also yields 4K ways).
-# PDM: Derived — the detected L1d associativity itself (CPUID leaf 4 / 0x8000001D); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
-const _L1D_ASSOC = @load_preference(
-    "l1d_assoc",
-    let w = try
-            leaf = cpuvendor() === :AMD ? 0x8000_001d : 0x0000_0004
-            eax, ebx, _, _ = cpuid(leaf, 0x0000_0000)
-            # subleaf 0 must be a level-1 data/unified cache (eax[0:4] type≠0, eax[5:7] level==1)
-            (eax & 0x1f) != 0 && ((eax >> 5) & 0x07) == 1 ? Int(1 + (ebx >> 22) & 0x03ff) : 0
-        catch
-            0
-        end
-        w > 0 ? w : 8
-    end
-)::Int
+# L1d associativity (ways). One way of an L1d indexed by page-offset bits is at most one memory page,
+# so ways = L1 bytes ÷ page size. Every known part has exactly one page per way:
+#   Zen3/Zen4 32 KiB 8-way, 4 KiB pages  -> 8     Zen5 48 KiB 12-way, 4 KiB pages -> 12
+#   Apple M 128 KiB 8-way, 16 KiB pages  -> 8
+# `Sys.PAGESIZE` is the OS allocation unit: the page size on Unix, the 64 KiB allocation granularity
+# on Windows, where it exceeds L1; the cap at `_L1_BYTES` then gives associativity 1 (one way spans
+# the whole L1). The way size (_L1_WAY_BYTES) is the address stride at which parallel streams collide in
+# ONE L1 set: gemvN column streams at lda·sizeof ≡ 0 (mod way) all index the same set, so at most
+# `ways` of them can coexist — the panel width selector keys on this.
+# PDM: Derived — one L1d way is one memory page (page-offset indexing); Sys.PAGESIZE, capped at L1; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+const _L1D_ASSOC = @load_preference("l1d_assoc", max(1, _L1_BYTES ÷ min(Sys.PAGESIZE, _L1_BYTES)))::Int
+
+# A way is a whole number of lines: L1 bytes = ways * sets * line. A triple that violates this
+# describes no real cache (typically an inconsistent preference pin), and every way-stride formula
+# below would silently be wrong, so precompilation stops here. Pure so it can be tested against
+# geometries no host has.
+function _check_l1_geometry(l1::Int, assoc::Int, line::Int; assoc_pinned::Bool = false)
+    (assoc > 0 && line > 0 && l1 > 0 && l1 % (assoc * line) == 0) && return nothing
+    src = assoc_pinned ? "associativity $assoc comes from the \"l1d_assoc\" preference; fix or remove it" :
+        "no cache-geometry preference is set, so all three values come from detection; this indicates an unsupported or virtualized CPU"
+    error(
+        "PureBLAS: inconsistent L1d cache geometry: L1 size $l1 B is not a whole multiple of " *
+        "associativity $assoc x line $line B (way size $(l1 / max(assoc, 1)) B is not a whole " *
+        "number of lines); $src."
+    )
+end
+const _L1_GEOMETRY_CHECKED = _check_l1_geometry(
+    _L1_BYTES, _L1D_ASSOC, _CACHELINE; assoc_pinned = !isnothing(load_preference(@__MODULE__, "l1d_assoc", nothing))
+)
 const _L1_WAY_BYTES = max(_CACHELINE, _L1_BYTES ÷ _L1D_ASSOC)
 # Doubles per L1 way, as a PURE FUNCTION of (L1 bytes, associativity) so it can be tested against cache
 # geometries no fleet box has. It exists because the same quantity was once spelled
