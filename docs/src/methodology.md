@@ -144,8 +144,8 @@ LinearAlgebra.BLAS.lbt_forward(
 )
 ```
 
-One forward call covers both BLAS and LAPACK (Accelerate ships them in the same umbrella binary, unlike
-AOCL's separate `libblis-mt`/`libflame`). Verified empirically on this machine: `LinearAlgebra.BLAS.lbt_get_config()`
+One forward call covers both BLAS and LAPACK (Accelerate ships them in the same umbrella binary, as
+AOCL does in `libaocl64`). Verified empirically on this machine: `LinearAlgebra.BLAS.lbt_get_config()`
 reports `[ILP64] Accelerate` after the forward, `dgemm` and `potrf` reconstruction errors sit at Float64
 noise floor (~1e-12–1e-14), and `dgemm` runs at a clearly distinct, much faster wall-clock than OpenBLAS —
 consistent with Accelerate's AMX-backed kernels.

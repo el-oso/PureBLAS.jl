@@ -486,7 +486,7 @@ if NT > 1
         isempty(PINNED) ? "UNPINNED" : PINNED)
 else
     out = Dict{String, Float64}()
-    for (nm, lib) in ("openblas" => nothing, "aocl" => AOCL_jll.aocl_blas_ilp64)
+    for (nm, lib) in ("openblas" => nothing, "aocl" => AOCL_jll.libaocl64)
         isnothing(lib) ? B.lbt_forward(_OPENBLAS; clear = true) :
             B.lbt_forward(lib; clear = true)  # clear=true, as plots.jl:66 does — clear=false leaves routing ambiguous
         out[nm] = armtime(refw)

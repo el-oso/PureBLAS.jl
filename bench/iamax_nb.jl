@@ -11,7 +11,7 @@ B.set_num_threads(1)
 const REF = "aocl" in ARGS ? "aocl" : "openblas"
 if REF == "aocl"
     using AOCL_jll
-    B.lbt_forward(AOCL_jll.aocl_blas_ilp64; clear = true)
+    B.lbt_forward(AOCL_jll.libaocl64; clear = true)
 end
 const REFNAME = REF == "aocl" ? "AOCL" : "OpenBLAS"
 
