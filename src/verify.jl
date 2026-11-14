@@ -988,4 +988,28 @@ if StrictMode.proofs_loaded()
             one(ComplexF64), Az3, Bz3, zero(ComplexF64), Cz3, -1
         )
     end
+    # Register pressure and vectorization of the gemm microkernels and the trsm side-R tile. A tile sized
+    # past the register file spills vectors to the stack on every k step, which neither the type-stability
+    # nor the allocation checks see; these scan the compiled native code. Each call also executes, so
+    # every operand is a live buffer. The argtypes are the FULL method signature, trailing `Val{B0}`
+    # included: the 7-argument `_microkernel!` and 9-argument `_microkernel_masked!` forms are
+    # default-argument forwarders whose native code is a call and a return, which a scan passes without
+    # reaching the kernel. The α-scaled `_microkernel!` shares the tile with a different epilogue and
+    # has its own `B0 = false` and `B0 = true` instances.
+    let m = 64, kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
+            Ap = ones(mr * kc), Bp = ones(nr * kc), Ck = ones(mr, nr),
+            Lt = ones(m, m), Bt = ones(m, m)
+        GC.@preserve Ap Bp Ck Lt Bt begin
+            ap = pointer(Ap); bp = pointer(Bp); cp = pointer(Ck)
+            @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
+            @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
+            @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(false))
+            @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(false))
+            @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(true))
+            @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(true))
+            @assert_no_spill _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(false))
+            @assert_vectorized _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(false))
+            @assert_no_spill _trsm_tile_R_f64!(false, false, false, pointer(Lt), m, pointer(Bt), m, m, m)
+        end
+    end
 end

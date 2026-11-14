@@ -305,7 +305,9 @@ end
             # with no vector spill/reload. Verified clean on both AVX-512 (Zen4/Zen5, 32 zmm) and AVX2 (Zen3,
             # 16 ymm) — the packed hot path. (NB the SMALL-matrix `_microkernel_unpacked!` spills 3 vectors on
             # AVX2 with the same tile — a real register-pressure finding, tracked separately; not asserted here.)
-            @assert_no_spill P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            # The full signature, `Val(false)` included: the 7-argument form is a default-argument forwarder
+            # whose native code is a call and a return, so a spill scan of it passes without reading the kernel.
+            @assert_no_spill P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
             @test_noalloc P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             @assert_typestable P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             @test_trim_compatible P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
