@@ -1423,3 +1423,15 @@ let n = 24, k = 12
     @assert_noescape geqp3!(ones(n, k) + LinearAlgebra.I[1:n, 1:k], zeros(Int, k), zeros(k))
     @assert_noescape gglse!(ones(8, 6) + LinearAlgebra.I[1:8, 1:6], ones(8), ones(4, 6) + LinearAlgebra.I[1:4, 1:6], ones(4), zeros(6))
 end
+# Trust boundary. `@assert_trusted` fails when a function's own body reads the payload of an `Untrusted`
+# value outside a registered boundary. The C-ABI entries take raw pointers and none takes an `Untrusted`.
+# The check passes a raw `Ptr` dereference, so on a C-ABI entry it cannot fail today (a StrictMode gap):
+# this site verifies only that the entry is reachable and takes no `Untrusted` payload.
+let x = ones(8), a = Ref(2.0), nn = Ref(8), inc = Ref(1)
+    GC.@preserve x a nn inc begin
+        @assert_trusted dscal_64_(
+            Base.unsafe_convert(Ptr{Int64}, nn), Base.unsafe_convert(Ptr{Float64}, a),
+            pointer(x), Base.unsafe_convert(Ptr{Int64}, inc)
+        )
+    end
+end
