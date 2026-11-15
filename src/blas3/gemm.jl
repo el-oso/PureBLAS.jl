@@ -5028,9 +5028,9 @@ const _REDP_F32 = Float32[]
 # Soundness is the argument above verbatim — one job at a time under `_MT_CLAIM` (shared by every
 # element type, which is what keeps a Float64 and a Float32 argmax off this one buffer together), the
 # driver sizes it inside the claim, each worker writes only the block slots it owns, nothing is held
-# across a yield. It is deliberately NOT a second `Vector{T}` with the index stored as a float: the chunk needs no
-# float round-trip and the only conversion left is the driver's single return, which `_iamax_mt_nmax`
-# bounds.
+# across a yield. It is deliberately NOT a second `Vector{T}` with the index stored as a float: the
+# chunk needs no float round-trip and the only conversion left is the driver's single return, which
+# `_iamax_mt_nmax` bounds.
 const _REDI = Int[]
 @inline _redi_partials() = _REDI
 
@@ -5693,8 +5693,9 @@ const _MT_NTHREADS = Threads.Atomic{Int}(1)
 const _MT_LOST = Threads.Atomic{Int}(0)
 
 # THE ONE THREADED-JOB CLAIM, shared by the four per-type pools. A task holds it from the CAS in
-# `_gemm_threaded!` until the join completes (or before anything was published). See there for what
-# relies on it.
+# `_gemm_threaded!` until the join completes, or until the setup fails before anything was published.
+# A forced unwind out of the join leaves it held for the rest of the process, so every later threaded
+# call runs serially. See there for what relies on it.
 const _MT_CLAIM = Threads.Atomic{Bool}(false)
 
 # How many jobs were published with a worker sitting out because the driver was on its thread. A test
@@ -7787,7 +7788,7 @@ function gemm!(
         # refusing to thread inside any scope, and in doing so silently serialised the 16 routines whose
         # `gemm!` sits inside their own `@scope` (getri!, trtri!, potri!, gels!, …). `_gemm_threaded!`
         # now PINS the driver to its thread for the join instead, and arena.jl's threading note gives the
-        # full argument for why a pinned driver plus the single pool claim keeps the bump stack LIFO.
+        # full argument for why a pinned driver plus the process-wide claim keeps the bump stack LIFO.
         #
         # Owners that are NOT arena scopes but ARE handed to workers as operands (`_LU_PAD`, `_QR_WS`,
         # the SVD/eigen pools, the symm twin) are per-TASK and stay so; see their definitions.

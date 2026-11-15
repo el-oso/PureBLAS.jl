@@ -15,9 +15,9 @@
 #               The earlier `iszero(_arena().depth)` admission guard is gone; it serialised 16 routines.
 #
 #   workspace.jl — the L3 pack pools are claimed INSIDE `_gemm_core!`, i.e. inside a chunk body, and a
-#               chunk holds one across a `_pool_barrier`, its only yield (`test/yield_lint.jl` is the
-#               lexical guard). They are per-chunk in practice,
-#               so no migration can occur while one is held. This is the ONE case where the original
+#               no chunk holds a per-thread owner across a `_pool_barrier`, its only yield
+#               (`test/yield_lint.jl` is the lexical guard). They are per-chunk in practice, so no
+#               migration can occur while one is held. This is the ONE case where the original
 #               "a worker runs as a nested interval" argument actually holds.
 #
 #   blas2/level2.jl — the trsv reciprocal caches. trsv is Level-2 and never calls `gemm!`, so nothing on
