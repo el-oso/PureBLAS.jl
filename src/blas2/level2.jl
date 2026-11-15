@@ -4318,7 +4318,8 @@ const _TRMV_F_SWITCH = @load_preference("trmv_f_switch", 2)::Int      # req8-ok:
                             $tail
                         end
                     end
-                    for j in lo:hi                    # F×F triangle, in registers
+                    # F×F triangle, in registers; only the columns that reach a row of the range
+                    for j in max(lo, r0 + 1):(lo <= r1 ? hi : 0)
                         cp = Ap + (j - 1) * lda * sz; t = unsafe_load(x0p, j)
                         for i in max(lo, r0 + 1):min(j - 1, r1)
                             unsafe_store!(xp, unsafe_load(xp, i) + t * unsafe_load(cp, i), i)
@@ -4345,7 +4346,7 @@ const _TRMV_F_SWITCH = @load_preference("trmv_f_switch", 2)::Int      # req8-ok:
                             $tail
                         end
                     end
-                    for j in hi:-1:lo
+                    for j in (hi > r0 ? min(hi, r1) : lo - 1):-1:lo
                         cp = Ap + (j - 1) * lda * sz; t = unsafe_load(x0p, j)
                         for i in max(j + 1, r0 + 1):min(hi, r1)
                             unsafe_store!(xp, unsafe_load(xp, i) + t * unsafe_load(cp, i), i)
