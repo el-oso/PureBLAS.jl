@@ -656,6 +656,22 @@ const _SVDWS_C = Base.OncePerTask{SVDWorkspace{ComplexF64}}(SVDWorkspace{Complex
 const _SVDWS_C32 = Base.OncePerTask{SVDWorkspace{ComplexF32}}(SVDWorkspace{ComplexF32})
 @inline _svdws(::Type{ComplexF64}) = _SVDWS_C()
 @inline _svdws(::Type{ComplexF32}) = _SVDWS_C32()
+# Float32 owner: holds the bidiagonal scratch of the generic real values path (`_brd_scratch`).
+const _SVDWS_F32 = Base.OncePerTask{SVDWorkspace{Float32}}(SVDWorkspace{Float32})
+@inline _svdws(::Type{Float32}) = _SVDWS_F32()
+
+# Zero-filled bidiagonal scratch (d, e, tauq, taup) for the generic real values path. Float32 borrows its
+# owned workspace so a warm call allocates nothing; every other element type allocates.
+_brd_scratch(::Type{T}, n::Int) where {T} = (zeros(T, n), zeros(T, max(n - 1, 0)), zeros(T, n), zeros(T, n))
+function _brd_scratch(::Type{Float32}, n::Int)
+    ws = _svdws(Float32)
+    ne = max(n - 1, 0)
+    ws.d = _gv(ws.d, n); ws.e = _gv(ws.e, ne); ws.tauq = _gv(ws.tauq, n); ws.taup = _gv(ws.taup, n)
+    return (
+        fill!(view(ws.d, 1:n), 0f0), fill!(view(ws.e, 1:ne), 0f0),
+        fill!(view(ws.tauq, 1:n), 0f0), fill!(view(ws.taup, 1:n), 0f0),
+    )
+end
 
 # Grow only the blocked-bidiag panels (complex values path; vectors buffers untouched).
 function _svd_grow_bidiag!(ws::SVDWorkspace{T}, M::Int, N::Int) where {T}
@@ -1672,8 +1688,7 @@ function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{T}) where {T <: Rea
         end
         return gesvd_vals!(At, S)
     end
-    d = zeros(T, n); e = zeros(T, max(n - 1, 0))
-    tauq = zeros(T, n); taup = zeros(T, n)
+    d, e, tauq, taup = _brd_scratch(T, n)
     _gebrd_unblocked!(A, d, e, tauq, taup)
     bdsqr!(d, e, nothing, nothing)
     @inbounds for i in 1:min(length(S), n)
@@ -1739,7 +1754,13 @@ function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{<:Real}) where {T <
     _svd_grow_bidiag!(ws, m, n)
     # Bidiagonal d,e in Float64 unconditionally: bdsqr! is the Float64 implicit-QR core, and the real
     # bidiagonal of a ComplexF32 A is fine to refine in double (σ then rounded back into S's eltype).
-    d = zeros(Float64, n); e = zeros(Float64, max(n - 1, 0)); tauq = zeros(T, n); taup = zeros(T, n)
+    # d and e come from the real workspace, tauq and taup from the complex one; both are zero-filled.
+    rws = _svdws()
+    ne = max(n - 1, 0)
+    rws.d = _gv(rws.d, n); rws.e = _gv(rws.e, ne)
+    ws.tauq = _gv(ws.tauq, n); ws.taup = _gv(ws.taup, n)
+    d = fill!(view(rws.d, 1:n), 0.0); e = fill!(view(rws.e, 1:ne), 0.0)
+    tauq = fill!(view(ws.tauq, 1:n), zero(T)); taup = fill!(view(ws.taup, 1:n), zero(T))
     gebrd!(A, d, e, tauq, taup, ws)                        # blocked zgebrd (zlabrd panels + gemm trailing)
     # dqds (dlasq) singular VALUES on the real bidiagonal; QR bdsqr! is the rare-failure fallback.
     _dlasq1!(d, e, ws.dqds_Z, ws.dqds_st) != 0 && bdsqr!(d, e, nothing, nothing)

@@ -1968,3 +1968,17 @@ end
     end
     @test_throws "requires m ≥ n" PureBLAS.gebrd!(randn(Float32, 3, 5), zeros(Float32, 5), zeros(Float32, 4), zeros(Float32, 5), zeros(Float32, 5))
 end
+
+# A warm `gesvd_vals!` into a caller-provided S allocates nothing for every BLAS element type; its
+# bidiagonal and reflector scratch lives in the owned workspaces.
+@testitem "gesvd_vals! — 0 B at steady state, all four BLAS types" begin
+    using PureBLAS, Random
+    Random.seed!(77)
+    measure(A, S) = @allocated PureBLAS.gesvd_vals!(A, S)
+    @testset "$T n=$n" for T in (Float32, Float64, ComplexF32, ComplexF64), n in (16, 48, 100)
+        A0 = randn(T, n, n); S = zeros(real(T), n)
+        PureBLAS.gesvd_vals!(copy(A0), S); PureBLAS.gesvd_vals!(copy(A0), S)
+        A = copy(A0)
+        @test measure(A, S) == 0
+    end
+end
