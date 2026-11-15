@@ -489,18 +489,20 @@ end
         ::Val{PAD}
     ) where {T, W, PAD}
     sz = sizeof(T); lane = Vec(ntuple(l -> l - 1, Val(W)))
-    kmsk = lane < kt; cmsk = lane < cn; smsk = lane < cs
-    cols = ntuple(r -> (r - 1) < cn ? vload(Vec{W, T}, src + (r - 1) * lda * sz, kmsk) : zero(Vec{W, T}), Val(W))
+    kmsk = lane < kt; cmsk = lane < cn
+    cols = ntuple(
+        r -> (r - 1) < cn ? (kt >= W ? vload(Vec{W, T}, src + (r - 1) * lda * sz) : vload(Vec{W, T}, src + (r - 1) * lda * sz, kmsk)) : zero(Vec{W, T}),
+        Val(W)
+    )
     rows = _transpose_regs(cols)
-    ntuple(
+    scaled = ntuple(
         pp -> begin
-            (pp - 1) < kt || return nothing
             row = av * rows[pp]
             PAD && (row = vifelse(cmsk, row, zero(row)))
-            vstore(row, dst + (pp - 1) * mrstride * sz, smsk)
-            nothing
+            row
         end, Val(W)
     )
+    _vstore_rows!(scaled, dst, mrstride, kt, cs)
     return nothing
 end
 
@@ -670,10 +672,17 @@ end
                     while c + W <= cn
                         vstore(vload(V, src + c * sz), dst + c * sz); c += W
                     end
-                    while c < nr
-                        vm = lane < (cn - c)
-                        vstore(vifelse(vm, vload(V, src + c * sz, vm), zero(V)), dst + c * sz, lane < (nr - c))
-                        c += W
+                    if cn == nr                        # full panel: the remaining fewer than W elements are a plain copy
+                        _tail_pieces(c, nr - c, Val(W)) do vh, j
+                            Vh = Vec{_pw(vh), T}
+                            vstore(vload(Vh, src + j * sz), dst + j * sz)
+                        end
+                    else                               # ragged last panel: zero-pad to nr
+                        while c < nr
+                            vm = lane < (cn - c)
+                            _vstore_r(vifelse(vm, vload(V, src + c * sz, vm), zero(V)), dst + c * sz, nr - c)
+                            c += W
+                        end
                     end
                 end
             else
@@ -2182,6 +2191,40 @@ function _pack_A_cmplx!(
     end
     return
 end
+# Full W×W block of complex elements: transpose `W` source columns (`src + r·lda2` reals apart), each holding
+# `W` interleaved complex elements, into separate real and imaginary rows at `dR`/`dI + pp·mrstride`. The real and
+# the imaginary parts are transposed one after the other so that only W vectors are live at a time.
+@generated function _tblk_cmplx_full!(dR::Ptr{T}, dI::Ptr{T}, src::Ptr{T}, lda2::Int, mrstride::Int, ::Val{W}) where {T, W}
+    sz = sizeof(T); V = Vec{W, T}; q = Int(round(log2(W)))
+    body = quote
+        $(Expr(:meta, :inline))
+    end
+    for (sel, dst) in ((:first, :dR), (:last, :dI))
+        cur = [Symbol(sel, :_c_, r) for r in 0:(W - 1)]
+        for r in 0:(W - 1)
+            push!(body.args, :($(cur[r + 1]) = $sel(_deint_cmplx(vload(Vec{$(2W), $T}, src + $r * lda2 * $sz)))))
+        end
+        for stage in 0:(q - 1)
+            s = 1 << stage; nxt = [Symbol(sel, :_s, stage, :_, i) for i in 0:(W - 1)]
+            for i in 0:(W - 1)
+                if (i & s) == 0
+                    j = i | s
+                    lo = ntuple(e0 -> (e = e0 - 1; blk = e ÷ (2s); w = e % (2s); w < s ? blk * 2s + w : W + blk * 2s + (w - s)), W)
+                    hi = ntuple(e0 -> (e = e0 - 1; blk = e ÷ (2s); w = e % (2s); w < s ? blk * 2s + s + w : W + blk * 2s + s + (w - s)), W)
+                    push!(body.args, :($(nxt[i + 1]) = shufflevector($(cur[i + 1]), $(cur[j + 1]), Val($lo))))
+                    push!(body.args, :($(nxt[j + 1]) = shufflevector($(cur[i + 1]), $(cur[j + 1]), Val($hi))))
+                end
+            end
+            cur = nxt
+        end
+        for pp in 0:(W - 1)
+            push!(body.args, :(vstore($(cur[pp + 1]), $dst + $pp * mrstride * $sz)))
+        end
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
 # Complex analogue of `_tblk_part!`: transpose `cn` source columns (`src + r·lda2` reals apart), each holding
 # `kt` interleaved complex elements, into separate real and imaginary rows at `dR`/`dI + pp·mrstride`, `kt`
 # rows, lanes `< cs` only. Columns `>= cn` read as exact zeros without being loaded.
@@ -2189,8 +2232,8 @@ end
         dR::Ptr{T}, dI::Ptr{T}, src::Ptr{T}, lda2::Int, mrstride::Int, kt::Int, cn::Int, cs::Int
     ) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
-    lane = Vec(ntuple(l -> l - 1, Val(W))); clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
-    cmask = clane <= kt; smask = lane < cs
+    clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
+    cmask = clane <= kt
     # The real and the imaginary parts are transposed one after the other (the source is read twice) so
     # that only W vectors are live at a time.
     @inline function pass(sel, dst)
@@ -2198,14 +2241,7 @@ end
             r -> (r - 1) < cn ? sel(_deint_cmplx(vload(Vec{2W, T}, src + (r - 1) * lda2 * sz, cmask))) : zero(V),
             Val(W)
         )
-        rows = _transpose_regs(cols)
-        ntuple(
-            pp -> begin
-                (pp - 1) < kt || return nothing
-                vstore(rows[pp], dst + (pp - 1) * mrstride * sz, smask)
-                nothing
-            end, Val(W)
-        )
+        _vstore_rows!(_transpose_regs(cols), dst, mrstride, kt, cs)
         return nothing
     end
     pass(first, dR)
@@ -2219,7 +2255,7 @@ end
         BpR::Vector{T}, BpI::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int
     ) where {T}
     W = _vwidth(T); sz = sizeof(T); ldb = stride(B, 2); np = cld(nce, nr)
-    lane = Vec(ntuple(l -> l - 1, Val(W))); clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
+    clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
     GC.@preserve B BpR BpI begin
         Bptr = Ptr{T}(pointer(B)); PR = pointer(BpR); PI = pointer(BpI)
         for ji in 0:(np - 1)
@@ -2237,8 +2273,7 @@ end
                     end
                     while c < nr
                         ar, ai = _deint_cmplx(vload(Vec{2W, T}, src + 2 * c * sz, clane <= (cn - c)))
-                        sm = lane < (nr - c)
-                        vstore(ar, PR + (dst + c) * sz, sm); vstore(ai, PI + (dst + c) * sz, sm)
+                        _vstore_r(ar, PR + (dst + c) * sz, nr - c); _vstore_r(ai, PI + (dst + c) * sz, nr - c)
                         c += W
                     end
                 end
@@ -2250,7 +2285,11 @@ end
                     while p < kce
                         kt = min(W, kce - p)
                         src = Bptr + 2 * ((pc + p) + (j0 + c0) * ldb) * sz
-                        _tblk_cmplx_part!(PR + (base + p * nr + c0) * sz, PI + (base + p * nr + c0) * sz, src, 2 * ldb, nr, kt, cnb, csb)
+                        if kt == W && cnb == W && csb == W
+                            _tblk_cmplx_full!(PR + (base + p * nr + c0) * sz, PI + (base + p * nr + c0) * sz, src, 2 * ldb, nr, Val(W))
+                        else
+                            _tblk_cmplx_part!(PR + (base + p * nr + c0) * sz, PI + (base + p * nr + c0) * sz, src, 2 * ldb, nr, kt, cnb, csb)
+                        end
                         p += W
                     end
                     c0 += W
