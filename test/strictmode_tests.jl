@@ -482,11 +482,9 @@ end
 # `gebal!`, `gehrd!`, `orghr!`, `ormhr!`, `hseqr!` and `geev!` are all @strict_contract members
 # (src/contracts.jl:368-380) and src/verify.jl carries purpose-built probes for every one of them
 # (`_strict_gehrd_probe` &c, ~20 call sites). None of it has ever run. Those call sites live inside the
-# `if StrictMode.proofs_loaded()` block, and a package cannot have the proving tier loaded during its OWN
-# precompile — that is the one moment src/verify.jl executes. The block was equally dead under 0.3.10,
-# where the guard asked `backend_available()` about a weak-dep extension that is likewise never loaded
-# there. So the tiers are: src/ REPORTS (the value-free IR scan, all StrictMode has available to it), and
-# test/ PROVES — and the proving half simply had no home for this family until now.
+# verification block, and a package cannot have the proving tier loaded during its OWN
+# precompile — that is the one moment src/verify.jl executes. So the tiers are: src/ REPORTS (the
+# value-free IR scan, all StrictMode has available to it), and test/ PROVES.
 #
 # `test_signatures` (StrictModeTest 0.4) is the right tool rather than a per-call macro, for two reasons
 # beyond not having to build valid eigen inputs. It takes SIGNATURES, so `Char` is a TYPE here: one entry
