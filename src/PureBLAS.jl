@@ -77,7 +77,6 @@ include("lapack/syconv.jl")        # LAPACK: Bunch-Kaufman factorization convert
 include("lapack/trrfs.jl")         # LAPACK: triangular-solve forward/backward error bounds (trrfs)
 include("lapack/tgsen.jl")         # LAPACK: generalized Schur reorder (tgsen) — complex complete; real all-real-λ only
 include("lapack/gesvx.jl")         # LAPACK: expert general solve (gesvx) — equilibrate + LU + refine + error bounds
-include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs all ops defined first)
 include("cabi/cabi.jl")          # @ccallable Fortran-ABI symbols (Mode 1): BLAS-1 + gemm
 include("cabi/cabi_cdot.jl")     # Mode 1: complex BLAS-1 dot (c/zdotu, c/zdotc) — needs _dotu/_dotc in scope from cabi.jl
 include("cabi/cabi_l2.jl")       # Mode 1: BLAS-2 (gemv/ger/symv/…, packed, banded)
@@ -90,6 +89,7 @@ include("cabi/cabi_lapack3.jl")  # Mode 1: LAPACK batch 3 (syconv/trrfs; tgsen/g
 include("cabi/cabi_forward.jl")  # in-process LBT forward registry (@cfunction pointers to the above)
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_set_forward
 include("tune.jl")          # per-machine tuning status + tune!() (spawns bench/calibrate.jl; NO benchmark here)
+include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs every op and C-ABI entry defined first)
 
 # ── Precompile workload ────────────────────────────────────────────────────────────────────────────
 # Run the hot native kernels once at precompile time so their native code is cached in the .ji — first-call
