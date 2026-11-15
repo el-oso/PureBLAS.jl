@@ -331,8 +331,8 @@ const _PACK_CG = max(1, _L1D_ASSOC >> 1)
 
 # SIMD pack for tA='N', dense unit-column-stride A: each full mr-row panel column is a contiguous
 # segment of A, so pack = vector load + scale + vector store. The scalar packing was the measured
-# large-n bottleneck (pack_A ≈ 8.6 GB/s; this lifts it toward memory bandwidth). Partial last panel
-# (zero-padded) stays scalar.
+# large-n bottleneck (pack_A ≈ 8.6 GB/s; this lifts it toward memory bandwidth). The partial last panel
+# uses masked loads and is zero-padded.
 #
 # TRAVERSAL ORDER IS KEYED ON `mr == W`, and that is a cache-residency property, not a style choice.
 # When `mr > W` a panel visit copies `mr/W` ADJACENT vectors, so the line a later visit wants is
@@ -389,12 +389,19 @@ const _PACK_CG = max(1, _L1D_ASSOC >> 1)
                     end
                 end
             end
-            for pi in nf:(np - 1)             # partial panel — scalar, zero-padded
+            lane = Vec(ntuple(l -> l - 1, Val(W)))
+            for pi in nf:(np - 1)             # partial panel — masked loads, zero-padded rows
                 base = pi * mr * kce
+                rem = mce - pi * mr           # rows of A left in this panel (< mr)
                 for p in 0:(kce - 1)
-                    for r in 0:(mr - 1)
-                        lr = pi * mr + r
-                        Ap[base + p * mr + r + 1] = lr < mce ? alpha * A[ic + lr + 1, pc + p + 1] : zero(T)
+                    src = Aptr + (ic + pi * mr + (pc + p) * lda) * sz
+                    dst = App + (base + p * mr) * sz
+                    o = 0
+                    while o < mr
+                        vm = lane < (rem - o)                      # lanes holding rows of A; the rest are padding
+                        v = vload(V, src + o * sz, vm)
+                        vstore(vifelse(vm, av * v, zero(V)), dst + o * sz)
+                        o += W
                     end
                 end
             end
@@ -443,10 +450,63 @@ end
     return body
 end
 
+# W×W transpose of W vectors held in registers (the same shuffle butterfly as `_tblk!`): element `l` of
+# input vector `r` becomes element `r` of output vector `l`.
+@generated function _transpose_regs(c::NTuple{W, Vec{W, T}}) where {W, T}
+    q = Int(round(log2(W)))
+    body = quote
+        $(Expr(:meta, :inline))
+    end
+    cur = [Symbol(:c_, r) for r in 0:(W - 1)]
+    for r in 0:(W - 1)
+        push!(body.args, :($(cur[r + 1]) = c[$(r + 1)]))
+    end
+    for stage in 0:(q - 1)
+        s = 1 << stage; nxt = [Symbol(:s, stage, :_, i) for i in 0:(W - 1)]
+        for i in 0:(W - 1)
+            if (i & s) == 0
+                j = i | s
+                lo = ntuple(e0 -> (e = e0 - 1; blk = e ÷ (2s); w = e % (2s); w < s ? blk * 2s + w : W + blk * 2s + (w - s)), W)
+                hi = ntuple(e0 -> (e = e0 - 1; blk = e ÷ (2s); w = e % (2s); w < s ? blk * 2s + s + w : W + blk * 2s + s + (w - s)), W)
+                push!(body.args, :($(nxt[i + 1]) = shufflevector($(cur[i + 1]), $(cur[j + 1]), Val($lo))))
+                push!(body.args, :($(nxt[j + 1]) = shufflevector($(cur[i + 1]), $(cur[j + 1]), Val($hi))))
+            end
+        end
+        cur = nxt
+    end
+    push!(body.args, :(return $(Expr(:tuple, cur...))))
+    return body
+end
+
+# Partial form of `_tblk!`: transpose the block of `cn` source columns (`src + r·lda`, r < cn), each
+# holding `kt` contiguous elements, and store the `kt` transposed rows at `dst + pp·mrstride`, scaled by
+# `av`. Only lanes `< cs` of each row are written. Source elements outside the `kt × cn` block are never
+# read. Lanes `cn <= lane < cs` of a stored row are exact zeros when `PAD` is true (the ragged edge of a
+# zero-padded panel), and a `kt`/`cn`/`cs` of W reproduces `_tblk!`.
+@inline function _tblk_part!(
+        dst::Ptr{T}, src::Ptr{T}, lda::Int, mrstride::Int, av::Vec{W, T}, kt::Int, cn::Int, cs::Int,
+        ::Val{PAD}
+    ) where {T, W, PAD}
+    sz = sizeof(T); lane = Vec(ntuple(l -> l - 1, Val(W)))
+    kmsk = lane < kt; cmsk = lane < cn; smsk = lane < cs
+    cols = ntuple(r -> (r - 1) < cn ? vload(Vec{W, T}, src + (r - 1) * lda * sz, kmsk) : zero(Vec{W, T}), Val(W))
+    rows = _transpose_regs(cols)
+    ntuple(
+        pp -> begin
+            (pp - 1) < kt || return nothing
+            row = av * rows[pp]
+            PAD && (row = vifelse(cmsk, row, zero(row)))
+            vstore(row, dst + (pp - 1) * mrstride * sz, smsk)
+            nothing
+        end, Val(W)
+    )
+    return nothing
+end
+
 # SIMD transpose pack for tA='T' (op(A)=Aᵀ), dense unit-stride A, mr a multiple of W. op(A)[gi,gp] =
 # A[gp,gi] would need A's ROWS (strided) — the old scalar fallback. Instead read W contiguous A-columns
 # (op(A) rows), W contraction-rows at a time, transpose the W×W register block, and store the transposed
-# rows into Ap. Partial panels / contraction tail stay scalar (zero-padded).
+# rows into Ap. Partial panels and the contraction tail use `_tblk_part!` (masked; padding is zero).
 @inline function _pack_A_simd_T!(
         # `AbstractVector`, matching `_pack_A_simd!` above. A concrete `Vector` here excluded the
         # contiguous `view` that cooperative packing hands each worker for its own block, which showed
@@ -471,17 +531,24 @@ end
                         _tblk!(Ptr{T}(dst), Ptr{T}(src), lda, mr, av, Val(W))
                         p += W
                     end
-                    while p < kce                          # contraction tail — scalar
-                        for r in 0:(W - 1)
-                            Ap[base + p * mr + ri * W + r + 1] = alpha * A[pc + p + 1, ic + r0 + r + 1]
-                        end
-                        p += 1
+                    if p < kce                             # contraction tail: partial transpose block
+                        src = Aptr + ((ic + r0) * lda + (pc + p)) * sz
+                        dst = App + (base + p * mr + ri * W) * sz
+                        _tblk_part!(Ptr{T}(dst), Ptr{T}(src), lda, mr, av, kce - p, W, W, Val(false))
                     end
                 end
-            else                                          # partial panel — scalar, zero-padded
-                for p in 0:(kce - 1), r in 0:(mr - 1)
-                    lr = pi * mr + r
-                    Ap[base + p * mr + r + 1] = lr < mce ? alpha * A[pc + p + 1, ic + lr + 1] : zero(T)
+            else                                          # partial panel — zero-padded rows
+                for ri in 0:(sub - 1)
+                    r0 = pi * mr + ri * W
+                    cv = clamp(mce - r0, 0, W)            # op(A) rows of this block that exist
+                    p = 0
+                    while p < kce
+                        kt = min(W, kce - p)
+                        src = Aptr + ((ic + r0) * lda + (pc + p)) * sz
+                        dst = App + (base + p * mr + ri * W) * sz
+                        _tblk_part!(Ptr{T}(dst), Ptr{T}(src), lda, mr, av, kt, cv, W, Val(true))
+                        p += W
+                    end
                 end
             end
         end
@@ -577,9 +644,67 @@ end
     return _pack_B_dyn!(Bp, B, pc, jc, kce, nce, tB, nr, boff)
 end
 
+@inline _nrval(::Val{N}) where {N} = N
+@inline _nrval(n::Int) = n
+
+# Vector B-pack for real `T` over a unit-row-stride `B`. `nrv` is the panel width, either an `Int` or a
+# `Val` (a compile-time width gives the loops constant trip counts). Ragged panels, partial column
+# blocks and the contraction tail go through masked loads and stores, so nothing outside `B[1:kce, 1:nce]`
+# (as op(B) addresses it) is read and nothing outside the packed panels is written; padding lanes of a
+# ragged panel are exact zeros.
+@inline function _pack_B_simd!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nrv, boff::Int) where {T}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); ldb = stride(B, 2); nr = _nrval(nrv)
+    np = cld(nce, nr); lane = Vec(ntuple(l -> l - 1, Val(W))); ov = V(one(T))
+    GC.@preserve B Bp begin
+        Bptr = pointer(B); Bpp = pointer(Bp)
+        for ji in 0:(np - 1)
+            base = boff + ji * nr * kce
+            j0 = jc + ji * nr
+            cn = min(nr, nce - ji * nr)               # columns of op(B) in this panel
+            if tB
+                # op(B)=Bᵀ: for fixed p the c-run is down a B column (contiguous) — copy it, zero-padding to nr.
+                for p in 0:(kce - 1)
+                    src = Bptr + (j0 + (pc + p) * ldb) * sz; dst = Bpp + (base + p * nr) * sz
+                    c = 0
+                    while c + W <= cn
+                        vstore(vload(V, src + c * sz), dst + c * sz); c += W
+                    end
+                    while c < nr
+                        vm = lane < (cn - c)
+                        vstore(vifelse(vm, vload(V, src + c * sz, vm), zero(V)), dst + c * sz, lane < (nr - c))
+                        c += W
+                    end
+                end
+            else
+                # op(B)=B: a column of B is contiguous in p; transpose W×W blocks into the panel rows.
+                c0 = 0
+                while c0 < nr
+                    cnb = clamp(cn - c0, 0, W)         # valid columns in this block
+                    csb = min(W, nr - c0)              # panel-row lanes this block owns
+                    p = 0
+                    while p < kce
+                        kt = min(W, kce - p)
+                        src = Ptr{T}(Bptr + ((pc + p) + (j0 + c0) * ldb) * sz)
+                        dst = Ptr{T}(Bpp + (base + p * nr + c0) * sz)
+                        if kt == W && cnb == W && csb == W
+                            _tblk!(dst, src, ldb, nr, ov, Val(W))
+                        else
+                            _tblk_part!(dst, src, ldb, nr, ov, kt, cnb, csb, Val(true))
+                        end
+                        p += W
+                    end
+                    c0 += W
+                end
+            end
+        end
+    end
+    return
+end
+
 # Compile-time-nr twin of `_pack_B_dyn!`. Same memory order, same zero-fill of the ragged tail; the ONLY
 # difference is that `NR` is a type parameter, so the c-loops have constant trip counts.
 function _pack_B_val!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, ::Val{NR}, boff::Int = 0) where {T, NR}
+    (T <: BlasReal && _strided1(B)) && return _pack_B_simd!(Bp, B, pc, jc, kce, nce, tB, Val(NR), boff)
     np = cld(nce, NR)
     @inbounds for ji in 0:(np - 1)
         base = boff + ji * NR * kce
@@ -618,6 +743,7 @@ function _pack_B_val!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce:
 end
 
 function _pack_B_dyn!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int, boff::Int = 0) where {T}
+    (T <: BlasReal && _strided1(B)) && return _pack_B_simd!(Bp, B, pc, jc, kce, nce, tB, nr, boff)
     np = cld(nce, nr)
     @inbounds for ji in 0:(np - 1)
         base = boff + ji * nr * kce
@@ -2055,10 +2181,84 @@ function _pack_A_cmplx!(
     end
     return
 end
+# Complex analogue of `_tblk_part!`: transpose `cn` source columns (`src + r·lda2` reals apart), each holding
+# `kt` interleaved complex elements, into separate real and imaginary rows at `dR`/`dI + pp·mrstride`, `kt`
+# rows, lanes `< cs` only. Columns `>= cn` read as exact zeros without being loaded.
+@inline function _tblk_cmplx_part!(
+        dR::Ptr{T}, dI::Ptr{T}, src::Ptr{T}, lda2::Int, mrstride::Int, kt::Int, cn::Int, cs::Int
+    ) where {T}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    lane = Vec(ntuple(l -> l - 1, Val(W))); clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
+    cmask = clane <= kt; smask = lane < cs
+    pairs = ntuple(
+        r -> (r - 1) < cn ? _deint_cmplx(vload(Vec{2W, T}, src + (r - 1) * lda2 * sz, cmask)) : (zero(V), zero(V)),
+        Val(W)
+    )
+    re = _transpose_regs(ntuple(r -> pairs[r][1], Val(W)))
+    im = _transpose_regs(ntuple(r -> pairs[r][2], Val(W)))
+    ntuple(
+        pp -> begin
+            (pp - 1) < kt || return nothing
+            vstore(re[pp], dR + (pp - 1) * mrstride * sz, smask)
+            vstore(im[pp], dI + (pp - 1) * mrstride * sz, smask)
+            nothing
+        end, Val(W)
+    )
+    return nothing
+end
+
+# Vector complex B-pack for a unit-row-stride `B`; the structure and the masking guarantees are those of
+# `_pack_B_simd!`, with the real and imaginary parts split into `BpR` and `BpI`.
+@inline function _pack_B_cmplx_simd!(
+        BpR::Vector{T}, BpI::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int
+    ) where {T}
+    W = _vwidth(T); sz = sizeof(T); ldb = stride(B, 2); np = cld(nce, nr)
+    lane = Vec(ntuple(l -> l - 1, Val(W))); clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
+    GC.@preserve B BpR BpI begin
+        Bptr = Ptr{T}(pointer(B)); PR = pointer(BpR); PI = pointer(BpI)
+        for ji in 0:(np - 1)
+            base = ji * nr * kce
+            j0 = jc + ji * nr
+            cn = min(nr, nce - ji * nr)
+            if tB
+                for p in 0:(kce - 1)
+                    src = Bptr + 2 * (j0 + (pc + p) * ldb) * sz; dst = base + p * nr
+                    c = 0
+                    while c + W <= cn
+                        ar, ai = _deint_cmplx(vload(Vec{2W, T}, src + 2 * c * sz))
+                        vstore(ar, PR + (dst + c) * sz); vstore(ai, PI + (dst + c) * sz)
+                        c += W
+                    end
+                    while c < nr
+                        ar, ai = _deint_cmplx(vload(Vec{2W, T}, src + 2 * c * sz, clane <= (cn - c)))
+                        sm = lane < (nr - c)
+                        vstore(ar, PR + (dst + c) * sz, sm); vstore(ai, PI + (dst + c) * sz, sm)
+                        c += W
+                    end
+                end
+            else
+                c0 = 0
+                while c0 < nr
+                    cnb = clamp(cn - c0, 0, W); csb = min(W, nr - c0)
+                    p = 0
+                    while p < kce
+                        kt = min(W, kce - p)
+                        src = Bptr + 2 * ((pc + p) + (j0 + c0) * ldb) * sz
+                        _tblk_cmplx_part!(PR + (base + p * nr + c0) * sz, PI + (base + p * nr + c0) * sz, src, 2 * ldb, nr, kt, cnb, csb)
+                        p += W
+                    end
+                    c0 += W
+                end
+            end
+        end
+    end
+    return
+end
 function _pack_B_cmplx!(
         BpR::Vector{T}, BpI::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int,
         tB::Bool, nr::Int
     ) where {T}
+    (T <: BlasReal && eltype(B) === Complex{T} && _strided1(B)) && return _pack_B_cmplx_simd!(BpR, BpI, B, pc, jc, kce, nce, tB, nr)
     np = cld(nce, nr)
     @inbounds for ji in 0:(np - 1)
         base = ji * nr * kce
@@ -2535,12 +2735,13 @@ end
 end
 
 # Vectorized A-pack (tA='N', contiguous columns, mr a multiple of W): load Vec{2W} chunks of each
-# column, deinterleave → real panel ApR / imag panel ApI. Partial last panel stays scalar (zero-pad).
+# column, deinterleave → real panel ApR / imag panel ApI. The partial last panel uses masked loads and is zero-padded.
 function _pack_A_cmplx_simd!(
         ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int,
         mce::Int, kce::Int, mr::Int
     ) where {T}
     W = _vwidth(T); sz = sizeof(T); lda = stride(A, 2); np = cld(mce, mr)
+    clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))      # 1,1,2,2,…: the complex row of each real/imag lane
     GC.@preserve A ApR ApI begin
         Aptr = Ptr{T}(pointer(A)); PR = pointer(ApR); PI = pointer(ApI)
         @inbounds for pi in 0:(np - 1)
@@ -2555,13 +2756,16 @@ function _pack_A_cmplx_simd!(
                         o += W
                     end
                 end
-            else                                         # partial panel — scalar, zero-padded
-                for p in 0:(kce - 1), r in 0:(mr - 1)
-                    lr = pi * mr + r; idx = base + p * mr + r + 1
-                    if lr < mce
-                        v = A[ic + lr + 1, pc + p + 1]; ApR[idx] = real(v); ApI[idx] = imag(v)
-                    else
-                        ApR[idx] = zero(T); ApI[idx] = zero(T)
+            else                                         # partial panel — masked loads, zero-padded rows
+                rem = mce - pi * mr                      # complex rows of A left in this panel (< mr)
+                for p in 0:(kce - 1)
+                    col = 2 * (r0 + (pc + p) * lda); dst = base + p * mr
+                    o = 0
+                    while o < mr
+                        vm = clane <= (rem - o)          # real/imag lanes of the complex rows that exist
+                        ar, ai = _deint_cmplx(vload(Vec{2W, T}, Aptr + (col + 2 * o) * sz, vm))
+                        vstore(ar, PR + (dst + o) * sz); vstore(ai, PI + (dst + o) * sz)
+                        o += W
                     end
                 end
             end
