@@ -20,6 +20,20 @@ demonstrated.
 
 ## [Unreleased]
 
+### Fixed
+
+- Concurrent threaded callers of different element types could return wrong results, silently. The
+  four element-type pools each had their own claim, so a Float64 and a Float32 call could both be
+  suspended inside one thread's arena scope across their joins, and the first to leave rewound the
+  arena under the other; two threaded `iamax` calls of different types also wrote one shared index
+  buffer together. There is now one claim for the process: while a threaded call holds it, a threaded
+  call of any element type runs serially. Before: `getri!` n=1024 from two tasks on one thread, 200
+  calls each, was wrong in 8 to 108 of one type's or the other's calls depending on the pair (Zen4),
+  and two-thread `iamax` returned wrong indices in 1833 to 3103 of 4000 calls. After: 0 wrong in every
+  element-type pair on Zen3, Zen4 and Zen5. Cost on Zen4 (four workers): a Float64 `gemm!` and a Float32
+  `gemm!` on two tasks take 0.667x the wall time at n=1024 and 1.035x at n=2048; single-caller threaded
+  and serial calls show no slowdown beyond noise (ratio 0.94 to 1.01).
+
 ### Changed
 
 - The pool's keep-awake window is measured once per machine at install. `deps/build.jl`, which Pkg
