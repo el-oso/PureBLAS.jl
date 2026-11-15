@@ -152,9 +152,12 @@ end
 # aliasing.
 #
 # WHAT ACTUALLY PREVENTS IT, all three parts required:
-#   (a) EXACTLY ONE TASK-SWITCH POINT EXISTS INSIDE A SCOPE (`test/yield_lint.jl` enforces it): the
-#       driver's join in `_gemm_threaded!` (gemm.jl). By any other route two tasks cannot interleave
-#       *inside* scopes on one thread — the scenario above needs A to yield while holding borrows.
+#   (a) THE ONLY TASK-SWITCH POINTS INSIDE A SCOPE ARE THE THREADED DRIVER'S, and the driver holds the
+#       process-wide claim at both (`test/yield_lint.jl` enforces the lexical half): the join in
+#       `_gemm_threaded!` and the `_pool_barrier` waits of the chunk it runs itself (gemm.jl). By any
+#       other route two tasks cannot interleave *inside* scopes on one thread — the scenario above needs
+#       A to yield while holding borrows. No chunk holds an arena scope or per-thread owner across a
+#       barrier: a chunk's scopes open and close between barriers.
 #   (b) THE DRIVER IS PINNED TO ITS THREAD FOR THAT JOIN (`Task.sticky`, set and restored inside
 #       `_gemm_threaded!`). Unpinned, a yielded task usually resumes on a DIFFERENT thread — measured
 #       78% of yields — and would keep using thread t1's arena from t3 while t1 is free for another
@@ -167,20 +170,22 @@ end
 #       then call a public L3 entry (gels!, getri!, trtri!, potri!, lauum, gehrd, pbtrf, gbtrf, …),
 #       which measured as near-flat threaded cells misfiled as "nothing threads them".
 #   (c) EVERY OTHER SCOPE ON THAT THREAD IS A NESTED INTERVAL, so the bump stack stays LIFO. While the
-#       driver D is yielded at its join, another task E may run on t1 and open a scope on the SAME
-#       arena. E enters at depth d+1 and borrows ABOVE D's live offset, so nothing of D's is handed
-#       out. And E cannot itself be suspended inside its scope: the pool is ONE claim (`p.busy`), D
-#       holds it, so E's own `gemm!` loses the claim and runs serial, and nothing else inside a scope
-#       yields (a). E therefore runs to its scope exit — which restores `cur`/`off`/`depth` ABSOLUTELY
-#       to what D left — before D can resume. A worker chunk is the same case: a chunk never yields,
-#       so a scope it opens on any thread, including t1 on top of D's, is a nested interval too. At
-#       most ONE task in the whole process is ever suspended mid-scope, and (b) keeps it where its
-#       arena is.
+#       driver D is yielded at its join or a barrier, another task E may run on t1 and open a scope on
+#       the SAME arena. E enters at depth d+1 and borrows ABOVE D's live offset, so nothing of D's is
+#       handed out. And E cannot itself be suspended inside its scope: the claim (`_MT_CLAIM`) is ONE
+#       claim for the whole process, shared by the Float64, Float32, ComplexF64 and ComplexF32 pools. D
+#       holds it, so every threaded call E makes, of any element type, loses it and runs serial, and
+#       nothing else inside a scope yields (a). E therefore runs to its scope exit — which restores
+#       `cur`/`off`/`depth` ABSOLUTELY to what D left — before D can resume. A worker chunk is the same
+#       case: a chunk never yields outside a barrier, so a scope it opens on any thread, including t1 on
+#       top of D's, is a nested interval too. At most ONE task in the whole process is ever suspended
+#       mid-scope, and (b) keeps it where its arena is. A claim per pool would allow one suspended
+#       task per element type, and the first to exit would rewind the arena under the others.
 #
 # So the cost never had to be paid: per-task entry measures 9-12 ns against 2-4, and workspace.jl
 # records +7.5 ns being REJECTED as 7.4% of `trmm!` at n=8. `OncePerTask` remains the one-line drop-in
-# if any part above stops holding — in particular (c) rests on the SINGLE pool claim; per-caller pools
-# would let two tasks sit suspended mid-scope on one thread, and then only a per-task arena is sound.
+# if any part above stops holding — in particular (c) rests on the SINGLE process-wide claim; per-caller
+# pools would let two tasks sit suspended mid-scope on one thread, and then only a per-task arena is sound.
 #
 # NOTE the mechanism is only for the ARENA, whose borrows nest. A wholesale-claimed ROLE handed to the
 # workers as an operand (`_m3ws`, the symm materialize twin) is NOT covered by (c): a task landing on

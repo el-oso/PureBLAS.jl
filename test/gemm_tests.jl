@@ -1091,10 +1091,13 @@ end
             # FORCED LOSS: holding the claim makes the fallback certain, and `_MT_LOST` shows it ran.
             fill!(dst, NaN)
             lost0 = P._MT_LOST[]
-            _, held = @atomicreplace p.busy false => true
+            held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
             @test held
-            GC.@preserve src dst P._tricopy_mt!(pointer(dst), ldd, pointer(src), lds, n, up)
-            @atomic p.busy = false
+            held && try
+                GC.@preserve src dst P._tricopy_mt!(pointer(dst), ldd, pointer(src), lds, n, up)
+            finally
+                P._MT_CLAIM[] = false
+            end
             @test P._MT_LOST[] == lost0 + 1
             @test isequal(dst, ref)
         end
@@ -1164,9 +1167,12 @@ end
             P.set_num_threads(1); r = copy(S); P.potrf!(r; uplo = 'L')
             P.set_num_threads(nthreads())
             lost0 = P._MT_LOST[]
-            tasks = [@spawn (t = copy(S); P.potrf!(t; uplo = 'L'); t) for _ in 1:(nthreads() + 1)]
-            for t in tasks
-                @test bitsame(fetch(t), r)
+            # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
+            tasks = [@spawn (let w = copy(S); P.potrf!(w; uplo = 'L'); w end) for _ in 1:(nthreads() + 1)]
+            got = fetch.(tasks)
+            @test allunique(objectid.(got))
+            for g in got
+                @test bitsame(g, r)
             end
             @test P._MT_LOST[] > lost0
         end
