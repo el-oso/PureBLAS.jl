@@ -6895,9 +6895,11 @@ end
 # 28.7 ns at n=1e4 (see its own note); the serial path must pay one atomic read and one compare for this,
 # never a second body to inline.
 #
-# TWO METHODS, because `_simd2` admits exactly two operand shapes: raw pointers (the C-ABI boundary and
-# the reinterpreted complex/dual buffers, where the CALLER already holds the GC root) and dense arrays
-# (the native API, where the root is the array itself).
+# TWO METHODS PER HELPER, one for raw pointers (the C-ABI boundary and the reinterpreted complex/dual
+# buffers, where the CALLER already holds the GC root) and one for `_L1Mem`: dense arrays (the native API,
+# where the root is the array itself) and `PtrVector`s. Together they cover every operand `_simd1`/`_simd2`
+# admit.
+const _L1Mem{T} = Union{DenseArray{T}, PtrVector{T}}
 @noinline function _axpy_threaded!(n::Int, a::T, x::Ptr{T}, y::Ptr{T}, nw::Int) where {T <: BlasReal}
     _gemm_threaded!(
         PtrMatrix{T}(y, n, 1, n), PtrMatrix{T}(x, n, 1, n), PtrMatrix{T}(x, n, 1, n),
@@ -6905,7 +6907,7 @@ end
     )
     return y
 end
-@noinline function _axpy_threaded!(n::Int, a::T, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+@noinline function _axpy_threaded!(n::Int, a::T, x::_L1Mem{T}, y::_L1Mem{T}, nw::Int) where {T <: BlasReal}
     GC.@preserve x y _axpy_threaded!(n, a, pointer(x), pointer(y), nw)
     return y
 end
@@ -6919,7 +6921,7 @@ end
         one(T), zero(T), false, false, false, false, nw, _MT_KIND_DOT
     )
 end
-@noinline function _dot_threaded(n::Int, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+@noinline function _dot_threaded(n::Int, x::_L1Mem{T}, y::_L1Mem{T}, nw::Int) where {T <: BlasReal}
     return GC.@preserve x y _dot_threaded(n, pointer(x), pointer(y), nw)
 end
 
@@ -6931,7 +6933,7 @@ end
         one(T), zero(T), false, false, false, false, nw, _MT_KIND_ASUM
     )
 end
-@noinline function _asum_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+@noinline function _asum_threaded(n::Int, x::_L1Mem{T}, nw::Int) where {T <: BlasReal}
     return GC.@preserve x _asum_threaded(n, pointer(x), nw)
 end
 
@@ -6941,7 +6943,7 @@ end
         one(T), zero(T), false, false, false, false, nw, _MT_KIND_SUMSQ
     )
 end
-@noinline function _sumsq_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+@noinline function _sumsq_threaded(n::Int, x::_L1Mem{T}, nw::Int) where {T <: BlasReal}
     return GC.@preserve x _sumsq_threaded(n, pointer(x), nw)
 end
 
@@ -6955,7 +6957,7 @@ end
     )
     return Int(v)
 end
-@noinline function _iamax_threaded(n::Int, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+@noinline function _iamax_threaded(n::Int, x::_L1Mem{T}, nw::Int) where {T <: BlasReal}
     return GC.@preserve x _iamax_threaded(n, pointer(x), nw)
 end
 
@@ -7146,7 +7148,7 @@ end
     )
     return x
 end
-@noinline function _scal_threaded!(n::Int, a::T, x::DenseArray{T}, nw::Int) where {T <: BlasReal}
+@noinline function _scal_threaded!(n::Int, a::T, x::_L1Mem{T}, nw::Int) where {T <: BlasReal}
     GC.@preserve x _scal_threaded!(n, a, pointer(x), nw)
     return x
 end
@@ -7161,7 +7163,7 @@ end
     )
     return y
 end
-@noinline function _copy_threaded!(n::Int, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+@noinline function _copy_threaded!(n::Int, x::_L1Mem{T}, y::_L1Mem{T}, nw::Int) where {T <: BlasReal}
     GC.@preserve x y _copy_threaded!(n, pointer(x), pointer(y), nw)
     return y
 end
@@ -7173,7 +7175,7 @@ end
     )
     return nothing
 end
-@noinline function _swap_threaded!(n::Int, x::DenseArray{T}, y::DenseArray{T}, nw::Int) where {T <: BlasReal}
+@noinline function _swap_threaded!(n::Int, x::_L1Mem{T}, y::_L1Mem{T}, nw::Int) where {T <: BlasReal}
     GC.@preserve x y _swap_threaded!(n, pointer(x), pointer(y), nw)
     return nothing
 end

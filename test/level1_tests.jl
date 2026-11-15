@@ -729,3 +729,43 @@ end
         @test abs(d - sum(Float64.(x) .* Float64.(y))) <= 16 * eps(T) * n * (1 + maximum(abs, x) * maximum(abs, y))
     end
 end
+
+# Every threaded L1 helper must accept the operand shapes `_simd1`/`_simd2` admit, `PtrVector` included.
+# Results must match the serial path bit for bit.
+@testitem "L1 real: PtrVector operands take the threaded path" tags = [:checks] begin
+    using PureBLAS
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    nt = min(4, nthreads())
+    if nt < 2
+        @test_skip "needs >=2 julia threads"
+    else
+        for T in (Float32, Float64)
+            n = max(2 * nt * P._red_block(T), cld(P._L1_MT_MIN, sizeof(T))) + 3
+            x0 = randn(T, n); y0 = randn(T, n)
+            pv(a) = P.PtrVector{T}(pointer(a), length(a))
+            a = T(0.75)
+            function run(nw)
+                P.set_num_threads(nw)
+                x = copy(x0); y = copy(y0); out = Any[]
+                GC.@preserve x y begin
+                    px = pv(x); py = pv(y)
+                    P._copy!(n, px, 1, py, 1);     push!(out, copy(y)); copyto!(y, y0)
+                    P._swap!(n, px, 1, py, 1);     push!(out, copy(x), copy(y)); copyto!(x, x0); copyto!(y, y0)
+                    P._scal!(n, a, px, 1);         push!(out, copy(x)); copyto!(x, x0)
+                    P._axpy!(n, a, px, 1, py, 1);  push!(out, copy(y)); copyto!(y, y0)
+                    push!(out, P._dotu(n, px, 1, py, 1), P._nrm2(n, px, 1), P._asum(n, px, 1), P._iamax(n, px, 1))
+                end
+                return out
+            end
+            P.set_num_threads(nt)
+            p = P._gemm_pool(T)
+            g0 = @atomic p.gen
+            threaded = run(nt)
+            @test (@atomic p.gen) != g0          # the pool ran
+            serial = run(1)
+            P.set_num_threads(1)
+            @test all(isequal.(threaded, serial))
+        end
+    end
+end
