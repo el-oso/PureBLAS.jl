@@ -1267,3 +1267,95 @@ let
         @assert_noboxing pptrs!(copy(APsd), randn(n, 2); uplo = 'L')
         @assert_noboxing pptrf!(pack(She); uplo = 'L')
 end
+# Scalar hot loops. `@assert_no_scalar_loops` reports a scalar FP or integer loop that did not vectorize,
+# from the optimized LLVM IR. Covered: every SIMD kernel (microkernels, trsm/trmm tiles, L1 and L2
+# kernels, pack routines), each called with its FULL argument list so the generated body is inspected
+# rather than a defaulted-`Val{B0}` forwarder. All pointer operands point into one buffer per element
+# type, in disjoint regions; dimensions are small and ragged. The calls execute.
+let R = 1 << 15, ld = 128, W = _vwidth(Float64), WS = _vwidth(Float32), mr = _MR * W, mrs = _MR * WS,
+        cmr = _CMR * W, nr = _NR, cnr = _CNR, kc = 37, n = 37,
+        bd = ones(16R), bs = ones(Float32, 16R), bz = ones(ComplexF64, 16R)
+    GC.@preserve bd bs bz begin
+        d(i) = pointer(bd) + 8 * R * i
+        s(i) = pointer(bs) + 4 * R * i
+        z(i) = pointer(bz) + 16 * R * i
+        for b0 in (false, true)
+            @assert_no_scalar_loops _microkernel!(d(0), ld, d(1), d(2), kc, Val(_MR), Val(nr), Val(b0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            @assert_no_scalar_loops _microkernel!(d(0), ld, d(1), d(2), kc, 1.5, Val(_MR), Val(nr), Val(b0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            @assert_no_scalar_loops _microkernel_clip!(d(0), ld, d(1), d(2), kc, Val(_MR), Val(1), Val(nr), Val(b0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            @assert_no_scalar_loops _microkernel_clip!(d(0), ld, d(1), d(2), kc, 1.5, Val(_MR), Val(1), Val(nr), Val(b0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            @assert_no_scalar_loops _microkernel_masked!(d(0), ld, d(1), d(2), kc, 11, 5, Val(_MR), Val(nr), Val(b0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            @assert_no_scalar_loops _microkernel_masked!(d(0), ld, d(1), d(2), kc, 1.5, 11, 5, Val(_MR), Val(nr), Val(b0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            @assert_no_scalar_loops _microkernel_db!(d(0), ld, d(1), d(2), ld, kc, Val(_MR), Val(_MR), Val(nr), Val(b0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            @assert_no_scalar_loops _microkernel_db_masked!(d(0), ld, d(1), d(2), ld, kc, 11, 5, Val(_MR), Val(nr), Val(b0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            for tb in (false, true)
+                @assert_no_scalar_loops _microkernel_unpacked!(d(0), ld, d(1), ld, 0, d(2), ld, 0, kc, 1.0, 2.0, Val(_MR), Val(nr), Val(tb), Val(b0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            end
+        end
+        @assert_no_scalar_loops _microkernel_unpacked!(s(0), ld, s(1), ld, 0, s(2), ld, 0, kc, 1.0f0, 2.0f0, Val(_MR), Val(nr), Val(false), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _microkernel!(s(0), ld, s(1), s(2), kc, Val(_MR), Val(nr), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _microkernel_unpacked_mrows!(d(0), ld, d(1), ld, 0, d(2), ld, 0, kc, 1.0, 0.0, 12, Val(_MR), Val(nr), Val(false), Val(false), Val(W))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _microkernel_unpacked_split!(d(0), ld, d(1), ld, 0, d(2), ld, 0, kc, 1.0, 0.0, 12, Val(_MR), Val(nr), Val(2), Val(false), Val(false), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        # complex
+        for (full, tri) in ((true, false), (false, false), (false, true))
+            F = (_CMR, nr, false, 1, 1, false, false, false, full, tri)
+            @assert_no_scalar_loops _uker_cmplx!(d(0), cmr, d(1), cmr, 0, d(2), kc, 0, kc, 1.0, 0.5, full ? cmr : cmr - 1, 4, Val(F), 0, true)
+        end
+        @assert_no_scalar_loops _uker_cmplx!(d(0), W, d(1), W, 0, d(2), kc, 0, kc, 1.0, 0.5, W - 1, 4, Val((1, nr, false, 1, 1, false, false, false, false, false)), 0, true)
+        @assert_no_scalar_loops _microkernel_cmplx!(d(0), ld, d(1), d(2), d(3), d(4), kc, 1.0, 0.5, Val(_CMR), Val(cnr), Val(1), Val(1), Val(false), Val(false), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _microkernel_cmplx_masked!(d(0), ld, d(1), d(2), d(3), d(4), kc, 1.0, 0.5, 11, 3, Val(_CMR), Val(cnr), Val(1), Val(1), Val(false), Val(false), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _microkernel_cmplx_tri!(d(0), ld, d(1), d(2), d(3), d(4), kc, 1.0, 0.5, 11, 3, 0, false, Val(_CMR), Val(cnr), Val(1), Val(1), Val(false), Val(false), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _microkernel2_cmplx!(d(0), ld, d(1), d(2), d(3), d(4), d(5), d(6), d(7), d(8), kc, Val(_CMR), Val(cnr), Val(1), Val(1), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        # trsm / trmm tiles
+        @assert_no_scalar_loops _microkernel_tri!(d(0), ld, d(1), d(2), kc, 1.0, mr, nr, 0, false, Val(_MR), Val(nr), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _microkernel2!(d(0), ld, d(1), d(2), d(3), d(4), kc, 1.0, mr, nr, 0, false, Val(_MR), Val(nr), Val(:full), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _microkernel_u!(d(0), ld, d(1), d(2), kc, 1.0, mr, nr, 0, false, Val(_MR), Val(nr), Val(:full), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _trsm_tile_L_f64!(false, false, d(0), 64, d(1), 64, 64, 64)
+        @assert_no_scalar_loops _trsm_tile_R_f64!(false, false, false, d(0), 64, d(1), 64, 64, 64)
+        @assert_no_scalar_loops _gemmtrsm_u_slab!(d(0), _GT_NRV * W, d(1), 4 * _GT_MR, d(2), 0, 4 * _GT_MR, Val(_GT_MR), Val(_GT_NRV))
+        @assert_no_scalar_loops _zrt_tile!(Val(4), Val(false), Val(false), d(0), ld, d(1), ld, d(2), 0, 8, W)   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        # L1
+        @assert_no_scalar_loops _axpy_unrolled!(Val(4), n, 2.0, d(0), d(1), 0)   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _axpy_phase!(Val(4), Val(W), 4 * W * 3, 2.0, d(0), d(1))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _axpy_simd!(n, 2.0, d(0), d(1), 0, -1)
+        @assert_no_scalar_loops _scal_simd!(n, 2.0, d(0), -1)
+        @assert_no_scalar_loops _dot_simd(n, d(0), d(1), Float64) types = (Int, Ptr{Float64}, Ptr{Float64}, Type{Float64})
+        @assert_no_scalar_loops _dot_blocked(n, d(0), d(1), Float64) types = (Int, Ptr{Float64}, Ptr{Float64}, Type{Float64})
+        @assert_no_scalar_loops _dot_blocked_serial(n, d(0), d(1), Float64) types = (Int, Ptr{Float64}, Ptr{Float64}, Type{Float64})
+        @assert_no_scalar_loops _asum_simd(n, d(0), Float64) types = (Int, Ptr{Float64}, Type{Float64})
+        @assert_no_scalar_loops _sumsq_simd(n, d(0), Float64) types = (Int, Ptr{Float64}, Type{Float64})
+        @assert_no_scalar_loops _iamax_tree!(Val(4), n, d(0), 0.0)   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _iamax_thresh!(Val(4), n, d(0), 0.0)   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _iamax_simd!(n, d(0))
+        let xc = ones(ComplexF64, n), yc = ones(ComplexF64, n)
+            @assert_no_scalar_loops _dot_pair_simd(Val(:cplx), n, xc, yc, Float64, Val(false)) types = (Val{:cplx}, Int, Vector{ComplexF64}, Vector{ComplexF64}, Type{Float64}, Val{false})
+            @assert_no_scalar_loops _scal_pair_simd!(Val(:cplx), n, 2.0, 0.5, xc)
+        end
+        # L2
+        for b0 in (false, true)
+            @assert_no_scalar_loops _gemv_n_block!(d(0), d(1), ld, d(2), n, 1.0, 0.5, Val(4), Val(b0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            @assert_no_scalar_loops _gemv_t_block!(d(0), ntuple(c -> d(1) + (c - 1) * ld * 8, 4), d(2), n, 1.0, 0.5, Val(4), Val(b0), Val(2), Val(0))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        end
+        @assert_no_scalar_loops _gemv_n_block_masked!(d(0), d(1), ld, d(2), n, 1.0, 0.5, 5, Val(2), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _gemv_n_panel!(d(0), d(1), ld, d(2), 0, 8, 5, 1.0, Val(2))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _gemv_n_panel_full!(d(0), d(1), ld, d(2), 0, 8, 1.0, Val(4))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _gemv_n_panel_minner!(d(0), d(1), ld, d(2), 0, n, 1.0, Val(4), Val(2))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _ger_panel!(d(0), ld, d(1), d(2), 0, n, 1.0, 0, Val(4), Val(2))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _symv_lowerpanel!(n, 1.0, d(0), ld, d(1), d(2), Val(2), Val(4))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _symv_upperpanel!(n, 1.0, d(0), ld, d(1), d(2), Val(2), Val(4))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _gemv_n_block_cmplx!(d(0), d(1), ld, d(2), 0, 8, 1.0, 0.5, Val(2))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _gemv_n_pair_panel!(Val(:cplx), d(0), d(1), ld, d(2), 0, n, 1.0, 0.5, Val(2), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _gemv_tc_pair_block!(Val(:cplx), z(0), z(1), ld, z(2), n, 1.0 + 0.5im, 0.5 + 0im, false, Val(2), Val(false), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        @assert_no_scalar_loops _ger_pair_panel!(Val(:cplx), z(0), ld, z(1), z(2), 0, n, 1.0 + 0.5im, Val(2), Val(false), Val(2), Val(false))   # req8-ok: probe arm; the literal selects the kernel instance inspected
+        # pack
+        let A = ones(64, 64), Apk = zeros(64 * 64), Az = ones(ComplexF64, 64, 64)
+            @assert_no_scalar_loops _pack_A_simd!(Apk, A, 0, 0, 32, 16, 1.0, mr)
+            @assert_no_scalar_loops _pack_A_simd_T!(Apk, A, 0, 0, 32, 16, 1.0, mr)
+            @assert_no_scalar_loops _pack_B_val!(Apk, A, 0, 0, 16, 8, false, Val(nr), 0)   # req8-ok: probe arm; the literal selects the kernel instance inspected
+            @assert_no_scalar_loops _pack_B_dyn!(Apk, A, 0, 0, 16, 8, false, nr, 0)
+            @assert_no_scalar_loops _pack_A_tri_simd!(Apk, A, 0, 0, 32, 16, false, false, 1.0, mr)
+            @assert_no_scalar_loops _pack_A_cmplx_simd!(zeros(4096), zeros(4096), Az, 0, 0, 32, 16, cmr)
+            @assert_no_scalar_loops _pack_B_cmplx!(zeros(4096), zeros(4096), Az, 0, 0, 16, 8, false, cnr)
+        end
+    end
+end
