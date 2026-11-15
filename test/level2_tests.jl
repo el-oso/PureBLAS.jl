@@ -490,6 +490,7 @@ end
         lost0 = P._MT_LOST[]
         held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
         @test held
+        local Af
         held && try
             Af = copy(A0); P.ger!(0.75, x, y, Af)
         finally
@@ -634,6 +635,7 @@ end
                 lost0 = P._MT_LOST[]
                 held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
+                local yf
                 held && try
                     yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β)
                 finally
@@ -759,6 +761,7 @@ end
                 lost0 = P._MT_LOST[]
                 held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
+                local yf
                 held && try
                     yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β, trans = 'T')
                 finally
@@ -853,6 +856,7 @@ end
                 lost0 = P._MT_LOST[]
                 held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
+                local xf
                 held && try
                     xf = copy(x0); tmv!(A, xf, ul)
                 finally
@@ -975,6 +979,7 @@ end
             lost0 = P._MT_LOST[]
             held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
             @test held
+            local xf
             held && try
                 xf = copy(x0); nmv!(A, xf, ul, dg)
             finally
@@ -1114,6 +1119,7 @@ end
                 lost0 = P._MT_LOST[]
                 held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
+                local yf
                 held && try
                     yf = copy(yi); P.symv!(yf, Ai, xi; uplo = 'L', alpha = α, beta = β)
                 finally
@@ -1249,6 +1255,7 @@ end
         lost0 = P._MT_LOST[]
         held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
         @test held
+        local yf
         held && try
             yf = copy(y0); P.gbmv!(yf, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
         finally
