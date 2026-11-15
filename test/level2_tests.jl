@@ -488,17 +488,24 @@ end
         # thread" (the `p.gen` witness cannot: the lost path does not bump it).
         P.set_num_threads(nt)
         lost0 = P._MT_LOST[]
-        _, held = @atomicreplace p.busy false => true
+        held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
         @test held
-        Af = copy(A0); P.ger!(0.75, x, y, Af)
-        @atomic p.busy = false
+        local Af
+        held && try
+            Af = copy(A0); P.ger!(0.75, x, y, Af)
+        finally
+            P._MT_CLAIM[] = false
+        end
         @test P._MT_LOST[] == lost0 + 1
         @test Af == A2
         # CONCURRENT: several callers at once, so all but one LOSE the claim and run the fallback.
         # Every result must equal the serial one, which is what pins the fallback to the same arm.
-        tasks = [@spawn (t = copy(A0); P.ger!(0.75, x, y, t); t) for _ in 1:(nt + 1)]
-        for t in tasks
-            @test fetch(t) == A2
+        # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
+        tasks = [@spawn (let w = copy(A0); P.ger!(0.75, x, y, w); w end) for _ in 1:(nt + 1)]
+        got = fetch.(tasks)
+        @test allunique(objectid.(got))
+        for g in got
+            @test g == A2
         end
         P.set_num_threads(1)
     end
@@ -626,18 +633,25 @@ end
             # `_MT_LOST` would not move.
             if !sme
                 lost0 = P._MT_LOST[]
-                _, held = @atomicreplace p.busy false => true
+                held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
-                yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β)
-                @atomic p.busy = false
+                local yf
+                held && try
+                    yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β)
+                finally
+                    P._MT_CLAIM[] = false
+                end
                 @test P._MT_LOST[] == lost0 + 1
                 @test yf == y2
             end
             # CONCURRENT: all but one caller loses the claim and runs the fallback, which must reach
             # the same route as the winner's chunks.
-            tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β); t) for _ in 1:(2 * nt)]
-            for t in tasks
-                @test fetch(t) == y2
+            # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
+            tasks = [@spawn (let w = copy(y0); P.gemv!(w, A, x; alpha = α, beta = β); w end) for _ in 1:(2 * nt)]
+            got = fetch.(tasks)
+            @test allunique(objectid.(got))
+            for g in got
+                @test g == y2
             end
         end
         P.set_num_threads(1)
@@ -745,16 +759,23 @@ end
             # reason the gemv-N item gives: the call never reaches the claim.
             if !sme
                 lost0 = P._MT_LOST[]
-                _, held = @atomicreplace p.busy false => true
+                held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
-                yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β, trans = 'T')
-                @atomic p.busy = false
+                local yf
+                held && try
+                    yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β, trans = 'T')
+                finally
+                    P._MT_CLAIM[] = false
+                end
                 @test P._MT_LOST[] == lost0 + 1
                 @test yf == y2
             end
-            tasks = [@spawn (t = copy(y0); P.gemv!(t, A, x; alpha = α, beta = β, trans = 'T'); t) for _ in 1:(2 * nt)]
-            for t in tasks
-                @test fetch(t) == y2
+            # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
+            tasks = [@spawn (let w = copy(y0); P.gemv!(w, A, x; alpha = α, beta = β, trans = 'T'); w end) for _ in 1:(2 * nt)]
+            got = fetch.(tasks)
+            @test allunique(objectid.(got))
+            for g in got
+                @test g == y2
             end
         end
         P.set_num_threads(1)
@@ -833,16 +854,23 @@ end
             # FORCE THE LOSS: the fallback must run the same column bodies the chunks run.
             if !sme
                 lost0 = P._MT_LOST[]
-                _, held = @atomicreplace p.busy false => true
+                held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
-                xf = copy(x0); tmv!(A, xf, ul)
-                @atomic p.busy = false
+                local xf
+                held && try
+                    xf = copy(x0); tmv!(A, xf, ul)
+                finally
+                    P._MT_CLAIM[] = false
+                end
                 @test P._MT_LOST[] == lost0 + 1
                 @test bitsame(xf, want)
             end
-            tasks = [@spawn (t = copy(x0); tmv!(A, t, ul); t) for _ in 1:(2 * nt)]
-            for t in tasks
-                @test bitsame(fetch(t), want)
+            # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
+            tasks = [@spawn (let w = copy(x0); tmv!(A, w, ul); w end) for _ in 1:(2 * nt)]
+            got = fetch.(tasks)
+            @test allunique(objectid.(got))
+            for g in got
+                @test bitsame(g, want)
             end
             # The C-ABI entry, as LinearAlgebra reaches it after activate().
             xa = copy(x0)
@@ -949,15 +977,22 @@ end
             @test bitsame((t = copy(x0); nmv!(A, t, ul, dg); t), want)
             # FORCE THE LOSS: the fallback must run the same row body the chunks run.
             lost0 = P._MT_LOST[]
-            _, held = @atomicreplace p.busy false => true
+            held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
             @test held
-            xf = copy(x0); nmv!(A, xf, ul, dg)
-            @atomic p.busy = false
+            local xf
+            held && try
+                xf = copy(x0); nmv!(A, xf, ul, dg)
+            finally
+                P._MT_CLAIM[] = false
+            end
             @test P._MT_LOST[] == lost0 + 1
             @test bitsame(xf, want)
-            tasks = [@spawn (t = copy(x0); nmv!(A, t, ul, dg); t) for _ in 1:(2 * nt)]
-            for t in tasks
-                @test bitsame(fetch(t), want)
+            # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
+            tasks = [@spawn (let w = copy(x0); nmv!(A, w, ul, dg); w end) for _ in 1:(2 * nt)]
+            got = fetch.(tasks)
+            @test allunique(objectid.(got))
+            for g in got
+                @test bitsame(g, want)
             end
             # The C-ABI entry, as LinearAlgebra reaches it after activate().
             xa = copy(x0)
@@ -1082,16 +1117,23 @@ end
             # it. Skipped under SME, which returns before the claim.
             if !sme
                 lost0 = P._MT_LOST[]
-                _, held = @atomicreplace p.busy false => true
+                held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
-                yf = copy(yi); P.symv!(yf, Ai, xi; uplo = 'L', alpha = α, beta = β)
-                @atomic p.busy = false
+                local yf
+                held && try
+                    yf = copy(yi); P.symv!(yf, Ai, xi; uplo = 'L', alpha = α, beta = β)
+                finally
+                    P._MT_CLAIM[] = false
+                end
                 @test P._MT_LOST[] == lost0 + 1
                 @test yf == y2
             end
-            tasks = [@spawn (t = copy(yi); P.symv!(t, Ai, xi; uplo = 'L', alpha = α, beta = β); t) for _ in 1:(nt + 1)]
-            for t in tasks
-                @test fetch(t) == y2
+            # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
+            tasks = [@spawn (let w = copy(yi); P.symv!(w, Ai, xi; uplo = 'L', alpha = α, beta = β); w end) for _ in 1:(nt + 1)]
+            got = fetch.(tasks)
+            @test allunique(objectid.(got))
+            for g in got
+                @test g == y2
             end
         end
         P.set_num_threads(1)
@@ -1211,15 +1253,22 @@ end
         # serialised spawn storm would skip. See the ger item.
         P.set_num_threads(nt)
         lost0 = P._MT_LOST[]
-        _, held = @atomicreplace p.busy false => true
+        held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
         @test held
-        yf = copy(y0); P.gbmv!(yf, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
-        @atomic p.busy = false
+        local yf
+        held && try
+            yf = copy(y0); P.gbmv!(yf, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
+        finally
+            P._MT_CLAIM[] = false
+        end
         @test P._MT_LOST[] == lost0 + 1
         @test yf == y2
-        tasks = [@spawn (t = copy(y0); P.gbmv!(t, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
-        for t in tasks
-            @test fetch(t) == y2
+        # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
+        tasks = [@spawn (let w = copy(y0); P.gbmv!(w, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5); w end) for _ in 1:(2 * nt)]
+        got = fetch.(tasks)
+        @test allunique(objectid.(got))
+        for g in got
+            @test g == y2
         end
         # THE WIDE ARM MUST DECLINE THE POOL, and this is the assertion that pins the admission rule
         # rather than the speed that motivated it. Threading the per-column axpy arm measured 0.31x
