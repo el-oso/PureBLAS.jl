@@ -1382,3 +1382,22 @@ let m = 64, A = ones(m, m), x = ones(m)
     @assert_no_threadid_state _mt_poll_span()
     @assert_no_threadid_state trmv_split!(x, A)
 end
+# Concurrency safety. `@assert_concurrency_safe self = k f(args...)` fails when the scan reads a write to
+# storage reachable from argument `k`, the operand that parallel workers share and must treat as read-only
+# (a gemm's A, a gemv's x). It warns for a record it could not rule out. The calls execute.
+let m = 64, A = ones(m, m), B = ones(m, m), C = zeros(m, m), x = ones(m), y = zeros(m)
+    gemm3!(C, A, B) = gemm!(C, A, B)
+    syrk3!(C, A) = syrk!(C, A)
+    gemv3!(y, A, x) = gemv!(y, A, x)
+    axpy3!(y, a, x) = axpy!(y, a, x)
+    trmm3!(B, A) = trmm!(B, A)
+    trsm3!(B, A) = trsm!(B, A)
+    @assert_concurrency_safe self = 2 gemm3!(C, A, B)
+    @assert_concurrency_safe self = 3 gemm3!(C, A, B)
+    @assert_concurrency_safe self = 2 syrk3!(C, A)
+    @assert_concurrency_safe self = 2 gemv3!(y, A, x)
+    @assert_concurrency_safe self = 3 gemv3!(y, A, x)
+    @assert_concurrency_safe self = 3 axpy3!(y, 2.0, x)
+    @assert_concurrency_safe self = 2 trmm3!(copy(B), A)
+    @assert_concurrency_safe self = 2 trsm3!(copy(B), A + 64 * LinearAlgebra.I)
+end
