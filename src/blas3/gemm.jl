@@ -7615,10 +7615,11 @@ end
 # most 4 rows with B not transposed and k >= 16, and an n-vectorized form with scatter stores for a
 # tail of 1 to 5 rows with B transposed.
 #
-# The transposed-B tail has the unpacked kernel's bits; the dot-product tail does not, so that split
-# is taken only where the column-split pool never runs (`_gemm_never_pooled`), which keeps the result
-# the same at every thread count.
-@inline _gemm_never_pooled(m::Int, n::Int, k::Int) = 2 * m * n * k < _gemm_mt_work() || n < _NR
+# The transposed-B tail has the unpacked kernel's bits, so it may yield to the pool. The dot-product
+# tail does not, so it OWNS its shapes: whether it runs is decided from `(T, m, k)` and build
+# constants alone, and a call it takes runs serially at every thread count, as a Strassen call does.
+# It must not be keyed on the pool's flop floor: that floor is `typemax(Int)` until a pool exists and
+# a measured value afterwards, so the same call would change route, and bits, once a pool was created.
 @inline function _gemm_rows_split!(C, A, B, α::T, β::T, tA::Bool, tB::Bool, m::Int, n::Int, k::Int, nw::Int) where {T}
     W = _vwidth(T)
     T <: BlasReal && !tA && W < m <= _GEMM_MR1_MAX && n > 1 && k > 1 &&
@@ -7626,13 +7627,13 @@ end
     r = m % W; q = m - r
     iszero(r) && return false
     # Tail kernel: 1 = n-vectorized (B transposed, bit-identical to the unpacked kernel, so only
-    # when the pool declines the call), 2 = dot product (B not transposed, only where the pool never
-    # runs). Otherwise the unpacked driver's own ragged handling is as fast (measured on Zen4).
+    # when the pool declines the call), 2 = dot product (B not transposed, whatever the pool holds).
+    # Otherwise the unpacked driver's own ragged handling is as fast (measured on Zen4).
     if tB
         nw == 1 && (r < _at_tail_vw(_HW, T) || k >= _rows_dot_kmin(T, r)) || return false
         tk = 1
     else
-        _rows_dot_tail_ok(T, r) && k >= _rows_dot_kmin(T, r) && _gemm_never_pooled(m, n, k) || return false
+        _rows_dot_tail_ok(T, r) && k >= _rows_dot_kmin(T, r) || return false
         tk = 2
     end
     if iszero(α)
