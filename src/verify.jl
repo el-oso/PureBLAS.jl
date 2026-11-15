@@ -1030,3 +1030,240 @@ let W = _vwidth(Float64), mr = _MR * W, nr = _NR, kc = 64,
     @assert_inlined gemv!(y, A, x)
     @assert_inlined trsv!(A, x)
 end
+# Boxing and dynamic dispatch. `@assert_noboxing` reports a call that boxes or dispatches dynamically
+# (typed heap allocations are allowed). Covered: the kernels where a closure or tuple has boxed before
+# (the trsm bases, the microkernels, `_uker_cmplx!`, the gemv-T block callers), each with its FULL
+# argument list so the generated body is inspected rather than a defaulted-`Val{B0}` forwarder, and
+# every BLAS and LAPACK entry at each element type. The calls execute, so each operand is a live buffer.
+import LinearAlgebra
+let
+        tri(s) = (M = LinearAlgebra.tril(randn(s, s)); for i in 1:s; M[i, i] += s; end; M)
+        Atri = tri(32); BL = randn(32, 256); BR = randn(256, 32)
+        @assert_noboxing _trsm_base_invL!(false, false, false, Atri, BL)
+        @assert_noboxing _trsm_base_invR!(false, false, false, Atri, BR)
+        for tr in (true,), up in (false, true)
+            @assert_noboxing _trsm_base_invL!(up, tr, false, Atri, BL)
+        end
+        W = _vwidth(Float64); mr = _MR * W; nr = _NR; kc = 64
+        Ap = randn(mr * kc); Bp = randn(nr * kc); C = zeros(mr, nr)
+        GC.@preserve Ap Bp C begin
+            ap = pointer(Ap); bp = pointer(Bp); cptr = pointer(C); ldc = mr
+            for b0 in (false, true)
+                @assert_noboxing _microkernel!(cptr, ldc, ap, bp, kc, Val(_MR), Val(_NR), Val(b0))   # req8-ok: loop over literal arms; the probe exercises each arm
+                @assert_noboxing _microkernel!(cptr, ldc, ap, bp, kc, 1.5, Val(_MR), Val(_NR), Val(b0))   # req8-ok: loop over literal arms; the probe exercises each arm
+                @assert_noboxing _microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(b0))   # req8-ok: loop over literal arms; the probe exercises each arm
+                @assert_noboxing _microkernel_clip!(cptr, ldc, ap, bp, kc, Val(_MR), Val(1), Val(_NR), Val(b0))   # req8-ok: loop over literal arms; the probe exercises each arm
+            end
+            @assert_noboxing _microkernel!(cptr, ldc, ap, bp, kc, Val(_MR), Val(_NR))
+        end
+        kk = 32; Au = randn(mr * kk); Bu = randn(kk * nr); Cu = zeros(mr, nr)
+        GC.@preserve Au Bu Cu begin
+            aup = pointer(Au); bup = pointer(Bu); cup = pointer(Cu)
+            for tb in (false, true), b0 in (false, true)
+                @assert_noboxing _microkernel_unpacked!(cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, b0 ? 0.0 : 2.0, Val(_MR), Val(_NR), Val(tb), Val(b0))   # req8-ok: loop over literal arms; the probe exercises each arm
+            end
+            @assert_noboxing _microkernel_unpacked_mrows!(cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0, 12, Val(_MR), Val(_NR), Val(false), Val(true), Val(W))
+            @assert_noboxing _mrows_tail!(cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0, 2, Val(_NR), Val(false), Val(true))
+        end
+        let m = _CMR * W, n = 4, k = 16
+            A = randn(8 * m * k); B = randn(8 * k * n); Cc = zeros(8 * m * n)
+            GC.@preserve A B Cc for (tb, sa, sb, b0, a1, ar, full, tri) in (
+                    (false, 1, 1, true, false, false, true, false), (false, -1, 1, false, true, false, true, false),
+                    (true, 1, -1, true, false, true, false, false), (true, 1, 1, false, false, false, false, true),
+                )
+                F = (_CMR, n, tb, sa, sb, b0, a1, ar, full, tri)
+                @assert_noboxing _uker_cmplx!(pointer(Cc), m, pointer(A), m, 0, pointer(B), tb ? n : k, 0, k, 1.0, 0.5, m, n, Val(F), 0, true)
+            end
+        end
+        let T = Float64, m = 256, nc = 4
+            A = randn(m, 8); x = randn(m); y = zeros(8)
+            GC.@preserve A x y begin
+                ps = ntuple(c -> pointer(A) + (c - 1) * m * 8, nc)
+                for b0 in (false, true), (u, pf) in ((1, 0), (4, 0), (1, 8 * _CACHELINE))
+                    @assert_noboxing _gemv_t_block!(pointer(y), ps, pointer(x), m, 1.0, 0.0, Val(nc), Val(b0), Val(u), Val(pf))   # req8-ok: loop over literal arms; the probe exercises each arm
+                end
+                @assert_noboxing _gemvt_cols!(Val(nc), Val(false), 1, 0, pointer(y), pointer(A), pointer(x), m, m, 8, 1.0, 0.0, 8)   # req8-ok: loop over literal arms; the probe exercises each arm
+            end
+            @assert_noboxing _gemv_t_sweep_nc!(m, 8, 1.0, A, x, 0.0, y, 4)
+        end
+        let m = 128, n = 8, T = ComplexF64
+            A = randn(T, m, n); x = randn(T, m); y = zeros(T, n)
+            for cj in (false, true), half in (false, true)
+                @assert_noboxing _gemv_tc_run!(m, n, T(1.5), A, x, T(0.0), y, Val(cj), Val(4), Val(half))   # req8-ok: loop over literal arms; the probe exercises each arm
+            end
+        end
+end
+let
+        for T in (Float64, Float32, ComplexF64, ComplexF32)
+            n = 64
+            x = randn(T, n); y = randn(T, n); a = T(1.5)
+            @assert_noboxing axpy!(copy(y), a, x)
+            @assert_noboxing scal!(a, copy(x))
+            @assert_noboxing blascopy!(copy(y), x)
+            @assert_noboxing swap!(copy(x), copy(y))
+            @assert_noboxing dot(x, y)
+            @assert_noboxing dotu(x, y)
+            @assert_noboxing nrm2(x)
+            @assert_noboxing asum(x)
+            @assert_noboxing iamax(x)
+            A = randn(T, n, n); S = A + transpose(A); H = A + A'; U = LinearAlgebra.triu(A) + n * LinearAlgebra.I
+            @assert_noboxing gemv!(copy(y), A, x)
+            @assert_noboxing gemv!(copy(y), A, x; trans = 'T', alpha = a, beta = a)
+            @assert_noboxing ger!(a, x, y, copy(A))
+            @assert_noboxing symv!(copy(y), S, x)
+            T <: Complex && @assert_noboxing hemv!(copy(y), H, x)
+            @assert_noboxing trmv!(U, copy(x))
+            @assert_noboxing trsv!(U, copy(x))
+            ap = randn(T, n * (n + 1) ÷ 2)
+            @assert_noboxing spmv!(copy(y), ap, x)
+            @assert_noboxing tpmv!(ap, copy(x))
+            @assert_noboxing tpsv!(ap .+ T(n), copy(x))
+            @assert_noboxing spr!(a, x, copy(ap))
+            T <: Complex && @assert_noboxing hpmv!(copy(y), ap, x)
+            T <: Complex && @assert_noboxing hpr!(real(a), x, copy(ap))
+            AB = randn(T, 5, n)
+            @assert_noboxing gbmv!(copy(y), AB, x, n, 1, 3)
+            @assert_noboxing sbmv!(copy(y), AB, x)
+            @assert_noboxing tbmv!(AB, copy(x))
+            @assert_noboxing tbsv!(AB .+ T(n), copy(x))
+            C = zeros(T, n, n); B = randn(T, n, n)
+            @assert_noboxing gemm!(copy(C), A, B)
+            @assert_noboxing gemm!(copy(C), A, B; alpha = a, beta = a, transA = 'T', transB = 'N')
+            @assert_noboxing trsm!(copy(B), U; side = 'L', uplo = 'U', diag = 'N', alpha = a)
+            @assert_noboxing trsm!(copy(B), U; side = 'R', uplo = 'U', transA = 'N', diag = 'N', alpha = a)
+            @assert_noboxing trmm!(copy(B), U; side = 'L', uplo = 'U', diag = 'N', alpha = a)
+            @assert_noboxing syrk!(copy(C), A; uplo = 'L', trans = 'N', alpha = a, beta = a)
+            @assert_noboxing syr2k!(copy(C), A, B; uplo = 'L', trans = 'N', alpha = a, beta = a)
+            @assert_noboxing symm!(copy(C), S, B; side = 'L', uplo = 'L', alpha = a, beta = a)
+            if T <: Complex
+                @assert_noboxing herk!(copy(C), A; uplo = 'L', trans = 'N', alpha = real(a), beta = real(a))
+                @assert_noboxing her2k!(copy(C), A, B; uplo = 'L', trans = 'N', alpha = a, beta = real(a))
+                @assert_noboxing hemm!(copy(C), H, B; side = 'L', uplo = 'L', alpha = a, beta = a)
+            end
+            @assert_noboxing potrf!(S * S' + n * LinearAlgebra.I |> Matrix; uplo = 'L')
+            @assert_noboxing getrf!(copy(A))
+            @assert_noboxing geqrf!(copy(A))
+        end
+        n = 24; k = 12
+        Ad = (M = randn(n, n); M + transpose(M)); Az = (M = randn(ComplexF64, n, n); M + transpose(M))
+        Ahe = (M = randn(ComplexF64, n, n); M + M')
+        Sd = (M = randn(n, n); M * transpose(M) + n * LinearAlgebra.I)            # real SPD
+        She = (M = randn(ComplexF64, n, n); M * M' + n * LinearAlgebra.I)         # Hermitian PD
+
+        @assert_noboxing sysv!('L', copy(Ad), randn(n, 2))
+        @assert_noboxing sysv!('L', copy(Az), randn(ComplexF64, n, 2))
+        @assert_noboxing hesv!('L', copy(Ahe), randn(ComplexF64, n, 2))
+        LDd = copy(Ad); ipd = zeros(Int, n); sytrf!(LDd, ipd; uplo = 'L')
+        LDz = copy(Az); ipz = zeros(Int, n); sytrf!(LDz, ipz; uplo = 'L')
+        LDh = copy(Ahe); iph = zeros(Int, n); hetrf!(LDh, iph; uplo = 'L')
+        nbig = 96
+        Abd = (M = randn(nbig, nbig); M + transpose(M))
+        Abz = (M = randn(ComplexF64, nbig, nbig); M + transpose(M))
+        Abh = (M = randn(ComplexF64, nbig, nbig); M + M')
+        ipb = zeros(Int, nbig)
+        sytrf!(copy(Abd), ipb; uplo = 'L')                    # warm the owned W workspace first
+        hetrf!(copy(Abh), ipb; uplo = 'L')
+        for ul in ('L', 'U')
+            @assert_noboxing sytrf!(copy(Abd), zeros(Int, nbig); uplo = ul)
+            @assert_noboxing sytrf!(copy(Abz), zeros(Int, nbig); uplo = ul)
+            @assert_noboxing hetrf!(copy(Abh), zeros(Int, nbig); uplo = ul)
+        end
+        @assert_noboxing sytri!(copy(LDd), ipd; uplo = 'L')
+        @assert_noboxing sytri!(copy(LDz), ipz; uplo = 'L')
+        @assert_noboxing hetri!(copy(LDh), iph; uplo = 'L')
+        Aqd = randn(n, k); tqd = zeros(Float64, k); Aqz = randn(ComplexF64, n, k); tqz = zeros(ComplexF64, k)
+        Fqd = copy(Aqd); geqlf!(Fqd, tqd); Fqz = copy(Aqz); geqlf!(Fqz, tqz)
+        @assert_noboxing geqlf!(copy(Aqd), zeros(Float64, k))
+        @assert_noboxing orgql!(copy(Fqd), copy(tqd))
+        @assert_noboxing ormql!('L', 'N', copy(Fqd), tqd, randn(n, 3))
+        @assert_noboxing geqlf!(copy(Aqz), zeros(ComplexF64, k))
+        @assert_noboxing orgql!(copy(Fqz), copy(tqz))
+        @assert_noboxing ormql!('L', 'N', copy(Fqz), tqz, randn(ComplexF64, n, 3))
+        Ard = randn(k, n); Arz = randn(ComplexF64, k, n)
+        Grd = copy(Ard); gerqf!(Grd, tqd); Grz = copy(Arz); gerqf!(Grz, tqz)
+        @assert_noboxing gerqf!(copy(Ard), zeros(Float64, k))
+        @assert_noboxing orgrq!(copy(Grd), copy(tqd))
+        @assert_noboxing ormrq!('R', 'N', copy(Grd), tqd, randn(3, n))
+        @assert_noboxing gerqf!(copy(Arz), zeros(ComplexF64, k))
+        @assert_noboxing orgrq!(copy(Grz), copy(tqz))
+        Tzd = randn(k, n); ttd = zeros(Float64, k); tzrzf!(Tzd, ttd)
+        @assert_noboxing tzrzf!(randn(k, n), zeros(Float64, k))
+        @assert_noboxing tzrzf!(randn(ComplexF64, k, n), zeros(ComplexF64, k))
+        @assert_noboxing ormrz!('L', 'N', copy(Tzd), ttd, randn(n, 3))
+        @assert_noboxing pstrf!(copy(Sd), zeros(Int, n), -1.0; uplo = 'L')
+        @assert_noboxing pstrf!(copy(She), zeros(Int, n), -1.0; uplo = 'L')
+        @assert_noboxing gelsd!(randn(n, k), randn(n, 2), -1.0)
+        @assert_noboxing gelsd!(randn(ComplexF64, n, k), randn(ComplexF64, n, 2), -1.0)
+        @assert_noboxing gelsy!(randn(n, k), randn(n, 2), zeros(Int, k), -1.0)
+        @assert_noboxing gelsy!(randn(ComplexF64, n, k), randn(ComplexF64, n, 2), zeros(Int, k), -1.0)
+        @assert_noboxing gglse!(randn(8, 6), randn(8), randn(4, 6), randn(4))
+        @assert_noboxing gglse!(randn(ComplexF64, 8, 6), randn(ComplexF64, 8), randn(ComplexF64, 4, 6), randn(ComplexF64, 4))
+        @assert_noboxing trsyl!('N', 'N', 1, LinearAlgebra.triu(randn(n, n)) + n * LinearAlgebra.I, LinearAlgebra.triu(randn(n, n)) + n * LinearAlgebra.I, randn(n, n))
+        @assert_noboxing trsyl!('N', 'N', 1, LinearAlgebra.triu(randn(ComplexF64, n, n)) + n * LinearAlgebra.I, LinearAlgebra.triu(randn(ComplexF64, n, n)) + n * LinearAlgebra.I, randn(ComplexF64, n, n))
+        @assert_noboxing trexc!('V', LinearAlgebra.triu(randn(n, n)) + n * LinearAlgebra.I, Matrix(1.0 * LinearAlgebra.I, n, n), 2, n - 1)
+        @assert_noboxing trexc!('V', LinearAlgebra.triu(randn(ComplexF64, n, n)) + n * LinearAlgebra.I, Matrix(ComplexF64(1) * LinearAlgebra.I, n, n), 2, n - 1)
+        @assert_noboxing trsen!('N', 'V', rand(Bool, n), LinearAlgebra.triu(randn(n, n)) + n * LinearAlgebra.I, Matrix(1.0 * LinearAlgebra.I, n, n))
+        @assert_noboxing trsen!('N', 'V', rand(Bool, n), LinearAlgebra.triu(randn(ComplexF64, n, n)) + n * LinearAlgebra.I, Matrix(ComplexF64(1) * LinearAlgebra.I, n, n))
+        @assert_noboxing ggev!('N', 'V', randn(n, n), randn(n, n))
+        @assert_noboxing ggev!('N', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
+        @assert_noboxing gges!('V', 'V', randn(n, n), randn(n, n))
+        @assert_noboxing gges!('V', 'V', randn(ComplexF64, n, n), randn(ComplexF64, n, n))
+        @assert_noboxing ggsvd!('U', 'V', 'Q', randn(8, 6), randn(6, 6))
+        @assert_noboxing ggsvd!('U', 'V', 'Q', randn(ComplexF64, 8, 6), randn(ComplexF64, 6, 6))
+        @assert_noboxing sygvd!(1, 'V', 'U', copy(Ad), copy(Sd))
+        @assert_noboxing hegvd!(1, 'V', 'U', copy(Ahe), copy(She))
+        dd = randn(n); ee = randn(n - 1)
+        @assert_noboxing stebz!('A', 'B', 0.0, 0.0, 1, n, 0.0, copy(dd), copy(ee))
+        w, ib, isp, _ = stebz!('A', 'B', 0.0, 0.0, 1, n, 0.0, copy(dd), copy(ee))
+        @assert_noboxing stein!(copy(dd), copy(ee), w, ib, isp)
+        ABd2 = randn(6, n); _, gip, _ = gbtrf!(2, 1, n, ABd2)
+        @assert_noboxing gbtrf!(2, 1, n, randn(6, n))
+        @assert_noboxing gbtrs!('N', 2, 1, n, copy(ABd2), gip, randn(n, 2))
+        @assert_noboxing gbtrf!(2, 1, n, randn(ComplexF64, 6, n))
+        ldgb = 2 * 32 + 8 + 1
+        gbtrf!(32, 8, 64, randn(ldgb, 64))                 # warm the owned workspace first
+        gbtrf!(32, 8, 64, randn(ComplexF64, ldgb, 64))
+        @assert_noboxing gbtrf!(32, 8, 64, randn(ldgb, 64))
+        @assert_noboxing gbtrf!(32, 8, 64, randn(ComplexF64, ldgb, 64))
+        Dp = fill(4.0, n); Ep = fill(1.0, n - 1); Df = copy(Dp); Ef = copy(Ep); pttrf!(Df, Ef)
+        @assert_noboxing pttrf!(fill(4.0, n), fill(1.0, n - 1))
+        @assert_noboxing pttrs!(copy(Df), copy(Ef), randn(n, 2))
+        @assert_noboxing ptsv!(fill(4.0, n), fill(1.0, n - 1), randn(n, 2))
+        Dpz = fill(4.0, n); Epz = fill(1.0 + 0im, n - 1)
+        @assert_noboxing ptsv!(copy(Dpz), copy(Epz), randn(ComplexF64, n, 2))
+        dl = fill(1.0, n - 1); dm = fill(4.0, n); du = fill(1.0, n - 1)
+        du2 = zeros(Float64, n - 2); gtip = zeros(Int, n); gttrf!(copy(dl), copy(dm), copy(du), du2, gtip)
+        @assert_noboxing gtsv!(copy(dl), copy(dm), copy(du), randn(n, 2))
+        @assert_noboxing gttrf!(copy(dl), copy(dm), copy(du), zeros(Float64, n - 2), zeros(Int, n))
+        @assert_noboxing gtsv!(fill(1.0 + 0im, n - 1), fill(4.0 + 0im, n), fill(1.0 + 0im, n - 1), randn(ComplexF64, n, 2))
+        mkband(T) = (AB = zeros(T, 3, n); AB[1, :] .= T(10); AB[2, 1:(n - 1)] .= T(1); AB[3, 1:(n - 2)] .= T(0.5); AB)
+        ABsd = mkband(Float64); pbtrf!(ABsd; uplo = 'L', kd = 2)
+        @assert_noboxing pbtrf!(mkband(Float64); uplo = 'L', kd = 2)
+        @assert_noboxing pbtrs!(copy(ABsd), randn(n, 2); uplo = 'L', kd = 2)
+        @assert_noboxing pbtrf!(mkband(ComplexF64); uplo = 'L', kd = 2)
+        wideband(T, kd) = (
+            AB = zeros(T, kd + 1, n); AB[1, :] .= T(4 * kd);
+            for d in 1:kd
+                AB[1 + d, 1:(n - d)] .= T(0.5)
+            end; AB
+        )
+        wideU(T, kd) = (
+            AB = zeros(T, kd + 1, n); AB[kd + 1, :] .= T(4 * kd);
+            for d in 1:kd
+                AB[kd + 1 - d, (1 + d):n] .= T(0.5)
+            end; AB
+        )
+        @assert_noboxing pbtrf!(wideband(Float64, 64); uplo = 'L', kd = 64)
+        @assert_noboxing pbtrf!(wideU(Float64, 64); uplo = 'U', kd = 64)
+        @assert_noboxing _pbtrf_blocked!(wideband(Float64, 64), n, 64)
+        @assert_noboxing _pbtrf_repack_U!(wideU(Float64, 64), n, 64)
+        @assert_noboxing _pbtrf_blocked_U!(wideU(Float64, 64), n, 64)
+        @assert_noboxing _pbtrf_blocked!(wideband(ComplexF64, 32), n, 32)
+        @assert_noboxing _pbtrf_repack_U!(wideU(ComplexF64, 32), n, 32)
+        @assert_noboxing _pbtrf_blocked_U!(wideU(ComplexF64, 32), n, 32)
+        pack(M) = [M[i, j] for j in 1:n for i in j:n]              # lower column-packed
+        APsd = pack(Sd); pptrf!(APsd; uplo = 'L')
+        @assert_noboxing pptrf!(pack(Sd); uplo = 'L')
+        @assert_noboxing pptrs!(copy(APsd), randn(n, 2); uplo = 'L')
+        @assert_noboxing pptrf!(pack(She); uplo = 'L')
+end
