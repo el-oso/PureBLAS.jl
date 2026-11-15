@@ -4432,6 +4432,11 @@ const _MT_NW_MASK = Int(typemax(UInt16))     # so `set_num_threads` clamps to wh
     # and updated by one worker and the data a step produces stays in the cache group that produced it
     # (`_lustep_run_chunk` in lu.jl).
     _MT_KIND_LUSTEP
+    # gemm's few-row split (`_gemm_rows_split!`), by column bands on its own block grid. A kind of its
+    # own rather than the GEMM kind: the GEMM chunk is also the chunk of LAPACK trailing updates and
+    # Strassen leaves, whose serial twins run `_gemm_core!`, and this one must run the split's
+    # dot-product tail instead. `lam` is the tail's row count and `lanb` the block width.
+    _MT_KIND_ROWSPLIT
 end
 mutable struct GemmPool{T}
     @atomic gen::Int                 # `counter << _MT_NW_SHIFT | nw`; bumped to publish a job (see above)
@@ -4778,6 +4783,7 @@ end
     p.kind == _MT_KIND_SYMV && return _symv_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GBMVN && return _gbmvn_run_chunk(p, nw, i)
     p.kind == _MT_KIND_ELEM && return _elem_run_chunk(p, nw, i)
+    T <: BlasReal && p.kind == _MT_KIND_ROWSPLIT && return _rowsplit_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, _mt_band(nw, i))
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -6617,6 +6623,9 @@ end
             # bands reach. α after the product, as `trmm!` applies it.
             _trmm_left!(up, tA, cA, unit, A, C)
             isone(alpha) || _scal_all!(C, alpha)
+        elseif T <: BlasReal && kind == _MT_KIND_ROWSPLIT
+            # The whole split, serially: the same blocks the bands run.
+            _rows_split_serial!(C, A, B, alpha, beta, false, lup.m, A.n, lup.nb, 2)
         else
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
             _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
@@ -6729,6 +6738,7 @@ end
         # job, and the driver and idle workers are then in spin/wait loops with nowhere for a GC to
         # progress from. That failed as a swallowed worker exception or a silent hang, by interleaving.
         kind == _MT_KIND_TRMMR && _trmmr_prefit!(T, A.n, nw)
+        T <: BlasReal && kind == _MT_KIND_ROWSPLIT && _rowsplit_prefit!(T, lup.m * A.n, nw)
         # NOTE no prefit for `_MT_KIND_TRMM`. Side L splits COLUMNS and each band runs the same
         # `_trmm_left!` recursion the unsplit call runs, whose bases borrow from the arena rather
         # than from a pre-sized pool — the shape `_MT_KIND_TRSM` already has.
@@ -7617,9 +7627,12 @@ end
 #
 # The transposed-B tail has the unpacked kernel's bits, so it may yield to the pool. The dot-product
 # tail does not, so it OWNS its shapes: whether it runs is decided from `(T, m, k)` and build
-# constants alone, and a call it takes runs serially at every thread count, as a Strassen call does.
-# It must not be keyed on the pool's flop floor: that floor is `typemax(Int)` until a pool exists and
-# a measured value afterwards, so the same call would change route, and bits, once a pool was created.
+# constants alone, never from the pool's flop floor, which is `typemax(Int)` until a pool exists and a
+# measured value afterwards. The floor decides only `nw`, i.e. whether the call threads. A threaded
+# call splits the columns into bands (`_MT_KIND_ROWSPLIT`) and each band runs this same split, which
+# gives each element of C the bits the serial call gives it: the dot-product tail computes every
+# column on its own, and the unpacked kernel takes its route from the block width `nb`, not from the
+# width of the piece it is handed.
 @inline function _gemm_rows_split!(C, A, B, α::T, β::T, tA::Bool, tB::Bool, m::Int, n::Int, k::Int, nw::Int) where {T}
     W = _vwidth(T)
     T <: BlasReal && !tA && W < m <= _GEMM_MR1_MAX && n > 1 && k > 1 &&
@@ -7641,39 +7654,100 @@ end
     end
     Cp = _pm(C); Ap = _pm(A); Bp = _pm(B)
     rA = _root(A); rB = _root(B); rC = _root(C)
-    sz = sizeof(T)
-    Xs, _ = _gemm_scratch(T, tk == 2 ? r * k : 0, 0)
-    GC.@preserve rA rB rC Xs begin
-        # The dot-product tail reads its rows of A contiguous along k.
-        Xp = pointer(Xs)
-        if tk == 2
-            for i in 1:r, l in 1:k
-                unsafe_store!(Xp, unsafe_load(Ap.ptr, (q + i - 1) + (l - 1) * Ap.ld + 1), l + (i - 1) * k)
-            end
-        end
-        Atop = PtrMatrix(Ap.ptr, q, k, Ap.ld); Atl = PtrMatrix(Ap.ptr + q * sz, r, k, Ap.ld)
-        nb = _rows_split_nb(T, k, r, tk)
-        if iszero(β)
-            tB ? _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(true), Val(true)) :
-                _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(false), Val(true))
+    nb = _rows_split_nb(T, k, r, tk)
+    nwc = tk == 2 ? nw : 1
+    GC.@preserve rA rB rC begin
+        if nwc > 1
+            # `LuPanel` carries the tail's row count (`m`) and the block width (`nb`).
+            _gemm_threaded!(
+                Cp, Ap, Bp, α, β, false, false, false, false, nwc, _MT_KIND_ROWSPLIT, false, false, false,
+                LuPanel{T}(Ptr{T}(0), k, r, nb, Ptr{Int}(0), 0, 0, -1)
+            )
         else
-            tB ? _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(true), Val(false)) :
-                _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(false), Val(false))
+            _rows_split_serial!(Cp, Ap, Bp, α, β, tB, r, k, nb, tk)
         end
     end
     return true
 end
 
+# The dot-product tail reads its rows of A contiguous along k: rows `q+1 … q+r` of A into `Xp`.
+@inline function _rows_split_pack!(Xp::Ptr{T}, Ap::PtrMatrix{T}, r::Int, k::Int) where {T}
+    q = Ap.m - r
+    for i in 1:r, l in 1:k
+        unsafe_store!(Xp, unsafe_load(Ap.ptr, (q + i - 1) + (l - 1) * Ap.ld + 1), l + (i - 1) * k)
+    end
+    return nothing
+end
+
+# The whole split on the calling task, from its own scratch.
+@inline function _rows_split_serial!(
+        Cp::PtrMatrix{T}, Ap::PtrMatrix{T}, Bp::PtrMatrix{T}, α::T, β::T, tB::Bool, r::Int, k::Int, nb::Int, tk::Int
+    ) where {T}
+    Xs, _ = _gemm_scratch(T, tk == 2 ? r * k : 0, 0)
+    GC.@preserve Xs begin
+        tk == 2 && _rows_split_pack!(pointer(Xs), Ap, r, k)
+        _rows_split_cols!(Cp, Ap, pointer(Xs), Bp, α, β, tB, r, k, nb, tk, 0, Cp.n)
+    end
+    return nothing
+end
+
+# Grow every band's tail slot before the job is published (driver, inside the claim): a chunk body
+# must not allocate. The slots are `_trmmr_pack`'s, which no other job holds while this one runs.
+@inline function _rowsplit_prefit!(::Type{T}, len::Int, nw::Int) where {T}
+    for wi in 1:nw
+        _trmmr_pack(T, wi, len)
+    end
+    return nothing
+end
+
+# Columns `[j0, j1)` of the split, walked in blocks of `nb` from `j0`.
+@inline function _rows_split_cols!(
+        Cp::PtrMatrix{T}, Ap::PtrMatrix{T}, Xp::Ptr{T}, Bp::PtrMatrix{T}, α::T, β::T, tB::Bool,
+        r::Int, k::Int, nb::Int, tk::Int, j0::Int, j1::Int
+    ) where {T}
+    q = Cp.m - r
+    Atop = PtrMatrix(Ap.ptr, q, k, Ap.ld); Atl = PtrMatrix(Ap.ptr + q * sizeof(T), r, k, Ap.ld)
+    if iszero(β)
+        tB ? _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, j0, j1, k, nb, tk, Val(true), Val(true)) :
+            _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, j0, j1, k, nb, tk, Val(false), Val(true))
+    else
+        tB ? _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, j0, j1, k, nb, tk, Val(true), Val(false)) :
+            _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, j0, j1, k, nb, tk, Val(false), Val(false))
+    end
+    return nothing
+end
+
+# One band of a threaded split, cut on `_NR` columns as the gemm column split cuts them. B is not
+# transposed (only the dot-product tail threads). Each band packs the tail into its own slot: a pack
+# written by the driver and read by every worker costs a cache-line handoff per worker that the pack
+# itself does not.
+@inline function _rowsplit_run_chunk(p::GemmPool{T}, nw::Int, i::Int) where {T}
+    j0, len = _gemm_chunk(p.n, nw, _mt_band(nw, i))
+    len > 0 || return nothing
+    Ac = PtrMatrix{T}(p.Ap, p.m, p.k, p.lda)
+    Xs = _trmmr_pack(T, i, p.lam * p.k)
+    GC.@preserve Xs begin
+        _rows_split_pack!(pointer(Xs), Ac, p.lam, p.k)
+        _rows_split_cols!(
+            PtrMatrix{T}(p.Cp, p.m, p.n, p.ldc), Ac, pointer(Xs), PtrMatrix{T}(p.Bp, p.k, p.n, p.ldb),
+            p.alpha, p.beta, false, p.lam, p.k, p.lanb, 2, j0, j0 + len
+        )
+    end
+    return nothing
+end
+
 @inline function _rows_split_blocks!(
-        Cp::PtrMatrix{T}, Atop, Atl, Xp, Bp, α::T, β::T, q, r, n, k, nb, tk, ::Val{TB}, ::Val{B0}
+        Cp::PtrMatrix{T}, Atop, Atl, Xp, Bp, α::T, β::T, q, r, j0, j1, k, nb, tk, ::Val{TB}, ::Val{B0}
     ) where {T, TB, B0}
     sz = sizeof(T)
-    j = 0
-    while j < n
-        w = min(nb, n - j)
+    j = j0
+    while j < j1
+        w = min(nb, j1 - j)
         Bb = TB ? PtrMatrix(Bp.ptr + j * sz, w, k, Bp.ld) : PtrMatrix(Bp.ptr + j * Bp.ld * sz, k, w, Bp.ld)
         Cb = Cp.ptr + j * Cp.ld * sz
-        _gemm_unpacked!(Val(TB), Val(B0), q, w, k, α, Atop, Bb, β, PtrMatrix(Cb, q, w, Cp.ld))
+        # Routed as a block of `nb` columns whatever its width, so a band that ends mid-block, or a
+        # last block, computes its columns as the full blocks of the serial walk do.
+        _gemm_unpacked!(Val(TB), Val(B0), q, w, k, α, Atop, Bb, β, PtrMatrix(Cb, q, w, Cp.ld), (-1, nb, -1))
         if tk == 1
             _rows_bt_dispatch!(Cb + q * sz, Cp.ld, Atl.ptr, 1, Atl.ld, Bb.ptr, Bp.ld, r, w, k, α, β, Val(_vwidth(T) - 1), Val(B0))
         else
