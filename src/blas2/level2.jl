@@ -117,7 +117,7 @@ const _GEMV_MR = something(_GEMV_MR_PREF, 8)::Int
 # The PANEL path is deliberately NOT covered: there the winner does not track the
 # waste (measured: Zen3 wants 8 almost everywhere, Zen4 and Zen5 disagree size by size) and the whole
 # spread is 0.90-1.19 because the kernel is bandwidth-bound. It keeps `_GEMV_MR`.
-@inline _gemvn_mr_latency() = (_ILP_TARGET ÷ 2) * _datapath_bytes(_HW) ÷ _SIMD_BYTES
+@inline _gemvn_mr_latency() = _at_fma_chains(_HW)
 # Row-block heights `_gemv_n_rowblock!` is compiled for; `_gemvn_rowblock_mr` picks one per call.
 # PDM: Literal — the MR values the row-block driver dispatches to, not a tuning value
 const _GEMVN_ROWBLOCK_MRS = (2, 4, 6, 8)   # req8-ok: compiled kernel candidate set

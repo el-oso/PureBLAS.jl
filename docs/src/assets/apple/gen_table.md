@@ -5,21 +5,21 @@ PB / OpenBLAS speed ratio, median (worst cell) per op per µarch. Provenance: [`
 | op | ARM · NEON |
 |---|---|
 | `axpy` | 1.00 (0.97) |
-| `dot` | 1.07 (1.00) |
-| `nrm2` | 8.83 (7.00) |
+| `dot` | 1.41 (1.05) |
+| `nrm2` | 12.78 (11.22) |
 | `asum` | 1.00 (0.96) |
 | `scal` | 1.00 (0.92) |
 | `iamax` | 0.61 (0.50) |
 | `blascopy` | – |
 | `swap` | – |
 | `gemvN` | 6.41 (1.73) |
-| `gemvT` | 2.01 (1.47) |
+| `gemvT` | 2.14 (1.84) |
 | `ger` | 2.34 (0.91) |
 | `symv` | 1.38 (0.66) |
 | `trmv` | 1.84 (1.51) |
 | `trsv` | 1.44 (1.23) |
 | `trsvLN` | 1.35 (1.19) |
-| `trsvLT` | 2.05 (1.39) |
+| `trsvLT` | 2.13 (1.38) |
 | `spmv` | 1.44 (1.03) |
 | `gbmvN` | 0.79 (0.74) |
 | `sbmv` | 2.79 (2.73) |
@@ -38,7 +38,7 @@ PB / OpenBLAS speed ratio, median (worst cell) per op per µarch. Provenance: [`
 | `potrf` | 1.97 (1.53) |
 | `getrf` | 1.90 (0.89) |
 | `geqrf` | 1.21 (1.13) |
-| `gesvd` | 1.89 (1.02) |
+| `gesvd` | 1.98 (1.06) |
 | `potrfU` | – |
 | `getrs` | – |
 | `potrsL` | – |

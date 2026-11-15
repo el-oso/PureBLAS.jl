@@ -447,6 +447,13 @@ const _HW = (
 # in flight (2 × FMA_latency(4) × FMA_ports(2) = 16) to cover latency on all pipes + hide panel loads.
 # PDM: Literal — 2 x FMA latency(4) x FMA ports(2); an architectural assumption, and neither latency nor port count is detectable.
 const _ILP_TARGET = 16
+# Independent FMA chains, in register-wide ops, that keep a reduction's FP pipes busy for one FMA
+# latency: `_ILP_TARGET ÷ 2` datapath-wide FMAs in flight, rescaled to the register width. A
+# double-pumped part issues one register-wide FMA per datapath-wide slot pair, so it needs half as
+# many chains. Fleet values: Zen4 and Zen5-mobile 4 (512-bit registers on a 256-bit datapath),
+# Zen3 8, Zen5 desktop 8, arm64 NEON 8.
+# PDM: Derived — `_ILP_TARGET`, `_datapath_bytes`, the register width. | tune: n/a
+@inline _at_fma_chains(hw) = (_ILP_TARGET ÷ 2) * _datapath_bytes(hw) ÷ hw.simd
 @inline _at_gemm_nr(hw, ::Type{T} = Float64) where {T} = max(_lanes(hw, T), _ILP_TARGET ÷ _lanes(hw, T))
 @inline function _at_gemm_mr(hw, ::Type{T} = Float64) where {T}                               # MR (row W-blocks)
     nr = _at_gemm_nr(hw, T)

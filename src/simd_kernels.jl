@@ -1058,16 +1058,43 @@ end
     return nothing
 end
 
-# Reductions use 4 independent accumulators so the FMA/add latency is hidden — a single
-# accumulator is latency-bound (serial dependency) and leaves the pipeline idle at L1-resident
-# sizes. 4 chains × W lanes per iteration; then a W-at-a-time pass, then a scalar tail.
+# Four-way unroll of the fixed-shape BLAS-1 bodies, the narrow pass of `_dot_simd`/`_sumsq_simd`,
+# and the unit `_red_block` is counted in. 4 chains × W lanes per iteration; then a W-at-a-time pass,
+# then a scalar tail.
 # PDM: Literal — DERIVABLE, not yet derived: 4 chains x W lanes, an ILP count tied to _ILP_TARGET.
 const _UNROLL = 4
 
+# Accumulator chains of `_dot_simd` and `_sumsq_simd`: `_at_fma_chains`, never fewer than `_UNROLL`.
+# It must be a power of two dividing `256 * _UNROLL`, so `_red_block` stays a multiple of the main
+# step and `_pairfold` stays balanced; the check below fails the build otherwise.
+# PDM: Derived — `_at_fma_chains(_HW)`, the FMA chains that cover one latency on the detected datapath. | tune: n/a
+const _RED_CHAINS = max(_UNROLL, _at_fma_chains(_HW))
+(ispow2(_RED_CHAINS) && (256 * _UNROLL) % _RED_CHAINS == 0) ||
+    error("_RED_CHAINS = $(_RED_CHAINS) must be a power of two dividing 256 * _UNROLL; see _red_block")
+
+# Balanced pairwise fold of a power-of-two tuple, `((a1 + a2) + (a3 + a4)) + …`, log depth.
+@inline _pairfold(t::Tuple{Any}) = t[1]
+@inline _pairfold(t::Tuple) = _pairfold(ntuple(i -> t[2i - 1] + t[2i], Val(length(t) ÷ 2)))
+# Halve a power-of-two chain tuple until `M` chains remain: chain k takes chain k + K/2.
+@inline _fold_to(a::NTuple{K, Any}, ::Val{M}) where {K, M} =
+    K <= M ? a : _fold_to(ntuple(k -> a[k] + a[k + K ÷ 2], Val(K ÷ 2)), Val(M))
+
+# One step of the reduction loops: chains `1:m` take an FMA from vectors at `o + (k-1)·wb` bytes, the
+# rest pass through. The tuple is an argument, never a captured variable — a closure over the loop's
+# reassigned accumulator boxes it on the heap. `eltype(a)` is the vector type, fixed at compile time.
+@inline function _dot_step(a::NTuple{K, Any}, m, px, py, o, wb) where {K}
+    V = eltype(a)
+    return ntuple(k -> k <= m ? muladd(vload(V, px + o + (k - 1) * wb), vload(V, py + o + (k - 1) * wb), a[k]) : a[k], Val(K))
+end
+@inline function _sumsq_step(a::NTuple{K, Any}, m, px, o, wb) where {K}
+    V = eltype(a)
+    return ntuple(k -> k <= m ? (v = vload(V, px + o + (k - 1) * wb); muladd(v, v, a[k])) : a[k], Val(K))
+end
+
 # ── THE FIXED-BLOCK REDUCTION, WHICH IS WHAT MAKES A THREADED REDUCTION REPRODUCIBLE ────────────────
 #
-# WHY A REDUCTION CANNOT SIMPLY BE SPLIT. `_dot_simd` below carries `_UNROLL` vector chains, folds them
-# `(a0+a1)+(a2+a3)`, then takes a horizontal `sum(acc)`. Floating-point addition is not associative, so
+# WHY A REDUCTION CANNOT SIMPLY BE SPLIT. `_dot_simd` below carries `_RED_CHAINS` vector chains, folds them
+# pairwise, then takes a horizontal `sum(acc)`. Floating-point addition is not associative, so
 # ANY change of grouping moves the last bits — a worker holding half the vector and a caller holding all
 # of it do not produce summable pieces. There is no partition of the current kernel that reproduces its
 # own result.
@@ -1093,7 +1120,7 @@ const _UNROLL = 4
 # 8.63e-16 whole against 2.24e-16 blocked, because the per-block fold is a shallower tree than one long
 # chain. n=1e6: 1.73e-16 whole, 7.59e-16 blocked — comparable.
 #
-# B MUST BE A MULTIPLE OF `_UNROLL * _vwidth(T)`, or a block grows its own scalar tail and the fold order
+# B MUST BE A MULTIPLE OF `_RED_CHAINS * _vwidth(T)`, or a block grows its own scalar tail and the fold order
 # starts depending on where tails fall, which is the invariant this whole construction exists to hold.
 # PDM: Literal — 256 blocks' worth of fold overhead per block, validated by the table above rather than derived; the FORM (a multiple of the kernel's step, so it scales with unroll and ISA width) is what carries across machines. | tune: n/a, the tax is <1% across the measured range
 @inline _red_block(::Type{T}) where {T} = 256 * _UNROLL * _vwidth(T)   # req8-ok: validated literal, table above
@@ -1147,7 +1174,7 @@ end
 """
     _sumsq_blocked(n, x, ::Type{T}) -> T
 
-Σxᵢ² over the shared block grid — `nrm2`'s fast path. `_sumsq_simd` has the same four-chain shape as
+Σxᵢ² over the shared block grid — `nrm2`'s fast path. `_sumsq_simd` has the same chain shape as
 `_dot_simd`, so the same argument applies: a split changes the grouping, therefore one grid at every
 worker count.
 
@@ -1187,7 +1214,7 @@ end
 
 `asum` over the same fixed block grid as `_dot_blocked`, for the same reason: `_asum_simd` carries EIGHT
 chains and folds them `((a0+a1)+(a2+a3)) + ((a4+a5)+(a6+a7))`, so a split changes the grouping. One grid
-serves both — `_red_block` is a multiple of `8·_vwidth(T)` as well as of `_UNROLL·_vwidth(T)`, so no block
+serves both — `_red_block` is a multiple of `8·_vwidth(T)` as well as of `_RED_CHAINS·_vwidth(T)`, so no block
 of either kernel grows its own tail.
 """
 @inline function _asum_blocked_serial(n::Int, x, ::Type{T}) where {T <: BlasReal}
@@ -1216,20 +1243,41 @@ end
     return _asum_blocked_serial(n, x, T)
 end
 
+# `_dot_simd` and `_sumsq_simd` carry `_RED_CHAINS` vector chains, so the FMA latency is covered:
+# with too few chains the loop is latency-bound and the FP pipes idle. Measured on arm64 NEON, warm,
+# n = 256…2048, Float64, kernel time at 8 chains over 4: dot 0.83-0.96, sum of squares 0.55-0.86.
+# Against 8, 12 and 16 chains are within 1% for dot and 0.83-1.06 for the sum of squares, a gain at
+# n = 2048 that this derivation does not reach.
+# The wide chains run, and are folded down to `_UNROLL`, only when at least TWO wide steps fit: one
+# wide step plus the fold measured 0.82 of the `_UNROLL`-chain kernel at n = 16. Both tests sit inside
+# the one-`_UNROLL`-step test, and the fold happens inside that branch, so a vector too short for an
+# `_UNROLL` step starts from a literal zero and pays the single compare it always did — folding zeroed
+# chains at run time measured 0.87 at n = 4. The `_UNROLL`-chain loop takes what the wide loop leaves,
+# so a short column never drops into the one-chain loop.
 @inline function _dot_simd(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
-    px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
+    px = _ptr(x); py = _ptr(y); V = _vec(T); W = _vwidth(T); sz = sizeof(T)
+    step = _RED_CHAINS * W; step4 = _UNROLL * W
     GC.@preserve x y begin
-        a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
+        acc = zero(V)
         i = 0
-        while i + step <= n
-            o = i * sz
-            a0 = muladd(vload(V, px + o), vload(V, py + o), a0)
-            a1 = muladd(vload(V, px + o + W * sz), vload(V, py + o + W * sz), a1)
-            a2 = muladd(vload(V, px + o + 2W * sz), vload(V, py + o + 2W * sz), a2)
-            a3 = muladd(vload(V, px + o + 3W * sz), vload(V, py + o + 3W * sz), a3)
-            i += step
+        if step4 <= n
+            b = ntuple(_ -> zero(V), Val(_UNROLL))
+            if _RED_CHAINS > _UNROLL && 2step <= n   # const-folds away where the two counts agree
+                a = ntuple(_ -> zero(V), Val(_RED_CHAINS))
+                while i + step <= n
+                    o = i * sz
+                    a = _dot_step(a, _RED_CHAINS, px, py, o, W * sz)
+                    i += step
+                end
+                b = _fold_to(a, Val(_UNROLL))
+            end
+            while i + step4 <= n
+                o = i * sz
+                b = _dot_step(b, _UNROLL, px, py, o, W * sz)
+                i += step4
+            end
+            acc = _pairfold(b)
         end
-        acc = (a0 + a1) + (a2 + a3)
         while i + W <= n
             o = i * sz
             acc = muladd(vload(V, px + o), vload(V, py + o), acc)
@@ -1292,22 +1340,33 @@ end
     return s
 end
 
-# Sum of squares, SIMD, 4 accumulators. Fast path for nrm2 — may overflow to Inf or underflow to 0
-# on extreme inputs; the caller (_nrm2) detects that and falls back to scaled lassq.
+# Sum of squares, SIMD, `_RED_CHAINS` accumulators (see `_dot_simd`). Fast path for nrm2 — may
+# overflow to Inf or underflow to 0 on extreme inputs; the caller (_nrm2) detects that and falls
+# back to scaled lassq.
 @inline function _sumsq_simd(n::Int, x, ::Type{T}) where {T <: BlasReal}
-    px = _ptr(x); V = _vec(T); W = _vwidth(T); sz = sizeof(T); step = _UNROLL * W
+    px = _ptr(x); V = _vec(T); W = _vwidth(T); sz = sizeof(T)
+    step = _RED_CHAINS * W; step4 = _UNROLL * W
     GC.@preserve x begin
-        a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
+        acc = zero(V)
         i = 0
-        while i + step <= n
-            o = i * sz
-            v0 = vload(V, px + o); v1 = vload(V, px + o + W * sz)
-            v2 = vload(V, px + o + 2W * sz); v3 = vload(V, px + o + 3W * sz)
-            a0 = muladd(v0, v0, a0); a1 = muladd(v1, v1, a1)
-            a2 = muladd(v2, v2, a2); a3 = muladd(v3, v3, a3)
-            i += step
+        if step4 <= n
+            b = ntuple(_ -> zero(V), Val(_UNROLL))
+            if _RED_CHAINS > _UNROLL && 2step <= n   # const-folds away where the two counts agree
+                a = ntuple(_ -> zero(V), Val(_RED_CHAINS))
+                while i + step <= n
+                    o = i * sz
+                    a = _sumsq_step(a, _RED_CHAINS, px, o, W * sz)
+                    i += step
+                end
+                b = _fold_to(a, Val(_UNROLL))
+            end
+            while i + step4 <= n
+                o = i * sz
+                b = _sumsq_step(b, _UNROLL, px, o, W * sz)
+                i += step4
+            end
+            acc = _pairfold(b)
         end
-        acc = (a0 + a1) + (a2 + a3)
         while i + W <= n
             v = vload(V, px + i * sz); acc = muladd(v, v, acc); i += W
         end
