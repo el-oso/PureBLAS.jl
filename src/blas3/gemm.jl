@@ -1464,10 +1464,14 @@ end
             Val(3), Val(_SNR), Val(_GEMM_SPLIT_S), Val(TB), Val(B0), Val(MASK)
         )
     else
-        throw(ArgumentError("split row tile vt=$vt outside 1:$(_SMR); _GEMM_SPLIT_S moved and this cascade did not"))
+        _throw_split_rowtile(vt, _SMR)
     end
     return nothing
 end
+
+# `lazy"…"` keeps the interpolation out of the trim-verified call graph (see core.jl).
+@noinline _throw_split_rowtile(vt::Int, smr::Int) =
+    throw(ArgumentError(lazy"split row tile vt=$vt outside 1:$smr; _GEMM_SPLIT_S moved and this cascade did not"))
 
 # Small-n split driver (wide AVX-512 only — caller gates on _SPLIT_OK). EVERY row block under a full
 # column tile goes through the split kernel, W-aligned or not — the aligned ones unmasked, the ragged
