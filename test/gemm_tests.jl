@@ -231,6 +231,54 @@ end
     @test iszero(nbad[])
 end
 
+# A route must not read process history. The pool's flop floor is `typemax(Int)` until a pool exists
+# and a measured value afterwards, and `set_num_threads(1)` leaves it measured, so a route keyed on it
+# changes the bits of one call depending on whether a pool was ever created. Both states are set here
+# directly, so the item does not depend on what ran before it in this process.
+@testitem "gemm: few-row routes do not depend on the pool floor" tags = [:checks] begin
+    using PureBLAS, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+    cases = [
+        (T, tB, m, k, n) for T in (Float32, Float64), tB in ('N', 'T'), m in 1:P._GEMM_MR1_MAX,
+            k in (1, 33, 100), n in (40, 150, 600)
+    ]
+    function run(cases)
+        return map(enumerate(cases)) do (i, (T, tB, m, k, n))
+            Random.seed!(i)
+            A = randn(T, m, k); B = tB == 'N' ? randn(T, k, n) : randn(T, n, k); C = randn(T, m, n)
+            P.gemm!(C, A, B; alpha = T(1.3), beta = T(0.7), transB = tB)
+            C
+        end
+    end
+    # Witness: the dot-product tail is reached, so the comparison below covers the route it guards.
+    @test count(cases) do (T, tB, m, k, n)
+        W = P._vwidth(T); r = m % W
+        tB == 'N' && m > W && r > 0 && P._rows_dot_tail_ok(T, r) && k >= P._rows_dot_kmin(T, r)
+    end > 0
+    old = P.get_num_threads(); oldfloor = P._MT_FLOOR[]
+    try
+        P.set_num_threads(1)
+        P._MT_FLOOR[] = typemax(Int)       # the state before any pool exists
+        fresh = run(cases)
+        P._MT_FLOOR[] = 1                  # a measured floor that every case clears
+        @test all(map(bitsame, fresh, run(cases)))
+        if nthreads() >= 2
+            P.set_num_threads(nthreads())  # creates the pool and measures the floor
+            @test any(((T, tB, m, k, n),) -> P._gemm_workers(m, n, k) > 1, cases)
+            @test all(map(bitsame, fresh, run(cases)))
+            P.set_num_threads(1)
+            @test all(map(bitsame, fresh, run(cases)))
+        else
+            @test_skip "the pooled half needs >= 2 julia threads"
+        end
+    finally
+        P.set_num_threads(old)
+        P._MT_FLOOR[] = oldfloor
+    end
+end
+
 @testitem "GEMM beta=0 ignores NaN in C (BLAS semantics)" setup = [GemmOracle] begin
     using PureBLAS
     A = randn(64, 48); B = randn(48, 32)
