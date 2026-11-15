@@ -995,3 +995,38 @@ let m = 64, kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
         @assert_no_spill _trsm_tile_R_f64!(false, false, false, pointer(Lt), m, pointer(Bt), m, m, m)
     end
 end
+# Inlining. `@assert_inlined` fails when the call survives as an `:invoke` in the caller's optimized IR.
+# Covered: the width and tuning helpers, the defaulted-`Val{B0}` forwarders of the microkernels (which
+# inline and leave the call to the generated body), the pack routines, and the L1/L2 entries. The
+# 8-argument `_microkernel!` body is `@generated` and deliberately out of line, so it is not asserted.
+# The calls execute, so each operand is a live buffer.
+@assert_inlined _vwidth(Float64)
+@assert_inlined _vwidth(Float32)
+@assert_inlined _lanes(_HW, Float64)
+@assert_inlined _at_gemm_mr(_HW)
+@assert_inlined _at_gemm_mr(_HW, Float32)
+let W = _vwidth(Float64), mr = _MR * W, nr = _NR, kc = 64,
+        Ap = randn(mr * kc), Bp = randn(nr * kc), Ck = zeros(mr, nr)
+    GC.@preserve Ap Bp Ck begin
+        ap = pointer(Ap); bp = pointer(Bp); cp = pointer(Ck)
+        @assert_inlined _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR))
+        @assert_inlined _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR))
+        @assert_inlined _microkernel_clip!(cp, mr, ap, bp, kc, Val(_MR), Val(1), Val(_NR))
+    end
+    for T in (Float64, Float32)
+        A = randn(T, 64, 64); Apk = zeros(T, 64 * 64); mrr = _MR * _vwidth(T)
+        @assert_inlined _pack_A_simd!(Apk, A, 0, 0, 32, 16, T(1), mrr)
+        @assert_inlined _pack_A_simd_T!(Apk, A, 0, 0, 32, 16, T(1), mrr)
+        @assert_inlined _pack_B!(Apk, A, 0, 0, 16, 8, false, _NR)
+        @assert_inlined _pack_B!(Apk, A, 0, 0, 16, 8, false, _NR, 0)
+    end
+    let Az = randn(ComplexF64, 64, 64), mrr = _CMR * _vwidth(Float64)
+        @assert_inlined _pack_A_cmplx_simd_T!(zeros(4096), zeros(4096), Az, 0, 0, 32, 16, mrr)
+    end
+    x = randn(64); y = randn(64); A = randn(64, 64)
+    @assert_inlined axpy!(y, 2.0, x)
+    @assert_inlined dot(x, y)
+    @assert_inlined scal!(2.0, x)
+    @assert_inlined gemv!(y, A, x)
+    @assert_inlined trsv!(A, x)
+end
