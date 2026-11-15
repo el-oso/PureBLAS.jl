@@ -452,7 +452,8 @@ end
 
 # W×W transpose of W vectors held in registers (the same shuffle butterfly as `_tblk!`): element `l` of
 # input vector `r` becomes element `r` of output vector `l`.
-@generated function _transpose_regs(c::NTuple{W, Vec{W, T}}) where {W, T}
+@generated function _transpose_regs(c::Tuple{Vec{W, T}, Vararg{Vec{W, T}}}) where {W, T}
+    length(c.parameters) == W || error("_transpose_regs needs W vectors of width W")
     q = Int(round(log2(W)))
     body = quote
         $(Expr(:meta, :inline))
@@ -2190,20 +2191,25 @@ end
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     lane = Vec(ntuple(l -> l - 1, Val(W))); clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
     cmask = clane <= kt; smask = lane < cs
-    pairs = ntuple(
-        r -> (r - 1) < cn ? _deint_cmplx(vload(Vec{2W, T}, src + (r - 1) * lda2 * sz, cmask)) : (zero(V), zero(V)),
-        Val(W)
-    )
-    re = _transpose_regs(ntuple(r -> pairs[r][1], Val(W)))
-    im = _transpose_regs(ntuple(r -> pairs[r][2], Val(W)))
-    ntuple(
-        pp -> begin
-            (pp - 1) < kt || return nothing
-            vstore(re[pp], dR + (pp - 1) * mrstride * sz, smask)
-            vstore(im[pp], dI + (pp - 1) * mrstride * sz, smask)
-            nothing
-        end, Val(W)
-    )
+    # The real and the imaginary parts are transposed one after the other (the source is read twice) so
+    # that only W vectors are live at a time.
+    @inline function pass(sel, dst)
+        cols = ntuple(
+            r -> (r - 1) < cn ? sel(_deint_cmplx(vload(Vec{2W, T}, src + (r - 1) * lda2 * sz, cmask))) : zero(V),
+            Val(W)
+        )
+        rows = _transpose_regs(cols)
+        ntuple(
+            pp -> begin
+                (pp - 1) < kt || return nothing
+                vstore(rows[pp], dst + (pp - 1) * mrstride * sz, smask)
+                nothing
+            end, Val(W)
+        )
+        return nothing
+    end
+    pass(first, dR)
+    pass(last, dI)
     return nothing
 end
 

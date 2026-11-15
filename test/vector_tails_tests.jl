@@ -140,6 +140,15 @@ end
             want[idx] = lr < mce ? alpha * A[2 + lr, 1 + p] : 0.0
             wantT[idx] = lr < mce ? alpha * AT[1 + p, 2 + lr] : 0.0
         end
+        Ac = randn(rng, ComplexF64, mce + 3, kce + 2); cmr = P._CMR * W
+        clen = cld(mce, cmr) * cmr * kce; wr = fill(sent, clen + 5); wi = copy(wr)
+        for pi in 0:(cld(mce, cmr) - 1), p in 0:(kce - 1), r in 0:(cmr - 1)
+            lr = pi * cmr + r; idx = pi * cmr * kce + p * cmr + r + 1
+            v = lr < mce ? Ac[2 + lr, 1 + p] : 0.0im
+            wr[idx] = real(v); wi[idx] = imag(v)
+        end
+        Rp = fill(sent, clen + 5); Ip = copy(Rp); P._pack_A_cmplx_simd!(Rp, Ip, Ac, 1, 0, mce, kce, cmr)
+        @test bits(Rp) == bits(wr) && bits(Ip) == bits(wi)
         Ap = fill(sent, len + 5); P._pack_A_simd!(Ap, A, 1, 0, mce, kce, alpha, mr)
         @test bits(Ap) == bits(want)
         Ap = fill(sent, len + 5); P._pack_A_simd_T!(Ap, AT, 1, 0, mce, kce, alpha, mr)
@@ -153,6 +162,15 @@ end
             lc = ji * nr + c; idx = ji * nr * kce + p * nr + c + 1
             want[idx] = lc < nce ? (tB ? B[1 + lc, 1 + p] : B[1 + p, 1 + lc]) : 0.0
         end
+        Bc = tB ? randn(rng, ComplexF64, nce + 2, kce + 1) : randn(rng, ComplexF64, kce + 1, nce + 2)
+        wr = fill(sent, len + 5); wi = copy(wr)
+        for ji in 0:(cld(nce, nr) - 1), p in 0:(kce - 1), c in 0:(nr - 1)
+            lc = ji * nr + c; idx = ji * nr * kce + p * nr + c + 1
+            v = lc < nce ? (tB ? Bc[1 + lc, 1 + p] : Bc[1 + p, 1 + lc]) : 0.0im
+            wr[idx] = real(v); wi[idx] = imag(v)
+        end
+        Rp = fill(sent, len + 5); Ip = copy(Rp); P._pack_B_cmplx!(Rp, Ip, Bc, 0, 0, kce, nce, tB, nr)
+        @test bits(Rp) == bits(wr) && bits(Ip) == bits(wi)
         Bp = fill(sent, len + 5); P._pack_B_dyn!(Bp, B, 0, 0, kce, nce, tB, nr, 0)
         @test bits(Bp) == bits(want)
         if nr == NR
