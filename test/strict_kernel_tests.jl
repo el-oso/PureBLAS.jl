@@ -260,18 +260,21 @@ function toy_chain!(p::Ptr{Float64}, n::Int)
     P.vstore(acc, p)
     return nothing
 end
+
+# A defaulted-argument forwarder whose body is an out-of-line call: its own code is a call and a return.
+toy_fwd!(p::Ptr{Float64}, n::Int, ::Val{B} = Val(false)) where {B} = (@noinline toy_chain!(p, n); nothing)
 end
 
 @testitem "kernel: inspected bodies are real" tags = [:checks] setup = [KernelChecks] begin
     using StrictMode, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
-        KNOWN_WIDE_SPILL
+        KNOWN_WIDE_SPILL, toy_fwd!
     @info "kernel checks run on $(box())"
     # Control: a defaulted-argument forwarder is a thin trampoline. Its own code holds a call and no
     # vector arithmetic, so a check pointed at it reads nothing and the real-body test must reject it.
     Pd = Ptr{Float64}
-    fw = forwarder_info(P._microkernel!, (Pd, Int, Pd, Pd, Int, Val{P._MR}, Val{P._NR}))
+    fw = forwarder_info(toy_fwd!, (Pd, Int))
     @test fw.lines < 40 && fw.vfma == 0 && fw.calls >= 1 && !fw.vectorized
     # Control: a body that is a MethodError stub (here `_scal_pair_simd!` handed a raw Ptr instead of the
     # array it expects) has a plausible line count and no vector work.
@@ -351,7 +354,7 @@ end
     using StrictMode, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
-        KNOWN_WIDE_SPILL
+        KNOWN_WIDE_SPILL, toy_fwd!
     Pd = Ptr{Float64}
     # Controls: a strict-order reduction and a recurrence emit no vector code.
     @test !StrictMode.kernel_report(toy_strict_sum, (Pd, Int)).vectorized
@@ -365,7 +368,7 @@ end
             GC.@preserve Ap Bp C begin
                 # The forwarder is judged unvectorized; a check that follows the forwarder to its body would pass.
                 fwd_ok = try
-                    @assert_vectorized P._microkernel!(pointer(C), P._MR * W, pointer(Ap), pointer(Bp), 8, Val(P._MR), Val(P._NR))
+                    @assert_vectorized toy_fwd!(pointer(buf), 200)
                     true
                 catch e
                     e isa StrictViolation || rethrow()

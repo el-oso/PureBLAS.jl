@@ -298,15 +298,13 @@ end
         GC.@preserve Ap Bp C begin
             ap = pointer(Ap); bp = pointer(Bp); cptr = pointer(C); ldc = mr
             # register-blocked microkernel: the hot path — must be tight
-            @assert_typestable P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @test_noalloc P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @test_trim_compatible P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            @assert_typestable P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
+            @test_noalloc P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
+            @test_trim_compatible P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
             # StrictMode 0.3.9 @assert_no_spill: the µarch-derived _MR×_NR tile must fit the register file
             # with no vector spill/reload. Verified clean on both AVX-512 (Zen4/Zen5, 32 zmm) and AVX2 (Zen3,
             # 16 ymm) — the packed hot path. (NB the SMALL-matrix `_microkernel_unpacked!` spills 3 vectors on
             # AVX2 with the same tile — a real register-pressure finding, tracked separately; not asserted here.)
-            # The full signature, `Val(false)` included: the 7-argument form is a default-argument forwarder
-            # whose native code is a call and a return, so a spill scan of it passes without reading the kernel.
             @assert_no_spill P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
             @test_noalloc P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             @assert_typestable P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
