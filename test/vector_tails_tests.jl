@@ -1,4 +1,5 @@
-# The SIMD kernels finish a ragged length with masked vector loads and stores, never a scalar loop. These
+# The SIMD kernels finish a ragged length with binary-piece accesses (read-modify-write kernels, packs, trsm
+# tiles) or masked loads (reductions, iamax), never a scalar loop. These
 # items run every kernel over the lengths and panel shapes that exercise the ragged edge and compare against
 # a scalar reference: bitwise for elementwise kernels, packs and the trsm tiles, to a BigFloat tolerance for
 # reductions, and by first-index semantics for iamax.

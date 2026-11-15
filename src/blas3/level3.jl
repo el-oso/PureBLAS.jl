@@ -2006,11 +2006,12 @@ const _TRSM_NARROW_MAX = @load_preference("trsm_narrow_max", 4)::Int
     return
 end
 # Row-block load/store: a full block of W rows is an unmasked access; the ragged last block of `k mod W`
-# rows is a masked one, so no lane outside the matrix is read or written.
-@inline _trsm_ld(::Val{true}, p::Ptr{Float64}, msk) = vload(_CVF, p)
-@inline _trsm_ld(::Val{false}, p::Ptr{Float64}, msk) = vload(_CVF, p, msk)
-@inline _trsm_st(::Val{true}, v, p::Ptr{Float64}, msk) = vstore(v, p)
-@inline _trsm_st(::Val{false}, v, p::Ptr{Float64}, msk) = vstore(v, p, msk)
+# rows is loaded through a mask and stored as binary pieces (a masked store does not forward to a later
+# load), so no lane outside the matrix is read or written.
+@inline _trsm_ld(::Val{true}, p::Ptr{Float64}, nr) = vload(_CVF, p)
+@inline _trsm_ld(::Val{false}, p::Ptr{Float64}, nr) = vload(_CVF, p, Vec(ntuple(l -> l, Val(_CHOLW))) <= nr)
+@inline _trsm_st(::Val{true}, v, p::Ptr{Float64}, nr) = vstore(v, p)
+@inline _trsm_st(::Val{false}, v, p::Ptr{Float64}, nr) = _vstore_r(v, p, nr)
 
 # Reciprocal diagonal of the `nr` active rows of the block at row `rb` (lanes past `nr` hold 1.0 and are
 # never read from the matrix).
@@ -2029,13 +2030,13 @@ end
 # and are not stored.
 @generated function _trsm_diag_block!(
         ::Val{UP}, ::Val{UNIT}, ::Val{FULL}, pL::Ptr{Float64}, ld0::Int, pB::Ptr{Float64}, ldb::Int,
-        rb::Int, n::Int, nr::Int, msk, rv
+        rb::Int, n::Int, nr::Int, rv
     ) where {UP, UNIT, FULL}
     W = _CHOLW
     V = Vec{W, Float64}
     xs = [Symbol(:x, i) for i in 0:(W - 1)]
     loads = [
-        :($(Symbol(:col, q)) = $(q - 1) < cn ? _trsm_ld(Val($FULL), _cvptr(pB, rb, c + $(q - 1), ldb), msk) : zero($V))
+        :($(Symbol(:col, q)) = $(q - 1) < cn ? _trsm_ld(Val($FULL), _cvptr(pB, rb, c + $(q - 1), ldb), nr) : zero($V))
             for q in 1:W
     ]
     solve = Any[]
@@ -2053,7 +2054,7 @@ end
         )
     end
     stores = [
-        :($(q - 1) < cn && _trsm_st(Val($FULL), back[$q], _cvptr(pB, rb, c + $(q - 1), ldb), msk))
+        :($(q - 1) < cn && _trsm_st(Val($FULL), back[$q], _cvptr(pB, rb, c + $(q - 1), ldb), nr))
             for q in 1:W
     ]
     return quote
@@ -2072,6 +2073,12 @@ end
     end
 end
 
+# Load/store with an optional mask: `nothing` is an unmasked access of the vector type's own width.
+@inline _ldm(::Type{Vh}, p::Ptr{Float64}, ::Nothing) where {Vh} = vload(Vh, p)
+@inline _ldm(::Type{Vh}, p::Ptr{Float64}, msk) where {Vh} = vload(Vh, p, msk)
+@inline _stm(v, p::Ptr{Float64}, ::Nothing) = vstore(v, p)
+@inline _stm(v, p::Ptr{Float64}, msk) = vstore(v, p, msk)
+
 # Register-tiled trsm-L base for the no-trans f64 case (op(A)=A), GENERAL up/unit: solve A·X=B, A k×k lower
 # (fwd) or upper (bwd), unit or non-unit diagonal. W-row blocks — downdate each block against the ALREADY-
 # SOLVED rows (vectorized; the 4-B-column unroll reuses the A row-block vector), then solve the W×W diagonal
@@ -2081,8 +2088,7 @@ end
 # Measured Zen3: lower-unit (getrf) +119–151%; upper-non-unit (trsm gate) +44–47%. pL/pB = &·[1,1], ld col.
 @inline function _trsm_tile_L_f64!(up::Bool, unit::Bool, pL::Ptr{Float64}, ld0::Int, pB::Ptr{Float64}, ldb::Int, k::Int, n::Int)
     W = _CHOLW; nb = k ÷ W; nt = k - nb * W
-    lane = Vec{W, Int}(ntuple(q -> q - 1, Val(W)))
-    @inline function doblock(rb, ::Val{FULL}, nr, msk) where {FULL}
+    @inline function doblock(rb, ::Val{FULL}, nr) where {FULL}
         F = Val(FULL)
         solved = up ? ((rb + W):k) : (1:(rb - 1))            # already-solved rows: below (upper) / above (lower)
         # With nothing solved yet the downdate would read and rewrite the same values; skipping it keeps
@@ -2090,25 +2096,25 @@ end
         if !isempty(solved)
             c = 1
             @inbounds while c + 3 <= n
-                a0 = _trsm_ld(F, _cvptr(pB, rb, c, ldb), msk);     a1 = _trsm_ld(F, _cvptr(pB, rb, c + 1, ldb), msk)
-                a2 = _trsm_ld(F, _cvptr(pB, rb, c + 2, ldb), msk); a3 = _trsm_ld(F, _cvptr(pB, rb, c + 3, ldb), msk)
+                a0 = _trsm_ld(F, _cvptr(pB, rb, c, ldb), nr);     a1 = _trsm_ld(F, _cvptr(pB, rb, c + 1, ldb), nr)
+                a2 = _trsm_ld(F, _cvptr(pB, rb, c + 2, ldb), nr); a3 = _trsm_ld(F, _cvptr(pB, rb, c + 3, ldb), nr)
                 for j in solved
-                    Lv = _trsm_ld(F, _cvptr(pL, rb, j, ld0), msk)
+                    Lv = _trsm_ld(F, _cvptr(pL, rb, j, ld0), nr)
                     a0 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))), Lv, a0)
                     a1 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 1, ldb))), Lv, a1)
                     a2 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 2, ldb))), Lv, a2)
                     a3 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 3, ldb))), Lv, a3)
                 end
-                _trsm_st(F, a0, _cvptr(pB, rb, c, ldb), msk);     _trsm_st(F, a1, _cvptr(pB, rb, c + 1, ldb), msk)
-                _trsm_st(F, a2, _cvptr(pB, rb, c + 2, ldb), msk); _trsm_st(F, a3, _cvptr(pB, rb, c + 3, ldb), msk)
+                _trsm_st(F, a0, _cvptr(pB, rb, c, ldb), nr);     _trsm_st(F, a1, _cvptr(pB, rb, c + 1, ldb), nr)
+                _trsm_st(F, a2, _cvptr(pB, rb, c + 2, ldb), nr); _trsm_st(F, a3, _cvptr(pB, rb, c + 3, ldb), nr)
                 c += 4
             end
             @inbounds while c <= n
-                a = _trsm_ld(F, _cvptr(pB, rb, c, ldb), msk)
+                a = _trsm_ld(F, _cvptr(pB, rb, c, ldb), nr)
                 for j in solved
-                    a = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))), _trsm_ld(F, _cvptr(pL, rb, j, ld0), msk), a)
+                    a = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))), _trsm_ld(F, _cvptr(pL, rb, j, ld0), nr), a)
                 end
-                _trsm_st(F, a, _cvptr(pB, rb, c, ldb), msk); c += 1
+                _trsm_st(F, a, _cvptr(pB, rb, c, ldb), nr); c += 1
             end
         end
         # W diagonal reciprocals ONCE per block (not per column — the redundant per-cc inv() was a division
@@ -2116,28 +2122,27 @@ end
         rv = unit ? _CVF(1.0) : _trsm_recips(F, pL, ld0, rb, nr)
         return up ?
             (
-                unit ? _trsm_diag_block!(Val(true), Val(true), F, pL, ld0, pB, ldb, rb, n, nr, msk, rv) :
-                _trsm_diag_block!(Val(true), Val(false), F, pL, ld0, pB, ldb, rb, n, nr, msk, rv)
+                unit ? _trsm_diag_block!(Val(true), Val(true), F, pL, ld0, pB, ldb, rb, n, nr, rv) :
+                _trsm_diag_block!(Val(true), Val(false), F, pL, ld0, pB, ldb, rb, n, nr, rv)
             ) :
             (
-                unit ? _trsm_diag_block!(Val(false), Val(true), F, pL, ld0, pB, ldb, rb, n, nr, msk, rv) :
-                _trsm_diag_block!(Val(false), Val(false), F, pL, ld0, pB, ldb, rb, n, nr, msk, rv)
+                unit ? _trsm_diag_block!(Val(false), Val(true), F, pL, ld0, pB, ldb, rb, n, nr, rv) :
+                _trsm_diag_block!(Val(false), Val(false), F, pL, ld0, pB, ldb, rb, n, nr, rv)
             )
     end
     # ORDER: solve in the substitution direction. Upper=backward ⇒ the ragged block (bottom) FIRST, then
     # blocks bottom-up (they downdate against it as "solved"). Lower=forward ⇒ blocks top-down, then the
     # ragged block.
-    tmsk = lane < nt
     if up
-        nt > 0 && doblock(nb * W + 1, Val(false), nt, tmsk)
+        nt > 0 && doblock(nb * W + 1, Val(false), nt)
         for bi in nb:-1:1
-            doblock((bi - 1) * W + 1, Val(true), W, tmsk)
+            doblock((bi - 1) * W + 1, Val(true), W)
         end
     else
         for bi in 1:nb
-            doblock((bi - 1) * W + 1, Val(true), W, tmsk)
+            doblock((bi - 1) * W + 1, Val(true), W)
         end
-        nt > 0 && doblock(nb * W + 1, Val(false), nt, tmsk)
+        nt > 0 && doblock(nb * W + 1, Val(false), nt)
     end
     return nothing
 end
@@ -4796,18 +4801,21 @@ end
             vstore(a0, _cvptr(pB, i, j0, ldb));     vstore(a1, _cvptr(pB, i, j0 + 1, ldb))
             vstore(a2, _cvptr(pB, i, j0 + 2, ldb)); vstore(a3, _cvptr(pB, i, j0 + 3, ldb)); i += W
         end
-        # MASKED m tail, one pass, for the 1..W-1 rows left after the full vectors.
+        # The 1..W-1 rows left after the full vectors, one pass: a single row is a one-lane vector, two or
+        # more rows are one masked vector (inactive lanes are never accessed).
         @inbounds if i <= m && !isempty(solved)
-            msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)  # inactive lanes are never accessed (no OOB)
-            a0 = vload(_CVF, _cvptr(pB, i, j0, ldb), msk);     a1 = vload(_CVF, _cvptr(pB, i, j0 + 1, ldb), msk)
-            a2 = vload(_CVF, _cvptr(pB, i, j0 + 2, ldb), msk); a3 = vload(_CVF, _cvptr(pB, i, j0 + 3, ldb), msk)
-            for l in solved
-                xv = vload(_CVF, _cvptr(pB, i, l, ldb), msk)
-                a0 = muladd(_CVF(-cf(j0, l)), xv, a0); a1 = muladd(_CVF(-cf(j0 + 1, l)), xv, a1)
-                a2 = muladd(_CVF(-cf(j0 + 2, l)), xv, a2); a3 = muladd(_CVF(-cf(j0 + 3, l)), xv, a3)
+            @inline function tail4(::Type{Vh}, msk, ii) where {Vh}
+                a0 = _ldm(Vh, _cvptr(pB, ii, j0, ldb), msk);     a1 = _ldm(Vh, _cvptr(pB, ii, j0 + 1, ldb), msk)
+                a2 = _ldm(Vh, _cvptr(pB, ii, j0 + 2, ldb), msk); a3 = _ldm(Vh, _cvptr(pB, ii, j0 + 3, ldb), msk)
+                for l in solved
+                    xv = _ldm(Vh, _cvptr(pB, ii, l, ldb), msk)
+                    a0 = muladd(Vh(-cf(j0, l)), xv, a0); a1 = muladd(Vh(-cf(j0 + 1, l)), xv, a1)
+                    a2 = muladd(Vh(-cf(j0 + 2, l)), xv, a2); a3 = muladd(Vh(-cf(j0 + 3, l)), xv, a3)
+                end
+                _stm(a0, _cvptr(pB, ii, j0, ldb), msk);     _stm(a1, _cvptr(pB, ii, j0 + 1, ldb), msk)
+                _stm(a2, _cvptr(pB, ii, j0 + 2, ldb), msk); _stm(a3, _cvptr(pB, ii, j0 + 3, ldb), msk)
             end
-            vstore(a0, _cvptr(pB, i, j0, ldb), msk);     vstore(a1, _cvptr(pB, i, j0 + 1, ldb), msk)
-            vstore(a2, _cvptr(pB, i, j0 + 2, ldb), msk); vstore(a3, _cvptr(pB, i, j0 + 3, ldb), msk)
+            m - i == 0 ? tail4(Vec{1, Float64}, nothing, i) : tail4(_CVF, Vec(ntuple(l -> l, Val(W))) <= (m - i + 1), i)
         end
         return @inbounds for t in (asc ? (0:(NC - 1)) : ((NC - 1):-1:0))    # in-block 4×4 coupling solve, vectorized over m
             jj = j0 + t; d = unit ? 1.0 : inv(cf(jj, jj)); rng = asc ? (0:(t - 1)) : ((t + 1):(NC - 1)); i = 1
@@ -4819,13 +4827,15 @@ end
                 end
                 unit || (x = x * _CVF(d)); vstore(x, _cvptr(pB, i, jj, ldb)); i += W
             end
-            if i <= m                                        # masked for the 1..W-1 rows left (see doblock)
-                msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)
-                x = vload(_CVF, _cvptr(pB, i, jj, ldb), msk)
-                for u in rng
-                    x = muladd(_CVF(-cf(jj, j0 + u)), vload(_CVF, _cvptr(pB, i, j0 + u, ldb), msk), x)
+            if i <= m                                        # the 1..W-1 rows left (see doblock)
+                @inline function tail1(::Type{Vh}, msk, ii) where {Vh}
+                    x = _ldm(Vh, _cvptr(pB, ii, jj, ldb), msk)
+                    for u in rng
+                        x = muladd(Vh(-cf(jj, j0 + u)), _ldm(Vh, _cvptr(pB, ii, j0 + u, ldb), msk), x)
+                    end
+                    unit || (x = x * Vh(d)); _stm(x, _cvptr(pB, ii, jj, ldb), msk)
                 end
-                unit || (x = x * _CVF(d)); vstore(x, _cvptr(pB, i, jj, ldb), msk)
+                m - i == 0 ? tail1(Vec{1, Float64}, nothing, i) : tail1(_CVF, Vec(ntuple(l -> l, Val(W))) <= (m - i + 1), i)
             end
         end
     end
@@ -4839,13 +4849,15 @@ end
             end
             unit || (x = x * _CVF(d)); vstore(x, _cvptr(pB, i, j, ldb)); i += W
         end
-        return @inbounds if i <= m                           # masked for the 1..W-1 rows left (see doblock)
-            msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)
-            x = vload(_CVF, _cvptr(pB, i, j, ldb), msk)
-            for l in solved
-                x = muladd(_CVF(-cf(j, l)), vload(_CVF, _cvptr(pB, i, l, ldb), msk), x)
+        return @inbounds if i <= m                           # the 1..W-1 rows left (see doblock)
+            @inline function tailc(::Type{Vh}, msk, ii) where {Vh}
+                x = _ldm(Vh, _cvptr(pB, ii, j, ldb), msk)
+                for l in solved
+                    x = muladd(Vh(-cf(j, l)), _ldm(Vh, _cvptr(pB, ii, l, ldb), msk), x)
+                end
+                unit || (x = x * Vh(d)); _stm(x, _cvptr(pB, ii, j, ldb), msk)
             end
-            unit || (x = x * _CVF(d)); vstore(x, _cvptr(pB, i, j, ldb), msk)
+            m - i == 0 ? tailc(Vec{1, Float64}, nothing, i) : tailc(_CVF, Vec(ntuple(l -> l, Val(W))) <= (m - i + 1), i)
         end
     end
     # ORDER (as side-L): ascending ⇒ blocks low→high then tail cols; descending ⇒ tail cols (high) FIRST,

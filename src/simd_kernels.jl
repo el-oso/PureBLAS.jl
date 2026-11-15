@@ -1,8 +1,72 @@
 # SIMD.jl fast paths for the bandwidth-bound Level-1 kernels, real (`Float32`/`Float64`),
 # unit-stride, dense memory. Everything else falls back to the generic scalar loops in
-# level1.jl. Pointer-based `vload`/`vstore` over `GC.@preserve`d buffers; masked vector remainders.
+# level1.jl. Pointer-based `vload`/`vstore` over `GC.@preserve`d buffers; vector remainders: binary pieces for read-modify-write kernels, masked loads for reductions.
 
 using SIMD: Vec, vload, vstore, vifelse, shufflevector
+
+# Store lanes `1:r` of `v` (`0 <= r <= W`) at `p` as binary pieces (see `_tail_pieces`); lanes past `r` are
+# not written. One compile-time case per `r`, so every piece reads a fixed lane range of `v`.
+@generated function _vstore_r(v::Vec{W, T}, p::Ptr{T}, r::Int) where {W, T}
+    sz = sizeof(T)
+    ex = :(nothing)
+    for rr in (W - 1):-1:1
+        stmts = Any[]; off = 0; h = W >> 1
+        while h >= 1
+            if (rr & h) != 0
+                push!(
+                    stmts, h == 1 ? :(unsafe_store!(p, v[$(off + 1)], $(off + 1))) :
+                        :(vstore(shufflevector(v, Val($(ntuple(k -> off + k - 1, h)))), p + $(off * sz)))
+                )
+                off += h
+            end
+            h >>= 1
+        end
+        ex = Expr(:if, :(r == $rr), Expr(:block, stmts...), ex)
+    end
+    return quote
+        $(Expr(:meta, :inline))
+        r >= $W ? vstore(v, p) : $ex
+        return nothing
+    end
+end
+
+# Store the first `kt` of the `W` row vectors in `rows` at `dst + (pp - 1) * mrstride` elements, lanes `1:cs`
+# of each (`1 <= cs <= W`), as binary pieces. The lane count `cs` is dispatched once, so every row store is
+# a fixed-shape access.
+@generated function _vstore_rows!(rows::NTuple{W, Vec{W, T}}, dst::Ptr{T}, mrstride::Int, kt::Int, cs::Int) where {W, T}
+    sz = sizeof(T)
+    function rowstores(rr)
+        out = Any[]
+        for pp in 1:W
+            stmts = Any[]; off = 0; h = W >> 1
+            if rr >= W
+                push!(stmts, :(vstore(rows[$pp], dst + ($(pp - 1)) * mrstride * $sz)))
+            else
+                while h >= 1
+                    if (rr & h) != 0
+                        push!(
+                            stmts, h == 1 ? :(unsafe_store!(dst + ($(pp - 1)) * mrstride * $sz, rows[$pp][$(off + 1)], $(off + 1))) :
+                                :(vstore(shufflevector(rows[$pp], Val($(ntuple(k -> off + k - 1, h)))), dst + (($(pp - 1)) * mrstride + $off) * $sz))
+                        )
+                        off += h
+                    end
+                    h >>= 1
+                end
+            end
+            push!(out, :($pp <= kt && $(Expr(:block, stmts...))))
+        end
+        return Expr(:block, out...)
+    end
+    ex = rowstores(W)
+    for rr in (W - 1):-1:1
+        ex = Expr(:if, :(cs == $rr), rowstores(rr), ex)
+    end
+    return quote
+        $(Expr(:meta, :inline))
+        $ex
+        return nothing
+    end
+end
 
 # Vec type for element `T` at the detected register width (folds to a concrete type — see cpuinfo.jl).
 @inline _vec(::Type{T}) where {T} = Vec{_vwidth(T), T}
@@ -90,7 +154,7 @@ _pair_oddsel(ALG, V, N, q) = ALG === :cplx ?
 # Elementwise kernels are 4-way unrolled (4 vectors / iteration) to keep load/store ports busy and
 # give the prefetcher a longer stride — a single vector/iteration is throughput-starved in the
 # L2-resident regime. `_UNROLL` is defined with the reductions below. Pattern: unrolled body, then
-# a W-at-a-time pass, then one masked vector for the remaining fewer than W elements.
+# a W-at-a-time pass, then binary pieces (`_axpy_tail!`) for the remaining fewer than W elements.
 # `pf` = software-prefetch distance (elements ahead) for the OUTPUT stream `y`. Default 0 → the whole
 # prefetch block const-folds away, so the L1 `axpy` path (and every other 4-arg caller) is byte-identical.
 # `ger` passes `pf>0`: its `y` is a full A column, so at large m the sequential read-modify-write is
@@ -98,6 +162,18 @@ _pair_oddsel(ALG, V, N, q) = ALG === :cplx ?
 # unrolled step (the HW prefetcher can't be relied on there) hides it (measured: Zen5 ger n=4096
 # 0.88→~1.0). The prefetch may reach up to `pf` elements past the column end; `llvm.prefetch` lowers to a
 # non-faulting `prefetcht0`, so that's safe. Distance `pf` is a derived const (see `_GER_PF_BYTES`).
+# `y[i+1:i+r] += a * x[i+1:i+r]` for the `r < W` remaining elements, as binary pieces of widths `h`, `h/2`, …, 1
+# (the bits of `r`, widest first; see `_tail_pieces`). `yc` is the checked-store carrier.
+@inline function _axpy_tail!(yc, px::Ptr{T}, py::Ptr{T}, a, i::Int, r::Int, ::Val{h}) where {T, h}
+    if r & h != 0
+        Vh = Vec{h, T}
+        _vstcb!(yc, 0, py, i, h, muladd(Vh(a), vload(Vh, px + i * sizeof(T)), vload(Vh, py + i * sizeof(T))))
+        i += h
+    end
+    return _axpy_tail!(yc, px, py, a, i, r, Val(h >> 1))
+end
+@inline _axpy_tail!(yc, px::Ptr, py::Ptr, a, i::Int, r::Int, ::Val{0}) = nothing
+
 # The unrolled body, U vectors per iteration. `U` is a `Val` so each arm is its own straight-line code.
 @generated function _axpy_unrolled!(::Val{U}, n::Int, a::T, x, y, pf::Int) where {U, T <: BlasReal}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
@@ -138,10 +214,8 @@ _pair_oddsel(ALG, V, N, q) = ALG === :cplx ?
                 _vstcb!(yc, 0, py, i, $W, muladd(va, vload($V, px + o), vload($V, py + o)))
                 i += $W
             end
-            if i < n                                  # masked remainder: no lane outside x[1:n], y[1:n] is read or written
-                msk = Vec($(Expr(:tuple, (1:W)...))) <= (n - i)
-                o = i * sz
-                _vstcb!(yc, 0, py, i, n - i, muladd(va,vload($V, px + o, msk), vload($V, py + o, msk)), msk)
+            if i < n                                  # remainder: binary pieces, nothing outside x[1:n], y[1:n] is touched
+                _axpy_tail!(yc, px, py, a, i, n - i, Val($(W >> 1)))
             end
         end
         return y
@@ -187,10 +261,8 @@ end
                 _vstcb!(yc, 0, py, i, $W, muladd(vaw, vload($V, px + o), vload($V, py + o)))
                 i += $W
             end
-            if i < n                                  # masked remainder: no lane outside x[1:n], y[1:n] is read or written
-                msk = Vec($(Expr(:tuple, (1:W)...))) <= (n - i)
-                o = i * $sz
-                _vstcb!(yc, 0, py, i, n - i, muladd(vaw, vload($V, px + o, msk), vload($V, py + o, msk)), msk)
+            if i < n                                  # remainder: binary pieces, nothing outside x[1:n], y[1:n] is touched
+                _axpy_tail!(yc, px, py, a, i, n - i, Val($(W >> 1)))
             end
         end
         return y
@@ -259,10 +331,10 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
 # meaning "route from `n`", which is every serial call and keeps them byte-identical to before.
 #
 # WHY IT IS NEEDED HERE AT ALL, and it is req#11 and not an optimisation. Every arm below writes
-# `muladd(a, x[i], y[i])` per element — vector body, W-wide loop and masked tail alike — so the arms
+# `muladd(a, x[i], y[i])` per element — vector body, W-wide loop and tail pieces alike — so the arms
 # carry no cross-element accumulation and agree bitwise AS LONG AS `muladd` contracts the same way in
 # each. That proviso is the gap: `muladd` is licensed to fuse or not at LLVM's discretion, and the arms
-# move which elements land in a full vector and which in the masked tail, so a length-dependent arm
+# move which elements land in a full vector and which in the tail pieces, so a length-dependent arm
 # choice puts the guarantee in the compiler's hands rather than the source's. req#11 does not allow
 # that — any size-keyed branch a chunk body can reach takes its size from the route, not from the
 # slice. So a partitioned caller passes the WHOLE problem's length and computes on its slice, and
@@ -325,7 +397,7 @@ end
 # predicate below is size-keyed, so a worker routing from its own slice length can take the hand-unrolled
 # arm where the unsplit call takes the `@simd ivdep` one. Both arms write one `a * x[i]` per element, with
 # no cross-element accumulation, so they agree bitwise; but which elements land in a full vector and which
-# in the masked tail moves between them, and that is the compiler's rounding to decide once `muladd`-class
+# in the tail pieces moves between them, and that is the compiler's rounding to decide once `muladd`-class
 # contraction is in play. Route from the whole, compute on the slice. Defaults to `-1` = "route from `n`",
 # which is every serial call.
 @inline function _scal_simd!(n::Int, a::T, x, nroute::Int = -1) where {T <: BlasReal}
@@ -456,12 +528,13 @@ end
             # `@simd ivdep` must stay: hand-unrolling was measured WORSE past L1 (see above). `_stcb!`
             # is a plain store in release, so the vectorizer sees the same loop.
             # The loop covers a multiple of `step` elements, so the vectorizer needs no scalar epilogue; the
-            # remaining fewer than `step` elements go through the vector and masked passes below.
+            # remaining fewer than `step` elements go through `_scal_rest!`.
             m = n & -step
             @inbounds @simd ivdep for j in 1:m
                 _stcb!(xc, 0, px, j, a * unsafe_load(px, j))
             end
-            i = m
+            _scal_rest!(xc, px, a, m, n)
+            return x
         end
         # FALSIFIED 2026-07-30 (Zen4, freq-locked, plots.jl op=scal): scal misses AOCL ONLY at
         # n=1e6 (8 MB against a 16 MB L3, doubled by RMW read + dirty-writeback) and gates everywhere
@@ -481,17 +554,26 @@ end
             _vstcb!(xc, 0, px, i + 3W, W, va * vload(V, px + o + 3W * sz))
             i += step
         end
-        while i + W <= n
-            o = i * sz
-            _vstcb!(xc, 0, px, i, W, va * vload(V, px + o))
-            i += W
-        end
-        if i < n                                      # masked remainder: lanes outside x[1:n] are neither read nor written
-            msk = Vec(ntuple(l -> l, Val(W))) <= (n - i)
-            _vstcb!(xc, 0, px, i, n - i, va * vload(V, px + i * sz, msk), msk)
-        end
+        _scal_rest!(xc, px, a, i, n)
     end
     return x
+end
+
+# `x[i+1:n] .*= a` for the elements left after the unrolled loop: whole vectors, then the fewer than W
+# remaining as binary pieces (nothing outside x[1:n] is touched).
+@inline function _scal_rest!(xc, px::Ptr{T}, a, i::Int, n::Int) where {T}
+    V = _vec(T); W = _vwidth(T); sz = sizeof(T); va = V(a)
+    while i + W <= n
+        _vstcb!(xc, 0, px, i, W, va * vload(V, px + i * sz))
+        i += W
+    end
+    if i < n
+        _tail_pieces(i, n - i, Val(W)) do vh, j
+            Vh = Vec{_pw(vh), T}
+            _vstcb!(xc, 0, px, j, _pw(vh), Vh(a) * vload(Vh, px + j * sz))
+        end
+    end
+    return nothing
 end
 
 # Complex scal: x .*= (alr + i·ali). Bandwidth-bound (read-modify-write), so minimise the shuffle chain:
