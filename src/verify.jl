@@ -975,9 +975,8 @@ end
 # past the register file spills vectors to the stack on every k step, which neither the type-stability
 # nor the allocation checks see; these scan the compiled native code. Each call also executes, so
 # every operand is a live buffer. The argtypes are the FULL method signature, trailing `Val{B0}`
-# included: the 7-argument `_microkernel!` and 9-argument `_microkernel_masked!` forms are
-# default-argument forwarders whose native code is a call and a return, which a scan passes without
-# reaching the kernel. The α-scaled `_microkernel!` shares the tile with a different epilogue and
+# included: the 9-argument `_microkernel_masked!` form is a default-argument forwarder whose native
+# code is a call and a return, which a scan passes without reaching the kernel. The α-scaled `_microkernel!` shares the tile with a different epilogue and
 # has its own `B0 = false` and `B0 = true` instances.
 let m = 64, kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
         Ap = ones(mr * kc), Bp = ones(nr * kc), Ck = ones(mr, nr),
@@ -996,10 +995,10 @@ let m = 64, kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
     end
 end
 # Inlining. `@assert_inlined` fails when the call survives as an `:invoke` in the caller's optimized IR.
-# Covered: the width and tuning helpers, the defaulted-`Val{B0}` forwarders of the microkernels (which
-# inline and leave the call to the generated body), the pack routines, and the L1/L2 entries. The
-# 8-argument `_microkernel!` body is `@generated` and deliberately out of line, so it is not asserted.
-# The calls execute, so each operand is a live buffer.
+# Covered: the width and tuning helpers, the generated `_microkernel!` bodies (unscaled and α-scaled;
+# `_mk_full_body` puts an inline meta in each), the defaulted-`Val{B0}` forwarders of the masked and
+# clip microkernels (which inline and leave the call to the generated body), the pack routines, and
+# the L1/L2 entries. The calls execute, so each operand is a live buffer.
 @assert_inlined _vwidth(Float64)
 @assert_inlined _vwidth(Float32)
 @assert_inlined _lanes(_HW, Float64)
@@ -1009,7 +1008,8 @@ let W = _vwidth(Float64), mr = _MR * W, nr = _NR, kc = 64,
         Ap = randn(mr * kc), Bp = randn(nr * kc), Ck = zeros(mr, nr)
     GC.@preserve Ap Bp Ck begin
         ap = pointer(Ap); bp = pointer(Bp); cp = pointer(Ck)
-        @assert_inlined _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR))
+        @assert_inlined _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
+        @assert_inlined _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(false))
         @assert_inlined _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR))
         @assert_inlined _microkernel_clip!(cp, mr, ap, bp, kc, Val(_MR), Val(1), Val(_NR))
     end
@@ -1054,7 +1054,7 @@ let
                 @assert_noboxing _microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(b0))   # req8-ok: loop over literal arms; the probe exercises each arm
                 @assert_noboxing _microkernel_clip!(cptr, ldc, ap, bp, kc, Val(_MR), Val(1), Val(_NR), Val(b0))   # req8-ok: loop over literal arms; the probe exercises each arm
             end
-            @assert_noboxing _microkernel!(cptr, ldc, ap, bp, kc, Val(_MR), Val(_NR))
+            @assert_noboxing _microkernel!(cptr, ldc, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
         end
         kk = 32; Au = randn(mr * kk); Bu = randn(kk * nr); Cu = zeros(mr, nr)
         GC.@preserve Au Bu Cu begin

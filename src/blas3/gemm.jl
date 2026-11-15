@@ -115,6 +115,8 @@ end
 function _mk_full_body(::Type{T}, MR::Int, NR::Int, B0::Bool, SC::Bool) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
+    # `@inline` on a `@generated` signature does not reach its CodeInfo; the meta must be in the body.
+    push!(body.args, Expr(:meta, :inline))
     SC && push!(body.args, :(av = $V(alpha)))
     # prefetch the C output tile (NR columns) so the cold read-modify-write at the end overlaps the
     # k-loop — matters at large n where C doesn't fit cache.
@@ -166,7 +168,7 @@ end
 
 @generated function _microkernel!(
         C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
-        ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)
+        ::Val{MR}, ::Val{NR}, ::Val{B0}
     ) where {T, MR, NR, B0}
     return _mk_full_body(T, MR, NR, B0, false)
 end
