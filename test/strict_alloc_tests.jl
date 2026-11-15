@@ -498,13 +498,15 @@
     run_getrf!(A, A0, ip) = (copyto!(A, A0); P.getrf!(A, ip))
     # Bytes `f` allocates on newly scheduled tasks, after `f` is compiled: `(first, later)`. `first` is the
     # largest first-call count over `tasks` tasks (the call that pays for any per-task workspace);
-    # `later` is the largest over those tasks of the smallest count among that task's remaining calls,
-    # so it is nonzero only when the call allocates every time.
+    # `later` is the largest count over every call after a task's first.
     function fresh_task_bytes(f; tasks = 3, calls = 5)
         f()
         per = [fetch(Threads.@spawn [@allocated(f()) for _ in 1:calls]) for _ in 1:tasks]
-        return (maximum(first, per), maximum(b -> minimum(b[2:end]), per))
+        return (maximum(first, per), maximum(b -> maximum(b[2:end]), per))
     end
+    # Runs for milliseconds and allocates nothing: a control that `@allocated` sees only other threads' allocations.
+    const SPIN_SINK = Ref(0)
+    spin!() = (x = 0; for i in 1:30_000_000; x += i & 3; end; SPIN_SINK[] = x; nothing)
     toy_alloc(x) = zeros(length(x))
     toy_ok(x) = sum(x)
     toy_c_alloc(x::Vector{Float64}) = zeros(length(x))
@@ -775,6 +777,11 @@ end
     using Test, StrictMode, StrictModeTest, LinearAlgebra
     VIOL = StrictMode.StrictViolation
     P = PureBLAS
+    # JET (a StrictModeTest dependency) loads Revise, whose REPL-backend poll allocates on another thread
+    # for about a second after load, and `@allocated` counts every thread. Wait it out, then require a
+    # call that allocates nothing to measure 0.
+    sleep(1.5)
+    @test AllocT.fresh_task_bytes(AllocT.spin!) == (0, 0)
     # Controls, on the same task and on a fresh task.
     x = zeros(8)
     @test_throws VIOL @test_steady_state AllocT.toy_grows!(x)
