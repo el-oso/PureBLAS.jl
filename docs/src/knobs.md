@@ -310,13 +310,13 @@ handle after it is what a person would sweep by hand meanwhile.
 
 ## Tuning constants that are NOT knobs
 
-36 `const _X = <literal>` values in `src/` with no `@load_preference`.
+37 `const _X = <literal>` values in `src/` with no `@load_preference`.
 They are tuning constants all the same — and in a WORSE position than a knob, because
 they cannot be pinned, cannot be tuned by `tune!()`, and were invisible to the audit
 above. `trtrs` is the worked example: its real path (trsm side-L) runs almost entirely
 on these, not on knobs.
 
-**Tier:** 1 Measured · 32 Literal · 3 Unaudited.
+**Tier:** 1 Measured · 33 Literal · 3 Unaudited.
 
 
 ### BLAS-1 SIMD kernels
@@ -409,6 +409,12 @@ on these, not on knobs.
 |---|---|---|---|
 | `_DC_THRESHOLD` | 64 | Literal | divide-and-conquer cut. TUNABLE, algorithm-intrinsic so no formula. |
 | `_SEC_BISECT_CAP` | 0 | Literal | secular-equation bisection cap; 0 disables. TUNABLE. |
+
+### arena
+
+| Const | Value | Tier | Why |
+|---|---|---|---|
+| `_ARENA_CHECK` | false | Literal | a debugging switch, false on every machine; nothing in it depends on the hardware. |
 
 ### gemm (BLAS-3)
 

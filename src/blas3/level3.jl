@@ -5529,6 +5529,16 @@ function trsm!(
         B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Char = 'U',
         transA::Char = 'N', diag::Char = 'N', alpha::Number = true
     )
+    return _trsm_entry!(B, A, side, uplo, transA, diag, alpha, Val(true))
+end
+
+# `trsm!`'s body. `Val(true)` is the public entry; `Val(false)` is the SERIAL entry: the same routes
+# with both pool splits removed, the form a `ThreadArena` body (arena.jl) calls. Each split computes
+# the same bits as the serial solve (req#11), so the two entries agree.
+@inline function _trsm_entry!(
+        B::AbstractMatrix, A::AbstractMatrix, side::Char, uplo::Char, transA::Char, diag::Char,
+        alpha::Number, ::Val{MT}
+    ) where {MT}
     sl = side == 'L'
     k = sl ? size(B, 1) : size(B, 2)
     (size(A, 1) == size(A, 2) == k) || _throw_square(:trsm!, k)
@@ -5543,7 +5553,7 @@ function trsm!(
     # `stride(B,1) != 1`. O(k·n) against the solve's O(k²·n), paid only by inputs that were wrong before.
     if eltype(B) <: BlasReal && !_strided1(B)
         Bc = Matrix(B)
-        trsm!(Bc, A; side, uplo, transA, diag, alpha)
+        _trsm_entry!(Bc, A, side, uplo, transA, diag, alpha, Val(MT))
         copyto!(B, Bc)
         return B
     end
@@ -5729,7 +5739,7 @@ function trsm!(
     # Measured on Zen4, ComplexF64, uplo 'U', transA 'N': B 41x1024 at alpha=3.7-1.25i and B 48x512 at
     # alpha=1 both diverge bitwise at every worker count 2..6. Square power-of-two B does NOT — every
     # band is then a multiple of the 8-row granule — which is why a square-only check passes it.
-    if !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
+    if MT && !sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 2) == k
         nwr = _trsmr_sme_nw(eltype(B), _trsm_workers_r(k, size(B, 1), eltype(B)), k,
                             size(B, 1), A, B, transA == 'C')
         if nwr > 1
@@ -5751,7 +5761,7 @@ function trsm!(
     # width and it is safe by coincidence; `ComplexF32` has twice the lanes and does not.
     # Measured on Zen4: `ComplexF32`, m=n=k=1001, α=3.7-1.25i diverges bitwise at worker counts 2, 4, 5
     # and 6, while the same shape at α=1 and every `ComplexF64` shape tried are bit-identical.
-    if sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 1) == k
+    if MT && sl && !iszero(alpha) && eltype(B) <: BlasReal && _strided1(A) && _strided1(B) && size(B, 1) == k
         nw = _trsm_workers(k, size(B, 2))
         if nw > 1
             rA = _root(A); rB = _root(B)

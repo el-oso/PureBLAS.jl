@@ -4935,6 +4935,7 @@ end
 # `failed`, which the worker loop sets before it stops.
 @inline function _pool_barrier(p::GemmPool{T}, nw::Int) where {T}
     nw <= 1 && return true
+    _ARENA_CHECK && (_arena_idle() || _throw_arena_live())
     # A MONOTONIC COUNTER, NOT A COUNTER THAT RESETS. Resetting it and then flipping a sense is the
     # textbook shape and it deadlocks here: between the reset and the flip, a worker released from
     # THIS barrier can reach the NEXT one and increment, and the reset then erases that arrival, so
@@ -6694,6 +6695,8 @@ end
     # region below allocates, so that is not a hypothetical path.
     published = false
     try
+        # Inside the `try`, so a failed check releases the claim on the way out (nothing is published).
+        _ARENA_CHECK && (_arena_idle() || _throw_arena_live())
         # SIZE THE SHARED BUFFER UNDER THE CLAIM, and before the job is published. The pool grows by
         # `push!`/`resize!`, and doing that outside the claim lets two large callers race on the same
         # vector: they collide exactly at a new high-water mark, and a loser's `resize!` can move
@@ -7762,6 +7765,17 @@ function gemm!(
     elseif transB == 'N' && _lazyop(B) != 'N'
         return gemm!(C, A, parent(B); alpha, beta, transA, transB = _lazyop(B))
     end
+    return _gemm_entry!(C, A, B, alpha, beta, transA, transB, Val(true))
+end
+
+# `gemm!`'s body. `Val(true)` is the public entry; `Val(false)` is the SERIAL entry, the same routes
+# with the worker count fixed at one, so it contains no call into the pool — the form a body holding
+# per-thread borrows (a `ThreadArena` body, arena.jl) calls. One call computes the same bits either
+# way, because the worker count decides who computes a column band and never how.
+@inline function _gemm_entry!(
+        C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix, alpha, beta, transA::Char, transB::Char,
+        ::Val{MT}
+    ) where {MT}
     T = eltype(C)
     tA = transA != 'N'; tB = transB != 'N'
     m = size(C, 1); n = size(C, 2)
@@ -7802,7 +7816,7 @@ function gemm!(
         # and declines the pool later than it needs to. Conservative in the safe direction — it never
         # threads a call too small to pay the join — and a complex floor is a tuning question that
         # needs its own measurement, not a guess here.
-        nw = (T === Float64 || T === Float32 || T === ComplexF64 || T === ComplexF32) &&
+        nw = MT && (T === Float64 || T === Float32 || T === ComplexF64 || T === ComplexF32) &&
             eltype(A) === T && eltype(B) === T && _strided1(A) && _strided1(B) ?
             _gemm_workers(m, n, k) : 1
         # A STRASSEN CALL IS NOT COLUMN-SPLIT, AND THAT IS WHAT KEEPS gemm REPRODUCIBLE.
