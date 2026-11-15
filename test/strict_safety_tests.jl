@@ -146,6 +146,20 @@ end
     @test viol(P._gbmv!, true, false, 4096, 96, 15, 16, 1.0, randn(32, 96), randn(40), 1, 0.0, zeros(96), 1)
     @test viol(P._gemm_core!, zeros(64, 453), randn(64, 64), randn(64, 8), 1.0, 0.0, false, false, false, false, (-1, -1, -1))
 
+    # Controls in the level-1 axpy shape (raw pointers, one element past the end): the harness must name
+    # a store past the end as a WRITE and a load past the end as a READ, so a clean verdict on the real
+    # axpy kernel below is a verdict from a probe that can fail.
+    include(joinpath(@__DIR__, "memsafe_controls.jl"))
+    rs = memsafe_report(ctl_store_past!, 37, 1.5, randn(37), randn(37))
+    @test !isnothing(rs.violation) && occursin("out-of-bounds WRITE", rs.violation)
+    rl = memsafe_report(ctl_load_past!, 37, 1.5, randn(37), randn(37))
+    @test !isnothing(rl.violation) && occursin("out-of-bounds READ", rl.violation)
+
+    # axpy: n = 37 leaves a scalar tail; n = 64 is a multiple of every vector width and unroll step.
+    for T in (Float64, Float32), n in (37, 64)
+        @test clean(P._axpy_simd!, n, T(1.5), randn(T, n), randn(T, n))
+    end
+
     # gemm: unpacked direct reads with partial tiles, and the blocked direct-B masked tail (n = 453).
     for (m, k, n) in ((12, 8, 5), (13, 7, 11), (64, 64, 453))
         @test clean(P.gemm!, zeros(m, n), randn(m, k), randn(k, n))
