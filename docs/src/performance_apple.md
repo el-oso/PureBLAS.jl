@@ -29,8 +29,9 @@ individual samples inside a round is far wider in the small BLAS-3 cells — 1.1
 is not a usable figure.
 
 **Machine:** Apple M6 (`_vwidth(Float64)=2`, `sme_max_svl_b=64` ⇒ 8 FP64 lanes in a ZA tile), unlocked
-clock. The PureBLAS arm of every cell was measured at commit `076b102a` on 2026-11-09; the OpenBLAS
-and Accelerate arms are reused from runs between 2026-09-22 and 2026-09-28. Full provenance:
+clock. The PureBLAS arm of `dot`, `nrm2`, `dznrm2`, `gemvT`, `gemvTrect`, `trsvLT`, `geqp3` and `gesvd`
+was measured at commit `041112f80` on 2026-11-15, and of every other cell at `076b102a` on
+2026-11-09; the OpenBLAS and Accelerate arms are reused from runs between 2026-09-22 and 2026-09-28. Full provenance:
 [`provenance.md`](assets/apple/provenance.md).
 
 ⚠ **The two arms of this cache are six weeks apart, and the box moved between them.** Across the 591
@@ -54,10 +55,11 @@ quiet-box re-measure is what would settle them.
 ## Headline
 
 **The median and the worst cell tell opposite stories here, and the gate reports the worst cell.**
-On the median PureBLAS beats Accelerate on `nrm2` (2.09x), `symv` (1.71x), `gesvd` (1.24x), `iamax`
-(1.13x), `getrf` (1.11x), `axpy` (1.04x) and `spmv` (1.02x), ties it on `dot`, `asum` and `trsvLT`,
-and beats OpenBLAS on the median of every BLAS-3 and LAPACK op measured. Only `nrm2` passes the
-gate; every other op has at least one size where it does not.
+On the median PureBLAS beats Accelerate on `nrm2` (2.98x), `symv` (1.71x), `gesvd` (1.37x), `dot`
+(1.18x), `iamax` (1.13x), `getrf` (1.11x), `gemvT` (1.05x), `axpy` (1.04x), `trsvLT` (1.04x) and
+`spmv` (1.02x), ties it on `asum`, and beats OpenBLAS on the median of every BLAS-3 and LAPACK op
+measured. `nrm2` and `dot` pass the gate — `dot` at 1.006, inside the machine-state term above;
+every other op has at least one size where it does not.
 
 Where the remaining gap lives, by op family:
 
@@ -175,19 +177,19 @@ FAIL can still have a winning median — true below for every op except `asum`, 
 | level | op | vs OpenBLAS | vs Accelerate | gate | verdict |
 |---|---|---|---|---|---|
 | L1 | `axpy` | 1.00 (0.97) | **1.04** (0.65) | 0.648 | FAIL |
-| L1 | `dot` | **1.07** (1.00) | 1.00 (0.96) | 0.961 | FAIL |
-| L1 | `nrm2` | **8.83** (7.00) | **2.09** (1.67) | 1.672 | **PASS** |
+| L1 | `dot` | **1.41** (1.05) | **1.18** (1.01) | 1.006 | **PASS** |
+| L1 | `nrm2` | **12.78** (11.22) | **2.98** (2.67) | 2.667 | **PASS** |
 | L1 | `asum` | 1.00 (0.96) | 1.00 (0.51) | 0.506 | FAIL |
 | L1 | `scal` | 1.00 (0.92) | 0.85 (0.38) | 0.377 | FAIL |
 | L1 | `iamax` | 0.61 (0.50) | **1.13** (0.99) | 0.503 | FAIL |
 | L2 | `gemvN` | **6.41** (1.73) | 0.78 (0.49) | 0.489 | FAIL |
-| L2 | `gemvT` | **2.01** (1.47) | 0.83 (0.32) | 0.318 | FAIL |
+| L2 | `gemvT` | **2.14** (1.84) | **1.05** (0.35) | 0.345 | FAIL |
 | L2 | `ger` | **2.34** (0.91) | 0.87 (0.58) | 0.579 | FAIL |
 | L2 | `symv` | **1.38** (0.66) | **1.71** (0.83) | 0.660 | FAIL |
 | L2 | `trmv` | **1.84** (1.51) | 0.62 (0.36) | 0.359 | FAIL |
 | L2 | `trsv` | **1.44** (1.23) | 0.80 (0.65) | 0.652 | FAIL |
 | L2 | `trsvLN` | **1.35** (1.19) | 0.79 (0.65) | 0.653 | FAIL |
-| L2 | `trsvLT` | **2.05** (1.39) | 1.00 (0.79) | 0.793 | FAIL |
+| L2 | `trsvLT` | **2.13** (1.38) | **1.04** (0.80) | 0.805 | FAIL |
 | L2 | `spmv` | **1.44** (1.03) | **1.02** (0.62) | 0.615 | FAIL |
 | L2 | `gbmvN` | 0.79 (0.74) | 0.73 (0.65) | 0.649 | FAIL |
 | L2 | `sbmv` | **2.79** (2.73) | 0.71 (0.62) | 0.619 | FAIL |
@@ -202,7 +204,7 @@ FAIL can still have a winning median — true below for every op except `asum`, 
 | LP | `potrf` | **1.97** (1.53) | 0.55 (0.36) | 0.358 | FAIL |
 | LP | `getrf` | **1.90** (0.89) | **1.11** (0.52) | 0.515 | FAIL |
 | LP | `geqrf` | **1.21** (1.13) | 0.98 (0.26) | 0.264 | FAIL |
-| LP | `gesvd` | **1.89** (1.02) | **1.24** (0.88) | 0.878 | FAIL |
+| LP | `gesvd` | **1.98** (1.06) | **1.37** (0.91) | 0.908 | FAIL |
 
 203 of 281 measured cells sit below the gate. The worst are `syrk` at n = 32-100, `trmmR` at
 n = 50-100 and `trmm` at n = 50-128. The two binding cells carry a q10-q90 sample spread of 1.15x
@@ -251,6 +253,19 @@ one launch per group because `group=` is an exact match and a comma list matches
 ```
 for g in L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP; do
     julia --project=bench bench/plots.jl bench group=$g arms=pb cold nodraw
+done
+julia --project=bench bench/plots.jl outdir=docs/src/assets/apple
+```
+
+The 2026-11-15 refresh re-measured only the eight ops that reach the BLAS-1 reduction kernels, the
+same way, one op per launch:
+
+```
+for op in dot nrm2 dznrm2 gemvT gemvTrect trsvLT; do
+    julia --project=bench bench/plots.jl bench op=$op arms=pb cold nodraw
+done
+for op in geqp3 gesvd; do
+    julia --project=bench bench/plots.jl bench op=$op arms=pb maxsize=2048 cold nodraw
 done
 julia --project=bench bench/plots.jl outdir=docs/src/assets/apple
 ```
