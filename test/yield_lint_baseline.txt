@@ -8,8 +8,8 @@
 #              It runs measurements through public entries; each of those opens and closes its own scope
 #              between the log lines, so no scope is ever live across one.
 #
-#   gemm.jl  — the M4 thread pool, and these four lines are the ONLY yields in a kernel file, so read
-#              the reason carefully before adding a fifth.
+#   gemm.jl  — the M4 thread pool, and these five lines are the ONLY yields in a kernel file, so read
+#              the reason carefully before adding a sixth.
 #              * `@lock _MT_SETUP_LOCK begin` in `set_num_threads` — the same construction path, serialised
 #                so two concurrent first calls cannot each push a pool. Never reached from `gemm!`.
 #              * `wait(p.evs[i])` — an IDLE worker parking between jobs. It holds no scope: it has not
@@ -23,8 +23,12 @@
 #              * `yield()` in the driver's join — the driver has finished its OWN chunk (so its scope is
 #                closed) and is waiting for the others. The yield is not optional: a driver can run on
 #                the thread a sticky worker is bound to, and a bare spin here deadlocks (seen at 399% CPU).
+#              * `Base.yield()` in `_pool_barrier` — a worker or the driver waiting for the other workers
+#                of ONE job to reach a barrier, after a clock-bounded spin. The driver holds the
+#                process-wide claim, so no other threaded job can be suspended mid-scope (src/arena.jl,
+#                part (c)); a chunk holds no per-thread owner across a barrier.
 #              The invariant still holds everywhere that matters: no `@scope` is live across any of
-#              them, and a chunk BODY — the actual kernel — yields nowhere.
+#              them except under that one claim, and a chunk BODY yields only at a barrier.
 #
 # Add a line here ONLY with such a reason. If a KERNEL ever needs to yield, do not baseline it: switch
 # the owners to `Base.OncePerTask` (one line each, measured 14.7 ns vs 1.5 ns per lookup) instead.
