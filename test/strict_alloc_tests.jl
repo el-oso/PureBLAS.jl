@@ -496,6 +496,15 @@
     run_syrk!(C, A) = P.syrk!(C, A; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)
     run_potrf!(A, A0) = (copyto!(A, A0); P.potrf!(A; uplo = 'L'))
     run_getrf!(A, A0, ip) = (copyto!(A, A0); P.getrf!(A, ip))
+    # Bytes `f` allocates on newly scheduled tasks, after `f` is compiled: `(first, later)`. `first` is the
+    # largest first-call count over `tasks` tasks (the call that pays for any per-task workspace);
+    # `later` is the largest over those tasks of the smallest count among that task's remaining calls,
+    # so it is nonzero only when the call allocates every time.
+    function fresh_task_bytes(f; tasks = 3, calls = 5)
+        f()
+        per = [fetch(Threads.@spawn [@allocated(f()) for _ in 1:calls]) for _ in 1:tasks]
+        return (maximum(first, per), maximum(b -> minimum(b[2:end]), per))
+    end
     toy_alloc(x) = zeros(length(x))
     toy_ok(x) = sum(x)
     toy_c_alloc(x::Vector{Float64}) = zeros(length(x))
@@ -638,11 +647,12 @@ end
         "_gpackws", "_strws", "_symm_scr", "_ws_grow!", "_ws_slot!", "_arena_grow!", "_arena_coalesce!", "_qr_ws",
         "Arena", "L3Workspace",
     )
+    pkgsrc = joinpath(pkgdir(PureBLAS), "src") * "/"      # a checkout need not be named "PureBLAS"
     function stray_sites(f, types)
         r = AC.check_allocs(f, types; ignore_throw = true)
         stray = String[]
         for a in r
-            fr = findfirst(fr -> occursin("PureBLAS", string(fr.file)) && occursin("/src/", string(fr.file)), a.backtrace)
+            fr = findfirst(fr -> startswith(string(fr.file), pkgsrc), a.backtrace)
             if isnothing(fr)   # an allocation reached only through Base (lock, task and scheduler internals)
                 baseonly = all(x -> startswith(string(x.file), "./") || x.file === :unknown || occursin("/share/julia/", string(x.file)), a.backtrace)
                 baseonly || push!(stray, "non-Base frame outside PureBLAS/src")
@@ -764,6 +774,7 @@ end
 @testitem "alloc: @test_steady_state and @test_no_gc_pause on L3 and LAPACK entries" setup = [AllocT] tags = [:checks] begin
     using Test, StrictMode, StrictModeTest, LinearAlgebra
     VIOL = StrictMode.StrictViolation
+    P = PureBLAS
     # Controls, on the same task and on a fresh task.
     x = zeros(8)
     @test_throws VIOL @test_steady_state AllocT.toy_grows!(x)
@@ -781,21 +792,33 @@ end
         @test_no_gc_pause AllocT.run_gemm!(C, A, B)
         @test_no_gc_pause AllocT.run_potrf!(S, S0)
         @test_no_gc_pause AllocT.run_getrf!(LU, A, ip)
-        # A newly scheduled task pays for its per-task workspace again. At n = 64 only syrk! reaches one; at
-        # every larger size every entry does.
-        if n == 64
-            @test_steady_state AllocT.run_gemm!(C, A, B) fresh_task = true
-            @test_steady_state AllocT.run_trsm!(U, B, B0) fresh_task = true
-            @test_steady_state AllocT.run_potrf!(S, S0) fresh_task = true
-            @test_steady_state AllocT.run_getrf!(LU, A, ip) fresh_task = true
-            @test_throws VIOL @test_steady_state AllocT.run_syrk!(C, A) fresh_task = true
-        else
+        # A newly scheduled task pays for any per-task workspace the route touches. Only gemm's route is a
+        # single predicate: the blocked path packs into `_gpackws`, the unpacked path touches no
+        # workspace. The other entries reach per-task state through recursion over sub-gemms, so what
+        # holds on every CPU is that the calls after the first on the same task allocate nothing; the
+        # first call's bytes are recorded.
+        gemm_ws = !P._use_unpacked(n, n, n)
+        if gemm_ws
             @test_throws VIOL @test_steady_state AllocT.run_gemm!(C, A, B) fresh_task = true
-            @test_throws VIOL @test_steady_state AllocT.run_trsm!(U, B, B0) fresh_task = true
-            @test_throws VIOL @test_steady_state AllocT.run_syrk!(C, A) fresh_task = true
-            @test_throws VIOL @test_steady_state AllocT.run_potrf!(S, S0) fresh_task = true
-            @test_throws VIOL @test_steady_state AllocT.run_getrf!(LU, A, ip) fresh_task = true
+        else
+            @test_steady_state AllocT.run_gemm!(C, A, B) fresh_task = true
         end
+        for (name, f) in (
+                ("gemm", () -> AllocT.run_gemm!(C, A, B)), ("trsm", () -> AllocT.run_trsm!(U, B, B0)),
+                ("syrk", () -> AllocT.run_syrk!(C, A)), ("potrf", () -> AllocT.run_potrf!(S, S0)),
+                ("getrf", () -> AllocT.run_getrf!(LU, A, ip)),
+            )
+            first_bytes, later_bytes = AllocT.fresh_task_bytes(f)
+            @info "fresh-task bytes" cpu = Sys.CPU_NAME op = name n first_call = first_bytes later_calls = later_bytes
+            @test later_bytes == 0
+            name == "gemm" && @test (first_bytes > 0) == gemm_ws
+        end
+    end
+    # Controls for the later-call property: a call that allocates every time fails it, a per-task
+    # initializer does not.
+    @test AllocT.fresh_task_bytes(() -> AllocT.toy_grows!(x))[2] > 0
+    let (b1, b2) = AllocT.fresh_task_bytes(() -> AllocT.toy_pertask!(x))
+        @test b1 > 0 && b2 == 0
     end
     # A collection pause is detected when the call allocates.
     @test_throws VIOL @test_no_gc_pause AllocT.toy_grows_big!(x) samples = 400
@@ -898,7 +921,8 @@ end
     @test StrictMode.steady(r)
     @test !StrictMode.steady(StrictMode.steady_state_report(AllocT.toy_grows!, x; repeats = 3))
     @test !StrictMode.steady(StrictMode.steady_state_report(AllocT.toy_pertask!, x; fresh_task = true, repeats = 3))
-    @test !StrictMode.steady(StrictMode.steady_state_report(AllocT.run_gemm!, C, A, B; fresh_task = true, repeats = 3))
+    # A fresh task pays for gemm's per-task pack buffers only on the blocked route.
+    @test StrictMode.steady(StrictMode.steady_state_report(AllocT.run_gemm!, C, A, B; fresh_task = true, repeats = 3)) == PureBLAS._use_unpacked(n, n, n)
     @test StrictMode.gc_free(StrictMode.gc_pause_report(AllocT.run_gemm!, C, A, B; samples = 300))
     @test !StrictMode.gc_free(StrictMode.gc_pause_report(AllocT.toy_grows_big!, x; samples = 400))
 end
