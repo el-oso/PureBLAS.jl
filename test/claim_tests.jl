@@ -123,8 +123,9 @@ end
                         @test all(bitsame.(free, want))
                         # HOLD THE CLAIM: every pool's generation stays put, the loss is counted,
                         # bits are serial.
-                        @test !Threads.atomic_cas!(P._MT_CLAIM, false, true)
-                        try
+                        acquired = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
+                        @test acquired
+                        acquired && try
                             j0 = alljobs(); l0 = P._MT_LOST[]
                             held = f()
                             @test alljobs() == j0

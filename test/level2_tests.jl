@@ -490,8 +490,11 @@ end
         lost0 = P._MT_LOST[]
         held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
         @test held
-        Af = copy(A0); P.ger!(0.75, x, y, Af)
-        P._MT_CLAIM[] = false
+        held && try
+            Af = copy(A0); P.ger!(0.75, x, y, Af)
+        finally
+            P._MT_CLAIM[] = false
+        end
         @test P._MT_LOST[] == lost0 + 1
         @test Af == A2
         # CONCURRENT: several callers at once, so all but one LOSE the claim and run the fallback.
@@ -628,8 +631,11 @@ end
                 lost0 = P._MT_LOST[]
                 held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
-                yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β)
-                P._MT_CLAIM[] = false
+                held && try
+                    yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β)
+                finally
+                    P._MT_CLAIM[] = false
+                end
                 @test P._MT_LOST[] == lost0 + 1
                 @test yf == y2
             end
@@ -747,8 +753,11 @@ end
                 lost0 = P._MT_LOST[]
                 held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
-                yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β, trans = 'T')
-                P._MT_CLAIM[] = false
+                held && try
+                    yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β, trans = 'T')
+                finally
+                    P._MT_CLAIM[] = false
+                end
                 @test P._MT_LOST[] == lost0 + 1
                 @test yf == y2
             end
@@ -835,8 +844,11 @@ end
                 lost0 = P._MT_LOST[]
                 held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
-                xf = copy(x0); tmv!(A, xf, ul)
-                P._MT_CLAIM[] = false
+                held && try
+                    xf = copy(x0); tmv!(A, xf, ul)
+                finally
+                    P._MT_CLAIM[] = false
+                end
                 @test P._MT_LOST[] == lost0 + 1
                 @test bitsame(xf, want)
             end
@@ -951,8 +963,11 @@ end
             lost0 = P._MT_LOST[]
             held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
             @test held
-            xf = copy(x0); nmv!(A, xf, ul, dg)
-            P._MT_CLAIM[] = false
+            held && try
+                xf = copy(x0); nmv!(A, xf, ul, dg)
+            finally
+                P._MT_CLAIM[] = false
+            end
             @test P._MT_LOST[] == lost0 + 1
             @test bitsame(xf, want)
             tasks = [@spawn (t = copy(x0); nmv!(A, t, ul, dg); t) for _ in 1:(2 * nt)]
@@ -1084,8 +1099,11 @@ end
                 lost0 = P._MT_LOST[]
                 held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
-                yf = copy(yi); P.symv!(yf, Ai, xi; uplo = 'L', alpha = α, beta = β)
-                P._MT_CLAIM[] = false
+                held && try
+                    yf = copy(yi); P.symv!(yf, Ai, xi; uplo = 'L', alpha = α, beta = β)
+                finally
+                    P._MT_CLAIM[] = false
+                end
                 @test P._MT_LOST[] == lost0 + 1
                 @test yf == y2
             end
@@ -1213,8 +1231,11 @@ end
         lost0 = P._MT_LOST[]
         held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
         @test held
-        yf = copy(y0); P.gbmv!(yf, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
-        P._MT_CLAIM[] = false
+        held && try
+            yf = copy(y0); P.gbmv!(yf, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
+        finally
+            P._MT_CLAIM[] = false
+        end
         @test P._MT_LOST[] == lost0 + 1
         @test yf == y2
         tasks = [@spawn (t = copy(y0); P.gbmv!(t, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]
