@@ -1168,7 +1168,7 @@ end
             P.set_num_threads(nthreads())
             lost0 = P._MT_LOST[]
             # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
-            tasks = [@spawn let w = copy(S); P.potrf!(w; uplo = 'L'); w end for _ in 1:(nthreads() + 1)]
+            tasks = [@spawn (let w = copy(S); P.potrf!(w; uplo = 'L'); w end) for _ in 1:(nthreads() + 1)]
             got = fetch.(tasks)
             @test allunique(objectid.(got))
             for g in got

@@ -500,7 +500,7 @@ end
         # CONCURRENT: several callers at once, so all but one LOSE the claim and run the fallback.
         # Every result must equal the serial one, which is what pins the fallback to the same arm.
         # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
-        tasks = [@spawn let w = copy(A0); P.ger!(0.75, x, y, w); w end for _ in 1:(nt + 1)]
+        tasks = [@spawn (let w = copy(A0); P.ger!(0.75, x, y, w); w end) for _ in 1:(nt + 1)]
         got = fetch.(tasks)
         @test allunique(objectid.(got))
         for g in got
@@ -645,7 +645,7 @@ end
             # CONCURRENT: all but one caller loses the claim and runs the fallback, which must reach
             # the same route as the winner's chunks.
             # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
-            tasks = [@spawn let w = copy(y0); P.gemv!(w, A, x; alpha = α, beta = β); w end for _ in 1:(2 * nt)]
+            tasks = [@spawn (let w = copy(y0); P.gemv!(w, A, x; alpha = α, beta = β); w end) for _ in 1:(2 * nt)]
             got = fetch.(tasks)
             @test allunique(objectid.(got))
             for g in got
@@ -768,7 +768,7 @@ end
                 @test yf == y2
             end
             # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
-            tasks = [@spawn let w = copy(y0); P.gemv!(w, A, x; alpha = α, beta = β, trans = 'T'); w end for _ in 1:(2 * nt)]
+            tasks = [@spawn (let w = copy(y0); P.gemv!(w, A, x; alpha = α, beta = β, trans = 'T'); w end) for _ in 1:(2 * nt)]
             got = fetch.(tasks)
             @test allunique(objectid.(got))
             for g in got
@@ -862,7 +862,7 @@ end
                 @test bitsame(xf, want)
             end
             # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
-            tasks = [@spawn let w = copy(x0); tmv!(A, w, ul); w end for _ in 1:(2 * nt)]
+            tasks = [@spawn (let w = copy(x0); tmv!(A, w, ul); w end) for _ in 1:(2 * nt)]
             got = fetch.(tasks)
             @test allunique(objectid.(got))
             for g in got
@@ -983,7 +983,7 @@ end
             @test P._MT_LOST[] == lost0 + 1
             @test bitsame(xf, want)
             # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
-            tasks = [@spawn let w = copy(x0); nmv!(A, w, ul, dg); w end for _ in 1:(2 * nt)]
+            tasks = [@spawn (let w = copy(x0); nmv!(A, w, ul, dg); w end) for _ in 1:(2 * nt)]
             got = fetch.(tasks)
             @test allunique(objectid.(got))
             for g in got
@@ -1123,7 +1123,7 @@ end
                 @test yf == y2
             end
             # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
-            tasks = [@spawn let w = copy(yi); P.symv!(w, Ai, xi; uplo = 'L', alpha = α, beta = β); w end for _ in 1:(nt + 1)]
+            tasks = [@spawn (let w = copy(yi); P.symv!(w, Ai, xi; uplo = 'L', alpha = α, beta = β); w end) for _ in 1:(nt + 1)]
             got = fetch.(tasks)
             @test allunique(objectid.(got))
             for g in got
@@ -1257,7 +1257,7 @@ end
         @test P._MT_LOST[] == lost0 + 1
         @test yf == y2
         # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
-        tasks = [@spawn let w = copy(y0); P.gbmv!(w, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5); w end for _ in 1:(2 * nt)]
+        tasks = [@spawn (let w = copy(y0); P.gbmv!(w, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5); w end) for _ in 1:(2 * nt)]
         got = fetch.(tasks)
         @test allunique(objectid.(got))
         for g in got
