@@ -1167,9 +1167,12 @@ end
             P.set_num_threads(1); r = copy(S); P.potrf!(r; uplo = 'L')
             P.set_num_threads(nthreads())
             lost0 = P._MT_LOST[]
-            tasks = [@spawn (t = copy(S); P.potrf!(t; uplo = 'L'); t) for _ in 1:(nthreads() + 1)]
-            for t in tasks
-                @test bitsame(fetch(t), r)
+            # Each task owns its operand (`let`), so no variable is shared across the spawned closures.
+            tasks = [@spawn let w = copy(S); P.potrf!(w; uplo = 'L'); w end for _ in 1:(nthreads() + 1)]
+            got = fetch.(tasks)
+            @test allunique(objectid.(got))
+            for g in got
+                @test bitsame(g, r)
             end
             @test P._MT_LOST[] > lost0
         end
