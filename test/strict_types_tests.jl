@@ -9,6 +9,9 @@
 @testmodule StrictTypesT begin
     using StrictMode, StrictModeTest, Test
 
+    # The `@test_noboxing` sweep passes only on StrictMode >= 0.5.11; 0.5.10 rejects entries 0.5.11 accepts.
+    @assert pkgversion(StrictMode) >= v"0.5.11" "strict_types_tests.jl requires StrictMode >= 0.5.11, found $(pkgversion(StrictMode))"
+
     # Names of `OptimizationFailureReport` frames, keyed by call label. JET reports a frame it could not
     # optimize (a recursive cycle) as information: the types are known, so this is not instability.
     const OPTFAIL = Dict{String, Vector{String}}()
@@ -77,15 +80,15 @@
         return esc(:($(chk)($v; broken = true)))
     end
 
-    # A trim verdict judged against an exact allowlist of call labels. An allowed call must be rejected,
-    # for exactly the interpolation helpers the in-process verifier leaves unresolved on stock Base;
-    # every other call must be accepted.
+    # A trim verdict judged against an allowlist of call labels. An allowed call is accepted, or rejected
+    # for exactly the interpolation helpers the in-process verifier leaves unresolved on stock Base: whether
+    # it is rejected depends on which route the host CPU takes (a throw reachable only on wide-vector
+    # hardware is an unresolved call only there). Any other unresolved call fails, allowed or not.
     const INTERP_CALLS = Set(["Base._str_sizehint", "Base.print"])
     function trim_check(r, allow)
         unresolved = Set(String(m.captures[1]) for m in eachmatch(r"unresolved call: :\(([\w.!]+)\(", r.msg))
         if r.label in allow
-            @test !r.ok
-            @test unresolved == INTERP_CALLS
+            @test r.ok || unresolved == INTERP_CALLS
         else
             r.ok || @error "trim rejection outside the allowlist" call = r.label finding = r.msg
             @test r.ok
@@ -960,10 +963,11 @@ end
 
 # ── TRIM COMPATIBILITY: the exact tolerated set ────────────────────────────────────────────────────
 # `@test_trim_compatible` runs juliac's verifier in-process against stock Base. Every signature below
-# is run WITHOUT a tolerance and must be accepted, except the ones in `ALLOW`: those are rejected only
-# for `Base._str_sizehint` / `Base.print`, which stock Base leaves unresolved for a string interpolation
-# on a throw path (any interpolation, not just long ones; see StrictModeTest issue 19) and juliac's
-# patched Base resolves. An allowed signature that is accepted, or rejected for any other call, fails.
+# is run WITHOUT a tolerance and must be accepted, except the ones in `ALLOW`: those may be rejected, but
+# only for `Base._str_sizehint` / `Base.print`, which stock Base leaves unresolved for a string
+# interpolation on a throw path (any interpolation, not just long ones; see StrictModeTest issue 19) and
+# juliac's patched Base resolves. Whether an allowed signature reaches such a throw depends on the CPU's
+# route, so accepted is also fine; rejected for any other call fails.
 @testitem "StrictTypes: trim verifier accepts every LAPACK signature except the interpolated-throw set" tags = [:checks] setup = [StrictTypesT] begin
     using StrictModeTest, StrictMode, TrimCheck, LinearAlgebra
     P = PureBLAS; V = StrictTypesT
