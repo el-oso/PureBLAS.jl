@@ -84,6 +84,13 @@
     @test P._at_cpotf2_mr(tigerlake) == 1    # Intel native-512
     @test P._at_cpotrf_base(tigerlake) == 64
     @test P._double_pumped(zen4) && !P._double_pumped(zen5) && !P._double_pumped(tigerlake)
+    # FMA chains that cover one latency, in register-wide ops (`_RED_CHAINS` for dot/sumsq). A
+    # double-pumped part needs half as many; at 4 the reductions keep their four-chain kernel.
+    @test P._at_fma_chains(zen4) == P._at_fma_chains(zen5m) == 4
+    @test P._at_fma_chains(zen3) == P._at_fma_chains(zen5) == P._at_fma_chains(tigerlake) == 8
+    @test P._at_fma_chains(hw(16, 64 * 1024, 4 * 1024^2, 0, :Apple, 0x00, 32)) == 8   # arm64 NEON; the formula reads no cache size
+    @test P._RED_CHAINS == max(P._UNROLL, P._at_fma_chains(P._HW))
+    @test P._gemvn_mr_latency() == P._at_fma_chains(P._HW)
 
     # ── Real-axpy DRAM arm (replaced a OncePerProcess duel, 2026-08-19) ───────────────────────────────
     # Only the double-pumped part takes the narrow 256-bit phase arm; native-256 and native-512 both take
