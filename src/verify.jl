@@ -1394,12 +1394,12 @@ let m = 64, A = ones(m, m), B = ones(m, m), C = zeros(m, m), x = ones(m), y = ze
     trsm3!(B, A) = trsm!(B, A)
     @assert_concurrency_safe self = 2 gemm3!(C, A, B)
     @assert_concurrency_safe self = 3 gemm3!(C, A, B)
-    @assert_concurrency_safe self = 2 syrk3!(C, A)
+    @assert_concurrency_safe self = 2 max_depth = 12 syrk3!(C, A)
     @assert_concurrency_safe self = 2 gemv3!(y, A, x)
     @assert_concurrency_safe self = 3 gemv3!(y, A, x)
     @assert_concurrency_safe self = 3 axpy3!(y, 2.0, x)
-    @assert_concurrency_safe self = 2 trmm3!(copy(B), A)
-    @assert_concurrency_safe self = 2 trsm3!(copy(B), A + 64 * LinearAlgebra.I)
+    @assert_concurrency_safe self = 2 max_depth = 12 trmm3!(copy(B), A)
+    @assert_concurrency_safe self = 2 max_depth = 12 trsm3!(copy(B), A + 64 * LinearAlgebra.I)
 end
 # Scoped-handle escape. `@assert_noescape` reports a value of a type registered with `register_scoped!`
 # (an arena handle) that leaves the frame of the call: returned, stored globally, or captured. The arena
