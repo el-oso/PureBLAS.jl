@@ -129,16 +129,6 @@ const KNOWN_WIDE_SPILL = union(
     )
 )
 
-# Kernels whose scalar loops are the remainder after the vector loops. `scalar_fp_loops` reports them.
-const SCALAR_TAIL = Set(
-    [
-        "_trsm_tile_L_f64!", "_trsm_tile_R_f64!", "_axpy_unrolled! U=4", "_axpy_phase!", "_axpy_simd!",
-        "_scal_simd!", "_dot_simd", "_dot_blocked", "_dot_blocked_serial", "_asum_simd", "_sumsq_simd (nrm2)",
-        "_iamax_tree!", "_iamax_thresh!", "_iamax_simd!", "_pack_A_simd!", "_pack_A_simd_T!", "_pack_B_val!",
-        "_pack_B_dyn!", "_pack_A_tri_simd!", "_pack_A_cmplx_simd!", "_pack_B_cmplx!",
-    ]
-)
-
 native_lines(f, T) = split(sprint(io -> code_native(io, f, T; debuginfo = :none)), '\n')
 
 # Spans (first line, last line) of every loop, found as a label targeted by a later backward jump.
@@ -276,7 +266,7 @@ end
     using StrictMode, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
-        KNOWN_WIDE_SPILL, SCALAR_TAIL
+        KNOWN_WIDE_SPILL
     @info "kernel checks run on $(box())"
     # Control: a defaulted-argument forwarder is a thin trampoline. Its own code holds a call and no
     # vector arithmetic, so a check pointed at it reads nothing and the real-body test must reject it.
@@ -305,7 +295,7 @@ end
     using StrictMode, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
-        KNOWN_WIDE_SPILL, SCALAR_TAIL
+        KNOWN_WIDE_SPILL
     N = 3 * NVREG
     # Control: a toy with 3x the register file of live accumulators spills inside its loop.
     toy = StrictMode.spill_report(toy_spill!, (Ptr{Float64}, Int, Val{N}))
@@ -361,7 +351,7 @@ end
     using StrictMode, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
-        KNOWN_WIDE_SPILL, SCALAR_TAIL
+        KNOWN_WIDE_SPILL
     Pd = Ptr{Float64}
     # Controls: a strict-order reduction and a recurrence emit no vector code.
     @test !StrictMode.kernel_report(toy_strict_sum, (Pd, Int)).vectorized
@@ -406,7 +396,7 @@ end
     using StrictMode, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
-        KNOWN_WIDE_SPILL, SCALAR_TAIL
+        KNOWN_WIDE_SPILL
     Pd = Ptr{Float64}
     # Controls: scalar loops are flagged.
     @test StrictMode.scalar_fp_loops(toy_strict_sum, (Pd, Int))
@@ -428,24 +418,16 @@ end
     for (name, f, T) in KERNELS
         r = info(name)
         @testset "$name" begin
-            if name in SCALAR_TAIL
-                # PureBLAS's scalar loops here are remainders; the check reports them as hot loops.
-                @test_broken !r.scalar
-            else
-                @test !r.scalar
-            end
+            @test !r.scalar
         end
     end
-    # `_trsm_tile_L_f64!` also holds a scalar W x W in-block diagonal solve per block (a hot loop, not a
-    # remainder); the report cannot separate it from the remainder row loop.
-    @test info("_trsm_tile_L_f64!").scalar
 end
 
 @testitem "kernel: register_report" tags = [:checks] setup = [KernelChecks] begin
     using StrictMode, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
-        KNOWN_WIDE_SPILL, SCALAR_TAIL
+        KNOWN_WIDE_SPILL
     N = 3 * NVREG
     if W >= 8
         toy = StrictMode.register_report(toy_spill!, (Ptr{Float64}, Int, Val{N}))
@@ -467,7 +449,7 @@ end
     using StrictMode, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
-        KNOWN_WIDE_SPILL, SCALAR_TAIL
+        KNOWN_WIDE_SPILL
     if Base.find_package("LLVM_full_jll") === nothing
         @test_skip "llvm-mca needs LLVM_full_jll, which is not in this test environment" == ""
     else

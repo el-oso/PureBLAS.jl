@@ -1,6 +1,6 @@
 # SIMD.jl fast paths for the bandwidth-bound Level-1 kernels, real (`Float32`/`Float64`),
 # unit-stride, dense memory. Everything else falls back to the generic scalar loops in
-# level1.jl. Pointer-based `vload`/`vstore` over `GC.@preserve`d buffers; masked scalar tail.
+# level1.jl. Pointer-based `vload`/`vstore` over `GC.@preserve`d buffers; masked vector remainders.
 
 using SIMD: Vec, vload, vstore, vifelse, shufflevector
 
@@ -90,7 +90,7 @@ _pair_oddsel(ALG, V, N, q) = ALG === :cplx ?
 # Elementwise kernels are 4-way unrolled (4 vectors / iteration) to keep load/store ports busy and
 # give the prefetcher a longer stride — a single vector/iteration is throughput-starved in the
 # L2-resident regime. `_UNROLL` is defined with the reductions below. Pattern: unrolled body, then
-# a W-at-a-time pass, then a scalar tail.
+# a W-at-a-time pass, then one masked vector for the remaining fewer than W elements.
 # `pf` = software-prefetch distance (elements ahead) for the OUTPUT stream `y`. Default 0 → the whole
 # prefetch block const-folds away, so the L1 `axpy` path (and every other 4-arg caller) is byte-identical.
 # `ger` passes `pf>0`: its `y` is a full A column, so at large m the sequential read-modify-write is
@@ -138,10 +138,10 @@ _pair_oddsel(ALG, V, N, q) = ALG === :cplx ?
                 _vstcb!(yc, 0, py, i, $W, muladd(va, vload($V, px + o), vload($V, py + o)))
                 i += $W
             end
-            while i < n
-                j = i + 1
-                _stcb!(yc, 0, py, j, muladd(a, unsafe_load(px, j), unsafe_load(py, j)))
-                i += 1
+            if i < n                                  # masked remainder: no lane outside x[1:n], y[1:n] is read or written
+                msk = Vec($(Expr(:tuple, (1:W)...))) <= (n - i)
+                o = i * sz
+                _vstcb!(yc, 0, py, i, n - i, muladd(va,vload($V, px + o, msk), vload($V, py + o, msk)), msk)
             end
         end
         return y
@@ -187,10 +187,10 @@ end
                 _vstcb!(yc, 0, py, i, $W, muladd(vaw, vload($V, px + o), vload($V, py + o)))
                 i += $W
             end
-            while i < n
-                j = i + 1
-                _stcb!(yc, 0, py, j, muladd(a, unsafe_load(px, j), unsafe_load(py, j)))
-                i += 1
+            if i < n                                  # masked remainder: no lane outside x[1:n], y[1:n] is read or written
+                msk = Vec($(Expr(:tuple, (1:W)...))) <= (n - i)
+                o = i * $sz
+                _vstcb!(yc, 0, py, i, n - i, muladd(vaw, vload($V, px + o, msk), vload($V, py + o, msk)), msk)
             end
         end
         return y
@@ -259,10 +259,10 @@ const _AXPY_DRAM = @load_preference("axpy_dram", _at_axpy_dram(_HW))::Int
 # meaning "route from `n`", which is every serial call and keeps them byte-identical to before.
 #
 # WHY IT IS NEEDED HERE AT ALL, and it is req#11 and not an optimisation. Every arm below writes
-# `muladd(a, x[i], y[i])` per element — vector body, W-wide loop and scalar tail alike — so the arms
+# `muladd(a, x[i], y[i])` per element — vector body, W-wide loop and masked tail alike — so the arms
 # carry no cross-element accumulation and agree bitwise AS LONG AS `muladd` contracts the same way in
 # each. That proviso is the gap: `muladd` is licensed to fuse or not at LLVM's discretion, and the arms
-# move which elements land in a vector lane and which in the scalar tail, so a length-dependent arm
+# move which elements land in a full vector and which in the masked tail, so a length-dependent arm
 # choice puts the guarantee in the compiler's hands rather than the source's. req#11 does not allow
 # that — any size-keyed branch a chunk body can reach takes its size from the route, not from the
 # slice. So a partitioned caller passes the WHOLE problem's length and computes on its slice, and
@@ -324,8 +324,8 @@ end
 # `nroute` — THE ROUTE WIDTH, as on `_axpy_simd!` above and for the same req#11 reason: the L1-residency
 # predicate below is size-keyed, so a worker routing from its own slice length can take the hand-unrolled
 # arm where the unsplit call takes the `@simd ivdep` one. Both arms write one `a * x[i]` per element, with
-# no cross-element accumulation, so they agree bitwise; but which elements land in a vector lane and which
-# in the scalar tail moves between them, and that is the compiler's rounding to decide once `muladd`-class
+# no cross-element accumulation, so they agree bitwise; but which elements land in a full vector and which
+# in the masked tail moves between them, and that is the compiler's rounding to decide once `muladd`-class
 # contraction is in play. Route from the whole, compute on the slice. Defaults to `-1` = "route from `n`",
 # which is every serial call.
 @inline function _scal_simd!(n::Int, a::T, x, nroute::Int = -1) where {T <: BlasReal}
@@ -455,10 +455,13 @@ end
         if nrt * sizeof(T) > _L1_BYTES   # `nrt`, not `n`: route from the whole problem (see the header)
             # `@simd ivdep` must stay: hand-unrolling was measured WORSE past L1 (see above). `_stcb!`
             # is a plain store in release, so the vectorizer sees the same loop.
-            @inbounds @simd ivdep for j in 1:n
+            # The loop covers a multiple of `step` elements, so the vectorizer needs no scalar epilogue; the
+            # remaining fewer than `step` elements go through the vector and masked passes below.
+            m = n & -step
+            @inbounds @simd ivdep for j in 1:m
                 _stcb!(xc, 0, px, j, a * unsafe_load(px, j))
             end
-            return x
+            i = m
         end
         # FALSIFIED 2026-07-30 (Zen4, freq-locked, plots.jl op=scal): scal misses AOCL ONLY at
         # n=1e6 (8 MB against a 16 MB L3, doubled by RMW read + dirty-writeback) and gates everywhere
@@ -483,10 +486,9 @@ end
             _vstcb!(xc, 0, px, i, W, va * vload(V, px + o))
             i += W
         end
-        while i < n
-            j = i + 1
-            _stcb!(xc, 0, px, j, a * unsafe_load(px, j))
-            i += 1
+        if i < n                                      # masked remainder: lanes outside x[1:n] are neither read nor written
+            msk = Vec(ntuple(l -> l, Val(W))) <= (n - i)
+            _vstcb!(xc, 0, px, i, n - i, va * vload(V, px + i * sz, msk), msk)
         end
     end
     return x
@@ -1060,7 +1062,8 @@ end
 
 # Reductions use 4 independent accumulators so the FMA/add latency is hidden — a single
 # accumulator is latency-bound (serial dependency) and leaves the pipeline idle at L1-resident
-# sizes. 4 chains × W lanes per iteration; then a W-at-a-time pass, then a scalar tail.
+# sizes. 4 chains × W lanes per iteration; then a W-at-a-time pass, then one masked vector folded into
+# the accumulator before the horizontal sum.
 # PDM: Literal — DERIVABLE, not yet derived: 4 chains x W lanes, an ILP count tied to _ILP_TARGET.
 const _UNROLL = 4
 
@@ -1093,7 +1096,7 @@ const _UNROLL = 4
 # 8.63e-16 whole against 2.24e-16 blocked, because the per-block fold is a shallower tree than one long
 # chain. n=1e6: 1.73e-16 whole, 7.59e-16 blocked — comparable.
 #
-# B MUST BE A MULTIPLE OF `_UNROLL * _vwidth(T)`, or a block grows its own scalar tail and the fold order
+# B MUST BE A MULTIPLE OF `_UNROLL * _vwidth(T)`, or a block grows its own masked remainder and the fold order
 # starts depending on where tails fall, which is the invariant this whole construction exists to hold.
 # PDM: Literal — 256 blocks' worth of fold overhead per block, validated by the table above rather than derived; the FORM (a multiple of the kernel's step, so it scales with unroll and ISA width) is what carries across machines. | tune: n/a, the tax is <1% across the measured range
 @inline _red_block(::Type{T}) where {T} = 256 * _UNROLL * _vwidth(T)   # req8-ok: validated literal, table above
@@ -1137,9 +1140,8 @@ end
     # (1.004) into a failing one. `nblk ÷ 2` declines that case and costs nothing above it.
     B = _red_block(T)
     if n > B
-        nblk = cld(n, B)
-        nw = min(_l1_workers(2 * n * sizeof(T), n, T), nblk ÷ 2)
-        nw > 1 && return _dot_threaded(n, x, y, nw)
+        nw = _l1_workers(2 * n * sizeof(T), n, T)
+        nw > 1 && (nw = min(nw, cld(n, B) ÷ 2)) > 1 && return _dot_threaded(n, x, y, nw)
     end
     return _dot_blocked_serial(n, x, y, T)
 end
@@ -1235,12 +1237,11 @@ end
             acc = muladd(vload(V, px + o), vload(V, py + o), acc)
             i += W
         end
-        s = sum(acc)
-        while i < n
-            j = i + 1
-            s += unsafe_load(px, j) * unsafe_load(py, j)
-            i += 1
+        if i < n                                  # masked remainder folded into `acc`; inactive lanes load 0 and add nothing
+            msk = Vec(ntuple(l -> l, Val(W))) <= (n - i)
+            acc = muladd(vload(V, px + i * sz, msk), vload(V, py + i * sz, msk), acc)
         end
+        s = sum(acc)
     end
     return s
 end
@@ -1282,12 +1283,11 @@ end
             acc += abs(vload(V, px + i * sz))
             i += W
         end
-        s = sum(acc)
-        while i < n
-            j = i + 1
-            s += abs(unsafe_load(px, j))
-            i += 1
+        if i < n                                  # masked remainder folded into `acc`; inactive lanes load 0 and add nothing
+            msk = Vec(ntuple(l -> l, Val(W))) <= (n - i)
+            acc += abs(vload(V, px + i * sz, msk))
         end
+        s = sum(acc)
     end
     return s
 end
@@ -1311,10 +1311,11 @@ end
         while i + W <= n
             v = vload(V, px + i * sz); acc = muladd(v, v, acc); i += W
         end
-        s = sum(acc)
-        while i < n
-            j = i + 1; v = unsafe_load(px, j); s = muladd(v, v, s); i += 1
+        if i < n                                  # masked remainder folded into `acc`; inactive lanes load 0 and add nothing
+            msk = Vec(ntuple(l -> l, Val(W))) <= (n - i)
+            v = vload(V, px + i * sz, msk); acc = muladd(v, v, acc)
         end
+        s = sum(acc)
     end
     return s
 end
@@ -1614,8 +1615,16 @@ const _IAMAX_NB_STREAM = 4
             end
             o += $W
         end
-        @inbounds for k in (o + 1):n                   # scalar remainder
-            a = abs(unsafe_load(xp, k)); a > gmax && (gmax = a; bi = k)
+        if o < n                                       # masked remainder; inactive lanes load 0, which never exceeds `gmax` (>= 0 or NaN)
+            msk = Vec($(Expr(:tuple, (1:W)...))) <= (n - o)
+            u0 = abs(vload($V, xp + o * $sz, msk))
+            if any(u0 > thr)
+                bm = gmax; bl = 0
+                for l in 1:$W
+                    u0[l] > bm && (bm = u0[l]; bl = l)
+                end
+                bl != 0 && (gmax = bm; bi = o + bl; thr = $V(gmax))
+            end
         end
         return bi
     end
@@ -1694,8 +1703,16 @@ end
             end
             o += $W
         end
-        @inbounds for k in (o + 1):n                   # scalar remainder (no OOB / masked read needed)
-            a = abs(unsafe_load(xp, k)); a > gmax && (gmax = a; bi = k)
+        if o < n                                       # masked remainder; inactive lanes load 0, which never exceeds `gmax` (>= 0 or NaN)
+            msk = Vec($(Expr(:tuple, (1:W)...))) <= (n - o)
+            u0 = abs(vload($V, xp + o * $sz, msk))
+            if any(u0 > thr)
+                bm = gmax; bl = 0
+                for l in 1:$W
+                    u0[l] > bm && (bm = u0[l]; bl = l)
+                end
+                bl != 0 && (gmax = bm; bi = o + bl; thr = $V(gmax))
+            end
         end
         return bi
     end
