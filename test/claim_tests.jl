@@ -12,12 +12,17 @@
 @testmodule ClaimHarness begin
 using PureBLAS, Random, LinearAlgebra
 const P = PureBLAS
-export P, ELTYPES, bitsame, njobs, alljobs, cases, getri_input, getri_run!, loop_getri, loop_iamax
+export P, ELTYPES, sme, bitsame, njobs, alljobs, cases, getri_input, getri_run!, loop_getri, loop_iamax
 
 const ELTYPES = (Float64, Float32, ComplexF64, ComplexF32)
 bitsame(X, Y) = size(X) == size(Y) && reinterpret(UInt8, vec(collect(X))) == reinterpret(UInt8, vec(collect(Y)))
 njobs(T) = (@atomic P._gemm_pool(T).gen) >> P._MT_NW_SHIFT
 alljobs() = map(njobs, ELTYPES)
+
+# Real gemm on an SME host is taken by the coprocessor route before the pool claim, so its products
+# never publish a job or lose the claim; every pool witness below is asked only where the pool route
+# exists.
+sme(T) = (T === Float64 && P._SME_F64) || (T === Float32 && P._SME_F32)
 
 # One closure per (kind, element type): it builds nothing but fresh outputs from fixed inputs and returns
 # them as a tuple, so the same closure run at one thread and at many is a bitwise comparison.
@@ -88,21 +93,21 @@ end
         @test_skip "needs >= 2 julia threads"
     else
         P.set_num_threads(nthreads())
-        # Kinds that reach the pool for a type at these sizes on every host the suite runs on. Complex
-        # trsm/trmm/syrk/symm/potrf do not reach it, and neither does Float32 trmm side R. The rest of
-        # the table is exercised wherever the liveness check shows a kind threads, so a kind that does
-        # not thread for a type on this host is not asserted about vacuously.
+        # Kinds that reach the pool for a type at these sizes on every host without an SME route for
+        # that type. Complex trsm/trmm/syrk/symm/potrf do not reach it, and neither does Float32 trmm
+        # side R. Where the type has an SME route nothing is required. The table is exercised wherever
+        # the liveness check shows a kind threads, so a kind that does not thread for a type on this
+        # host is not asserted about vacuously.
         allkinds = Set(["gemm!", "trsm! L", "trsm! R", "trmm! L", "trmm! R", "syrk!", "symm!", "getrf!", "potrf!", "getri!"])
-        requiredfor(T) = T <: Complex ? Set(["gemm!", "getrf!", "getri!"]) :
+        requiredfor(T) = sme(T) ? Set{String}() : T <: Complex ? Set(["gemm!", "getrf!", "getri!"]) :
             T === Float32 ? setdiff(allkinds, ["trmm! R"]) : allkinds
-        required = allkinds
         nlive = Ref(0)
         for T in ELTYPES
             pending = Set{String}()
             for n in (512, 1024, 2048)
+                n > 512 && issubset(requiredfor(T), pending) && break
                 for (name, f) in cases(T, n; vectors = n == 512)
                     name in pending && continue
-                    (n == 512 || name in required) || continue
                     P.set_num_threads(1)
                     want = f()
                     P.set_num_threads(nthreads())
@@ -152,7 +157,8 @@ end
             P.set_num_threads(nthreads())
             D[T] = (LU, ip, ref)
         end
-        # Both tasks are sticky to this thread, which is the placement the unfixed code corrupted.
+        # Both tasks are sticky to this thread, so each is suspended inside its arena scope while the
+        # other runs.
         pairs = ((Float64, Float32), (Float64, ComplexF64), (Float32, ComplexF32), (ComplexF64, ComplexF32))
         @testset "$A + $B" for (A, B) in pairs
             j0 = alljobs(); l0 = P._MT_LOST[]
@@ -166,16 +172,18 @@ end
             # caller lost the claim to the other type's task. Which task wins is the scheduler's: the
             # task holding the claim across its join lets the other run a whole serial iteration, so
             # one loop can finish while the other still publishes.
-            @test dj[ia] + dj[ib] > 0
-            @test P._MT_LOST[] > l0
+            if !sme(A) && !sme(B)
+                @test dj[ia] + dj[ib] > 0
+                @test P._MT_LOST[] > l0
+            end
         end
-        # CONTROLS. Same type on both tasks (one pool, so it was safe before and must stay so).
+        # CONTROLS. Same type on both tasks: one pool, one claim.
         @testset "same type F64 + F64" begin
             l0 = P._MT_LOST[]
             ta = @async loop_getri(D[Float64]..., iters)
             tb = @async loop_getri(D[Float64]..., iters)
             @test (fetch(ta), fetch(tb)) == (0, 0)
-            @test P._MT_LOST[] > l0
+            sme(Float64) || @test P._MT_LOST[] > l0
         end
         # Mixed types run one after the other: no overlap, so no loss and every call publishes.
         @testset "mixed, sequential" begin
@@ -183,7 +191,8 @@ end
             @test loop_getri(D[Float64]..., iters) == 0
             @test loop_getri(D[Float32]..., iters) == 0
             dj = alljobs() .- j0
-            @test dj[1] > 0 && dj[2] > 0
+            sme(Float64) || @test dj[1] > 0
+            sme(Float32) || @test dj[2] > 0
             @test P._MT_LOST[] == l0
         end
         # The comparison can fail: a reference with one bit changed is flagged on every iteration.

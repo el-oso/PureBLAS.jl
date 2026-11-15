@@ -248,7 +248,7 @@ Both modes share ONE set of low-level kernels. Source map:
    note here — that not threading them was load-bearing — no longer describes the code. The mechanism is
    `_red_block(T)` in `src/simd_kernels.jl`: `n` is cut into `cld(n, _red_block(T))` blocks whose size is
    a function of `(n, T)` alone, each block is reduced by the unchanged serial kernel, and the DRIVER
-   folds the partials in index order after the join and before `busy` is released. So a worker count
+   folds the partials in index order after the join and before the claim is released. So a worker count
    decides who computes a partial and never how the partials combine. The blocked form is the ONLY form,
    used at one thread too — which changes results against earlier versions of this library, permitted
    because req#11's scope is thread counts and not versions. The gate is
