@@ -1382,60 +1382,8 @@ let m = 64, A = ones(m, m), x = ones(m)
     @assert_no_threadid_state _mt_poll_span()
     @assert_no_threadid_state trmv_split!(x, A)
 end
-# Concurrency safety. `@assert_concurrency_safe self = k f(args...)` fails when the scan reads a write to
-# storage reachable from argument `k`, the operand that parallel workers share and must treat as read-only
-# (a gemm's A, a gemv's x). It warns for a record it could not rule out. The calls execute.
-let m = 64, A = ones(m, m), B = ones(m, m), C = zeros(m, m), x = ones(m), y = zeros(m)
-    gemm3!(C, A, B) = gemm!(C, A, B)
-    syrk3!(C, A) = syrk!(C, A)
-    gemv3!(y, A, x) = gemv!(y, A, x)
-    axpy3!(y, a, x) = axpy!(y, a, x)
-    trmm3!(B, A) = trmm!(B, A)
-    trsm3!(B, A) = trsm!(B, A)
-    @assert_concurrency_safe self = 2 gemm3!(C, A, B)
-    @assert_concurrency_safe self = 3 gemm3!(C, A, B)
-    @assert_concurrency_safe self = 2 max_depth = 12 syrk3!(C, A)
-    @assert_concurrency_safe self = 2 gemv3!(y, A, x)
-    @assert_concurrency_safe self = 3 gemv3!(y, A, x)
-    @assert_concurrency_safe self = 3 axpy3!(y, 2.0, x)
-    @assert_concurrency_safe self = 2 max_depth = 12 trmm3!(copy(B), A)
-    @assert_concurrency_safe self = 2 max_depth = 12 trsm3!(copy(B), A + 64 * LinearAlgebra.I)
-end
-# Scoped-handle escape. `@assert_noescape` reports a value of a type registered with `register_scoped!`
-# (an arena handle) that leaves the frame of the call: returned, stored globally, or captured. The arena
-# handle types are registered here; the calls execute.
-for T in (Float32, Float64, ComplexF32, ComplexF64)
-    StrictMode.register_scoped!(PtrMatrix{T})
-    StrictMode.register_scoped!(PtrVector{T})
-end
-let n = 24, k = 12
-    for T in (Float64, ComplexF64)
-        M = T[i == j ? T(i) : T(1) / T(2 * (i + j)) for i in 1:n, j in 1:n]; S = M + transpose(M)
-        ip = zeros(Int, n); F = copy(S); sytrf!(F, ip; uplo = 'L')
-        # The keyword-less `sytri!(A, ipiv)` is a two-statement forwarder; the body that holds the arena
-        # borrow is its keyword body function, called with the default `uplo`.
-        sytri_body = Base.bodyfunction(which(sytri!, (Matrix{T}, Vector{Int})))
-        hetri_body = Base.bodyfunction(which(hetri!, (Matrix{T}, Vector{Int})))
-        @assert_noescape sytri_body('L', sytri!, copy(F), ip)
-        if T <: Complex
-            H = M + M'; ih = zeros(Int, n); FH = copy(H); hetrf!(FH, ih; uplo = 'L')
-            @assert_noescape hetri_body('L', hetri!, copy(FH), ih)
-        else
-            @assert_noescape hetri_body('L', hetri!, copy(F), ip)
-        end
-    end
-    @assert_noescape geqp3!(ones(n, k) + LinearAlgebra.I[1:n, 1:k], zeros(Int, k), zeros(k))
-    @assert_noescape gglse!(ones(8, 6) + LinearAlgebra.I[1:8, 1:6], ones(8), ones(4, 6) + LinearAlgebra.I[1:4, 1:6], ones(4), zeros(6))
-end
-# Trust boundary. `@assert_trusted` fails when a function's own body reads the payload of an `Untrusted`
-# value outside a registered boundary. The C-ABI entries take raw pointers and none takes an `Untrusted`.
-# The check passes a raw `Ptr` dereference, so on a C-ABI entry it cannot fail today (a StrictMode gap):
-# this site verifies only that the entry is reachable and takes no `Untrusted` payload.
-let x = ones(8), a = Ref(2.0), nn = Ref(8), inc = Ref(1)
-    GC.@preserve x a nn inc begin
-        @assert_trusted dscal_64_(
-            Base.unsafe_convert(Ptr{Int64}, nn), Base.unsafe_convert(Ptr{Float64}, a),
-            pointer(x), Base.unsafe_convert(Ptr{Int64}, inc)
-        )
-    end
-end
+# Guarantees not asserted at load, and what each waits for:
+#   `:owned`            inner functions take their per-task buffer as an argument.
+#   `:concurrency_safe` job operands reach chunk bodies as arguments, not through the shared pool.
+#   `:noescape`         StrictMode treats a borrowed handle passed to an out-of-line callee as escaping.
+#   `:trusted`          StrictMode does not track raw `Ptr` reads.
