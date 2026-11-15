@@ -1401,3 +1401,25 @@ let m = 64, A = ones(m, m), B = ones(m, m), C = zeros(m, m), x = ones(m), y = ze
     @assert_concurrency_safe self = 2 trmm3!(copy(B), A)
     @assert_concurrency_safe self = 2 trsm3!(copy(B), A + 64 * LinearAlgebra.I)
 end
+# Scoped-handle escape. `@assert_noescape` reports a value of a type registered with `register_scoped!`
+# (an arena handle) that leaves the frame of the call: returned, stored globally, or captured. The arena
+# handle types are registered here; the calls execute.
+for T in (Float32, Float64, ComplexF32, ComplexF64)
+    StrictMode.register_scoped!(PtrMatrix{T})
+    StrictMode.register_scoped!(PtrVector{T})
+end
+let n = 24, k = 12
+    for T in (Float64, ComplexF64)
+        M = T[i == j ? T(i) : T(1) / T(2 * (i + j)) for i in 1:n, j in 1:n]; S = M + transpose(M)
+        ip = zeros(Int, n); F = copy(S); sytrf!(F, ip; uplo = 'L')
+        @assert_noescape sytri!(copy(F), ip)
+        if T <: Complex
+            H = M + M'; ih = zeros(Int, n); FH = copy(H); hetrf!(FH, ih; uplo = 'L')
+            @assert_noescape hetri!(copy(FH), ih)
+        else
+            @assert_noescape hetri!(copy(F), ip)
+        end
+    end
+    @assert_noescape geqp3!(ones(n, k) + LinearAlgebra.I[1:n, 1:k], zeros(Int, k), zeros(k))
+    @assert_noescape gglse!(ones(8, 6) + LinearAlgebra.I[1:8, 1:6], ones(8), ones(4, 6) + LinearAlgebra.I[1:4, 1:6], ones(4), zeros(6))
+end
