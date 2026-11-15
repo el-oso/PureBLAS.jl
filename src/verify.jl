@@ -252,6 +252,25 @@ end
 # each new mark, so they are `@strict_exempt :noalloc` (workspace.jl) and asserted by measurement.
 const _BARRIER_FUNCTIONS = (_m3ws, _gpackws, _strws, _opt)
 
+# A heuristic check below reports by logging a `StrictViolation` warning instead of throwing. From here
+# to the end of this file the global logger is wrapped so each such message is also pushed onto
+# `_LOADTIME_WARNINGS`, which is saved in the package image; test/loadtime_warnings_tests.jl compares it
+# against a baseline. Messages still reach the original logger unchanged.
+const _LOADTIME_WARNINGS = String[]
+struct _WarnRecorder{L <: Base.CoreLogging.AbstractLogger} <: Base.CoreLogging.AbstractLogger
+    inner::L
+end
+Base.CoreLogging.min_enabled_level(r::_WarnRecorder) = Base.CoreLogging.min_enabled_level(r.inner)
+Base.CoreLogging.shouldlog(r::_WarnRecorder, args...) = Base.CoreLogging.shouldlog(r.inner, args...)
+Base.CoreLogging.catch_exceptions(r::_WarnRecorder) = Base.CoreLogging.catch_exceptions(r.inner)
+function Base.CoreLogging.handle_message(r::_WarnRecorder, level, message, args...; kwargs...)
+    if level == Base.CoreLogging.Warn && message isa AbstractString && startswith(message, "StrictViolation")
+        push!(_LOADTIME_WARNINGS, message)
+    end
+    return Base.CoreLogging.handle_message(r.inner, level, message, args...; kwargs...)
+end
+Base.CoreLogging.global_logger(_WarnRecorder(Base.CoreLogging.global_logger()))
+
 # The registry is process-global and not part of the saved image, so this registration covers only the
 # `@verify_strict` below, which runs while PureBLAS precompiles. test/strictmode_tests.jl registers
 # (and removes) its own barriers around each proof it runs in the test process.
@@ -1387,3 +1406,8 @@ end
 #   `:concurrency_safe` job operands reach chunk bodies as arguments, not through the shared pool.
 #   `:noescape`         StrictMode treats a borrowed handle passed to an out-of-line callee as escaping.
 #   `:trusted`          StrictMode does not track raw `Ptr` reads.
+
+# The checks are over: put back the logger `_WarnRecorder` wrapped.
+let lg = Base.CoreLogging.global_logger()
+    lg isa _WarnRecorder && Base.CoreLogging.global_logger(lg.inner)
+end
