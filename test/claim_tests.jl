@@ -8,10 +8,6 @@
 # the failure it prevents.
 #
 # CI sets `JULIA_NUM_THREADS`; with one thread nothing threads and every item here reports a skip.
-#
-# The file name sorts after gemm_tests.jl on purpose: these items create the pools, which replaces the
-# default `_gemm_mt_work()` floor with the measured one, and "GEMM few-row split" there assumes the
-# default.
 
 @testmodule ClaimHarness begin
 using PureBLAS, Random, LinearAlgebra
