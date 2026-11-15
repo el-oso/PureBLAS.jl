@@ -164,11 +164,15 @@ and a yielded task usually resumes on a DIFFERENT thread — measured on Zen 4, 
 moved. A routine that entered holding thread `t1`'s borrow would then finish on `t3` while `t1`'s arena
 was free for any other task to claim the same bytes. So the driver sets `Task.sticky` for the join and
 restores it after; Base requeues a sticky task on its own thread. That join is the only task-switch
-point inside a scope (`test/yield_lint.jl`), and the pool is one claim, so at most one task in the
-process is ever suspended mid-scope. Any other task scheduled onto the pinned thread during the yield
-opens a scope ABOVE the driver's live offset, cannot itself be suspended (its own `gemm!` loses the
-claim and runs serial), and rewinds to exactly the driver's state before the driver resumes — the bump
-stack stays LIFO. The full argument is the threading note in `src/arena.jl`.
+point inside a scope besides the driver's `_pool_barrier` waits (`test/yield_lint.jl`; no chunk holds a
+scope across a barrier), and the claim is ONE for the whole process — shared by the Float64, Float32,
+ComplexF64 and ComplexF32 pools — so at most one task in the process is ever suspended mid-scope. Any
+other task scheduled onto the pinned thread during the yield opens a scope ABOVE the driver's live
+offset, cannot itself be suspended (its own threaded call, of any element type, loses the claim and runs
+serial), and rewinds to exactly the driver's state before the driver resumes — the bump stack stays
+LIFO. If threaded callers ever get pools of their own, two tasks can be suspended mid-scope on one
+thread and the arena must become per-task (`Base.OncePerTask`). The full argument is the threading note
+in `src/arena.jl`.
 
 An earlier version refused to thread while any scope was live (`iszero(_arena().depth)`). That was
 sound, and it silently serialised every routine whose `gemm!` sits inside its own `@scope` — `gels!`,

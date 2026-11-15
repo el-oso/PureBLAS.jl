@@ -1091,10 +1091,10 @@ end
             # FORCED LOSS: holding the claim makes the fallback certain, and `_MT_LOST` shows it ran.
             fill!(dst, NaN)
             lost0 = P._MT_LOST[]
-            _, held = @atomicreplace p.busy false => true
+            held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
             @test held
             GC.@preserve src dst P._tricopy_mt!(pointer(dst), ldd, pointer(src), lds, n, up)
-            @atomic p.busy = false
+            P._MT_CLAIM[] = false
             @test P._MT_LOST[] == lost0 + 1
             @test isequal(dst, ref)
         end

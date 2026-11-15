@@ -332,8 +332,8 @@ end
 #
 # Here the `ic` blocks of one `pc` panel are dealt out across the workers, written into ONE buffer,
 # and read by everyone after a barrier. A PROCESS GLOBAL IS SOUND for it: the gemm pool admits one job
-# at a time (`p.busy`), the driver sizes the buffer inside that claim, and workers only ever write
-# blocks they own.
+# at a time, process-wide (`_MT_CLAIM`, shared by every element type's pool), the driver sizes the
+# buffer inside that claim, and workers only ever write blocks they own.
 const _GPKSH_F64 = Base.OncePerProcess{Vector{Vector{Float64}}}(() -> Vector{Float64}[])
 const _GPKSH_F32 = Base.OncePerProcess{Vector{Vector{Float32}}}(() -> Vector{Float32}[])
 @inline _gpack_shared_pool(::Type{Float64}) = _GPKSH_F64()
@@ -349,7 +349,7 @@ end
 # band packs op(A) for its own rows and shares nothing, so there is no barrier and no handoff.
 #
 # The slots come from the blocked-gemm pool because the two can never be live together — the gemm pool
-# admits one job at a time under `p.busy`, a side-R job never reaches `_gemm_blocked!`, and a serial
+# admits one job at a time under `_MT_CLAIM`, a side-R job never reaches `_gemm_blocked!`, and a serial
 # gemm takes its private buffer rather than this one (`coop = nw > 1`).
 #
 # THE DRIVER MUST SIZE THESE BEFORE PUBLISHING THE JOB. A chunk body that grows a buffer allocates
