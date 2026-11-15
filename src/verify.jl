@@ -1412,12 +1412,16 @@ let n = 24, k = 12
     for T in (Float64, ComplexF64)
         M = T[i == j ? T(i) : T(1) / T(2 * (i + j)) for i in 1:n, j in 1:n]; S = M + transpose(M)
         ip = zeros(Int, n); F = copy(S); sytrf!(F, ip; uplo = 'L')
-        @assert_noescape sytri!(copy(F), ip)
+        # The keyword-less `sytri!(A, ipiv)` is a two-statement forwarder; the body that holds the arena
+        # borrow is its keyword body function, called with the default `uplo`.
+        sytri_body = Base.bodyfunction(which(sytri!, (Matrix{T}, Vector{Int})))
+        hetri_body = Base.bodyfunction(which(hetri!, (Matrix{T}, Vector{Int})))
+        @assert_noescape sytri_body('L', sytri!, copy(F), ip)
         if T <: Complex
             H = M + M'; ih = zeros(Int, n); FH = copy(H); hetrf!(FH, ih; uplo = 'L')
-            @assert_noescape hetri!(copy(FH), ih)
+            @assert_noescape hetri_body('L', hetri!, copy(FH), ih)
         else
-            @assert_noescape hetri!(copy(F), ip)
+            @assert_noescape hetri_body('L', hetri!, copy(F), ip)
         end
     end
     @assert_noescape geqp3!(ones(n, k) + LinearAlgebra.I[1:n, 1:k], zeros(Int, k), zeros(k))
