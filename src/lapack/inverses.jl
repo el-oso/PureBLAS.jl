@@ -297,8 +297,21 @@ function _getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int)
     # was avoiding costs the same 40 ns, so the allocation bought nothing either.
     #
     # THE REAL TARGET at n=8 is the 181 ns one-block body — zeroing an 8x8 W, copying 28 elements and
-    # one `trsm!` keyword entry — not the choice of algorithm.
-    @scope arn begin
+    # one trsm entry — not the choice of algorithm.
+    return _thread_arena_ok(T) ? _getri_blocked!(A, ipiv, nb, ThreadArena(_arena())) :
+        _getri_blocked!(A, ipiv, nb, TaskArena(_tarena()))
+end
+
+# Steps 2 and 3 on the arena owner chosen at the root (`_thread_arena_ok`, arena.jl). The `ThreadArena`
+# body calls only the serial entries (`_entry_mt` is `Val(false)`), so `W` is a per-thread borrow that
+# no task switch of this body can outlive; the `TaskArena` body calls the thread-capable entries, and
+# `W` is then this task's own, whichever thread the task resumes on and whatever else runs there.
+function _getri_blocked!(
+        A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int, owner::Union{ThreadArena, TaskArena}
+    ) where {T}
+    n = size(A, 1)
+    mt = _entry_mt(owner)
+    @scope arn owner begin
         W = borrow!(arn, T, n, nb)
         j = ((n - 1) ÷ nb) * nb + 1                             # start of the LAST block column
         while j >= 1
@@ -317,11 +330,11 @@ function _getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int)
                 end
             end
             if j + jb <= n
-                gemm!(view(A, 1:n, j:(j + jb - 1)), view(A, 1:n, (j + jb):n), view(W, (j + jb):n, 1:jb);
-                      alpha = -one(T), beta = one(T))
+                _gemm_entry!(view(A, 1:n, j:(j + jb - 1)), view(A, 1:n, (j + jb):n), view(W, (j + jb):n, 1:jb),
+                             -one(T), one(T), 'N', 'N', mt)
             end
-            trsm!(view(A, 1:n, j:(j + jb - 1)), view(W, j:(j + jb - 1), 1:jb);
-                  side = 'R', uplo = 'L', transA = 'N', diag = 'U', alpha = one(T))
+            _trsm_entry!(view(A, 1:n, j:(j + jb - 1)), view(W, j:(j + jb - 1), 1:jb),
+                         'R', 'L', 'N', 'U', one(T), mt)
             j -= nb
         end
         @inbounds for jj in (n - 1):-1:1                        # 3. undo the column pivots

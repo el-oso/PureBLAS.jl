@@ -174,6 +174,16 @@ LIFO. If threaded callers ever get pools of their own, two tasks can be suspende
 thread and the arena must become per-task (`Base.OncePerTask`). The full argument is the threading note
 in `src/arena.jl`.
 
+**A routine can instead choose its owner at its root, and then it does not depend on the claim.**
+`getri!` does this. At one thread, for a BLAS element type, it runs a body specialized on
+`ThreadArena` (the per-thread arena) whose callees inside the scope are the serial entries
+`_gemm_entry!`/`_trsm_entry!` with `Val(false)`, which do not call the pool themselves (the paths below
+them that still can, gated on a worker count of one or on `_MT_NTHREADS`, are listed exactly in
+`test/arena_owner_tests.jl`). Otherwise it runs
+the same body on `TaskArena`, the per-task arena (`Base.OncePerTask`), and calls the thread-capable
+entries; a borrow held across a join then belongs to the suspended task alone. Both owners hold the same
+`Arena`, so the borrows are identical. `@scope s owner begin … end` borrows from the owner it is given.
+
 An earlier version refused to thread while any scope was live (`iszero(_arena().depth)`). That was
 sound, and it silently serialised every routine whose `gemm!` sits inside its own `@scope` — `gels!`,
 `getri!`, `trtri!`, `potri!`, `lauum`, `gehrd`, `pbtrf`, `gbtrf` and eight more. Pinning replaced it.

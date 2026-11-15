@@ -197,6 +197,43 @@ end
 const _ARENA = Base.OncePerThread{Arena}(Arena)
 @inline _arena() = _ARENA()
 
+# ── Owners chosen at a routine's root ───────────────────────────────────────────────────────────────
+# A routine converted to this form does not rest on part (c) above. It picks its owner ONCE, at its
+# root, and runs a body specialized on the owner's type:
+#   `ThreadArena` — the per-thread arena. Only for a body whose every callee inside the scope is a
+#                   serial entry (`_gemm_entry!`/`_trsm_entry!` with `Val(false)`), so its borrows are
+#                   never held across a task switch it makes itself.
+#   `TaskArena`   — the per-task arena. For a body that calls the thread-capable entries; a driver
+#                   suspended at a join holds borrows nobody else can see, whatever the claim allows.
+# Both hold the same `Arena`, so the borrows, their alignment and their layout are identical.
+# `_thread_arena_ok` is the root's choice: the per-thread arena only where nothing can thread, i.e. a BLAS
+# element type (a dual reaches thread-capable plane products) at one thread. The thread count is read
+# once; a `set_num_threads` during the call does not move a body onto the other owner.
+struct ThreadArena
+    a::Arena
+end
+struct TaskArena
+    a::Arena
+end
+# `@noinline` for the same reason as `_m3ws` (workspace.jl): inlined, `OncePerTask`'s task-local
+# IdDict exposes its one-off first-touch allocations to the all-paths allocation proof.
+const _TARENA = Base.OncePerTask{Arena}(Arena)
+@noinline _tarena() = _TARENA()
+@inline _entry_mt(::ThreadArena) = Val(false)
+@inline _entry_mt(::TaskArena) = Val(true)
+# A predicate, not a function returning the owner: a `Union{ThreadArena, TaskArena}` value is boxed
+# (16 B per call, measured), so each root branches on this and constructs its owner in the branch.
+@inline _thread_arena_ok(::Type{T}) where {T} = T <: BlasFloat && isone(_MT_NTHREADS[])
+
+# A debugging invariant, off in production (`false` compiles the check away): at a claim win in
+# `_gemm_threaded!` and at every `_pool_barrier`, the per-thread arena of the running thread holds no
+# live scope. A scope live there is a per-thread borrow held across the join or the barrier. Tests
+# redefine the const to `true`, which invalidates and recompiles its readers.
+# PDM: Literal — a debugging switch, false on every machine; nothing in it depends on the hardware.
+const _ARENA_CHECK = false
+@noinline _throw_arena_live() = error("_ARENA_CHECK: a per-thread arena scope is live across a threaded join or barrier")
+@inline _arena_idle() = iszero(_arena().depth)
+
 @inline function _arena_enter!(a::Arena)
     d = a.depth + 1
     a.depth = d
@@ -660,6 +697,20 @@ macro scope(s::Symbol, body)
     _arena_checks(body, s)
     return quote
         $(esc(s)) = _arena_enter!(_arena())
+        try
+            $(esc(body))
+        finally
+            _arena_exit!($(esc(s)))
+        end
+    end
+end
+
+# `@scope s owner begin … end`: the same scope, borrowing from the arena held by `owner` (a
+# `ThreadArena` or a `TaskArena`) instead of looking the per-thread one up.
+macro scope(s::Symbol, owner, body)
+    _arena_checks(body, s)
+    return quote
+        $(esc(s)) = _arena_enter!(($(esc(owner))).a)
         try
             $(esc(body))
         finally
