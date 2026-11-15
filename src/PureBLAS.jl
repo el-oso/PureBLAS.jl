@@ -125,6 +125,14 @@ using PrecompileTools: @setup_workload, @compile_workload
             getrf!(G)
             tau = zeros(T, n); geqrf!(copy(A), tau)
         end
+        # The register-tiled trsm-L base (k > 16 on AVX2) calls generated block solvers; compiling every
+        # (up, unit) form here keeps those calls out of the runtime-compiled, argument-boxing path.
+        Lt = zeros(21, 21); Bt = ones(21, 5); for i in 1:21
+            Lt[i, i] = 2.0
+        end
+        GC.@preserve Lt Bt for up in (false, true), unit in (false, true)
+            _trsm_tile_L_f64!(up, unit, pointer(Lt), 21, pointer(Bt), 21, 21, 5)
+        end
         As = reshape(collect(Float64, 1:(n * n)), n, n); As = As .+ As'
         _syev!('V', 'L', copy(As))
         Ah = reshape(collect(ComplexF64, 1:(n * n)), n, n); Ah = Ah .+ Ah'

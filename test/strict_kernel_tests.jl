@@ -112,7 +112,7 @@ const KERNELS = kernel_table(P)
 # width. Measured on Zen3 (W=4, 16 ymm), Zen4 and Zen5 (W=8, 32 zmm; the two agree).
 const KNOWN_WIDE_LOOP_SPILL = Set(
     [
-        (4, "_microkernel_unpacked_mrows!"), (4, "_microkernel_unpacked_split!"), (4, "_pack_A_tri_simd!"),
+        (4, "_microkernel_unpacked_mrows!"), (4, "_microkernel_unpacked_split!"),
         (8, "_microkernel_unpacked_split!"), (8, "_uker_cmplx! full"), (8, "_uker_cmplx! masked"),
         (8, "_uker_cmplx! tri"), (8, "_microkernel_cmplx!"), (8, "_microkernel_cmplx_masked!"),
         (8, "_microkernel_cmplx_tri!"), (8, "_microkernel2_cmplx!"),

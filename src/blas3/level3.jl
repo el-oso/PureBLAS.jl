@@ -2032,7 +2032,7 @@ end
         ::Val{UP}, ::Val{UNIT}, ::Val{FULL}, pL::Ptr{Float64}, ld0::Int, pB::Ptr{Float64}, ldb::Int,
         rb::Int, n::Int, nr::Int, rv
     ) where {UP, UNIT, FULL}
-    W = _CHOLW
+    W = _vwidth(Float64)   # not `_CHOLW`: that const is defined after this file, and a generator body is evaluated in the world of its definition
     V = Vec{W, Float64}
     xs = [Symbol(:x, i) for i in 0:(W - 1)]
     loads = [
@@ -2079,6 +2079,47 @@ end
 @inline _stm(v, p::Ptr{Float64}, ::Nothing) = vstore(v, p)
 @inline _stm(v, p::Ptr{Float64}, msk) = vstore(v, p, msk)
 
+# In-register solve of one W-row block (`nr` active rows) of the register-tiled trsm-L base below: downdate
+# against the already-solved rows, then the W×W diagonal block.
+@inline function _trsm_L_block!(
+        ::Val{UP}, ::Val{UNIT}, ::Val{FULL}, pL::Ptr{Float64}, ld0::Int, pB::Ptr{Float64}, ldb::Int, k::Int, n::Int,
+        rb::Int, nr::Int
+    ) where {UP, UNIT, FULL}
+    W = _CHOLW; up = UP; unit = UNIT
+    F = Val(FULL)
+    solved = up ? ((rb + W):k) : (1:(rb - 1))            # already-solved rows: below (upper) / above (lower)
+    # With nothing solved yet the downdate would read and rewrite the same values; skipping it keeps
+    # empty trip-counting loops out of the compiled body.
+    if !isempty(solved)
+        c = 1
+        @inbounds while c + 3 <= n
+            a0 = _trsm_ld(F, _cvptr(pB, rb, c, ldb), nr);     a1 = _trsm_ld(F, _cvptr(pB, rb, c + 1, ldb), nr)
+            a2 = _trsm_ld(F, _cvptr(pB, rb, c + 2, ldb), nr); a3 = _trsm_ld(F, _cvptr(pB, rb, c + 3, ldb), nr)
+            for j in solved
+                Lv = _trsm_ld(F, _cvptr(pL, rb, j, ld0), nr)
+                a0 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))), Lv, a0)
+                a1 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 1, ldb))), Lv, a1)
+                a2 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 2, ldb))), Lv, a2)
+                a3 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 3, ldb))), Lv, a3)
+            end
+            _trsm_st(F, a0, _cvptr(pB, rb, c, ldb), nr);     _trsm_st(F, a1, _cvptr(pB, rb, c + 1, ldb), nr)
+            _trsm_st(F, a2, _cvptr(pB, rb, c + 2, ldb), nr); _trsm_st(F, a3, _cvptr(pB, rb, c + 3, ldb), nr)
+            c += 4
+        end
+        @inbounds while c <= n
+            a = _trsm_ld(F, _cvptr(pB, rb, c, ldb), nr)
+            for j in solved
+                a = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))), _trsm_ld(F, _cvptr(pL, rb, j, ld0), nr), a)
+            end
+            _trsm_st(F, a, _cvptr(pB, rb, c, ldb), nr); c += 1
+        end
+    end
+    # W diagonal reciprocals ONCE per block (not per column — the redundant per-cc inv() was a division
+    # chain that sank non-unit on wide vectors).
+    rv = unit ? _CVF(1.0) : _trsm_recips(F, pL, ld0, rb, nr)
+    return _trsm_diag_block!(Val(UP), Val(UNIT), F, pL, ld0, pB, ldb, rb, n, nr, rv)
+end
+
 # Register-tiled trsm-L base for the no-trans f64 case (op(A)=A), GENERAL up/unit: solve A·X=B, A k×k lower
 # (fwd) or upper (bwd), unit or non-unit diagonal. W-row blocks — downdate each block against the ALREADY-
 # SOLVED rows (vectorized; the 4-B-column unroll reuses the A row-block vector), then solve the W×W diagonal
@@ -2087,62 +2128,32 @@ end
 # Bit-identical to the row-by-row substitution.
 # Measured Zen3: lower-unit (getrf) +119–151%; upper-non-unit (trsm gate) +44–47%. pL/pB = &·[1,1], ld col.
 @inline function _trsm_tile_L_f64!(up::Bool, unit::Bool, pL::Ptr{Float64}, ld0::Int, pB::Ptr{Float64}, ldb::Int, k::Int, n::Int)
+    # One body per (up, unit), so every block call is compiled with both constant.
+    return up ?
+        (
+            unit ? _trsm_tile_L_body!(Val(true), Val(true), pL, ld0, pB, ldb, k, n) :
+            _trsm_tile_L_body!(Val(true), Val(false), pL, ld0, pB, ldb, k, n)
+        ) :
+        (
+            unit ? _trsm_tile_L_body!(Val(false), Val(true), pL, ld0, pB, ldb, k, n) :
+            _trsm_tile_L_body!(Val(false), Val(false), pL, ld0, pB, ldb, k, n)
+        )
+end
+@inline function _trsm_tile_L_body!(::Val{UP}, ::Val{UNIT}, pL::Ptr{Float64}, ld0::Int, pB::Ptr{Float64}, ldb::Int, k::Int, n::Int) where {UP, UNIT}
     W = _CHOLW; nb = k ÷ W; nt = k - nb * W
-    @inline function doblock(rb, ::Val{FULL}, nr) where {FULL}
-        F = Val(FULL)
-        solved = up ? ((rb + W):k) : (1:(rb - 1))            # already-solved rows: below (upper) / above (lower)
-        # With nothing solved yet the downdate would read and rewrite the same values; skipping it keeps
-        # empty trip-counting loops out of the compiled body.
-        if !isempty(solved)
-            c = 1
-            @inbounds while c + 3 <= n
-                a0 = _trsm_ld(F, _cvptr(pB, rb, c, ldb), nr);     a1 = _trsm_ld(F, _cvptr(pB, rb, c + 1, ldb), nr)
-                a2 = _trsm_ld(F, _cvptr(pB, rb, c + 2, ldb), nr); a3 = _trsm_ld(F, _cvptr(pB, rb, c + 3, ldb), nr)
-                for j in solved
-                    Lv = _trsm_ld(F, _cvptr(pL, rb, j, ld0), nr)
-                    a0 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))), Lv, a0)
-                    a1 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 1, ldb))), Lv, a1)
-                    a2 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 2, ldb))), Lv, a2)
-                    a3 = muladd(_CVF(-unsafe_load(pB, _clidx(j, c + 3, ldb))), Lv, a3)
-                end
-                _trsm_st(F, a0, _cvptr(pB, rb, c, ldb), nr);     _trsm_st(F, a1, _cvptr(pB, rb, c + 1, ldb), nr)
-                _trsm_st(F, a2, _cvptr(pB, rb, c + 2, ldb), nr); _trsm_st(F, a3, _cvptr(pB, rb, c + 3, ldb), nr)
-                c += 4
-            end
-            @inbounds while c <= n
-                a = _trsm_ld(F, _cvptr(pB, rb, c, ldb), nr)
-                for j in solved
-                    a = muladd(_CVF(-unsafe_load(pB, _clidx(j, c, ldb))), _trsm_ld(F, _cvptr(pL, rb, j, ld0), nr), a)
-                end
-                _trsm_st(F, a, _cvptr(pB, rb, c, ldb), nr); c += 1
-            end
-        end
-        # W diagonal reciprocals ONCE per block (not per column — the redundant per-cc inv() was a division
-        # chain that sank non-unit on wide vectors).
-        rv = unit ? _CVF(1.0) : _trsm_recips(F, pL, ld0, rb, nr)
-        return up ?
-            (
-                unit ? _trsm_diag_block!(Val(true), Val(true), F, pL, ld0, pB, ldb, rb, n, nr, rv) :
-                _trsm_diag_block!(Val(true), Val(false), F, pL, ld0, pB, ldb, rb, n, nr, rv)
-            ) :
-            (
-                unit ? _trsm_diag_block!(Val(false), Val(true), F, pL, ld0, pB, ldb, rb, n, nr, rv) :
-                _trsm_diag_block!(Val(false), Val(false), F, pL, ld0, pB, ldb, rb, n, nr, rv)
-            )
-    end
     # ORDER: solve in the substitution direction. Upper=backward ⇒ the ragged block (bottom) FIRST, then
     # blocks bottom-up (they downdate against it as "solved"). Lower=forward ⇒ blocks top-down, then the
     # ragged block.
-    if up
-        nt > 0 && doblock(nb * W + 1, Val(false), nt)
+    if UP
+        nt > 0 && _trsm_L_block!(Val(UP), Val(UNIT), Val(false), pL, ld0, pB, ldb, k, n, nb * W + 1, nt)
         for bi in nb:-1:1
-            doblock((bi - 1) * W + 1, Val(true), W)
+            _trsm_L_block!(Val(UP), Val(UNIT), Val(true), pL, ld0, pB, ldb, k, n, (bi - 1) * W + 1, W)
         end
     else
         for bi in 1:nb
-            doblock((bi - 1) * W + 1, Val(true), W)
+            _trsm_L_block!(Val(UP), Val(UNIT), Val(true), pL, ld0, pB, ldb, k, n, (bi - 1) * W + 1, W)
         end
-        nt > 0 && doblock(nb * W + 1, Val(false), nt)
+        nt > 0 && _trsm_L_block!(Val(UP), Val(UNIT), Val(false), pL, ld0, pB, ldb, k, n, nb * W + 1, nt)
     end
     return nothing
 end
