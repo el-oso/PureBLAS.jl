@@ -1359,3 +1359,26 @@ let R = 1 << 15, ld = 128, W = _vwidth(Float64), WS = _vwidth(Float32), mr = _MR
         end
     end
 end
+# Thread-id state. `@assert_no_threadid_state` fails when a function writes mutable state selected by
+# `Threads.threadid()`, directly or through an object loaded out of such a slot. Covered: the per-task and
+# per-thread workspace owners, each written through its accessor, the arena, and the L2 split driver.
+# The scan does not follow calls left out of line. The calls execute.
+let m = 64, A = ones(m, m), x = ones(m)
+    w_gpk(n) = _ws_grow!(_gpackws(Float64)[1], n)
+    w_m3(n) = _ws_grow!(_m3ws(Float64)[1], n)
+    w_str(n) = _ws_grow!(_strws(Float64)[2], n)
+    w_l3(n) = _ws_grow!(_l3ws(Float64).cg[1], n)
+    w_acc(n) = _ws_grow!(_trmv_accbuf(Float64), n)
+    w_slot(n) = _ws_slot!(Vector{Float64}[], 2, n)
+    trmv_split!(x, A) = _trmv_split!(true, false, size(A, 1), A, x)
+    @assert_no_threadid_state w_gpk(16)
+    @assert_no_threadid_state w_m3(16)
+    @assert_no_threadid_state w_str(16)
+    @assert_no_threadid_state w_l3(16)
+    @assert_no_threadid_state w_acc(16)
+    @assert_no_threadid_state w_slot(16)
+    @assert_no_threadid_state _arena()
+    @assert_no_threadid_state _symm_scr(Float64, 8)
+    @assert_no_threadid_state _mt_poll_span()
+    @assert_no_threadid_state trmv_split!(x, A)
+end
