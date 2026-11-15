@@ -707,10 +707,20 @@ function gebrd!(
         tauq::AbstractVector, taup::AbstractVector; nb::Int = _brd_nb()
     ) where {T <: Number}
     m, n = size(A)
+    if !_has_brd_kernel(T)
+        # No owned workspace and no blocked kernel for this element type (Float32, Dual, …): the
+        # generic unblocked reduction.
+        m >= n || _throw_mge_n(:gebrd!, m, n)
+        _gebrd_unblocked!(A, d, e, tauq, taup)
+        return A
+    end
     ws = _svdws(T)
     _svd_grow_bidiag!(ws, m, n)
     return gebrd!(A, d, e, tauq, taup, ws; nb = nb)
 end
+# Element types with a blocked `gebrd!` kernel on an owned `SVDWorkspace`.
+_has_brd_kernel(::Type) = false
+_has_brd_kernel(::Type{<:Union{Float64, ComplexF64, ComplexF32}}) = true
 
 # ── power-of-two `lda` aliasing in the bidiagonalization ────────────────────────────────────────────
 # `_labrd!`'s panel walks COLUMNS of A (the reflector, and the gemv operands `As[i:m, j]`) once per
@@ -1730,7 +1740,7 @@ function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{<:Real}) where {T <
     # Bidiagonal d,e in Float64 unconditionally: bdsqr! is the Float64 implicit-QR core, and the real
     # bidiagonal of a ComplexF32 A is fine to refine in double (σ then rounded back into S's eltype).
     d = zeros(Float64, n); e = zeros(Float64, max(n - 1, 0)); tauq = zeros(T, n); taup = zeros(T, n)
-    gebrd!(A, d, e, tauq, taup, ws)                          # blocked zgebrd (zlabrd panels + gemm trailing)
+    gebrd!(A, d, e, tauq, taup, ws)                        # blocked zgebrd (zlabrd panels + gemm trailing)
     # dqds (dlasq) singular VALUES on the real bidiagonal; QR bdsqr! is the rare-failure fallback.
     _dlasq1!(d, e, ws.dqds_Z, ws.dqds_st) != 0 && bdsqr!(d, e, nothing, nothing)
     @inbounds for i in 1:n

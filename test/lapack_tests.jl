@@ -1947,3 +1947,24 @@ end
         @test_throws ArgumentError fn('L', A, tau, A)              # the aliased one must THROW
     end
 end
+
+# The five-argument `gebrd!` entry admits every `T <: Number`; element types without a blocked kernel
+# (Float32, Dual) take the generic unblocked reduction. The bidiagonal must carry A's singular values.
+@testitem "gebrd! (workspace-free entry) — every admitted element type reduces to a bidiagonal with A's σ" begin
+    using PureBLAS, LinearAlgebra, ForwardDiff, Random
+    Random.seed!(31)
+    D1 = ForwardDiff.Dual{Nothing, Float64, 1}
+    @testset "$T" for T in (Float32, Float64, ComplexF32, ComplexF64, D1)
+        m, n = 20, 12
+        A0 = T <: ForwardDiff.Dual ? T.(randn(m, n), ForwardDiff.Partials.(tuple.(randn(m, n)))) : randn(T, m, n)
+        A = copy(A0)
+        R = T <: ForwardDiff.Dual ? T : real(T)
+        d = zeros(R, n); e = zeros(R, n - 1); tauq = zeros(T, n); taup = zeros(T, n)
+        @test PureBLAS.gebrd!(A, d, e, tauq, taup) === A
+        val(x) = x isa ForwardDiff.Dual ? ForwardDiff.value(x) : x
+        ref = svdvals(val.(A0))
+        got = svdvals(Bidiagonal(Float64.(val.(d)), Float64.(val.(e)), :U))
+        @test maximum(abs, got .- ref) / ref[1] < (T in (Float32, ComplexF32) ? 1.0e-5 : 1.0e-12)
+    end
+    @test_throws "requires m ≥ n" PureBLAS.gebrd!(randn(Float32, 3, 5), zeros(Float32, 5), zeros(Float32, 4), zeros(Float32, 5), zeros(Float32, 5))
+end
