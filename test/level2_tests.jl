@@ -488,10 +488,10 @@ end
         # thread" (the `p.gen` witness cannot: the lost path does not bump it).
         P.set_num_threads(nt)
         lost0 = P._MT_LOST[]
-        _, held = @atomicreplace p.busy false => true
+        held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
         @test held
         Af = copy(A0); P.ger!(0.75, x, y, Af)
-        @atomic p.busy = false
+        P._MT_CLAIM[] = false
         @test P._MT_LOST[] == lost0 + 1
         @test Af == A2
         # CONCURRENT: several callers at once, so all but one LOSE the claim and run the fallback.
@@ -626,10 +626,10 @@ end
             # `_MT_LOST` would not move.
             if !sme
                 lost0 = P._MT_LOST[]
-                _, held = @atomicreplace p.busy false => true
+                held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
                 yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β)
-                @atomic p.busy = false
+                P._MT_CLAIM[] = false
                 @test P._MT_LOST[] == lost0 + 1
                 @test yf == y2
             end
@@ -745,10 +745,10 @@ end
             # reason the gemv-N item gives: the call never reaches the claim.
             if !sme
                 lost0 = P._MT_LOST[]
-                _, held = @atomicreplace p.busy false => true
+                held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
                 yf = copy(y0); P.gemv!(yf, A, x; alpha = α, beta = β, trans = 'T')
-                @atomic p.busy = false
+                P._MT_CLAIM[] = false
                 @test P._MT_LOST[] == lost0 + 1
                 @test yf == y2
             end
@@ -833,10 +833,10 @@ end
             # FORCE THE LOSS: the fallback must run the same column bodies the chunks run.
             if !sme
                 lost0 = P._MT_LOST[]
-                _, held = @atomicreplace p.busy false => true
+                held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
                 xf = copy(x0); tmv!(A, xf, ul)
-                @atomic p.busy = false
+                P._MT_CLAIM[] = false
                 @test P._MT_LOST[] == lost0 + 1
                 @test bitsame(xf, want)
             end
@@ -949,10 +949,10 @@ end
             @test bitsame((t = copy(x0); nmv!(A, t, ul, dg); t), want)
             # FORCE THE LOSS: the fallback must run the same row body the chunks run.
             lost0 = P._MT_LOST[]
-            _, held = @atomicreplace p.busy false => true
+            held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
             @test held
             xf = copy(x0); nmv!(A, xf, ul, dg)
-            @atomic p.busy = false
+            P._MT_CLAIM[] = false
             @test P._MT_LOST[] == lost0 + 1
             @test bitsame(xf, want)
             tasks = [@spawn (t = copy(x0); nmv!(A, t, ul, dg); t) for _ in 1:(2 * nt)]
@@ -1082,10 +1082,10 @@ end
             # it. Skipped under SME, which returns before the claim.
             if !sme
                 lost0 = P._MT_LOST[]
-                _, held = @atomicreplace p.busy false => true
+                held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
                 @test held
                 yf = copy(yi); P.symv!(yf, Ai, xi; uplo = 'L', alpha = α, beta = β)
-                @atomic p.busy = false
+                P._MT_CLAIM[] = false
                 @test P._MT_LOST[] == lost0 + 1
                 @test yf == y2
             end
@@ -1211,10 +1211,10 @@ end
         # serialised spawn storm would skip. See the ger item.
         P.set_num_threads(nt)
         lost0 = P._MT_LOST[]
-        _, held = @atomicreplace p.busy false => true
+        held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
         @test held
         yf = copy(y0); P.gbmv!(yf, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5)
-        @atomic p.busy = false
+        P._MT_CLAIM[] = false
         @test P._MT_LOST[] == lost0 + 1
         @test yf == y2
         tasks = [@spawn (t = copy(y0); P.gbmv!(t, AB, x, m, kl, ku; alpha = 0.75, beta = 2.5); t) for _ in 1:(2 * nt)]

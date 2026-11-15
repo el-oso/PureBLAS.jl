@@ -4317,7 +4317,7 @@ end
 # worker in ONE atomic load, and that packing is a correctness requirement, not a compaction. The
 # earlier layout kept `nw` as a plain field next to `gen`, and a worker read them in two steps. A worker
 # whose index is ≥ this job's `nw` is one the driver never waits for, so between those two loads the job
-# could complete, `busy` be released, and the NEXT job publish different fields with a larger `nw`. The
+# could complete, the claim be released, and the NEXT job publish different fields with a larger `nw`. The
 # surplus worker then read the new `nw`, found itself in range, ran a chunk of a job it was never
 # dispatched for, bumped `done`, looped, saw the changed generation, and ran the SAME chunk again —
 # driving `done` to its target while another worker was still writing C, so the driver returned and the
@@ -4436,7 +4436,6 @@ end
 mutable struct GemmPool{T}
     @atomic gen::Int                 # `counter << _MT_NW_SHIFT | nw`; bumped to publish a job (see above)
     @atomic done::Int                # workers that have finished the current job
-    @atomic busy::Bool               # a claim, so two concurrent gemms cannot share one pool
     @atomic failed::Bool             # a worker's chunk threw; the driver turns this into an error
     const evs::Vector{Threads.Event} # one wake per worker
     const tids::Vector{Int}          # the thread worker i is sticky to (see `_gemm_pool_start!`)
@@ -5012,8 +5011,10 @@ end
 # whole.
 # ── THE REDUCTION PARTIALS BUFFER ───────────────────────────────────────────────────────────────────
 # A PROCESS GLOBAL IS SOUND for it, by the same argument `_GPKSH_F64` records: the pool admits one job at
-# a time under `p.busy`, the driver sizes this inside that claim, and each worker writes only the block
-# indices it owns. Nothing here is held across a yield by a caller, so it needs no task ownership.
+# a time process-wide under `_MT_CLAIM`, the driver sizes this inside that claim, and each worker
+# writes only the block indices it owns. Nothing here is held across a yield by a caller, so it needs no
+# task ownership. The claim is shared by every element type's pool: a per-pool claim would let a Float64
+# and a Float32 reduction run together on this one buffer.
 #
 # A bare `const` Vector rather than a `OncePerProcess`: an owner reachable from a kernel takes a `lock()`
 # whose first call descends through `yield()`/`wait()` into Base's `OncePerThread{Task}` scheduler, which
@@ -5024,9 +5025,10 @@ const _REDP_F32 = Float32[]
 @inline _red_partials(::Type{Float32}) = _REDP_F32
 
 # The ARGMAX partials: one BLOCK INDEX per block, so a single `Int` buffer serves every element type.
-# Soundness is the argument above verbatim — one job at a time under `p.busy`, the driver sizes it
-# inside the claim, each worker writes only the block slots it owns, nothing is held across a yield.
-# It is deliberately NOT a second `Vector{T}` with the index stored as a float: the chunk needs no
+# Soundness is the argument above verbatim — one job at a time under `_MT_CLAIM` (shared by every
+# element type, which is what keeps a Float64 and a Float32 argmax off this one buffer together), the
+# driver sizes it inside the claim, each worker writes only the block slots it owns, nothing is held
+# across a yield. It is deliberately NOT a second `Vector{T}` with the index stored as a float: the chunk needs no
 # float round-trip and the only conversion left is the driver's single return, which `_iamax_mt_nmax`
 # bounds.
 const _REDI = Int[]
@@ -5648,7 +5650,7 @@ end
     length(tids) >= nwmax ||
         error("PureBLAS: $nwmax pool workers but only $(length(tids)) threads to bind them to: $tids")
     p = GemmPool{T}(
-        0, 0, false, false, [Threads.Event(true) for _ in 1:nwmax], tids[1:nwmax],
+        0, 0, false, [Threads.Event(true) for _ in 1:nwmax], tids[1:nwmax],
         Ptr{T}(0), Ptr{T}(0), Ptr{T}(0), 0, 0, 0, 1, 1, 1,
         zero(T), zero(T), false, false, false, false,
         _MT_KIND_GEMM, false, false, false, 0,
@@ -5689,6 +5691,11 @@ const _MT_NTHREADS = Threads.Atomic{Int}(1)
 # asserts only agreement passes vacuously when the scheduler serialises its tasks and no caller ever
 # loses. Bumped on the lost path only, which already pays for a full serial computation.
 const _MT_LOST = Threads.Atomic{Int}(0)
+
+# THE ONE THREADED-JOB CLAIM, shared by the four per-type pools. A task holds it from the CAS in
+# `_gemm_threaded!` until the join completes (or before anything was published). See there for what
+# relies on it.
+const _MT_CLAIM = Threads.Atomic{Bool}(false)
 
 # How many jobs were published with a worker sitting out because the driver was on its thread. A test
 # witness, like `_MT_LOST`: a placement test that only compares bits passes when the driver happened
@@ -6443,12 +6450,19 @@ end
     nwk = skip > 0 ? min(nw, length(p.evs)) : nw - 1
     skip > 0 && nwk < 2 && (skip = 0; nwk = nw - 1)
     nc = skip > 0 ? nwk : nw
-    # ONE claim, and a serial fallback if it fails. This is what keeps threading composable: a host that
-    # runs `Threads.@threads` over many `mul!` calls has one caller win the pool and every other caller
-    # run serially on its own thread, which is the right answer anyway — the machine is already busy.
-    # ponytail: a single global claim, not a work-stealing scheduler. Upgrade to per-caller pools only
-    # if a measurement shows nested callers starving, which needs a nested-parallel benchmark first.
-    _, won = @atomicreplace p.busy false => true
+    # ONE claim FOR THE WHOLE PROCESS, and a serial fallback if it fails. This is what keeps threading
+    # composable: a host that runs `Threads.@threads` over many `mul!` calls has one caller win and every
+    # other caller run serially on its own thread, which is the right answer anyway — the machine is
+    # already busy. The claim is shared by the four per-type pools, not held per pool, because three
+    # things outside any one pool rely on "one threaded job at a time": the per-thread arena, the
+    # reduction/argmax partials buffers (`_REDI`, `_red_partials`) and the shared pack buffers. While a
+    # task holds the claim, every threaded call of every element type and job kind loses it, takes the
+    # serial path below and publishes nothing; at most one task in the process is therefore suspended
+    # between claim and release (at the join or a `_pool_barrier`).
+    # ponytail: a single global claim, not a work-stealing scheduler. Per-caller pools would break the
+    # premises of arena.jl (part (c)) and of the shared buffers above; upgrade to them only if a
+    # measurement shows nested callers starving, and make the arena per-task in the same change.
+    won = !Threads.atomic_cas!(_MT_CLAIM, false, true)
     # `_gemm_core!` returns different things on different routes, so its value is discarded and every path
     # here returns a `T` instead — `zero(T)` where the result is in `C`, the fold for a reduction. What
     # matters is that the type is the SAME on both paths: a union return propagates into every caller's
@@ -6624,14 +6638,14 @@ end
         return zero(T)
     end
     # SIZE THE SHARED BUFFER HERE — AFTER THE CLAIM, NOT BEFORE IT. The pool grows by
-    # `push!`/`resize!`, and doing that before winning `busy` lets two large callers race on the same
+    # `push!`/`resize!`, and doing that before winning the claim lets two large callers race on the same
     # vector: they collide exactly at a new high-water mark, which is when two large calls arrive
     # together, and a loser's `resize!` can move storage the winner's workers already hold pointers
     # into. Inside the claim only one caller is ever here, so the workers that follow do nothing but
     # read the outer vector.
     # SIGNALS ARE DEFERRED FOR THE WHOLE THREADED BODY. The join below is the `finally` of the chunk,
     # and its `yield()` is a safepoint where a Ctrl-C on the main thread lands as an InterruptException.
-    # Unwinding from there would abandon the join, release `busy`, return to the caller, and end its
+    # Unwinding from there would abandon the join, release the claim, return to the caller, and end its
     # `GC.@preserve` while workers are still writing C. `sigatomic_begin`/`end` is the ccall pair Base's
     # own `disable_sigint` uses: a SIGINT that arrives inside the region is held and delivered at
     # `sigatomic_end`, and the defer count follows this TASK across a yield (Julia saves it per task on
@@ -6749,7 +6763,7 @@ end
         @atomic p.failed = false
         # ONE atomic store publishes the worker count together with the generation (see `GemmPool`)
         # and, being sequentially consistent, every plain field written above. Only the driver writes
-        # `gen`, and only under `busy`, so read-modify-write here needs no CAS.
+        # `gen`, and only under the claim, so read-modify-write here needs no CAS.
         # Set BEFORE the store, not after: the conservative direction is to poison when unsure, and a
         # throw between the two lines would otherwise release a pool whose workers had been released.
         published = true
@@ -6793,10 +6807,10 @@ end
         end
         (@atomic p.failed) && _throw_gemm_worker()
         # The next panel's `info`, read inside the claim for the reason the folds below are: once
-        # `busy` is released the next job's publish clears the field.
+        # the claim is released the next job's publish clears the field.
         kind == _MT_KIND_LUSTEP && (red = T(p.lainfo))
         # FOLD A REDUCTION HERE, INSIDE THE CLAIM. It cannot wait until after the `finally` below: that
-        # releases `busy`, and the next caller's driver resizes and rewrites the very slots this fold
+        # releases the claim, and the next caller's driver resizes and rewrites the very slots this fold
         # reads. Here the job is joined (no worker is writing) and the claim is still held (no other
         # caller can be), which is the only window where both are true.
         #
@@ -6866,10 +6880,10 @@ end
         #
         # `joined` is set on the line after the join loop, so it is false on one path: something
         # unwound OUT of that loop — which, with signals deferred, is a forced interrupt or a
-        # `throwto`, never a plain Ctrl-C. There workers may still hold `C.ptr`, and releasing `busy`
-        # would let the NEXT call publish a job over a pool with live workers. So the pool stays
-        # claimed for the life of the process ("poisoned"): every later `gemm!` loses the
-        # `@atomicreplace` above and runs serially, which is correct and merely slower.
+        # `throwto`, never a plain Ctrl-C. There workers may still hold `C.ptr`, and releasing the claim
+        # would let the NEXT call publish a job over a pool with live workers. So the claim stays
+        # held for the life of the process ("poisoned"): every later threaded call of every element
+        # type loses the `atomic_cas!` above and runs serially, which is correct and merely slower.
         #
         # `!published` covers the opposite case: nothing unwound out of a join because no job was ever
         # published, so no worker can have started and the claim is safe to hand back. The setup above
@@ -6879,7 +6893,7 @@ end
         #
         # A chunk that THROWS is neither path: its join still runs to completion, `joined` is true, and
         # the pool is released before the error propagates.
-        (joined || !published) && (@atomic p.busy = false)
+        (joined || !published) && (_MT_CLAIM[] = false)
         ct.sticky = was_sticky
         Base.sigatomic_end()   # last: a deferred SIGINT is thrown from here, after the pool is released
     end
