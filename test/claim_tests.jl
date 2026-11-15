@@ -217,7 +217,7 @@ end
         P.set_num_threads(1); r64 = P.iamax(x64); r32 = P.iamax(x32)
         P.set_num_threads(nthreads())
         @test (r64, r32) == (1_500_000, 3_100_000)
-        iters = 200
+        iters = 1000
         j0 = alljobs(); l0 = P._MT_LOST[]
         t1 = Threads.@spawn loop_iamax(x64, r64, iters)
         t2 = Threads.@spawn loop_iamax(x32, r32, iters)
