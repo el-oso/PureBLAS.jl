@@ -5013,8 +5013,8 @@ end
 # A PROCESS GLOBAL IS SOUND for it, by the same argument `_GPKSH_F64` records: the pool admits one job at
 # a time process-wide under `_MT_CLAIM`, the driver sizes this inside that claim, and each worker
 # writes only the block indices it owns. Nothing here is held across a yield by a caller, so it needs no
-# task ownership. The claim is shared by every element type's pool: a per-pool claim would let a Float64
-# and a Float32 reduction run together on this one buffer.
+# task ownership. The buffer is per element type, so it needs only the one-job-at-a-time property of
+# its own pool.
 #
 # A bare `const` Vector rather than a `OncePerProcess`: an owner reachable from a kernel takes a `lock()`
 # whose first call descends through `yield()`/`wait()` into Base's `OncePerThread{Task}` scheduler, which
@@ -6454,14 +6454,14 @@ end
     # ONE claim FOR THE WHOLE PROCESS, and a serial fallback if it fails. This is what keeps threading
     # composable: a host that runs `Threads.@threads` over many `mul!` calls has one caller win and every
     # other caller run serially on its own thread, which is the right answer anyway — the machine is
-    # already busy. The claim is shared by the four per-type pools, not held per pool, because three
-    # things outside any one pool rely on "one threaded job at a time": the per-thread arena, the
-    # reduction/argmax partials buffers (`_REDI`, `_red_partials`) and the shared pack buffers. While a
+    # already busy. The claim is shared by the four per-type pools, not held per pool, because two
+    # things that cross element types rely on "one threaded job at a time": the per-thread arena and the
+    # argmax index buffer `_REDI`. (The partials and pack buffers are per element type.) While a
     # task holds the claim, every threaded call of every element type and job kind loses it, takes the
     # serial path below and publishes nothing; at most one task in the process is therefore suspended
     # between claim and release (at the join or a `_pool_barrier`).
     # ponytail: a single global claim, not a work-stealing scheduler. Per-caller pools would break the
-    # premises of arena.jl (part (c)) and of the shared buffers above; upgrade to them only if a
+    # premises of arena.jl (part (c)) and of `_REDI`; upgrade to them only if a
     # measurement shows nested callers starving, and make the arena per-task in the same change.
     won = !Threads.atomic_cas!(_MT_CLAIM, false, true)
     # `_gemm_core!` returns different things on different routes, so its value is discarded and every path

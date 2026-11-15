@@ -1093,8 +1093,11 @@ end
             lost0 = P._MT_LOST[]
             held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
             @test held
-            GC.@preserve src dst P._tricopy_mt!(pointer(dst), ldd, pointer(src), lds, n, up)
-            P._MT_CLAIM[] = false
+            held && try
+                GC.@preserve src dst P._tricopy_mt!(pointer(dst), ldd, pointer(src), lds, n, up)
+            finally
+                P._MT_CLAIM[] = false
+            end
             @test P._MT_LOST[] == lost0 + 1
             @test isequal(dst, ref)
         end

@@ -18,8 +18,9 @@
 #       return — a chunk yields only at a `_pool_barrier` (`test/yield_lint.jl` is the lexical
 #       guard) — so it is per-chunk in practice and cannot outlive a migration;
 #   (c) the ARENA only: its borrows NEST, the driver is pinned to its thread across the join and the
-#       barriers, the only yields that can sit inside a scope (`Task.sticky` in `_gemm_threaded!`), and the single process-wide claim
-#       (`_MT_CLAIM`, shared by every element type's pool) means at most one task in the process is
+#       barriers, the only yields that can sit inside a scope (`Task.sticky` in
+#       `_gemm_threaded!`), and the single process-wide claim (`_MT_CLAIM`, shared by every element
+#       type's pool) means at most one task in the process is
 #       ever suspended mid-scope — src/arena.jl's threading note. Per-caller pools would end that and
 #       require a per-task arena. This argument does NOT transfer to a wholesale-claimed role (a `Ref`,
 #       a fixed buffer): another task on the pinned thread claims the same role during the yield and
