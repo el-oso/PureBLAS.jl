@@ -155,15 +155,19 @@ end
         Ap = fill(sent, len + 5); P._pack_A_simd_T!(Ap, AT, 1, 0, mce, kce, alpha, mr)
         @test bits(Ap) == bits(wantT)
     end
-    for nce in (1, NR - 1, NR + 1, 2NR + 3, 30), kce in (1, 3, W, W + 1, 17), tB in (false, true), nr in unique((NR, NR + 2, 3))
-        B = tB ? randn(rng, nce + 2, kce + 1) : randn(rng, kce + 1, nce + 2)
+    # `way`: op(B)=Bᵀ with columns a whole number of L1 ways apart, which takes the skewed panel walk.
+    for nce in (1, NR - 1, NR + 1, 2NR + 3, 30), kce in (1, 3, W, W + 1, 17), (tB, way) in ((false, false), (true, false), (true, true)), nr in unique((NR, NR + 2, 3))
+        wr8 = P._L1_WAY_BYTES ÷ sizeof(Float64); wc16 = P._L1_WAY_BYTES ÷ sizeof(ComplexF64)
+        ldr = way ? cld(nce + 2, wr8) * wr8 : nce + 2
+        ldc = way ? cld(nce + 2, wc16) * wc16 : nce + 2
+        B = tB ? randn(rng, ldr, kce + 1) : randn(rng, kce + 1, nce + 2)
         len = cld(nce, nr) * nr * kce
         want = fill(sent, len + 5)
         for ji in 0:(cld(nce, nr) - 1), p in 0:(kce - 1), c in 0:(nr - 1)
             lc = ji * nr + c; idx = ji * nr * kce + p * nr + c + 1
             want[idx] = lc < nce ? (tB ? B[1 + lc, 1 + p] : B[1 + p, 1 + lc]) : 0.0
         end
-        Bc = tB ? randn(rng, ComplexF64, nce + 2, kce + 1) : randn(rng, ComplexF64, kce + 1, nce + 2)
+        Bc = tB ? randn(rng, ComplexF64, ldc, kce + 1) : randn(rng, ComplexF64, kce + 1, nce + 2)
         wr = fill(sent, len + 5); wi = copy(wr)
         for ji in 0:(cld(nce, nr) - 1), p in 0:(kce - 1), c in 0:(nr - 1)
             lc = ji * nr + c; idx = ji * nr * kce + p * nr + c + 1

@@ -652,6 +652,77 @@ end
 @inline _nrval(::Val{N}) where {N} = N
 @inline _nrval(n::Int) = n
 
+# One row of a real op(B)=Bᵀ panel: copy the `cn` contiguous elements at `src` to `dst`, zero-padding
+# to `nr`. A copy does no arithmetic, so a register wider than the FP datapath only splits into
+# datapath-width operations; the copy moves datapath-width vectors (`Wc`), which equals `_vwidth`
+# except on a double-pumped part. Zen4 (64-byte registers, 32-byte datapath), nr=10, kce=256,
+# against the 64-byte copy: 0.81 at nce=256, 0.89 at nce=37, 0.91 at nce=63.
+@inline function _pack_B_row_T!(dst::Ptr{T}, src::Ptr{T}, nr::Int, cn::Int) where {T}
+    sz = sizeof(T); Wc = max(1, _datapath_bytes(_HW) ÷ sz); Vc = Vec{Wc, T}
+    if cn == nr                                # full panel
+        c = 0
+        while c + Wc <= cn
+            vstore(vload(Vc, src + c * sz), dst + c * sz); c += Wc
+        end
+        _tail_pieces(c, nr - c, Val(Wc)) do vh, j   # the remaining fewer than Wc elements are a plain copy
+            Vh = Vec{_pw(vh), T}
+            vstore(vload(Vh, src + j * sz), dst + j * sz)
+        end
+    else                                       # ragged last panel: full-width masked vectors, zero-padded to nr
+        W = _vwidth(T); V = Vec{W, T}; lane = Vec(ntuple(l -> l - 1, Val(W)))
+        c = 0
+        while c + W <= cn
+            vstore(vload(V, src + c * sz), dst + c * sz); c += W
+        end
+        while c < nr
+            vm = lane < (cn - c)
+            _vstore_r(vifelse(vm, vload(V, src + c * sz, vm), zero(V)), dst + c * sz, nr - c)
+            c += W
+        end
+    end
+    return nothing
+end
+
+# Calls `row(ji, p)` once for every panel `ji` in `0:np-1` and contraction row `p` in `0:kce-1`, in the
+# order an op(B)=Bᵀ pack wants when the columns of `B` are a whole number of L1 ways apart. Every
+# source row of one panel then falls in the same L1 set, and copying one panel at a time puts more of
+# those lines in flight than the set has ways. So the panels go in pairs, walked on a skew: step `s`
+# copies row `s` of the first panel, then row `s + 1` (wrapping to 0) of the second. Consecutive loads
+# alternate between two set groups and consecutive stores stay on different lines. Measured on Zen4
+# against one panel at a time, kce=256: real nr=10 at nce=512 and 1024 (4 and 8 KiB columns),
+# 0.63 and 0.56; complex nr=8 at nce=256, 0.87.
+@inline function _skew_panel_pairs(row::F, np::Int, kce::Int) where {F}
+    for jg in 0:2:(np - 1)
+        if jg + 1 < np
+            for s in 0:(kce - 1)
+                row(jg, s)
+                row(jg + 1, s + 1 == kce ? 0 : s + 1)
+            end
+        else
+            for p in 0:(kce - 1)
+                row(jg, p)
+            end
+        end
+    end
+    return nothing
+end
+
+# The op(B)=Bᵀ case of `_pack_B_simd!` walked by `_skew_panel_pairs`; same rows, same result.
+@inline function _pack_B_skew!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, nr::Int, boff::Int) where {T}
+    sz = sizeof(T); ldb = stride(B, 2)
+    GC.@preserve B Bp begin
+        Bptr = pointer(B); Bpp = pointer(Bp)
+        _skew_panel_pairs(cld(nce, nr), kce) do ji, p
+            @inline
+            _pack_B_row_T!(
+                Bpp + (boff + ji * nr * kce + p * nr) * sz, Bptr + (jc + ji * nr + (pc + p) * ldb) * sz,
+                nr, min(nr, nce - ji * nr)
+            )
+        end
+    end
+    return
+end
+
 # Vector B-pack for real `T` over a unit-row-stride `B`. `nrv` is the panel width, either an `Int` or a
 # `Val` (a compile-time width gives the loops constant trip counts). Ragged panels, partial column
 # blocks and the contraction tail go through masked loads and stores, so nothing outside `B[1:kce, 1:nce]`
@@ -659,7 +730,8 @@ end
 # ragged panel are exact zeros.
 @inline function _pack_B_simd!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nrv, boff::Int) where {T}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); ldb = stride(B, 2); nr = _nrval(nrv)
-    np = cld(nce, nr); lane = Vec(ntuple(l -> l - 1, Val(W))); ov = V(one(T))
+    np = cld(nce, nr); ov = V(one(T))
+    tB && iszero((ldb * sz) % _L1_WAY_BYTES) && return _pack_B_skew!(Bp, B, pc, jc, kce, nce, nr, boff)
     GC.@preserve B Bp begin
         Bptr = pointer(B); Bpp = pointer(Bp)
         for ji in 0:(np - 1)
@@ -669,23 +741,7 @@ end
             if tB
                 # op(B)=Bᵀ: for fixed p the c-run is down a B column (contiguous) — copy it, zero-padding to nr.
                 for p in 0:(kce - 1)
-                    src = Bptr + (j0 + (pc + p) * ldb) * sz; dst = Bpp + (base + p * nr) * sz
-                    c = 0
-                    while c + W <= cn
-                        vstore(vload(V, src + c * sz), dst + c * sz); c += W
-                    end
-                    if cn == nr                        # full panel: the remaining fewer than W elements are a plain copy
-                        _tail_pieces(c, nr - c, Val(W)) do vh, j
-                            Vh = Vec{_pw(vh), T}
-                            vstore(vload(Vh, src + j * sz), dst + j * sz)
-                        end
-                    else                               # ragged last panel: zero-pad to nr
-                        while c < nr
-                            vm = lane < (cn - c)
-                            _vstore_r(vifelse(vm, vload(V, src + c * sz, vm), zero(V)), dst + c * sz, nr - c)
-                            c += W
-                        end
-                    end
+                    _pack_B_row_T!(Bpp + (base + p * nr) * sz, Bptr + (j0 + (pc + p) * ldb) * sz, nr, cn)
                 end
             else
                 # op(B)=B: a column of B is contiguous in p; transpose W×W blocks into the panel rows.
@@ -2251,13 +2307,47 @@ end
     return nothing
 end
 
+# One row of a complex op(B)=Bᵀ panel: split the `cn` contiguous complex elements at `src` into
+# `dR`/`dI`, zero-padding both to `nr`.
+@inline function _pack_B_cmplx_row_T!(dR::Ptr{T}, dI::Ptr{T}, src::Ptr{T}, nr::Int, cn::Int) where {T}
+    W = _vwidth(T); sz = sizeof(T); clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
+    c = 0
+    while c + W <= cn
+        ar, ai = _deint_cmplx(vload(Vec{2W, T}, src + 2 * c * sz))
+        vstore(ar, dR + c * sz); vstore(ai, dI + c * sz)
+        c += W
+    end
+    while c < nr
+        ar, ai = _deint_cmplx(vload(Vec{2W, T}, src + 2 * c * sz, clane <= (cn - c)))
+        _vstore_r(ar, dR + c * sz, nr - c); _vstore_r(ai, dI + c * sz, nr - c)
+        c += W
+    end
+    return nothing
+end
+
+# The op(B)=Bᵀ case of `_pack_B_cmplx_simd!` walked by `_skew_panel_pairs`; same rows, same result.
+@inline function _pack_B_cmplx_skew!(
+        BpR::Vector{T}, BpI::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, nr::Int
+    ) where {T}
+    sz = sizeof(T); ldb = stride(B, 2)
+    GC.@preserve B BpR BpI begin
+        Bptr = Ptr{T}(pointer(B)); PR = pointer(BpR); PI = pointer(BpI)
+        _skew_panel_pairs(cld(nce, nr), kce) do ji, p
+            @inline
+            dst = (ji * nr * kce + p * nr) * sz
+            _pack_B_cmplx_row_T!(PR + dst, PI + dst, Bptr + 2 * (jc + ji * nr + (pc + p) * ldb) * sz, nr, min(nr, nce - ji * nr))
+        end
+    end
+    return
+end
+
 # Vector complex B-pack for a unit-row-stride `B`; the structure and the masking guarantees are those of
 # `_pack_B_simd!`, with the real and imaginary parts split into `BpR` and `BpI`.
 @inline function _pack_B_cmplx_simd!(
         BpR::Vector{T}, BpI::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int
     ) where {T}
     W = _vwidth(T); sz = sizeof(T); ldb = stride(B, 2); np = cld(nce, nr)
-    clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
+    tB && iszero((2 * ldb * sz) % _L1_WAY_BYTES) && return _pack_B_cmplx_skew!(BpR, BpI, B, pc, jc, kce, nce, nr)
     GC.@preserve B BpR BpI begin
         Bptr = Ptr{T}(pointer(B)); PR = pointer(BpR); PI = pointer(BpI)
         for ji in 0:(np - 1)
@@ -2266,18 +2356,8 @@ end
             cn = min(nr, nce - ji * nr)
             if tB
                 for p in 0:(kce - 1)
-                    src = Bptr + 2 * (j0 + (pc + p) * ldb) * sz; dst = base + p * nr
-                    c = 0
-                    while c + W <= cn
-                        ar, ai = _deint_cmplx(vload(Vec{2W, T}, src + 2 * c * sz))
-                        vstore(ar, PR + (dst + c) * sz); vstore(ai, PI + (dst + c) * sz)
-                        c += W
-                    end
-                    while c < nr
-                        ar, ai = _deint_cmplx(vload(Vec{2W, T}, src + 2 * c * sz, clane <= (cn - c)))
-                        _vstore_r(ar, PR + (dst + c) * sz, nr - c); _vstore_r(ai, PI + (dst + c) * sz, nr - c)
-                        c += W
-                    end
+                    dst = (base + p * nr) * sz
+                    _pack_B_cmplx_row_T!(PR + dst, PI + dst, Bptr + 2 * (j0 + (pc + p) * ldb) * sz, nr, cn)
                 end
             else
                 c0 = 0
