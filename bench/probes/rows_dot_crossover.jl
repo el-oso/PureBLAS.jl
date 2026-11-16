@@ -29,12 +29,21 @@ function cell(::Type{T}, r, k, n) where {T}
     return (a1 + a2) / 2, (b1 + b2) / 2
 end
 
+# Multiples of 8 plus, for Float64, every residue mod the register width above 32, 64 and 128: a C
+# whose last column block is narrower than the unpacked tile is where the two arms handle the ragged
+# edge differently.
+ladder(::Type{T}) where {T} = T === Float64 ?
+    sort!(unique!(vcat([8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512], [b + e for b in (32, 64, 128) for e in 1:(P._vwidth(T) - 1)]))) :
+    [8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
+
 function main()
+    println("# host: W64=", P._vwidth(Float64), " lanes64=", P._at_tail_vw(P._HW, Float64), " NR=", P._NR, " MR=", P._MR,
+        " NVREG=", P._NVREG, " L1=", P._L1_BYTES, " MR1_MAX=", P._GEMM_MR1_MAX)
     println("T\tW\tr\tk\tn\tdot_ns\tvec_ns\tvec/dot\trule\treachable"); flush(stdout)
     worst = 1.0; bad = 0; tot = 0
     for T in (Float64, Float32)
         W = P._vwidth(T)
-        for r in 1:(W - 1), k in (33, 100, 300), n in (8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512)
+        for r in 1:(W - 1), k in (33, 100, 300), n in ladder(T)
             d, v = cell(T, r, k, n)
             # The shipped rule's pick, and whether `gemm!` can reach the split for this T on this host.
             pick = P._rows_dot_tail_pays(T, W, r, k, n)

@@ -8026,28 +8026,43 @@ end
     return Expr(:block, Expr(:meta, :inline), ex)
 end
 
-# TW columns at a time: each column's R rows in one masked load, the TW×TW register transpose
-# (`_transpose_regs`), and R row stores of the block's columns (`_vstore_rows!`, which never stores
-# through a mask). R is a type parameter so the transpose computes only the R rows it stores, and TW
-# is the smallest power of two holding them, since a wider block costs more shuffles per element.
-# PDM: Derived for R ≥ 2 (the row count); one row is a strided copy with no shape to derive from, and
-# its block width is a literal (req8-ok) measured on Zen4, ns per element against the scalar copy:
+# TW columns at a time: each column's rows in one masked load, the TW×TW register transpose
+# (`_transpose_regs`), and the row stores of the block's columns (`_vstore_rows!`, which never stores
+# through a mask). The row count is a type parameter so the transpose computes only the rows it stores,
+# and TW is the smallest power of two holding them, since a wider block costs more shuffles per element.
+# A transpose holds TW source vectors and TW results at once, so rows go in passes of at most
+# `_NVREG ÷ 4` (`_rows_pack_tw`): at `_NVREG ÷ 2` it spills (StrictMode `spill_report`: TW = 16 with 32
+# registers, TW = 8 with 16).
+# PDM: Derived for two or more rows (row count, register count); one row is a strided copy with no shape
+# to derive from, and its block width is a literal (req8-ok) measured on Zen4, ns per element against
+# the scalar copy:
 #   width        2      4      8      16     scalar   (k = 100 / 300)
 #   Float32    0.67   0.52   0.49   0.59     0.53
 #              0.49   0.41   0.40   0.47     0.39
 #   Float64    0.60   0.52   0.49     -      0.50
 #              0.49   0.48   0.38     -      0.42
+@inline _rows_pack_rows(::Type{T}, r::Int) where {T} = min(r, _vwidth(T), _NVREG ÷ 4)
+@inline _rows_pack_tw(::Type{T}, c::Int) where {T} = min(isone(c) ? 8 : nextpow(2, c), _vwidth(T))   # req8-ok: one-row width, table above
 @inline function _rows_split_pack!(Xp::Ptr{T}, Ap::PtrMatrix{T}, ::Val{R}, k::Int) where {T, R}
-    TW = min(isone(R) ? 8 : nextpow(2, R), _vwidth(T))   # req8-ok: one-row width, table above
-    sz = sizeof(T); ld = Ap.ld; src = Ap.ptr + (Ap.m - R) * sz
-    rmsk = Vec(ntuple(i -> i - 1, Val(TW))) < R
+    _rows_pack_pass!(Xp, Ap.ptr + (Ap.m - R) * sizeof(T), Ap.ld, Val(R), k)
+    return nothing
+end
+@inline function _rows_pack_pass!(Xp::Ptr{T}, src::Ptr{T}, ld::Int, ::Val{R}, k::Int) where {T, R}
+    C = _rows_pack_rows(T, R)
+    _rows_pack_block!(Xp, src, ld, Val(C), k)
+    C < R && _rows_pack_pass!(Xp + C * k * sizeof(T), src + C * sizeof(T), ld, Val(R - C), k)
+    return nothing
+end
+@inline function _rows_pack_block!(Xp::Ptr{T}, src::Ptr{T}, ld::Int, ::Val{C}, k::Int) where {T, C}
+    TW = _rows_pack_tw(T, C); sz = sizeof(T)
+    rmsk = Vec(ntuple(i -> i - 1, Val(TW))) < C
     p = 0
     while p < k
         # Fresh bindings per block: the closure below must not capture the reassigned `p`, which
         # would box it.
         cn = min(TW, k - p); blk = src + p * ld * sz
         cols = ntuple(c -> (c - 1) < cn ? vload(Vec{TW, T}, blk + (c - 1) * ld * sz, rmsk) : zero(Vec{TW, T}), Val(TW))
-        _vstore_rows!(_transpose_regs(cols), Xp + p * sz, k, R, cn)
+        _vstore_rows!(_transpose_regs(cols), Xp + p * sz, k, C, cn)
         p += TW
     end
     return nothing
