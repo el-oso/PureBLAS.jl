@@ -1,12 +1,13 @@
-# The `@verify_strict` block in src/verify.jl runs at every precompile. A proof-backed failure there
-# stops the build; a heuristic one only logs a `StrictViolation` warning. The block records each such
+# The ungated StrictMode checks at the end of src/verify.jl (`@assert_no_spill`, `@assert_vectorized`)
+# run at every precompile. A proof-backed failure there stops the build; a heuristic one only logs a
+# `StrictViolation` warning. src/verify.jl records each such
 # warning in `PureBLAS._LOADTIME_WARNINGS`, saved with the package image, so this item reads the warnings
 # of the build under test without compiling anything, and fails on any one not listed in
 # test/loadtime_warnings_baseline.txt.
 
 @testitem "Load-time StrictMode block logs no new warnings" tags = [:checks] begin
     using PureBLAS, StrictMode
-    # With checks disabled the block expands to bare calls and logs nothing, so a pass would be vacuous.
+    # With checks disabled the checks expand to bare calls and logs nothing, so a pass would be vacuous.
     @test StrictMode.checks_enabled()
     file = joinpath(@__DIR__, "loadtime_warnings_baseline.txt")
     baseline = Set(l for l in eachline(file) if !isempty(strip(l)) && !startswith(l, '#'))
