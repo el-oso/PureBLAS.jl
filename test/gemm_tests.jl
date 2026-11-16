@@ -171,7 +171,8 @@ end
         # has its own items.
         tB == 'N' && m <= P._rows_dot_max(T) && k >= P._rows_dot_kmin(T, m) && continue
         r = m % P._vwidth(T)
-        tB == 'N' && tA == 'N' && m > P._vwidth(T) && r > 0 && P._rows_dot_tail_pays(T, m - r, r, k, n) && continue
+        tB == 'N' && tA == 'N' && m > P._vwidth(T) && r > 0 && P._rows_dot_tail_ok(T, r) &&
+            k >= P._rows_dot_kmin(T, r) && continue
         A = tA == 'N' ? randn(T, m, k) : randn(T, k, m)
         B = tB == 'N' ? randn(T, k, n) : randn(T, n, k)
         C0 = randn(T, m, n); α = T(1.3)
@@ -199,8 +200,7 @@ end
 # A C of W·q + r rows (r < W, up to `_GEMM_MR1_MAX`) runs its q full vectors through the unpacked kernel
 # and its r rows through the dot-product kernel (B not transposed) or the n-vectorized kernel (B
 # transposed), over blocks of columns. The top rows match the serial core bit for bit, and every
-# element is one chain whose order depends on k alone, so columns computed in two calls match one call
-# when both calls take its route (`_rows_dot_tail_pays` reads n).
+# element is one chain whose order depends on k alone, so columns computed in two calls match one call.
 @testitem "GEMM few-row split: full vectors plus a tail" setup = [GemmOracle] begin
     using PureBLAS
     const P = PureBLAS
@@ -220,9 +220,9 @@ end
         nbad[] += C[1:q, :] != Cc[1:q, :]
         if tB == 'T' || r == 0
             nbad[] += C != Cc
-        elseif (h = n ÷ 2; P._rows_dot_tail_pays(T, q, r, k, h) == P._rows_dot_tail_pays(T, q, r, k, n - h) ==
-                P._rows_dot_tail_pays(T, q, r, k, n))
-            # Columns in two halves give the same bits, when both halves take the whole call's route.
+        else
+            # Columns in two halves give the same bits.
+            h = n ÷ 2
             Cl = copy(C0[:, 1:h]); Cr = copy(C0[:, (h + 1):n])
             P.gemm!(Cl, A, B[:, 1:h]; alpha = α, beta = β); P.gemm!(Cr, A, B[:, (h + 1):n]; alpha = α, beta = β)
             nbad[] += C != hcat(Cl, Cr)
@@ -257,12 +257,12 @@ end
         return C
     end
     run(cases) = [call1(i, c) for (i, c) in enumerate(cases)]
-    dottail(T, tB, m, k, n) = (
+    dottail(T, tB, m, k) = (
         W = P._vwidth(T); r = m % W;
-        tB == 'N' && m > W && r > 0 && P._rows_dot_tail_pays(T, m - r, r, k, n)
+        tB == 'N' && m > W && r > 0 && P._rows_dot_tail_ok(T, r) && k >= P._rows_dot_kmin(T, r)
     )
     # Witness: the dot-product tail is reached, so the comparison below covers the route it guards.
-    iw = findfirst(((T, tB, m, k, n),) -> T === Float64 && n == 600 && dottail(T, tB, m, k, n), cases)
+    iw = findfirst(((T, tB, m, k, n),) -> T === Float64 && n == 600 && dottail(T, tB, m, k), cases)
     @test !isnothing(iw)
     old = P.get_num_threads(); oldfloor = P._MT_FLOOR[]
     try

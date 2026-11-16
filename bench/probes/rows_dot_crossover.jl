@@ -6,7 +6,7 @@
 #   vector = `_gemm_core!` serial, which is what `gemm!` runs when the split declines.
 # Each cell is timed in rotation A B B A (Chairmarks medians), and the ratio is vector/dot (> 1 means
 # the dot tail is faster). Prints one TSV row per cell with the pick of the shipped rule
-# (`_rows_dot_tail_pays`) and whether `gemm!` can reach the split for that T on this host, then a
+# (`_rows_dot_tail_ok` and the depth rule `_rows_dot_kmin`) and whether `gemm!` can reach the split for that T on this host, then a
 # summary of how often the rule's pick is slower than the other arm. Run on each µarch with:
 #   JULIA_NUM_THREADS=1 taskset -c <one core> julia --project=. bench/probes/rows_dot_crossover.jl
 using PureBLAS, Chairmarks, Statistics, Random, LinearAlgebra
@@ -46,7 +46,7 @@ function main()
         for r in 1:(W - 1), k in (33, 100, 300), n in ladder(T)
             d, v = cell(T, r, k, n)
             # The shipped rule's pick, and whether `gemm!` can reach the split for this T on this host.
-            pick = P._rows_dot_tail_pays(T, W, r, k, n)
+            pick = P._rows_dot_tail_ok(T, r) && k >= P._rows_dot_kmin(T, r)
             reach = W + r <= P._GEMM_MR1_MAX
             println(T, '\t', W, '\t', r, '\t', k, '\t', n, '\t', round(d; digits = 1), '\t', round(v; digits = 1),
                 '\t', round(v / d; digits = 3), '\t', pick ? "dot" : "vec", '\t', reach); flush(stdout)

@@ -7967,7 +7967,7 @@ end
 # run the unpacked kernel unmasked; the r rows would cost a whole masked register per column and k
 # step, so they go to a kernel that vectorizes along k (B not transposed) or along n (B transposed)
 # and spends r/W of a register instead: the transposed-B tail under the rule `_gemm_rows_bt!` uses,
-# the dot-product tail where `_rows_dot_tail_pays`. OpenBLAS's small-matrix kernels for this part do the same: a dot-product form for a tail of at
+# the dot-product tail under `_rows_dot_tail_ok` and the dot route's depth rule. OpenBLAS's small-matrix kernels for this part do the same: a dot-product form for a tail of at
 # most 4 rows with B not transposed and k >= 16, and an n-vectorized form with scatter stores for a
 # tail of 1 to 5 rows with B transposed.
 #
@@ -7992,7 +7992,7 @@ end
         nw == 1 && (r < _at_tail_vw(_HW, T) || k >= _rows_dot_kmin(T, r)) || return false
         tk = 1
     else
-        _rows_dot_tail_pays(T, q, r, k, n) || return false
+        _rows_dot_tail_ok(T, r) && k >= _rows_dot_kmin(T, r) || return false
         tk = 2
     end
     if iszero(α)
@@ -8150,62 +8150,19 @@ end
 # Columns per block of the split: both passes over a block of B find it in L1 when the block fills at
 # most half of L1 (`_L1_BYTES`), and a block is at least one column tile of the tail kernel and of the
 # unpacked kernel (`_NR`), so neither runs a narrower tile than it would unblocked.
-# Whether the dot-product tail beats the unpacked kernel's vector tail for the last `r` of `q + r`
-# rows (q a multiple of W = `_vwidth(T)`), as a cost count in datapath vectors (`lanes = _at_tail_vw`,
-# so a register vector is `s = W ÷ lanes` of them). The q full rows' arithmetic is the same either way
-# and drops out.
-#   vector tail, per column:  k · cld(r, lanes)           one masked vector per k step
-#                           + mstore · (L(q + r) - L(q))  the masked stores the q + r rows add over q
-#   dot tail,    per column:  s · r · cld(k, W)           r chains along k in register vectors
-#                           + r · (log2(W) + 2)           a horizontal sum (log2 W steps) and a store per row
-#   dot tail,    per call:    2 · r · k                   packing the r rows contiguous along k
-# so the dot tail pays when the per-column saving is positive and repays the pack over n columns.
-# L(m) is the masked lanes the unpacked driver stores per column for m rows (`_unpacked_masked_lanes`),
-# and `mstore` what one such lane costs (`_masked_store_lane_slots`).
-# PDM: Derived — vector and pipeline widths from `_vwidth` and `_at_tail_vw`, the masked-store cost from
-# the ISA and vendor (see `_masked_store_lane_slots`); the per-element pack cost of 2 datapath slots (a
-# scalar load and a scalar store against the FMA issue) is a literal (req8-ok), fitted with the
-# epilogue term to forced-arm timings (`bench/probes/rows_dot_crossover.jl`, base clock, one thread).
-# Crossover n, derived against measured (first n of the ladder 8 … 384 from which the dot tail stays
-# ahead), Float64, q = W:
-#   Zen4  r = 1      2      3      4      5      6      7
-#   k=33      4/16  44/48  -/-    -/-    -/-    -/-    -/-
-#   k=100     3/8   11/16  86/64  -/-    23/24  86/128 -/-
-#   k=300     3/8    9/16  32/24  -/48   16/24  32/48  128/384
-#   Zen3  r = 1      2      3                                  (8 is the smallest n measured)
-#   k=33      2/8    4/8     7/16
-#   k=100     2/8    6/8    13/16
-#   k=300     3/8    7/8    19/48
-# The pack literal is where the parts disagree: the same rule finds Zen5's crossovers late (r = 3,
-# k = 100: derived 86, measured 24), while Zen4's threaded split, which packs once per band, needs it.
-@inline function _rows_dot_tail_pays(::Type{T}, q::Int, r::Int, k::Int, n::Int) where {T}
-    W = _vwidth(T); lanes = _at_tail_vw(_HW, T); s = W ÷ lanes
-    save = k * cld(r, lanes) - s * r * cld(k, W) - r * (trailing_zeros(W) + 2) +
-        _masked_store_lane_slots(_HW) * (_unpacked_masked_lanes(T, q + r) - _unpacked_masked_lanes(T, q))
-    return save > 0 && n * save > 2 * r * k
+# A dot-product tail of r rows, against the unpacked driver's one vector for them: that vector is the
+# datapath width for r up to it and the register width above, so it leaves `lanes - r` lanes idle.
+# The dot form pays a horizontal sum per element, and it wins only where the vector wastes at least a
+# quarter of its lanes. The lane count derives from detected widths; the quarter does not: it is the
+# measured break-even on Zen4, a literal with its table (req8-ok), unvalidated on other parts:
+#   r   1     2     3     4     5     6     7      (k = 100, n = 553, against max(OpenBLAS, AOCL))
+#       1.02  1.00  1.03  0.92  1.07  0.98  0.91   dot tail
+#       0.78  0.85  0.99  0.99  0.96  0.96  0.96   vector tail
+@inline function _rows_dot_tail_ok(::Type{T}, r::Int) where {T}
+    lanes = r <= _at_tail_vw(_HW, T) ? _at_tail_vw(_HW, T) : _vwidth(T)
+    return 4 * (lanes - r) >= lanes
 end
 
-# Lanes the unpacked driver stores through a mask per column for a C of `m` rows, `W <= m <= _MR·W`,
-# following `_unpacked_cols_full!`: a whole tile or one whole vector stores unmasked; ragged rows on a
-# double-pumped datapath store one masked vector at datapath width (`_mrows_ragged!`); otherwise every
-# one of the tile's `_MR` vectors stores through its mask.
-@inline function _unpacked_masked_lanes(::Type{T}, m::Int) where {T}
-    W = _vwidth(T); tw = _at_tail_vw(_HW, T)
-    (m == _MR * W || m == W) && return 0
-    tw < W && m <= W + tw && return tw
-    return _MR * W
-end
-
-# What one lane of a masked vector store costs, in datapath FMA slots. AVX-512 stores through a mask
-# register at the cost of a plain store, and Intel's AVX2 `vmaskmov` store is one instruction (LLVM's
-# Skylake and Alder Lake models: 1 cycle). AMD from family 0x19 on executes the AVX2 `vmaskmov` store
-# lane by lane (LLVM's znver3 model: 6 cycles for 4 lanes, 12 for 8, against 1 for an AVX-512 masked
-# store), which at two FMA issues a cycle is 3 slots a lane. So the cost appears only on an AMD part of
-# that family running AVX2, which is Zen3 on the fleet; there `gemm!`'s vector tail stores `_MR` masked
-# vectors per column, and the forced-arm timings show that cost (about 6 ns per Float64 column at base
-# clock, absent on Zen4 and Zen5). Zen2 (LLVM: 1 cycle) and Intel AVX2 parts take no cost here.
-@inline _masked_store_lane_slots(hw) =
-    Sys.ARCH === :x86_64 && hw.vendor === :AMD && hw.family >= 0x19 && hw.simd < 64 ? 3 : 0
 
 @inline function _rows_split_nb(::Type{T}, k::Int, r::Int, tk::Int) where {T}
     tile = tk == 1 ? _rows_dot_nc(T, r) * _vwidth(T) : _rows_dot_nc(T, r)
