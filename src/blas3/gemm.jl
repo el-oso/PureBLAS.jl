@@ -8016,11 +8016,39 @@ end
     return true
 end
 
-# The dot-product tail reads its rows of A contiguous along k: rows `q+1 … q+r` of A into `Xp`.
-@inline function _rows_split_pack!(Xp::Ptr{T}, Ap::PtrMatrix{T}, r::Int, k::Int) where {T}
-    q = Ap.m - r
-    for i in 1:r, l in 1:k
-        unsafe_store!(Xp, unsafe_load(Ap.ptr, (q + i - 1) + (l - 1) * Ap.ld + 1), l + (i - 1) * k)
+# The dot-product tail reads its rows of A contiguous along k: rows `q+1 … q+r` of A into `Xp`, row i
+# at `Xp + (i-1)·k`. Element for element a copy, so the dot tail sees the same values.
+@generated function _rows_split_pack!(Xp::Ptr{T}, Ap::PtrMatrix{T}, r::Int, k::Int) where {T}
+    ex = :(return _rows_split_pack!(Xp, Ap, Val($(_vwidth(T) - 1)), k))
+    for R in (_vwidth(T) - 2):-1:1
+        ex = :(r == $R ? (return _rows_split_pack!(Xp, Ap, Val($R), k)) : $ex)
+    end
+    return Expr(:block, Expr(:meta, :inline), ex)
+end
+
+# TW columns at a time: each column's R rows in one masked load, the TW×TW register transpose
+# (`_transpose_regs`), and R row stores of the block's columns (`_vstore_rows!`, which never stores
+# through a mask). R is a type parameter so the transpose computes only the R rows it stores, and TW
+# is the smallest power of two holding them, since a wider block costs more shuffles per element.
+# PDM: Derived for R ≥ 2 (the row count); one row is a strided copy with no shape to derive from, and
+# its block width is a literal (req8-ok) measured on Zen4, ns per element against the scalar copy:
+#   width        2      4      8      16     scalar   (k = 100 / 300)
+#   Float32    0.67   0.52   0.49   0.59     0.53
+#              0.49   0.41   0.40   0.47     0.39
+#   Float64    0.60   0.52   0.49     -      0.50
+#              0.49   0.48   0.38     -      0.42
+@inline function _rows_split_pack!(Xp::Ptr{T}, Ap::PtrMatrix{T}, ::Val{R}, k::Int) where {T, R}
+    TW = min(isone(R) ? 8 : nextpow(2, R), _vwidth(T))   # req8-ok: one-row width, table above
+    sz = sizeof(T); ld = Ap.ld; src = Ap.ptr + (Ap.m - R) * sz
+    rmsk = Vec(ntuple(i -> i - 1, Val(TW))) < R
+    p = 0
+    while p < k
+        # Fresh bindings per block: the closure below must not capture the reassigned `p`, which
+        # would box it.
+        cn = min(TW, k - p); blk = src + p * ld * sz
+        cols = ntuple(c -> (c - 1) < cn ? vload(Vec{TW, T}, blk + (c - 1) * ld * sz, rmsk) : zero(Vec{TW, T}), Val(TW))
+        _vstore_rows!(_transpose_regs(cols), Xp + p * sz, k, R, cn)
+        p += TW
     end
     return nothing
 end
