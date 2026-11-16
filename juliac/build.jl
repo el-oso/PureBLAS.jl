@@ -23,19 +23,12 @@ const DLEXT = Sys.iswindows() ? "dll" : (Sys.isapple() ? "dylib" : "so")
 const OUT = joinpath(OUTDIR, "libpureblas." * DLEXT)
 const ENTRY = joinpath(@__DIR__, "entry.jl")
 
-# ⚠ THIS BUILD RUNS WITH StrictMode CHECKS ENABLED, AND ONLY GETS AWAY WITH IT BY ACCIDENT OF WHICH
-# MACRO THE SOURCE USES. `--trim=safe` wants `checks_enabled = false` in the environment it builds from:
-# upstream measured ONE reachable `@strict` call site producing 248 verifier errors with checks on, and
-# a clean build with them off (per-call allocation is 0 B either way, so it buys nothing at runtime).
-#
-# `checks_enabled()` is TRUE in `$ROOT`, the project this build uses. What saves it is that `src/` uses
-# `@strict_contract` — a contract DECLARATION — and contains no bare `@strict` call site, and that
-# `entry.jl` reaches the `@ccallable` kernels without touching `src/verify.jl`, whose probes are the
-# only thing near that shape.
-#
-# So adding a bare `@strict` anywhere reachable from the entry will break this build with 248 errors
-# that name the verifier rather than the cause. The fix then is a `checks_enabled = false` preference
-# for the build environment, which is a PIN and therefore the user's decision, not a code edit.
+# THE .so IS A SHIPPED ARTIFACT, SO IT IS BUILT WITH StrictMode CHECKS OFF (`checks_enabled = false`,
+# set below for the duration of the build). Every guarantee macro then expands to the bare call: the
+# load-time dogfood in `src/verify.jl` runs its kernels without inspecting them, and `--trim=safe`
+# sees no checker code (upstream measured ONE reachable `@strict` call site producing 248 verifier
+# errors with checks on, and a clean build with them off). The guarantees are proven by the test
+# suite, which sets `checks_enabled = true` in `test/Project.toml`.
 const JCFLAGS = `--output-lib $OUT --experimental --trim=safe --compile-ccallable --verbose`
 @info "juliac: JuliaC.jl from $TOOLENV"
 run(`$(Base.julia_cmd()) --startup-file=no --project=$TOOLENV -e "using Pkg; Pkg.instantiate()"`)
@@ -65,6 +58,9 @@ cmd = `$(Base.julia_cmd()) --startup-file=no --project=$TOOLENV
 # restore the prior state. Value is arbitrary among 1/2/4/8; the .so uses a fixed stream count regardless.
 Base.set_active_project(joinpath(ROOT, "Project.toml"))   # so set_preferences! targets ROOT's LocalPreferences
 using Preferences
+# Removed again after the build when this run created it, so no LocalPreferences.toml is left behind.
+const LOCALPREFS = joinpath(ROOT, "LocalPreferences.toml")
+const _had_localprefs = isfile(LOCALPREFS)
 const PUREBLAS_UUID = Base.UUID("cc9e14db-574f-4602-bf53-1167cc4b26d2")
 const _prev_ger = load_preference(PUREBLAS_UUID, "ger_panel_np")
 # Pin `brd_nb` too: gebrd's OncePerProcess panel-width auto-tune is a runtime benchmark (not trim-safe);
@@ -154,6 +150,11 @@ set_preferences!(PUREBLAS_UUID, "pbtrf_nb" => 40; force = true)         # band p
 set_preferences!(PUREBLAS_UUID, "pbtrf_u_native_kd" => 256; force = true)  # upper repack-vs-native (Measure tier)
 set_preferences!(PUREBLAS_UUID, "pbtrf_nb_small" => 8; force = true)      # narrow-band panel width (Measure tier)
 set_preferences!(PUREBLAS_UUID, "gbtrf_cross" => 16; force = true)         # banded-LU blocking floor (Measure tier)
+# StrictMode checks off for the artifact (see the note above JCFLAGS). This is StrictMode's own
+# preference, not a PureBLAS tuning knob.
+const STRICTMODE_UUID = Base.UUID("0e98b4f4-d0e6-42ac-af0a-707c24852f32")
+const _prev_checks = load_preference(STRICTMODE_UUID, "checks_enabled")
+set_preferences!(STRICTMODE_UUID, "checks_enabled" => false; force = true)
 
 @info "PureBLAS: building trimmed library" OUT
 try
@@ -239,6 +240,12 @@ if _prev_gbnb === nothing
 else
     set_preferences!(PUREBLAS_UUID, "gbtrf_nb" => _prev_gbnb; force = true)
 end
+    if _prev_checks === nothing
+        delete_preferences!(STRICTMODE_UUID, "checks_enabled"; force = true)
+    else
+        set_preferences!(STRICTMODE_UUID, "checks_enabled" => _prev_checks; force = true)
+    end
+    _had_localprefs || rm(LOCALPREFS; force = true)
 end
 # Strip DWARF debug info: juliac emits it (`-g1` default) and it dominates the file — ~110 MB of ~154 MB
 # is `.debug_*` sections, dead weight in a distributed drop-in. `--strip-debug` keeps the full symbol
