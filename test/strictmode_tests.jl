@@ -149,26 +149,9 @@ end
             a_invR(A, B) = @allocated PureBLAS._trsm_base_invR!(false, false, false, A, B)
             @test minimum(a_invL(Atri, BL) for _ in 1:8) == 0
             @test minimum(a_invR(Atri, BR) for _ in 1:8) == 0
-            # BROKEN: the all-paths proof on the same two drivers. Each assertion still runs, so it
-            # reports an unexpected pass once it holds.
-            @test_broken (
-                try
-                    @test_noalloc P._trsm_base_invL!(false, false, false, Atri, BL)
-                    true
-                catch e
-                    e isa StrictMode.StrictViolation || rethrow()
-                    false
-                end
-            )
-            @test_broken (
-                try
-                    @test_noalloc P._trsm_base_invR!(false, false, false, Atri, BR)
-                    true
-                catch e
-                    e isa StrictMode.StrictViolation || rethrow()
-                    false
-                end
-            )
+            # The same two drivers as a steady-state assertion: warmed, then zero bytes.
+            @test_steady_state P._trsm_base_invL!(false, false, false, Atri, BL)
+            @test_steady_state P._trsm_base_invR!(false, false, false, Atri, BR)
             # Fused gemmtrsm leaf (side-L upper, the wide-B gate shape f64) — typestable + alloc-free steady
             # state. Covers the transpose pack (shufflevector kernels) + the const-owned ftrsm buffer.
             Aup = (
@@ -242,16 +225,7 @@ end
             P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)
             @test minimum(a_syr2kp(As, Bs, Cs, 512) for _ in 1:8) == 0
             @test minimum(a_symm(As, Bs, Cs) for _ in 1:8) == 0
-            # BROKEN: the all-paths proof on `_symm!`, as for `_trsm_base_invL!` above.
-            @test_broken (
-                try
-                    @test_noalloc P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)
-                    true
-                catch e
-                    e isa StrictMode.StrictViolation || rethrow()
-                    false
-                end
-            )
+            @test_steady_state P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)
             # PUBLIC ENTRY POINTS — assertable directly now that StrictMode ≥0.3.4 supports kwarg calls
             # (issue el-oso/StrictMode.jl#4). This closes the mandate: StrictMode on every entry point, not
             # just the positional internal drivers. :full-mode JET sees the whole kwarg→dispatch→kernel tree.
@@ -808,34 +782,12 @@ end
             f(W, n)                               # warm: grow the owned scratch once
             @test minimum(f(copyto!(W, W0), n) for _ in 1:8) == 0
         end
-        # BROKEN: the all-paths proof on the same two drivers, with the per-task accessors registered as
-        # barriers. Each assertion still runs, so it reports an unexpected pass once it holds.
-        let pools = (P._m3ws, P._gpackws, P._strws, P._opt)
-            foreach(StrictMode.register_alloc_barrier!, pools)
-            try
-                @test_broken (
-                    try
-                        @test_noalloc P._pbtrf_blocked!(Wpb, n, 64)
-                        true
-                    catch e
-                        e isa StrictMode.StrictViolation || rethrow()
-                        false
-                    end
-                )
-                @test_broken (
-                    try
-                        @test_noalloc P._pbtrf_blocked_U!(WpbU, n, 64)
-                        true
-                    catch e
-                        e isa StrictMode.StrictViolation || rethrow()
-                        false
-                    end
-                )
-            finally
-                foreach(f -> delete!(StrictMode._ALLOC_BARRIERS, f), pools)
-                StrictMode.clear_cache!()
-            end
-        end
+        # The same two drivers as a steady-state assertion. Each call factors in place, so the band is
+        # restored first to keep every call on the same input.
+        refac(f, W, W0, nn) = (copyto!(W, W0); f(W, nn, 64))
+        Wss = copy(Wpb); WssU = copy(WpbU)
+        @test_steady_state refac(P._pbtrf_blocked!, Wss, Wpb, n)
+        @test_steady_state refac(P._pbtrf_blocked_U!, WssU, WpbU, n)
         pack(M) = [M[i, j] for j in 1:n for i in j:n]              # lower column-packed
         APsd = pack(Sd); P.pptrf!(APsd; uplo = 'L')
         trimok(() -> @test_trim_compatible P.pptrf!(pack(Sd); uplo = 'L'))
@@ -990,61 +942,33 @@ end
     end
 end
 
-# The all-paths proof on `gemm!`, with the per-task accessors registered as barriers. Each assertion is
-# marked broken and still runs, so it reports an unexpected pass once it holds. The registration is
-# session-wide and keyed on function identity, so this item unregisters afterwards.
-@testitem "StrictMode dogfood: gemm! is statically allocation-free (barrier-exempt pools)" tags = [:checks] begin
+# `gemm!` reaches the pool growers, which allocate once per new high-water mark, so it takes the
+# steady-state measurement (warmed, then zero bytes) rather than the all-paths proof.
+@testitem "StrictMode dogfood: gemm! is allocation-free once warmed" tags = [:checks] begin
     using StrictModeTest, StrictMode, LinearAlgebra, ForwardDiff
     if !StrictMode.checks_enabled()
-        @info "StrictMode checks disabled — skipping gemm! static noalloc proof"
+        @info "StrictMode checks disabled — skipping gemm! steady-state check"
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
-        pools = (P._m3ws, P._gpackws, P._strws, P._opt)
-        foreach(StrictMode.register_alloc_barrier!, pools)
-        try
+        begin
             n = 64
             A = randn(n, n); B = randn(n, n); C = zeros(n, n)
-            P.gemm!(C, A, B)                                   # warm: grow every pool once
-            @test_broken (
-                try
-                    @test_noalloc P.gemm!(C, A, B)
-                    true
-                catch e
-                    e isa StrictMode.StrictViolation || rethrow()
-                    false
-                end
-            )
+            @test_steady_state P.gemm!(C, A, B)
             # The keyword entry with every argument non-default, as `mul!(C, A, B, α, β)` and LAPACK
             # callers use it. Values come from variables, so nothing const-folds the keywords away.
             al = 2.5; be = 0.5
-            P.gemm!(C, A, B; alpha = al, beta = be, transB = 'T')
-            @test_broken (
-                try
-                    @test_noalloc P.gemm!(C, A, B; alpha = al, beta = be, transB = 'T')
-                    true
-                catch e
-                    e isa StrictMode.StrictViolation || rethrow()
-                    false
-                end
-            )
+            @test_steady_state P.gemm!(C, A, B; alpha = al, beta = be, transB = 'T')
             D = ForwardDiff.Dual{Nothing, Float64, 1}
             Ad = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n))
             Bd = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n))
             Cd = zeros(D, n, n)
-            P.gemm!(Cd, Ad, Bd)
-            @test_broken (
-                try
-                    @test_noalloc P.gemm!(Cd, Ad, Bd)
-                    true
-                catch e
-                    e isa StrictMode.StrictViolation || rethrow()
-                    false
-                end
-            )
-        finally
-            foreach(f -> delete!(StrictMode._ALLOC_BARRIERS, f), pools)   # internal: no public unregister exists
-            StrictMode.clear_cache!()                                      # the registration cached verdicts
+            @test_steady_state P.gemm!(Cd, Ad, Bd)
+            # POSITIVE CONTROL. A call that allocates on every call never reaches a steady state, so
+            # the assertion must fail on it; if it passes, the macro has gone inert.
+            sink = Ref{Any}(nothing)
+            alloc_each_call(r, k) = (r[] = Vector{Float64}(undef, k); nothing)
+            @test_throws StrictMode.StrictViolation @test_steady_state alloc_each_call(sink, 1024)
         end
     end
 end
