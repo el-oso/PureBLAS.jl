@@ -37,7 +37,7 @@ function main()
         for r in 1:(W - 1), k in (33, 100, 300), n in (8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512)
             d, v = cell(T, r, k, n)
             # The shipped rule's pick, and whether `gemm!` can reach the split for this T on this host.
-            pick = P._rows_dot_tail_pays(T, r, k, n)
+            pick = P._rows_dot_tail_pays(T, W, r, k, n)
             reach = W + r <= P._GEMM_MR1_MAX
             println(T, '\t', W, '\t', r, '\t', k, '\t', n, '\t', round(d; digits = 1), '\t', round(v; digits = 1),
                 '\t', round(v / d; digits = 3), '\t', pick ? "dot" : "vec", '\t', reach); flush(stdout)
