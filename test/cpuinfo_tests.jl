@@ -100,3 +100,48 @@ end
     # Positive control: the check can fail.
     @test_throws "inconsistent L1d cache geometry" P._check_l1_geometry(32768, 12, 64)
 end
+
+# The vector width, register budget and gemm tile follow the CODEGEN target, not the build machine:
+# an `x86-64-v3` library built on an AVX-512 host must get the 256-bit tile, or its microkernel spills.
+@testitem "cpuinfo: SIMD constants follow the codegen target" tags = [:checks] begin
+    using PureBLAS
+    P = PureBLAS
+
+    # What an AVX-512 build machine detects, compiled for each target through the same functions
+    # that produce `_SIMD_BYTES`, `_NVREG` and the gemm tile.
+    tile(target) = let simd = P._target_simd_bytes(64, P._target_simd_cap(target))
+        hw = (simd = simd, nvreg = P._nvreg(simd))
+        (simd = simd, W = P._lanes(hw, Float64), nvreg = hw.nvreg,
+         mr = P._at_gemm_mr(hw), nr = P._at_gemm_nr(hw))
+    end
+
+    @test tile("x86-64-v4").W == 8
+    @test tile("x86-64-v3").W == 4
+    @test tile("x86-64-v3,-avx512f").W == 4                      # modifiers do not change the level
+    @test tile("x86-64-v3;znver4,clone_all").W == 4              # the baseline group decides
+    @test tile("generic").W == 2
+    @test tile("x86-64-v2").W == 2
+    if Sys.ARCH === :x86_64
+        @test tile("x86-64-v4").nvreg == 32
+        @test tile("x86-64-v3").nvreg == 16
+        @test tile("generic").nvreg == 16
+        for t in ("x86-64-v4", "x86-64-v3", "generic")
+            x = tile(t)
+            # MR·NR accumulators plus one register per A row-block and one B broadcast.
+            @test x.mr * x.nr + x.mr + 1 <= x.nvreg
+        end
+    end
+
+    # Positive control: targets that do not name an ISA level leave detection alone, so the test
+    # above is measuring the cap and not a width that was 256-bit all along.
+    for t in ("native", "znver4", "apple-m1,+sme")
+        @test isnothing(P._target_simd_cap(t))
+        @test tile(t).W == 8
+    end
+    @test tile("x86-64-v3").mr * tile("x86-64-v3").nr * 4 < tile("native").mr * tile("native").nr * 8
+
+    # The live build obeys its own target unless `simd_bytes` is pinned.
+    if isnothing(P.load_preference(P, "simd_bytes", nothing))
+        @test P._SIMD_BYTES <= something(P._TARGET_SIMD_CAP, typemax(Int))
+    end
+end
