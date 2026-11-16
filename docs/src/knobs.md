@@ -142,7 +142,7 @@ Every `@load_preference` key in `src/` — 170 of them.
 | `fp_datapath_bytes` | formula | Derived | the detected FP datapath width itself (CPUID Fn8000_001A FP128/FP256/FP512, else the register width); the preference exists for cross-compile and trim builds. | n/a |
 | `l1d_assoc` | formula | Derived | one L1d way is one memory page (page-offset indexing); Sys.PAGESIZE, capped at L1; the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `l3_bytes` | formula | Derived | the detected L3 size itself (`cachesize()`, floored at L2 where no L3/SLC is queryable, see above); the override exists for cross-compile and trim builds, not tuning. | n/a |
-| `simd_bytes` | delegates | Derived | the detected SIMD width itself (`simdbytes()` on x86, the 16 B NEON floor elsewhere); the override exists for cross-compile and trim builds, not tuning. | n/a |
+| `simd_bytes` | delegates | Derived | the detected SIMD width itself (`simdbytes()` on x86, the 16 B NEON floor elsewhere), capped by the codegen target's vector ISA; the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `sme_f32` | other | Derived | the detected FEAT_SME2 + SME_F32F32 pair itself (`sysctlbyname`); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `sme_f64` | other | Derived | the detected FEAT_SME2 + FEAT_SME_F64F64 pair itself (`sysctlbyname`); the override exists for cross-compile and trim builds, not tuning. | n/a |
 | `sme_lanes` | formula | Derived | the detected streaming vector length itself (`hw.optional.arm.sme_max_svl_b`); the override exists for cross-compile and trim builds, not tuning. | n/a |
