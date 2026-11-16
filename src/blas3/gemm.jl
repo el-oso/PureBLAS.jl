@@ -8021,12 +8021,16 @@ end
 
 # The dot-product tail reads its rows of A contiguous along k: rows `q+1 … q+r` of A into `Xp`, row i
 # at `Xp + (i-1)·k`. Element for element a copy, so the dot tail sees the same values.
+# OUT OF LINE: the dispatcher holds one unrolled transpose pack per row count (15 for Float32 at
+# AVX-512), so it is compiled once per element type instead of into every caller: inlined, the
+# `--check-bounds=yes` precompile on Zen4 needs more than 18 GB, against 17.7 GB out of line. One
+# call per pack.
 @generated function _rows_split_pack!(Xp::Ptr{T}, Ap::PtrMatrix{T}, r::Int, k::Int) where {T}
     ex = :(return _rows_split_pack!(Xp, Ap, Val($(_vwidth(T) - 1)), k))
     for R in (_vwidth(T) - 2):-1:1
         ex = :(r == $R ? (return _rows_split_pack!(Xp, Ap, Val($R), k)) : $ex)
     end
-    return Expr(:block, Expr(:meta, :inline), ex)
+    return Expr(:block, Expr(:meta, :noinline), ex)
 end
 
 # TW columns at a time: each column's rows in one masked load, the TW×TW register transpose
