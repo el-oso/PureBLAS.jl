@@ -362,7 +362,10 @@ const _PACK_CG = max(1, _L1D_ASSOC >> 1)
     GC.@preserve A Ap begin
         Aptr = pointer(A); App = pointer(Ap); av = V(alpha)
         @inbounds begin
-            if mr == W && iszero(_EXPINT[14])
+            # `nf > 0`: with no full panel the column-group walk below copies nothing, yet with
+            # `_PACK_CG = 6` (a 12-way L1) LLVM keeps its empty `p0` loop, `kce / 6` idle trips,
+            # where with 4 or 8 it deletes it.
+            if mr == W && nf > 0 && iszero(_EXPINT[14])
                 for p0 in 0:_PACK_CG:(kce - 1)
                     pe = min(p0 + _PACK_CG - 1, kce - 1)
                     for pi in 0:(nf - 1)
