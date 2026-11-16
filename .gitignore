@@ -51,6 +51,8 @@ bench/probes/*.bak
 # EXCEPTION: cited as evidence from a src/ comment (src/blas3/gemm.jl), so it is documentation, not a
 # disposable probe. A probe referenced from shipped source must stay tracked or the comment dangles.
 !bench/probes/zgemm32_k_scaling.jl
+# Cited from `_rows_dot_tail_pays` (src/blas3/gemm.jl) as the measurement behind its crossover table.
+!bench/probes/rows_dot_crossover.jl
 
 # local build output and scratch logs
 bench/tools/build/

@@ -7967,7 +7967,7 @@ end
 # run the unpacked kernel unmasked; the r rows would cost a whole masked register per column and k
 # step, so they go to a kernel that vectorizes along k (B not transposed) or along n (B transposed)
 # and spends r/W of a register instead: the transposed-B tail under the rule `_gemm_rows_bt!` uses,
-# the dot-product tail under `_rows_dot_tail_ok` and the dot route's depth rule. OpenBLAS's small-matrix kernels for this part do the same: a dot-product form for a tail of at
+# the dot-product tail where `_rows_dot_tail_pays`. OpenBLAS's small-matrix kernels for this part do the same: a dot-product form for a tail of at
 # most 4 rows with B not transposed and k >= 16, and an n-vectorized form with scatter stores for a
 # tail of 1 to 5 rows with B transposed.
 #
@@ -7992,7 +7992,7 @@ end
         nw == 1 && (r < _at_tail_vw(_HW, T) || k >= _rows_dot_kmin(T, r)) || return false
         tk = 1
     else
-        _rows_dot_tail_ok(T, r) && k >= _rows_dot_kmin(T, r) || return false
+        _rows_dot_tail_pays(T, r, k, n) || return false
         tk = 2
     end
     if iszero(α)
@@ -8107,17 +8107,29 @@ end
 # Columns per block of the split: both passes over a block of B find it in L1 when the block fills at
 # most half of L1 (`_L1_BYTES`), and a block is at least one column tile of the tail kernel and of the
 # unpacked kernel (`_NR`), so neither runs a narrower tile than it would unblocked.
-# A dot-product tail of r rows, against the unpacked driver's one vector for them: that vector is the
-# datapath width for r up to it and the register width above, so it leaves `lanes - r` lanes idle.
-# The dot form pays a horizontal sum per element, and it wins only where the vector wastes at least a
-# quarter of its lanes. The lane count derives from detected widths; the quarter does not: it is the
-# measured break-even on Zen4, a literal with its table (req8-ok), unvalidated on other parts:
-#   r   1     2     3     4     5     6     7      (k = 100, n = 553, against max(OpenBLAS, AOCL))
-#       1.02  1.00  1.03  0.92  1.07  0.98  0.91   dot tail
-#       0.78  0.85  0.99  0.99  0.96  0.96  0.96   vector tail
-@inline function _rows_dot_tail_ok(::Type{T}, r::Int) where {T}
-    lanes = r <= _at_tail_vw(_HW, T) ? _at_tail_vw(_HW, T) : _vwidth(T)
-    return 4 * (lanes - r) >= lanes
+# Whether the dot-product tail beats the unpacked kernel's vector tail for the last `r` of `W + r`
+# rows (W = `_vwidth(T)`), as a cost count in datapath vectors (`lanes = _at_tail_vw`, so a register
+# vector is `s = W ÷ lanes` of them). The W full rows cost the same either way and drop out.
+#   vector tail, per column:  k · cld(r, lanes)           one masked vector per k step
+#   dot tail,    per column:  s · r · cld(k, W)           r chains along k in register vectors
+#                           + r · (log2(W) + 2)           a horizontal sum (log2 W steps) and a store per row
+#   dot tail,    per call:    2 · r · k                   packing the r rows contiguous along k
+# so the dot tail pays when the per-column saving is positive and repays the pack over n columns.
+# PDM: Derived — vector and pipeline widths from `_vwidth` and `_at_tail_vw`; the per-element pack cost
+# of 2 datapath slots (a scalar load and a scalar store against the FMA issue) is a literal (req8-ok),
+# fitted with the epilogue term to forced-arm timings on Zen4 (`bench/probes/rows_dot_crossover.jl`,
+# base clock, one thread). Crossover n, derived against measured (first n of the ladder 8 … 384 from
+# which the dot tail stays ahead); F64 is the type that reaches this route on Zen4:
+#   F64  r = 1      2      3      4      5      6      7
+#   k=33     4/16  44/48  -/-    -/-    -/-    -/-    -/-
+#   k=100    3/8   11/16  86/64  -/-    23/24  86/128 -/-
+#   k=300    3/8    9/16  32/24  -/48   16/24  32/48  128/384
+# A wrong call costs at most 5% across those 231 cells (r = 4, k = 300), and 14% at n = 8, k = 33.
+# Unvalidated on Zen3 and Zen5.
+@inline function _rows_dot_tail_pays(::Type{T}, r::Int, k::Int, n::Int) where {T}
+    W = _vwidth(T); lanes = _at_tail_vw(_HW, T); s = W ÷ lanes
+    save = k * cld(r, lanes) - s * r * cld(k, W) - r * (trailing_zeros(W) + 2)
+    return save > 0 && n * save > 2 * r * k
 end
 
 @inline function _rows_split_nb(::Type{T}, k::Int, r::Int, tk::Int) where {T}
