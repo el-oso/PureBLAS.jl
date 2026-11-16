@@ -243,7 +243,7 @@ _EDCWork{T}() where {T} = _EDCWork{T}(
 
 # Grow to fit a root problem of size n. Pure scratch — every slot is written before it is read on each
 # level, so growth just reallocates when too small and preserves nothing.
-function _edc_grow!(ws::_EDCWork{T}, n::Int) where {T}
+@noinline function _edc_grow!(ws::_EDCWork{T}, n::Int) where {T}
     ws.n >= n && return ws
     m = max(n, 1)
     fv() = Vector{T}(undef, m); iv() = Vector{Int}(undef, m)
@@ -259,13 +259,14 @@ function _edc_grow!(ws::_EDCWork{T}, n::Int) where {T}
     ws.n = m
     return ws
 end
+@strict_exempt _edc_grow! guarantees = (:noalloc,) reason = "grows the divide-and-conquer workspace to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # One workspace per thread (written during the call) — see `_l3ws`.
 const _EDCWS_F64 = Base.OncePerTask{_EDCWork{Float64}}(_EDCWork{Float64})
 const _EDCWS_F32 = Base.OncePerTask{_EDCWork{Float32}}(_EDCWork{Float32})
 const _EDCWS_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any})
-@inline _edcws(::Type{Float64}) = _EDCWS_F64()
-@inline _edcws(::Type{Float32}) = _EDCWS_F32()
+@inline _edcws(::Type{Float64}) = _opt(_EDCWS_F64)
+@inline _edcws(::Type{Float32}) = _opt(_EDCWS_F32)
 _edcws(::Type{T}) where {T} = get!(() -> _EDCWork{T}(), _EDCWS_OTHER(), T)::_EDCWork{T}
 
 # --- recursive D&C driver (dlaed0 recursion + dlaed1 merge + dlaed2 deflation + dlaed3 secular solve)
@@ -436,7 +437,10 @@ function _dc_eigen!(
     # single assembly pass at the end: j>0 ⇒ R[:,j] (secular combine), 0 ⇒ Zsort[:,i] (deflated column).
     # This replaces the old `Qout = copy(Zsort)` + per-survivor scatter + `Qout[:,ord2]` resort — THREE
     # O(n²) Q-copies/allocs per merge — with ONE write pass into Z (LAPACK dlaed2/dlaed3 assemble-once).
-    Dout = view(ws.dout, 1:n); copyto!(Dout, dsort)
+    Dout = view(ws.dout, 1:n)
+    for i in 1:n        # elementwise: `copyto!(view, view)` carries an alias-check `copy` path
+        Dout[i] = dsort[i]
+    end
     srcmap = view(ws.srcmap, 1:n); fill!(srcmap, 0)
     R = view(ws.R, 1:n, 1:max(K, 0))       # survivor eigenvectors B·V (0 cols if none)
 
@@ -634,8 +638,14 @@ function _stedc!(
                 Ztmp[r, p] = Z[r, op]
             end
         end
-        copyto!(view(d, 1:n), dtmp)         # copyto!(view, X), not slice-assign (setindex_shape_check --trim-unsafe)
-        copyto!(view(Z, :, 1:n), Ztmp)
+        # Elementwise, not `copyto!(view, X)` (its alias check carries a `copy` path) and not slice-assign
+        # (setindex_shape_check --trim-unsafe).
+        for p in 1:n
+            d[p] = dtmp[p]
+        end
+        for p in 1:n, r in axes(Z, 1)
+            Z[r, p] = Ztmp[r, p]
+        end
     end
     return d, Z
 end

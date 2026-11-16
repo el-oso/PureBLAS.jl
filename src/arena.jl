@@ -240,14 +240,10 @@ end
     return nothing
 end
 
-# THE FOLD IS ITS OWN `@noinline` FUNCTION SO THE PROOF CAN BE TOLD ABOUT IT. This is the only
-# allocation an arena scope can make, and a static all-paths proof is granted an exemption for it only
-# when the allocating call is a registrable barrier — which requires the registered function to BE the
-# `:invoke` callee, so an inlined one can never be registered (`workspace.jl` states the same
-# requirement for `_ws_grow!`). Inlined here, this fold made every driver that borrows from the arena
-# fall through to AllocCheck's per-site proof, which then reported the pool growth the barriers
-# already covered: 103 sites for `_trsm_base_invL!`, every one of them a workspace or arena high-water
-# mark. Behind the call they are attributable and the proof holds.
+# THE FOLD IS ITS OWN `@noinline` FUNCTION SO THE ALLOCATION IS ATTRIBUTABLE. This is the only
+# allocation an arena scope makes besides `_arena_grow!`. Both run only after a call that reached a new
+# high-water mark, so a report names them rather than the driver that borrowed from the arena; they
+# are `@strict_exempt :noalloc` (workspace.jl) and asserted by measurement, not registered as barriers.
 #
 # The branch is cold by construction — reached only after a call that grew — so this costs a scope
 # exit nothing. Measured, potrf/potri/sysv at n=16..128, eight processes per arm: no cell moved by

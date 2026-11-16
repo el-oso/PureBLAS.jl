@@ -154,13 +154,13 @@ jobs:
     # release can change that default with no change in this repo — naming the target here is what
     # makes the gate independent of it.
     #
-    # ONE TARGET IS WHAT THIS GATE NEEDS: it proves the trim verifier passes and that the .so links
-    # for a C host, and neither depends on the ISA level. `generic` runs on any runner, so the ctest.c
-    # step below can execute what this step built. juliac/build.jl deliberately leaves the target to
-    # the driver — a distributable Linux .so wants the multiversioned default — so the single target
-    # is this job's choice, not the build script's.
+    # ONE TARGET: `x86-64-v3` (AVX2 + FMA). PureBLAS sizes its kernel tiles from the vector ISA the
+    # codegen target allows (src/cpuinfo.jl, `_target_simd_cap`), so this build gets 256-bit tiles
+    # whatever the runner's own ISA. The ctest.c step below executes what this step built, so it
+    # needs a runner that implements v3. juliac/build.jl leaves the target to the driver, so the
+    # single target is this job's choice, not the build script's.
     env:
-      JULIA_CPU_TARGET: generic
+      JULIA_CPU_TARGET: x86-64-v3
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2

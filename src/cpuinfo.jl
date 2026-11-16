@@ -27,7 +27,29 @@ using Preferences: @load_preference, load_preference
 # 16 is a floor rather than a guess — aarch64 mandates 128-bit NEON. SVE can be wider but its width is
 # runtime-variable and so cannot fold to a const; a wider part is under-used, never mis-compiled. The
 # same floor covers x86 hosts whose feature leaves a VM has masked.
-# PDM: Derived — the detected SIMD width itself (`simdbytes()` on x86, the 16 B NEON floor elsewhere); the override exists for cross-compile and trim builds, not tuning. | tune: n/a
+# THE CODEGEN TARGET BOUNDS THE ISA, NOT THE BUILD MACHINE. Code is compiled for the `-C` target of
+# the process evaluating this file (`native` unless one is given; juliac passes its `--cpu-target`
+# / JULIA_CPU_TARGET down to both its precompile and its image step). A `.so` built for
+# `x86-64-v3` on an AVX-512 machine runs 256-bit code, so a tile sized for 32 zmm registers spills on
+# every k step. The named x86-64 levels fix the vector ISA: generic/x86-64/v2 = SSE (16 B),
+# v3 = AVX2+FMA (32 B), v4 = AVX-512 (64 B). Only the first group of a multiversioned target
+# (`a;b;…`) is read, the baseline every clone must satisfy, and feature modifiers (`,+x`/`,-x`) are
+# ignored. Any other name — `native`, a µarch such as `znver4`, `apple-m1,…` — returns `nothing`
+# and detection stands. Pure, so it is tested on targets this host is not compiling for.
+function _target_simd_cap(target::AbstractString)
+    name = first(split(first(split(target, ';')), ','))
+    name in ("generic", "x86-64", "x86-64-v2") && return 16
+    name == "x86-64-v3" && return 32
+    name == "x86-64-v4" && return 64
+    return nothing
+end
+const _CPU_TARGET = let p = Base.JLOptions().cpu_target
+    p == C_NULL ? "native" : unsafe_string(p)
+end
+const _TARGET_SIMD_CAP = _target_simd_cap(_CPU_TARGET)
+_target_simd_bytes(detected::Int, cap) = isnothing(cap) ? detected : min(detected, cap)
+
+# PDM: Derived — the detected SIMD width itself (`simdbytes()` on x86, the 16 B NEON floor elsewhere), capped by the codegen target's vector ISA; the override exists for cross-compile and trim builds, not tuning. | tune: n/a
 const _SIMD_BYTES = let p = @load_preference("simd_bytes", nothing)
     if !isnothing(p)
         Int(p)::Int
@@ -37,7 +59,7 @@ const _SIMD_BYTES = let p = @load_preference("simd_bytes", nothing)
         catch
             16  # detection unavailable (masked CPUID leaf) — SSE2 is the x86-64 baseline
         end
-        max(b, 16)
+        _target_simd_bytes(max(b, 16), _TARGET_SIMD_CAP)
     else
         16  # NEON is architecturally 128-bit; CpuId cannot see it and reports sizeof(Int)
     end
@@ -52,9 +74,12 @@ end
 # here (confirmed via `llvm-mca -mcpu=haswell`: the Cholesky base k-reduction runs 10 cyc/iter vs a 4-cyc
 # resource bound). Kernels can opt into extra-accumulator splits keyed on this (see `_CHOL_BASE_SPLIT`).
 # Detected at build (const-folds, trim-safe); AMD / AVX-512 / non-x86 → false. Width and cache size can't
-# distinguish this — it's a microarchitecture trait, so it needs the vendor + feature bits.
+# distinguish this — it's a microarchitecture trait, so it needs the vendor + feature bits. A feature
+# counts only when the codegen target can emit it (`_TARGET_SIMD_CAP` above): an x86-64-v3 build on an
+# AVX-512 Intel part sees AVX2 without AVX-512, and a generic build sees neither.
 const _INTEL_AVX2 = try
-    cpuvendor() === :Intel && cpufeature(:AVX2) && !cpufeature(:AVX512F)
+    cap = something(_TARGET_SIMD_CAP, typemax(Int))
+    cpuvendor() === :Intel && cpufeature(:AVX2) && cap >= 32 && !(cpufeature(:AVX512F) && cap >= 64)
 catch
     false
 end
@@ -379,7 +404,8 @@ const _CPU_FAMILY = @load_preference(
     end
 )::Int
 # Architectural vector registers: 32 (AVX-512, AArch64 NEON) vs 16 (AVX2/SSE) — the register budget cap.
-const _NVREG = _SIMD_BYTES >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
+_nvreg(simd_bytes::Int) = simd_bytes >= 64 ? 32 : (Sys.ARCH === :x86_64 ? 16 : 32)
+const _NVREG = _nvreg(_SIMD_BYTES)
 
 # FP EXECUTION DATAPATH WIDTH in bytes — a DETECTED CAPABILITY, not an identity lookup.
 #

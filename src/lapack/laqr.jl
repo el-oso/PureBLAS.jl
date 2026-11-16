@@ -128,7 +128,7 @@ function _dlaqr5!(
     end
     nbmps = ns ÷ 2
     kdu = 4 * nbmps
-    vt = zeros(R, 3)
+    vt = _Vec3{R}()
     incol = ktop - 2 * nbmps + 1
     @inbounds while incol <= kbot - 2
         jtop = max(ktop, incol)
