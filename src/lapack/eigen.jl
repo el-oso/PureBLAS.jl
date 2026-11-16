@@ -151,23 +151,24 @@ mutable struct _TRDWork{T, R}
 end
 _TRDWork{T, R}() where {T, R} = _TRDWork{T, R}(0, 0, Matrix{T}(undef, 0, 0), T[])
 
-function _trd_grow!(ws::_TRDWork{T, R}, n::Int, nb::Int) where {T, R}
+@noinline function _trd_grow!(ws::_TRDWork{T, R}, n::Int, nb::Int) where {T, R}
     (ws.n >= n && ws.nb >= nb) && return ws
     m = max(n, 1); b = max(nb, 1)
     ws.W = Matrix{T}(undef, m, b); ws.tmp = Vector{T}(undef, b)
     ws.n = m; ws.nb = b
     return ws
 end
+@strict_exempt _trd_grow! guarantees = (:noalloc,) reason = "grows the tridiagonalization panel scratch to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # One workspace per thread (written during the call) — see `_l3ws`.
 const _TRDWS_F64 = Base.OncePerTask{_TRDWork{Float64, Float64}}(_TRDWork{Float64, Float64})
 const _TRDWS_F32 = Base.OncePerTask{_TRDWork{Float32, Float32}}(_TRDWork{Float32, Float32})
 const _TRDWS_C64 = Base.OncePerTask{_TRDWork{ComplexF64, Float64}}(_TRDWork{ComplexF64, Float64})
 const _TRDWS_C32 = Base.OncePerTask{_TRDWork{ComplexF32, Float32}}(_TRDWork{ComplexF32, Float32})
-@inline _trdws(::Type{Float64}) = _TRDWS_F64()
-@inline _trdws(::Type{Float32}) = _TRDWS_F32()
-@inline _trdws(::Type{ComplexF64}) = _TRDWS_C64()
-@inline _trdws(::Type{ComplexF32}) = _TRDWS_C32()
+@inline _trdws(::Type{Float64}) = _opt(_TRDWS_F64)
+@inline _trdws(::Type{Float32}) = _opt(_TRDWS_F32)
+@inline _trdws(::Type{ComplexF64}) = _opt(_TRDWS_C64)
+@inline _trdws(::Type{ComplexF32}) = _opt(_TRDWS_C32)
 # EVERY OTHER ELEMENT TYPE BORROWS FROM THE ARENA (inside `_sytrd_lower!`). The four consts above are
 # owned pools, one per BlasFloat (the GKH pattern); an open type set cannot have a const pool, so a
 # `ForwardDiff.Dual` once found no `_trdws` method at all (`_syev!` was a MethodError, commit c6a9ef19).

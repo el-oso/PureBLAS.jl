@@ -210,6 +210,21 @@ end
     return nothing
 end
 
+# Remainder of `r < W` elements handled as straight-line binary pieces: `f(Val(h), i)` is called for the
+# widths h = W/2, W/4, …, 1 present in the bits of `r`, widest first, with `i` the element index the piece
+# starts at. A piece is an ordinary full-width access of its own width, never a masked one: a masked store
+# does not forward to a following load on Zen3/Zen4, which stalls a read-modify-write of the same memory.
+@inline _tail_pieces(f::F, i::Int, r::Int, ::Val{W}) where {F, W} = _tail_pieces_(f, i, r, Val(W >> 1))
+@inline _tail_pieces_(f::F, i::Int, r::Int, ::Val{0}) where {F} = nothing
+@inline function _tail_pieces_(f::F, i::Int, r::Int, ::Val{h}) where {F, h}
+    if r & h != 0
+        f(Val(h), i)   # req8-ok: h is the piece width read off the bits of `r`, a type-level recursion, not a tuned quantity
+        i += h
+    end
+    return _tail_pieces_(f, i, r, Val(h >> 1))
+end
+@inline _pw(::Val{h}) where {h} = h
+
 # Fortran BLAS start index for a (possibly negative) increment: walk backwards from the end.
 @inline _start(n::Integer, inc::Integer) = inc > 0 ? 1 : 1 + (1 - n) * inc
 

@@ -115,6 +115,8 @@ end
 function _mk_full_body(::Type{T}, MR::Int, NR::Int, B0::Bool, SC::Bool) where {T}
     W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
     body = quote end
+    # `@inline` on a `@generated` signature does not reach its CodeInfo; the meta must be in the body.
+    push!(body.args, Expr(:meta, :inline))
     SC && push!(body.args, :(av = $V(alpha)))
     # prefetch the C output tile (NR columns) so the cold read-modify-write at the end overlaps the
     # k-loop — matters at large n where C doesn't fit cache.
@@ -166,7 +168,7 @@ end
 
 @generated function _microkernel!(
         C::Ptr{T}, ldc::Int, Ap::Ptr{T}, Bp::Ptr{T}, kc::Int,
-        ::Val{MR}, ::Val{NR}, ::Val{B0} = Val(false)
+        ::Val{MR}, ::Val{NR}, ::Val{B0}
     ) where {T, MR, NR, B0}
     return _mk_full_body(T, MR, NR, B0, false)
 end
@@ -331,8 +333,8 @@ const _PACK_CG = max(1, _L1D_ASSOC >> 1)
 
 # SIMD pack for tA='N', dense unit-column-stride A: each full mr-row panel column is a contiguous
 # segment of A, so pack = vector load + scale + vector store. The scalar packing was the measured
-# large-n bottleneck (pack_A ≈ 8.6 GB/s; this lifts it toward memory bandwidth). Partial last panel
-# (zero-padded) stays scalar.
+# large-n bottleneck (pack_A ≈ 8.6 GB/s; this lifts it toward memory bandwidth). The partial last panel
+# uses masked loads and is zero-padded.
 #
 # TRAVERSAL ORDER IS KEYED ON `mr == W`, and that is a cache-residency property, not a style choice.
 # When `mr > W` a panel visit copies `mr/W` ADJACENT vectors, so the line a later visit wants is
@@ -360,7 +362,10 @@ const _PACK_CG = max(1, _L1D_ASSOC >> 1)
     GC.@preserve A Ap begin
         Aptr = pointer(A); App = pointer(Ap); av = V(alpha)
         @inbounds begin
-            if mr == W && iszero(_EXPINT[14])
+            # `nf > 0`: with no full panel the column-group walk below copies nothing, yet with
+            # `_PACK_CG = 6` (a 12-way L1) LLVM keeps its empty `p0` loop, `kce / 6` idle trips,
+            # where with 4 or 8 it deletes it.
+            if mr == W && nf > 0 && iszero(_EXPINT[14])
                 for p0 in 0:_PACK_CG:(kce - 1)
                     pe = min(p0 + _PACK_CG - 1, kce - 1)
                     for pi in 0:(nf - 1)
@@ -389,12 +394,19 @@ const _PACK_CG = max(1, _L1D_ASSOC >> 1)
                     end
                 end
             end
-            for pi in nf:(np - 1)             # partial panel — scalar, zero-padded
+            lane = Vec(ntuple(l -> l - 1, Val(W)))
+            for pi in nf:(np - 1)             # partial panel — masked loads, zero-padded rows
                 base = pi * mr * kce
+                rem = mce - pi * mr           # rows of A left in this panel (< mr)
                 for p in 0:(kce - 1)
-                    for r in 0:(mr - 1)
-                        lr = pi * mr + r
-                        Ap[base + p * mr + r + 1] = lr < mce ? alpha * A[ic + lr + 1, pc + p + 1] : zero(T)
+                    src = Aptr + (ic + pi * mr + (pc + p) * lda) * sz
+                    dst = App + (base + p * mr) * sz
+                    o = 0
+                    while o < mr
+                        vm = lane < (rem - o)                      # lanes holding rows of A; the rest are padding
+                        v = vload(V, src + o * sz, vm)
+                        vstore(vifelse(vm, av * v, zero(V)), dst + o * sz)
+                        o += W
                     end
                 end
             end
@@ -443,10 +455,66 @@ end
     return body
 end
 
+# W×W transpose of W vectors held in registers (the same shuffle butterfly as `_tblk!`): element `l` of
+# input vector `r` becomes element `r` of output vector `l`.
+@generated function _transpose_regs(c::Tuple{Vec{W, T}, Vararg{Vec{W, T}}}) where {W, T}
+    length(c.parameters) == W || error("_transpose_regs needs W vectors of width W")
+    q = Int(round(log2(W)))
+    body = quote
+        $(Expr(:meta, :inline))
+    end
+    cur = [Symbol(:c_, r) for r in 0:(W - 1)]
+    for r in 0:(W - 1)
+        push!(body.args, :($(cur[r + 1]) = c[$(r + 1)]))
+    end
+    for stage in 0:(q - 1)
+        s = 1 << stage; nxt = [Symbol(:s, stage, :_, i) for i in 0:(W - 1)]
+        for i in 0:(W - 1)
+            if (i & s) == 0
+                j = i | s
+                lo = ntuple(e0 -> (e = e0 - 1; blk = e ÷ (2s); w = e % (2s); w < s ? blk * 2s + w : W + blk * 2s + (w - s)), W)
+                hi = ntuple(e0 -> (e = e0 - 1; blk = e ÷ (2s); w = e % (2s); w < s ? blk * 2s + s + w : W + blk * 2s + s + (w - s)), W)
+                push!(body.args, :($(nxt[i + 1]) = shufflevector($(cur[i + 1]), $(cur[j + 1]), Val($lo))))
+                push!(body.args, :($(nxt[j + 1]) = shufflevector($(cur[i + 1]), $(cur[j + 1]), Val($hi))))
+            end
+        end
+        cur = nxt
+    end
+    push!(body.args, :(return $(Expr(:tuple, cur...))))
+    return body
+end
+
+# Partial form of `_tblk!`: transpose the block of `cn` source columns (`src + r·lda`, r < cn), each
+# holding `kt` contiguous elements, and store the `kt` transposed rows at `dst + pp·mrstride`, scaled by
+# `av`. Only lanes `< cs` of each row are written. Source elements outside the `kt × cn` block are never
+# read. Lanes `cn <= lane < cs` of a stored row are exact zeros when `PAD` is true (the ragged edge of a
+# zero-padded panel), and a `kt`/`cn`/`cs` of W reproduces `_tblk!`.
+@inline function _tblk_part!(
+        dst::Ptr{T}, src::Ptr{T}, lda::Int, mrstride::Int, av::Vec{W, T}, kt::Int, cn::Int, cs::Int,
+        ::Val{PAD}
+    ) where {T, W, PAD}
+    sz = sizeof(T); lane = Vec(ntuple(l -> l - 1, Val(W)))
+    kmsk = lane < kt; cmsk = lane < cn
+    cols = ntuple(
+        r -> (r - 1) < cn ? (kt >= W ? vload(Vec{W, T}, src + (r - 1) * lda * sz) : vload(Vec{W, T}, src + (r - 1) * lda * sz, kmsk)) : zero(Vec{W, T}),
+        Val(W)
+    )
+    rows = _transpose_regs(cols)
+    scaled = ntuple(
+        pp -> begin
+            row = av * rows[pp]
+            PAD && (row = vifelse(cmsk, row, zero(row)))
+            row
+        end, Val(W)
+    )
+    _vstore_rows!(scaled, dst, mrstride, kt, cs)
+    return nothing
+end
+
 # SIMD transpose pack for tA='T' (op(A)=Aᵀ), dense unit-stride A, mr a multiple of W. op(A)[gi,gp] =
 # A[gp,gi] would need A's ROWS (strided) — the old scalar fallback. Instead read W contiguous A-columns
 # (op(A) rows), W contraction-rows at a time, transpose the W×W register block, and store the transposed
-# rows into Ap. Partial panels / contraction tail stay scalar (zero-padded).
+# rows into Ap. Partial panels and the contraction tail use `_tblk_part!` (masked; padding is zero).
 @inline function _pack_A_simd_T!(
         # `AbstractVector`, matching `_pack_A_simd!` above. A concrete `Vector` here excluded the
         # contiguous `view` that cooperative packing hands each worker for its own block, which showed
@@ -471,17 +539,24 @@ end
                         _tblk!(Ptr{T}(dst), Ptr{T}(src), lda, mr, av, Val(W))
                         p += W
                     end
-                    while p < kce                          # contraction tail — scalar
-                        for r in 0:(W - 1)
-                            Ap[base + p * mr + ri * W + r + 1] = alpha * A[pc + p + 1, ic + r0 + r + 1]
-                        end
-                        p += 1
+                    if p < kce                             # contraction tail: partial transpose block
+                        src = Aptr + ((ic + r0) * lda + (pc + p)) * sz
+                        dst = App + (base + p * mr + ri * W) * sz
+                        _tblk_part!(Ptr{T}(dst), Ptr{T}(src), lda, mr, av, kce - p, W, W, Val(false))
                     end
                 end
-            else                                          # partial panel — scalar, zero-padded
-                for p in 0:(kce - 1), r in 0:(mr - 1)
-                    lr = pi * mr + r
-                    Ap[base + p * mr + r + 1] = lr < mce ? alpha * A[pc + p + 1, ic + lr + 1] : zero(T)
+            else                                          # partial panel — zero-padded rows
+                for ri in 0:(sub - 1)
+                    r0 = pi * mr + ri * W
+                    cv = clamp(mce - r0, 0, W)            # op(A) rows of this block that exist
+                    p = 0
+                    while p < kce
+                        kt = min(W, kce - p)
+                        src = Aptr + ((ic + r0) * lda + (pc + p)) * sz
+                        dst = App + (base + p * mr + ri * W) * sz
+                        _tblk_part!(Ptr{T}(dst), Ptr{T}(src), lda, mr, av, kt, cv, W, Val(true))
+                        p += W
+                    end
                 end
             end
         end
@@ -577,9 +652,130 @@ end
     return _pack_B_dyn!(Bp, B, pc, jc, kce, nce, tB, nr, boff)
 end
 
+@inline _nrval(::Val{N}) where {N} = N
+@inline _nrval(n::Int) = n
+
+# One row of a real op(B)=Bᵀ panel: copy the `cn` contiguous elements at `src` to `dst`, zero-padding
+# to `nr`. A copy does no arithmetic, so a register wider than the FP datapath only splits into
+# datapath-width operations; the copy moves datapath-width vectors (`Wc`), which equals `_vwidth`
+# except on a double-pumped part. Zen4 (64-byte registers, 32-byte datapath), nr=10, kce=256,
+# against the 64-byte copy: 0.81 at nce=256, 0.89 at nce=37, 0.91 at nce=63.
+@inline function _pack_B_row_T!(dst::Ptr{T}, src::Ptr{T}, nr::Int, cn::Int) where {T}
+    sz = sizeof(T); Wc = max(1, _datapath_bytes(_HW) ÷ sz); Vc = Vec{Wc, T}
+    if cn == nr                                # full panel
+        c = 0
+        while c + Wc <= cn
+            vstore(vload(Vc, src + c * sz), dst + c * sz); c += Wc
+        end
+        _tail_pieces(c, nr - c, Val(Wc)) do vh, j   # the remaining fewer than Wc elements are a plain copy
+            Vh = Vec{_pw(vh), T}
+            vstore(vload(Vh, src + j * sz), dst + j * sz)
+        end
+    else                                       # ragged last panel: full-width masked vectors, zero-padded to nr
+        W = _vwidth(T); V = Vec{W, T}; lane = Vec(ntuple(l -> l - 1, Val(W)))
+        c = 0
+        while c + W <= cn
+            vstore(vload(V, src + c * sz), dst + c * sz); c += W
+        end
+        while c < nr
+            vm = lane < (cn - c)
+            _vstore_r(vifelse(vm, vload(V, src + c * sz, vm), zero(V)), dst + c * sz, nr - c)
+            c += W
+        end
+    end
+    return nothing
+end
+
+# Calls `row(ji, p)` once for every panel `ji` in `0:np-1` and contraction row `p` in `0:kce-1`, in the
+# order an op(B)=Bᵀ pack wants when the columns of `B` are a whole number of L1 ways apart. Every
+# source row of one panel then falls in the same L1 set, and copying one panel at a time puts more of
+# those lines in flight than the set has ways. So the panels go in pairs, walked on a skew: step `s`
+# copies row `s` of the first panel, then row `s + 1` (wrapping to 0) of the second. Consecutive loads
+# alternate between two set groups and consecutive stores stay on different lines. Measured on Zen4
+# against one panel at a time, kce=256: real nr=10 at nce=512 and 1024 (4 and 8 KiB columns),
+# 0.63 and 0.56; complex nr=8 at nce=256, 0.87.
+@inline function _skew_panel_pairs(row::F, np::Int, kce::Int) where {F}
+    for jg in 0:2:(np - 1)
+        if jg + 1 < np
+            for s in 0:(kce - 1)
+                row(jg, s)
+                row(jg + 1, s + 1 == kce ? 0 : s + 1)
+            end
+        else
+            for p in 0:(kce - 1)
+                row(jg, p)
+            end
+        end
+    end
+    return nothing
+end
+
+# The op(B)=Bᵀ case of `_pack_B_simd!` walked by `_skew_panel_pairs`; same rows, same result.
+@inline function _pack_B_skew!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, nr::Int, boff::Int) where {T}
+    sz = sizeof(T); ldb = stride(B, 2)
+    GC.@preserve B Bp begin
+        Bptr = pointer(B); Bpp = pointer(Bp)
+        _skew_panel_pairs(cld(nce, nr), kce) do ji, p
+            @inline
+            _pack_B_row_T!(
+                Bpp + (boff + ji * nr * kce + p * nr) * sz, Bptr + (jc + ji * nr + (pc + p) * ldb) * sz,
+                nr, min(nr, nce - ji * nr)
+            )
+        end
+    end
+    return
+end
+
+# Vector B-pack for real `T` over a unit-row-stride `B`. `nrv` is the panel width, either an `Int` or a
+# `Val` (a compile-time width gives the loops constant trip counts). Ragged panels, partial column
+# blocks and the contraction tail go through masked loads and stores, so nothing outside `B[1:kce, 1:nce]`
+# (as op(B) addresses it) is read and nothing outside the packed panels is written; padding lanes of a
+# ragged panel are exact zeros.
+@inline function _pack_B_simd!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nrv, boff::Int) where {T}
+    W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); ldb = stride(B, 2); nr = _nrval(nrv)
+    np = cld(nce, nr); ov = V(one(T))
+    tB && iszero((ldb * sz) % _L1_WAY_BYTES) && return _pack_B_skew!(Bp, B, pc, jc, kce, nce, nr, boff)
+    GC.@preserve B Bp begin
+        Bptr = pointer(B); Bpp = pointer(Bp)
+        for ji in 0:(np - 1)
+            base = boff + ji * nr * kce
+            j0 = jc + ji * nr
+            cn = min(nr, nce - ji * nr)               # columns of op(B) in this panel
+            if tB
+                # op(B)=Bᵀ: for fixed p the c-run is down a B column (contiguous) — copy it, zero-padding to nr.
+                for p in 0:(kce - 1)
+                    _pack_B_row_T!(Bpp + (base + p * nr) * sz, Bptr + (j0 + (pc + p) * ldb) * sz, nr, cn)
+                end
+            else
+                # op(B)=B: a column of B is contiguous in p; transpose W×W blocks into the panel rows.
+                c0 = 0
+                while c0 < nr
+                    cnb = clamp(cn - c0, 0, W)         # valid columns in this block
+                    csb = min(W, nr - c0)              # panel-row lanes this block owns
+                    p = 0
+                    while p < kce
+                        kt = min(W, kce - p)
+                        src = Ptr{T}(Bptr + ((pc + p) + (j0 + c0) * ldb) * sz)
+                        dst = Ptr{T}(Bpp + (base + p * nr + c0) * sz)
+                        if kt == W && cnb == W && csb == W
+                            _tblk!(dst, src, ldb, nr, ov, Val(W))
+                        else
+                            _tblk_part!(dst, src, ldb, nr, ov, kt, cnb, csb, Val(true))
+                        end
+                        p += W
+                    end
+                    c0 += W
+                end
+            end
+        end
+    end
+    return
+end
+
 # Compile-time-nr twin of `_pack_B_dyn!`. Same memory order, same zero-fill of the ragged tail; the ONLY
 # difference is that `NR` is a type parameter, so the c-loops have constant trip counts.
 function _pack_B_val!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, ::Val{NR}, boff::Int = 0) where {T, NR}
+    (T <: BlasReal && _strided1(B)) && return _pack_B_simd!(Bp, B, pc, jc, kce, nce, tB, Val(NR), boff)
     np = cld(nce, NR)
     @inbounds for ji in 0:(np - 1)
         base = boff + ji * NR * kce
@@ -618,6 +814,7 @@ function _pack_B_val!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce:
 end
 
 function _pack_B_dyn!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int, boff::Int = 0) where {T}
+    (T <: BlasReal && _strided1(B)) && return _pack_B_simd!(Bp, B, pc, jc, kce, nce, tB, nr, boff)
     np = cld(nce, nr)
     @inbounds for ji in 0:(np - 1)
         base = boff + ji * nr * kce
@@ -2055,10 +2252,143 @@ function _pack_A_cmplx!(
     end
     return
 end
+# Full W×W block of complex elements: transpose `W` source columns (`src + r·lda2` reals apart), each holding
+# `W` interleaved complex elements, into separate real and imaginary rows at `dR`/`dI + pp·mrstride`. The real and
+# the imaginary parts are transposed one after the other so that only W vectors are live at a time.
+@generated function _tblk_cmplx_full!(dR::Ptr{T}, dI::Ptr{T}, src::Ptr{T}, lda2::Int, mrstride::Int, ::Val{W}) where {T, W}
+    sz = sizeof(T); V = Vec{W, T}; q = Int(round(log2(W)))
+    body = quote
+        $(Expr(:meta, :inline))
+    end
+    for (sel, dst) in ((:first, :dR), (:last, :dI))
+        cur = [Symbol(sel, :_c_, r) for r in 0:(W - 1)]
+        for r in 0:(W - 1)
+            push!(body.args, :($(cur[r + 1]) = $sel(_deint_cmplx(vload(Vec{$(2W), $T}, src + $r * lda2 * $sz)))))
+        end
+        for stage in 0:(q - 1)
+            s = 1 << stage; nxt = [Symbol(sel, :_s, stage, :_, i) for i in 0:(W - 1)]
+            for i in 0:(W - 1)
+                if (i & s) == 0
+                    j = i | s
+                    lo = ntuple(e0 -> (e = e0 - 1; blk = e ÷ (2s); w = e % (2s); w < s ? blk * 2s + w : W + blk * 2s + (w - s)), W)
+                    hi = ntuple(e0 -> (e = e0 - 1; blk = e ÷ (2s); w = e % (2s); w < s ? blk * 2s + s + w : W + blk * 2s + s + (w - s)), W)
+                    push!(body.args, :($(nxt[i + 1]) = shufflevector($(cur[i + 1]), $(cur[j + 1]), Val($lo))))
+                    push!(body.args, :($(nxt[j + 1]) = shufflevector($(cur[i + 1]), $(cur[j + 1]), Val($hi))))
+                end
+            end
+            cur = nxt
+        end
+        for pp in 0:(W - 1)
+            push!(body.args, :(vstore($(cur[pp + 1]), $dst + $pp * mrstride * $sz)))
+        end
+    end
+    push!(body.args, :(return nothing))
+    return body
+end
+
+# Complex analogue of `_tblk_part!`: transpose `cn` source columns (`src + r·lda2` reals apart), each holding
+# `kt` interleaved complex elements, into separate real and imaginary rows at `dR`/`dI + pp·mrstride`, `kt`
+# rows, lanes `< cs` only. Columns `>= cn` read as exact zeros without being loaded.
+@inline function _tblk_cmplx_part!(
+        dR::Ptr{T}, dI::Ptr{T}, src::Ptr{T}, lda2::Int, mrstride::Int, kt::Int, cn::Int, cs::Int
+    ) where {T}
+    W = _vwidth(T); sz = sizeof(T); V = Vec{W, T}
+    clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
+    cmask = clane <= kt
+    # The real and the imaginary parts are transposed one after the other (the source is read twice) so
+    # that only W vectors are live at a time.
+    @inline function pass(sel, dst)
+        cols = ntuple(
+            r -> (r - 1) < cn ? sel(_deint_cmplx(vload(Vec{2W, T}, src + (r - 1) * lda2 * sz, cmask))) : zero(V),
+            Val(W)
+        )
+        _vstore_rows!(_transpose_regs(cols), dst, mrstride, kt, cs)
+        return nothing
+    end
+    pass(first, dR)
+    pass(last, dI)
+    return nothing
+end
+
+# One row of a complex op(B)=Bᵀ panel: split the `cn` contiguous complex elements at `src` into
+# `dR`/`dI`, zero-padding both to `nr`.
+@inline function _pack_B_cmplx_row_T!(dR::Ptr{T}, dI::Ptr{T}, src::Ptr{T}, nr::Int, cn::Int) where {T}
+    W = _vwidth(T); sz = sizeof(T); clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))
+    c = 0
+    while c + W <= cn
+        ar, ai = _deint_cmplx(vload(Vec{2W, T}, src + 2 * c * sz))
+        vstore(ar, dR + c * sz); vstore(ai, dI + c * sz)
+        c += W
+    end
+    while c < nr
+        ar, ai = _deint_cmplx(vload(Vec{2W, T}, src + 2 * c * sz, clane <= (cn - c)))
+        _vstore_r(ar, dR + c * sz, nr - c); _vstore_r(ai, dI + c * sz, nr - c)
+        c += W
+    end
+    return nothing
+end
+
+# The op(B)=Bᵀ case of `_pack_B_cmplx_simd!` walked by `_skew_panel_pairs`; same rows, same result.
+@inline function _pack_B_cmplx_skew!(
+        BpR::Vector{T}, BpI::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, nr::Int
+    ) where {T}
+    sz = sizeof(T); ldb = stride(B, 2)
+    GC.@preserve B BpR BpI begin
+        Bptr = Ptr{T}(pointer(B)); PR = pointer(BpR); PI = pointer(BpI)
+        _skew_panel_pairs(cld(nce, nr), kce) do ji, p
+            @inline
+            dst = (ji * nr * kce + p * nr) * sz
+            _pack_B_cmplx_row_T!(PR + dst, PI + dst, Bptr + 2 * (jc + ji * nr + (pc + p) * ldb) * sz, nr, min(nr, nce - ji * nr))
+        end
+    end
+    return
+end
+
+# Vector complex B-pack for a unit-row-stride `B`; the structure and the masking guarantees are those of
+# `_pack_B_simd!`, with the real and imaginary parts split into `BpR` and `BpI`.
+@inline function _pack_B_cmplx_simd!(
+        BpR::Vector{T}, BpI::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int
+    ) where {T}
+    W = _vwidth(T); sz = sizeof(T); ldb = stride(B, 2); np = cld(nce, nr)
+    tB && iszero((2 * ldb * sz) % _L1_WAY_BYTES) && return _pack_B_cmplx_skew!(BpR, BpI, B, pc, jc, kce, nce, nr)
+    GC.@preserve B BpR BpI begin
+        Bptr = Ptr{T}(pointer(B)); PR = pointer(BpR); PI = pointer(BpI)
+        for ji in 0:(np - 1)
+            base = ji * nr * kce
+            j0 = jc + ji * nr
+            cn = min(nr, nce - ji * nr)
+            if tB
+                for p in 0:(kce - 1)
+                    dst = (base + p * nr) * sz
+                    _pack_B_cmplx_row_T!(PR + dst, PI + dst, Bptr + 2 * (j0 + (pc + p) * ldb) * sz, nr, cn)
+                end
+            else
+                c0 = 0
+                while c0 < nr
+                    cnb = clamp(cn - c0, 0, W); csb = min(W, nr - c0)
+                    p = 0
+                    while p < kce
+                        kt = min(W, kce - p)
+                        src = Bptr + 2 * ((pc + p) + (j0 + c0) * ldb) * sz
+                        if kt == W && cnb == W && csb == W
+                            _tblk_cmplx_full!(PR + (base + p * nr + c0) * sz, PI + (base + p * nr + c0) * sz, src, 2 * ldb, nr, Val(W))
+                        else
+                            _tblk_cmplx_part!(PR + (base + p * nr + c0) * sz, PI + (base + p * nr + c0) * sz, src, 2 * ldb, nr, kt, cnb, csb)
+                        end
+                        p += W
+                    end
+                    c0 += W
+                end
+            end
+        end
+    end
+    return
+end
 function _pack_B_cmplx!(
         BpR::Vector{T}, BpI::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int,
         tB::Bool, nr::Int
     ) where {T}
+    (T <: BlasReal && eltype(B) === Complex{T} && _strided1(B)) && return _pack_B_cmplx_simd!(BpR, BpI, B, pc, jc, kce, nce, tB, nr)
     np = cld(nce, nr)
     @inbounds for ji in 0:(np - 1)
         base = ji * nr * kce
@@ -2535,12 +2865,13 @@ end
 end
 
 # Vectorized A-pack (tA='N', contiguous columns, mr a multiple of W): load Vec{2W} chunks of each
-# column, deinterleave → real panel ApR / imag panel ApI. Partial last panel stays scalar (zero-pad).
+# column, deinterleave → real panel ApR / imag panel ApI. The partial last panel uses masked loads and is zero-padded.
 function _pack_A_cmplx_simd!(
         ApR::Vector{T}, ApI::Vector{T}, A, ic::Int, pc::Int,
         mce::Int, kce::Int, mr::Int
     ) where {T}
     W = _vwidth(T); sz = sizeof(T); lda = stride(A, 2); np = cld(mce, mr)
+    clane = Vec(ntuple(l -> (l + 1) >> 1, Val(2W)))      # 1,1,2,2,…: the complex row of each real/imag lane
     GC.@preserve A ApR ApI begin
         Aptr = Ptr{T}(pointer(A)); PR = pointer(ApR); PI = pointer(ApI)
         @inbounds for pi in 0:(np - 1)
@@ -2555,13 +2886,16 @@ function _pack_A_cmplx_simd!(
                         o += W
                     end
                 end
-            else                                         # partial panel — scalar, zero-padded
-                for p in 0:(kce - 1), r in 0:(mr - 1)
-                    lr = pi * mr + r; idx = base + p * mr + r + 1
-                    if lr < mce
-                        v = A[ic + lr + 1, pc + p + 1]; ApR[idx] = real(v); ApI[idx] = imag(v)
-                    else
-                        ApR[idx] = zero(T); ApI[idx] = zero(T)
+            else                                         # partial panel — masked loads, zero-padded rows
+                rem = mce - pi * mr                      # complex rows of A left in this panel (< mr)
+                for p in 0:(kce - 1)
+                    col = 2 * (r0 + (pc + p) * lda); dst = base + p * mr
+                    o = 0
+                    while o < mr
+                        vm = clane <= (rem - o)          # real/imag lanes of the complex rows that exist
+                        ar, ai = _deint_cmplx(vload(Vec{2W, T}, Aptr + (col + 2 * o) * sz, vm))
+                        vstore(ar, PR + (dst + o) * sz); vstore(ai, PI + (dst + o) * sz)
+                        o += W
                     end
                 end
             end
@@ -4432,6 +4766,11 @@ const _MT_NW_MASK = Int(typemax(UInt16))     # so `set_num_threads` clamps to wh
     # and updated by one worker and the data a step produces stays in the cache group that produced it
     # (`_lustep_run_chunk` in lu.jl).
     _MT_KIND_LUSTEP
+    # gemm's few-row split (`_gemm_rows_split!`), by column bands on its own block grid. A kind of its
+    # own rather than the GEMM kind: the GEMM chunk is also the chunk of LAPACK trailing updates and
+    # Strassen leaves, whose serial twins run `_gemm_core!`, and this one must run the split's
+    # dot-product tail instead. `lam` is the tail's row count and `lanb` the block width.
+    _MT_KIND_ROWSPLIT
 end
 mutable struct GemmPool{T}
     @atomic gen::Int                 # `counter << _MT_NW_SHIFT | nw`; bumped to publish a job (see above)
@@ -4777,6 +5116,7 @@ end
     p.kind == _MT_KIND_SYMV && return _symv_run_chunk(p, nw, i)
     p.kind == _MT_KIND_GBMVN && return _gbmvn_run_chunk(p, nw, i)
     p.kind == _MT_KIND_ELEM && return _elem_run_chunk(p, nw, i)
+    T <: BlasReal && p.kind == _MT_KIND_ROWSPLIT && return _rowsplit_run_chunk(p, nw, i)
     j0, len = _gemm_chunk(p.n, nw, _mt_band(nw, i))
     len > 0 || return nothing
     Cc = PtrMatrix{T}(p.Cp + j0 * p.ldc * sizeof(T), p.m, len, p.ldc)
@@ -6632,6 +6972,9 @@ end
             # bands reach. α after the product, as `trmm!` applies it.
             _trmm_left!(up, tA, cA, unit, A, C)
             isone(alpha) || _scal_all!(C, alpha)
+        elseif T <: BlasReal && kind == _MT_KIND_ROWSPLIT
+            # The whole split, serially: the same blocks the bands run.
+            _rows_split_serial!(C, A, B, alpha, beta, false, lup.m, A.n, lup.nb, 2)
         else
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
             _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
@@ -6744,6 +7087,7 @@ end
         # job, and the driver and idle workers are then in spin/wait loops with nowhere for a GC to
         # progress from. That failed as a swallowed worker exception or a silent hang, by interleaving.
         kind == _MT_KIND_TRMMR && _trmmr_prefit!(T, A.n, nw)
+        T <: BlasReal && kind == _MT_KIND_ROWSPLIT && _rowsplit_prefit!(T, lup.m * A.n, nw)
         # NOTE no prefit for `_MT_KIND_TRMM`. Side L splits COLUMNS and each band runs the same
         # `_trmm_left!` recursion the unsplit call runs, whose bases borrow from the arena rather
         # than from a pre-sized pool — the shape `_MT_KIND_TRSM` already has.
@@ -7630,10 +7974,14 @@ end
 # most 4 rows with B not transposed and k >= 16, and an n-vectorized form with scatter stores for a
 # tail of 1 to 5 rows with B transposed.
 #
-# The transposed-B tail has the unpacked kernel's bits; the dot-product tail does not, so that split
-# is taken only where the column-split pool never runs (`_gemm_never_pooled`), which keeps the result
-# the same at every thread count.
-@inline _gemm_never_pooled(m::Int, n::Int, k::Int) = 2 * m * n * k < _gemm_mt_work() || n < _NR
+# The transposed-B tail has the unpacked kernel's bits, so it may yield to the pool. The dot-product
+# tail does not, so it OWNS its shapes: whether it runs is decided from `(T, m, k)` and build
+# constants alone, never from the pool's flop floor, which is `typemax(Int)` until a pool exists and a
+# measured value afterwards. The floor decides only `nw`, i.e. whether the call threads. A threaded
+# call splits the columns into bands (`_MT_KIND_ROWSPLIT`) and each band runs this same split, which
+# gives each element of C the bits the serial call gives it: the dot-product tail computes every
+# column on its own, and the unpacked kernel takes its route from the block width `nb`, not from the
+# width of the piece it is handed.
 @inline function _gemm_rows_split!(C, A, B, α::T, β::T, tA::Bool, tB::Bool, m::Int, n::Int, k::Int, nw::Int) where {T}
     W = _vwidth(T)
     T <: BlasReal && !tA && W < m <= _GEMM_MR1_MAX && n > 1 && k > 1 &&
@@ -7641,13 +7989,13 @@ end
     r = m % W; q = m - r
     iszero(r) && return false
     # Tail kernel: 1 = n-vectorized (B transposed, bit-identical to the unpacked kernel, so only
-    # when the pool declines the call), 2 = dot product (B not transposed, only where the pool never
-    # runs). Otherwise the unpacked driver's own ragged handling is as fast (measured on Zen4).
+    # when the pool declines the call), 2 = dot product (B not transposed, whatever the pool holds).
+    # Otherwise the unpacked driver's own ragged handling is as fast (measured on Zen4).
     if tB
         nw == 1 && (r < _at_tail_vw(_HW, T) || k >= _rows_dot_kmin(T, r)) || return false
         tk = 1
     else
-        _rows_dot_tail_ok(T, r) && k >= _rows_dot_kmin(T, r) && _gemm_never_pooled(m, n, k) || return false
+        _rows_dot_tail_ok(T, r) && k >= _rows_dot_kmin(T, r) || return false
         tk = 2
     end
     if iszero(α)
@@ -7655,39 +8003,147 @@ end
     end
     Cp = _pm(C); Ap = _pm(A); Bp = _pm(B)
     rA = _root(A); rB = _root(B); rC = _root(C)
-    sz = sizeof(T)
-    Xs, _ = _gemm_scratch(T, tk == 2 ? r * k : 0, 0)
-    GC.@preserve rA rB rC Xs begin
-        # The dot-product tail reads its rows of A contiguous along k.
-        Xp = pointer(Xs)
-        if tk == 2
-            for i in 1:r, l in 1:k
-                unsafe_store!(Xp, unsafe_load(Ap.ptr, (q + i - 1) + (l - 1) * Ap.ld + 1), l + (i - 1) * k)
-            end
-        end
-        Atop = PtrMatrix(Ap.ptr, q, k, Ap.ld); Atl = PtrMatrix(Ap.ptr + q * sz, r, k, Ap.ld)
-        nb = _rows_split_nb(T, k, r, tk)
-        if iszero(β)
-            tB ? _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(true), Val(true)) :
-                _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(false), Val(true))
+    nb = _rows_split_nb(T, k, r, tk)
+    nwc = tk == 2 ? nw : 1
+    GC.@preserve rA rB rC begin
+        if nwc > 1
+            # `LuPanel` carries the tail's row count (`m`) and the block width (`nb`).
+            _gemm_threaded!(
+                Cp, Ap, Bp, α, β, false, false, false, false, nwc, _MT_KIND_ROWSPLIT, false, false, false,
+                LuPanel{T}(Ptr{T}(0), k, r, nb, Ptr{Int}(0), 0, 0, -1)
+            )
         else
-            tB ? _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(true), Val(false)) :
-                _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, n, k, nb, tk, Val(false), Val(false))
+            _rows_split_serial!(Cp, Ap, Bp, α, β, tB, r, k, nb, tk)
         end
     end
     return true
 end
 
+# The dot-product tail reads its rows of A contiguous along k: rows `q+1 … q+r` of A into `Xp`, row i
+# at `Xp + (i-1)·k`. Element for element a copy, so the dot tail sees the same values.
+# OUT OF LINE: the dispatcher holds one unrolled transpose pack per row count (15 for Float32 at
+# AVX-512), so it is compiled once per element type instead of into every caller: inlined, the
+# `--check-bounds=yes` precompile on Zen4 needs more than 18 GB, against 17.7 GB out of line. One
+# call per pack.
+@generated function _rows_split_pack!(Xp::Ptr{T}, Ap::PtrMatrix{T}, r::Int, k::Int) where {T}
+    ex = :(return _rows_split_pack!(Xp, Ap, Val($(_vwidth(T) - 1)), k))
+    for R in (_vwidth(T) - 2):-1:1
+        ex = :(r == $R ? (return _rows_split_pack!(Xp, Ap, Val($R), k)) : $ex)
+    end
+    return Expr(:block, Expr(:meta, :noinline), ex)
+end
+
+# TW columns at a time: each column's rows in one masked load, the TW×TW register transpose
+# (`_transpose_regs`), and the row stores of the block's columns (`_vstore_rows!`, which never stores
+# through a mask). The row count is a type parameter so the transpose computes only the rows it stores,
+# and TW is the smallest power of two holding them, since a wider block costs more shuffles per element.
+# A transpose holds TW source vectors and TW results at once, so rows go in passes of at most
+# `_NVREG ÷ 4` (`_rows_pack_tw`): at `_NVREG ÷ 2` it spills (StrictMode `spill_report`: TW = 16 with 32
+# registers, TW = 8 with 16).
+# PDM: Derived for two or more rows (row count, register count); one row is a strided copy with no shape
+# to derive from, and its block width is a literal (req8-ok) measured on Zen4, ns per element against
+# the scalar copy:
+#   width        2      4      8      16     scalar   (k = 100 / 300)
+#   Float32    0.67   0.52   0.49   0.59     0.53
+#              0.49   0.41   0.40   0.47     0.39
+#   Float64    0.60   0.52   0.49     -      0.50
+#              0.49   0.48   0.38     -      0.42
+@inline _rows_pack_rows(::Type{T}, r::Int) where {T} = min(r, _vwidth(T), _NVREG ÷ 4)
+@inline _rows_pack_tw(::Type{T}, c::Int) where {T} = min(isone(c) ? 8 : nextpow(2, c), _vwidth(T))   # req8-ok: one-row width, table above
+@inline function _rows_split_pack!(Xp::Ptr{T}, Ap::PtrMatrix{T}, ::Val{R}, k::Int) where {T, R}
+    _rows_pack_pass!(Xp, Ap.ptr + (Ap.m - R) * sizeof(T), Ap.ld, Val(R), k)
+    return nothing
+end
+@inline function _rows_pack_pass!(Xp::Ptr{T}, src::Ptr{T}, ld::Int, ::Val{R}, k::Int) where {T, R}
+    C = _rows_pack_rows(T, R)
+    _rows_pack_block!(Xp, src, ld, Val(C), k)
+    C < R && _rows_pack_pass!(Xp + C * k * sizeof(T), src + C * sizeof(T), ld, Val(R - C), k)
+    return nothing
+end
+@inline function _rows_pack_block!(Xp::Ptr{T}, src::Ptr{T}, ld::Int, ::Val{C}, k::Int) where {T, C}
+    TW = _rows_pack_tw(T, C); sz = sizeof(T)
+    rmsk = Vec(ntuple(i -> i - 1, Val(TW))) < C
+    p = 0
+    while p < k
+        # Fresh bindings per block: the closure below must not capture the reassigned `p`, which
+        # would box it.
+        cn = min(TW, k - p); blk = src + p * ld * sz
+        cols = ntuple(c -> (c - 1) < cn ? vload(Vec{TW, T}, blk + (c - 1) * ld * sz, rmsk) : zero(Vec{TW, T}), Val(TW))
+        _vstore_rows!(_transpose_regs(cols), Xp + p * sz, k, C, cn)
+        p += TW
+    end
+    return nothing
+end
+
+# The whole split on the calling task, from its own scratch.
+@inline function _rows_split_serial!(
+        Cp::PtrMatrix{T}, Ap::PtrMatrix{T}, Bp::PtrMatrix{T}, α::T, β::T, tB::Bool, r::Int, k::Int, nb::Int, tk::Int
+    ) where {T}
+    Xs, _ = _gemm_scratch(T, tk == 2 ? r * k : 0, 0)
+    GC.@preserve Xs begin
+        tk == 2 && _rows_split_pack!(pointer(Xs), Ap, r, k)
+        _rows_split_cols!(Cp, Ap, pointer(Xs), Bp, α, β, tB, r, k, nb, tk, 0, Cp.n)
+    end
+    return nothing
+end
+
+# Grow every band's tail slot before the job is published (driver, inside the claim): a chunk body
+# must not allocate. The slots are `_trmmr_pack`'s, which no other job holds while this one runs.
+@inline function _rowsplit_prefit!(::Type{T}, len::Int, nw::Int) where {T}
+    for wi in 1:nw
+        _trmmr_pack(T, wi, len)
+    end
+    return nothing
+end
+
+# Columns `[j0, j1)` of the split, walked in blocks of `nb` from `j0`.
+@inline function _rows_split_cols!(
+        Cp::PtrMatrix{T}, Ap::PtrMatrix{T}, Xp::Ptr{T}, Bp::PtrMatrix{T}, α::T, β::T, tB::Bool,
+        r::Int, k::Int, nb::Int, tk::Int, j0::Int, j1::Int
+    ) where {T}
+    q = Cp.m - r
+    Atop = PtrMatrix(Ap.ptr, q, k, Ap.ld); Atl = PtrMatrix(Ap.ptr + q * sizeof(T), r, k, Ap.ld)
+    if iszero(β)
+        tB ? _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, j0, j1, k, nb, tk, Val(true), Val(true)) :
+            _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, j0, j1, k, nb, tk, Val(false), Val(true))
+    else
+        tB ? _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, j0, j1, k, nb, tk, Val(true), Val(false)) :
+            _rows_split_blocks!(Cp, Atop, Atl, Xp, Bp, α, β, q, r, j0, j1, k, nb, tk, Val(false), Val(false))
+    end
+    return nothing
+end
+
+# One band of a threaded split, cut on `_NR` columns as the gemm column split cuts them. B is not
+# transposed (only the dot-product tail threads). Each band packs the tail into its own slot: a pack
+# written by the driver and read by every worker costs a cache-line handoff per worker that the pack
+# itself does not.
+@inline function _rowsplit_run_chunk(p::GemmPool{T}, nw::Int, i::Int) where {T}
+    j0, len = _gemm_chunk(p.n, nw, _mt_band(nw, i))
+    len > 0 || return nothing
+    Ac = PtrMatrix{T}(p.Ap, p.m, p.k, p.lda)
+    Xs = _trmmr_pack(T, i, p.lam * p.k)
+    GC.@preserve Xs begin
+        _rows_split_pack!(pointer(Xs), Ac, p.lam, p.k)
+        _rows_split_cols!(
+            PtrMatrix{T}(p.Cp, p.m, p.n, p.ldc), Ac, pointer(Xs), PtrMatrix{T}(p.Bp, p.k, p.n, p.ldb),
+            p.alpha, p.beta, false, p.lam, p.k, p.lanb, 2, j0, j0 + len
+        )
+    end
+    return nothing
+end
+
 @inline function _rows_split_blocks!(
-        Cp::PtrMatrix{T}, Atop, Atl, Xp, Bp, α::T, β::T, q, r, n, k, nb, tk, ::Val{TB}, ::Val{B0}
+        Cp::PtrMatrix{T}, Atop, Atl, Xp, Bp, α::T, β::T, q, r, j0, j1, k, nb, tk, ::Val{TB}, ::Val{B0}
     ) where {T, TB, B0}
     sz = sizeof(T)
-    j = 0
-    while j < n
-        w = min(nb, n - j)
+    j = j0
+    while j < j1
+        w = min(nb, j1 - j)
         Bb = TB ? PtrMatrix(Bp.ptr + j * sz, w, k, Bp.ld) : PtrMatrix(Bp.ptr + j * Bp.ld * sz, k, w, Bp.ld)
         Cb = Cp.ptr + j * Cp.ld * sz
-        _gemm_unpacked!(Val(TB), Val(B0), q, w, k, α, Atop, Bb, β, PtrMatrix(Cb, q, w, Cp.ld))
+        # Routed as a block of `nb` columns whatever its width, so a band that ends mid-block, or a
+        # last block, computes its columns as the full blocks of the serial walk do.
+        _gemm_unpacked!(Val(TB), Val(B0), q, w, k, α, Atop, Bb, β, PtrMatrix(Cb, q, w, Cp.ld), (-1, nb, -1))
         if tk == 1
             _rows_bt_dispatch!(Cb + q * sz, Cp.ld, Atl.ptr, 1, Atl.ld, Bb.ptr, Bp.ld, r, w, k, α, β, Val(_vwidth(T) - 1), Val(B0))
         else
@@ -7713,6 +8169,7 @@ end
     lanes = r <= _at_tail_vw(_HW, T) ? _at_tail_vw(_HW, T) : _vwidth(T)
     return 4 * (lanes - r) >= lanes
 end
+
 
 @inline function _rows_split_nb(::Type{T}, k::Int, r::Int, tk::Int) where {T}
     tile = tk == 1 ? _rows_dot_nc(T, r) * _vwidth(T) : _rows_dot_nc(T, r)

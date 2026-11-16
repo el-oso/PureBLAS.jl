@@ -135,7 +135,7 @@ end
 _GVDWork{T, R}() where {T, R} =
     _GVDWork{T, R}(0, R[], T[], Matrix{R}(undef, 0, 0), Matrix{T}(undef, 0, 0))
 
-function _gvd_grow!(ws::_GVDWork{T, R}, n::Int) where {T, R}
+@noinline function _gvd_grow!(ws::_GVDWork{T, R}, n::Int) where {T, R}
     ws.n >= n && return ws
     m = max(n, 1)
     ws.e = Vector{R}(undef, m); ws.tau = Vector{T}(undef, m)
@@ -144,16 +144,17 @@ function _gvd_grow!(ws::_GVDWork{T, R}, n::Int) where {T, R}
     ws.n = m
     return ws
 end
+@strict_exempt _gvd_grow! guarantees = (:noalloc,) reason = "grows the generalized-eigenproblem workspace to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # One workspace per thread (written during the call) — see `_l3ws`.
 const _GVDWS_F64 = Base.OncePerTask{_GVDWork{Float64, Float64}}(_GVDWork{Float64, Float64})
 const _GVDWS_F32 = Base.OncePerTask{_GVDWork{Float32, Float32}}(_GVDWork{Float32, Float32})
 const _GVDWS_C64 = Base.OncePerTask{_GVDWork{ComplexF64, Float64}}(_GVDWork{ComplexF64, Float64})
 const _GVDWS_C32 = Base.OncePerTask{_GVDWork{ComplexF32, Float32}}(_GVDWork{ComplexF32, Float32})
-@inline _gvdws(::Type{Float64}) = _GVDWS_F64()
-@inline _gvdws(::Type{Float32}) = _GVDWS_F32()
-@inline _gvdws(::Type{ComplexF64}) = _GVDWS_C64()
-@inline _gvdws(::Type{ComplexF32}) = _GVDWS_C32()
+@inline _gvdws(::Type{Float64}) = _opt(_GVDWS_F64)
+@inline _gvdws(::Type{Float32}) = _opt(_GVDWS_F32)
+@inline _gvdws(::Type{ComplexF64}) = _opt(_GVDWS_C64)
+@inline _gvdws(::Type{ComplexF32}) = _opt(_GVDWS_C32)
 
 # Shared validation for every gvd entry.
 @inline function _gvd_check(itype, jobz, uplo, A, B)

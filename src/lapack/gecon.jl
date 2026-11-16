@@ -254,20 +254,19 @@ function pocon!(normA::Real, A_chol::AbstractMatrix{T}; uplo::Char = 'L', norm::
     (n == 0 || normA <= 0) && return zero(real(T))
 
     # A⁻¹ = L⁻ᴴ L⁻¹ (lower) or U⁻¹ U⁻ᴴ (upper); Hermitian ⇒ same operator for op and opᴴ.
-    solve! = uplo == 'L' ?
-        (
-            x -> (
-                trsv!(A_chol, x; uplo = 'L', trans = 'N', diag = 'N');
-                trsv!(A_chol, x; uplo = 'L', trans = 'C', diag = 'N'); x
-            )
-        ) :
-        (
-            x -> (
-                trsv!(A_chol, x; uplo = 'U', trans = 'C', diag = 'N');
-                trsv!(A_chol, x; uplo = 'U', trans = 'N', diag = 'N'); x
-            )
-        )
-    applyop!(x, _adj) = solve!(x)
+    # One closure type: a ternary choosing between two lambdas has a `Union` type, which `_lacn2!` then
+    # dispatches on at run time.
+    lower = uplo == 'L'
+    function applyop!(x, _adj)
+        if lower
+            trsv!(A_chol, x; uplo = 'L', trans = 'N', diag = 'N')
+            trsv!(A_chol, x; uplo = 'L', trans = 'C', diag = 'N')
+        else
+            trsv!(A_chol, x; uplo = 'U', trans = 'C', diag = 'N')
+            trsv!(A_chol, x; uplo = 'U', trans = 'N', diag = 'N')
+        end
+        return x
+    end
 
     ainv = _lacn2!(applyop!, T, n)
     return iszero(ainv) ? zero(real(T)) : (one(real(T)) / ainv) / real(normA)

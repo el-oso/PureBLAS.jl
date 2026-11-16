@@ -111,94 +111,105 @@ _strict_ungtr_probe(bk, A, tau, Q) = (ungtr!(bk, 'L', A, tau, Q); nothing)
 # the BACKEND method, since that is the method the contract actually binds. The `job`/`uplo`/`side`/
 # `trans` characters are passed as ARGUMENTS rather than baked in, so one probe covers every arm and the
 # strict block can list the arms it wants without a probe per combination.
-_strict_gebal_probe(bk, A, A0, scale) = (copyto!(A, A0); gebal!(bk, A, scale; job = 'B'); nothing)
+# Elementwise seed, used where the destination may be a `view` of a larger parent. `copyto!(view, array)`
+# first asks whether the two might alias and, if so, copies the source into a temporary — a runtime
+# allocation path the probed call would be charged for. This loop has none, and takes the same
+# `Matrix`/`Vector`/`SubArray` operand types the probes are called with.
+function _strict_seed!(dst::AbstractArray, src::AbstractArray)
+    axes(dst) == axes(src) || throw(DimensionMismatch("_strict_seed!: $(axes(dst)) vs $(axes(src))"))
+    for I in eachindex(dst, src)
+        dst[I] = src[I]
+    end
+    return dst
+end
+_strict_gebal_probe(bk, A, A0, scale) = (_strict_seed!(A, A0); gebal!(bk, A, scale; job = 'B'); nothing)
 _strict_gebak_probe(bk, V, V0, scale, ilo, ihi) =
-    (copyto!(V, V0); gebak!(bk, 'B', 'R', ilo, ihi, scale, V); nothing)
-_strict_gehrd_probe(bk, A, A0, ilo, ihi, tau) = (copyto!(A, A0); gehrd!(bk, A, ilo, ihi, tau); nothing)
+    (_strict_seed!(V, V0); gebak!(bk, 'B', 'R', ilo, ihi, scale, V); nothing)
+_strict_gehrd_probe(bk, A, A0, ilo, ihi, tau) = (_strict_seed!(A, A0); gehrd!(bk, A, ilo, ihi, tau); nothing)
 # orghr! consumes the FACTORED source (gehrd's reflectors), not the raw A, and overwrites it with Q.
-_strict_orghr_probe(bk, A, Af, ilo, ihi, tau) = (copyto!(A, Af); orghr!(bk, A, ilo, ihi, tau); nothing)
+_strict_orghr_probe(bk, A, Af, ilo, ihi, tau) = (_strict_seed!(A, Af); orghr!(bk, A, ilo, ihi, tau); nothing)
 # ormhr! leaves A/tau alone (read-only, as in reference LAPACK) and overwrites C.
 _strict_ormhr_probe(bk, C, C0, side, trans, ilo, ihi, Af, tau) =
-    (copyto!(C, C0); ormhr!(bk, side, trans, ilo, ihi, Af, tau, C); nothing)
+    (_strict_seed!(C, C0); ormhr!(bk, side, trans, ilo, ihi, Af, tau, C); nothing)
 _strict_hseqr_probe(bk, H, H0, job, compz, ilo, ihi, w, Z) =
-    (copyto!(H, H0); hseqr!(bk, job, compz, H, ilo, ihi, w, Z); nothing)
+    (_strict_seed!(H, H0); hseqr!(bk, job, compz, H, ilo, ihi, w, Z); nothing)
 _strict_trevc_probe(bk, Tw, T0, VL, VR, VR0) =
-    (copyto!(Tw, T0); copyto!(VR, VR0); trevc!(bk, 'R', 'B', Tw, VL, VR); nothing)
+    (_strict_seed!(Tw, T0); _strict_seed!(VR, VR0); trevc!(bk, 'R', 'B', Tw, VL, VR); nothing)
 _strict_trexc_probe(bk, Tw, T0, Q, Q0, ifst, ilst) =
-    (copyto!(Tw, T0); copyto!(Q, Q0); trexc!(bk, 'V', Tw, Q, ifst, ilst); nothing)
+    (_strict_seed!(Tw, T0); _strict_seed!(Q, Q0); trexc!(bk, 'V', Tw, Q, ifst, ilst); nothing)
 _strict_trsen_probe(bk, Tw, T0, Q, Q0, job, sel, w) =
-    (copyto!(Tw, T0); copyto!(Q, Q0); trsen!(bk, job, 'V', sel, Tw, Q, w); nothing)
+    (_strict_seed!(Tw, T0); _strict_seed!(Q, Q0); trsen!(bk, job, 'V', sel, Tw, Q, w); nothing)
 _strict_sygvd_probe(bk, Aw, A0, Bw, B0, it, jobz, uplo, w) =
-    (copyto!(Aw, A0); copyto!(Bw, B0); sygvd!(bk, it, jobz, uplo, Aw, Bw, w); nothing)
+    (_strict_seed!(Aw, A0); _strict_seed!(Bw, B0); sygvd!(bk, it, jobz, uplo, Aw, Bw, w); nothing)
 _strict_hegvd_probe(bk, Aw, A0, Bw, B0, it, jobz, uplo, w) =
-    (copyto!(Aw, A0); copyto!(Bw, B0); hegvd!(bk, it, jobz, uplo, Aw, Bw, w); nothing)
+    (_strict_seed!(Aw, A0); _strict_seed!(Bw, B0); hegvd!(bk, it, jobz, uplo, Aw, Bw, w); nothing)
 _strict_trsyl_probe(bk, C, C0, transa, transb, A, B) =
-    (copyto!(C, C0); trsyl!(bk, transa, transb, 1, A, B, C); nothing)
+    (_strict_seed!(C, C0); trsyl!(bk, transa, transb, 1, A, B, C); nothing)
 _strict_geevr_probe(bk, A, A0, wr, wi, VL, VR, scale) =
-    (copyto!(A, A0); geev!(bk, 'N', 'V', A, wr, wi, VL, VR, scale); nothing)
+    (_strict_seed!(A, A0); geev!(bk, 'N', 'V', A, wr, wi, VL, VR, scale); nothing)
 _strict_geevc_probe(bk, A, A0, w, VL, VR, scale) =
-    (copyto!(A, A0); geev!(bk, 'N', 'V', A, w, VL, VR, scale); nothing)
-_strict_gees_probe(bk, A, A0, w, VS, scale) = (copyto!(A, A0); gees!(bk, 'V', A, w, VS, scale); nothing)
+    (_strict_seed!(A, A0); geev!(bk, 'N', 'V', A, w, VL, VR, scale); nothing)
+_strict_gees_probe(bk, A, A0, w, VS, scale) = (_strict_seed!(A, A0); gees!(bk, 'V', A, w, VS, scale); nothing)
 
-_strict_sytrf_probe(bk, A, A0, ipiv, uplo) = (copyto!(A, A0); sytrf!(bk, A, ipiv; uplo = uplo); nothing)
-_strict_hetrf_probe(bk, A, A0, ipiv, uplo) = (copyto!(A, A0); hetrf!(bk, A, ipiv; uplo = uplo); nothing)
+_strict_sytrf_probe(bk, A, A0, ipiv, uplo) = (_strict_seed!(A, A0); sytrf!(bk, A, ipiv; uplo = uplo); nothing)
+_strict_hetrf_probe(bk, A, A0, ipiv, uplo) = (_strict_seed!(A, A0); hetrf!(bk, A, ipiv; uplo = uplo); nothing)
 _strict_sytrs_probe(bk, B, B0, Af, ipiv, uplo) =
-    (copyto!(B, B0); sytrs!(bk, Af, ipiv, B; uplo = uplo); nothing)
+    (_strict_seed!(B, B0); sytrs!(bk, Af, ipiv, B; uplo = uplo); nothing)
 _strict_hetrs_probe(bk, B, B0, Af, ipiv, uplo) =
-    (copyto!(B, B0); hetrs!(bk, Af, ipiv, B; uplo = uplo); nothing)
+    (_strict_seed!(B, B0); hetrs!(bk, Af, ipiv, B; uplo = uplo); nothing)
 # sytri!/hetri! take the FACTOR and overwrite it with the inverse — re-seed from the factorization.
-_strict_sytri_probe(bk, A, Af, ipiv, uplo) = (copyto!(A, Af); sytri!(bk, A, ipiv; uplo = uplo); nothing)
-_strict_hetri_probe(bk, A, Af, ipiv, uplo) = (copyto!(A, Af); hetri!(bk, A, ipiv; uplo = uplo); nothing)
+_strict_sytri_probe(bk, A, Af, ipiv, uplo) = (_strict_seed!(A, Af); sytri!(bk, A, ipiv; uplo = uplo); nothing)
+_strict_hetri_probe(bk, A, Af, ipiv, uplo) = (_strict_seed!(A, Af); hetri!(bk, A, ipiv; uplo = uplo); nothing)
 _strict_sysv_probe(bk, A, A0, B, B0, ipiv, uplo) =
-    (copyto!(A, A0); copyto!(B, B0); sysv!(bk, uplo, A, B, ipiv); nothing)
+    (_strict_seed!(A, A0); _strict_seed!(B, B0); sysv!(bk, uplo, A, B, ipiv); nothing)
 _strict_hesv_probe(bk, A, A0, B, B0, ipiv, uplo) =
-    (copyto!(A, A0); copyto!(B, B0); hesv!(bk, uplo, A, B, ipiv); nothing)
+    (_strict_seed!(A, A0); _strict_seed!(B, B0); hesv!(bk, uplo, A, B, ipiv); nothing)
 _strict_syconv_probe(bk, A, Af, ipiv, work, uplo) =
-    (copyto!(A, Af); syconv!(bk, uplo, A, ipiv, work); nothing)
+    (_strict_seed!(A, Af); syconv!(bk, uplo, A, ipiv, work); nothing)
 
 _strict_gghrd_probe(bk, A, A0, B, B0, Q, Z) =
-    (copyto!(A, A0); copyto!(B, B0); gghrd!(bk, 'I', 'I', A, B, Q, Z); nothing)
+    (_strict_seed!(A, A0); _strict_seed!(B, B0); gghrd!(bk, 'I', 'I', A, B, Q, Z); nothing)
 _strict_hgeqz_probe(bk, H, H0, Tm, T0, alpha, beta, Q, Z) =
-    (copyto!(H, H0); copyto!(Tm, T0); hgeqz!(bk, 'S', 'I', 'I', H, Tm, alpha, beta, Q, Z); nothing)
+    (_strict_seed!(H, H0); _strict_seed!(Tm, T0); hgeqz!(bk, 'S', 'I', 'I', H, Tm, alpha, beta, Q, Z); nothing)
 _strict_tgevc_probe(bk, S, S0, Pm, P0, VL, VR, VR0) =
     (
-    copyto!(S, S0); copyto!(Pm, P0); copyto!(VR, VR0);
+    _strict_seed!(S, S0); _strict_seed!(Pm, P0); _strict_seed!(VR, VR0);
     tgevc!(bk, 'R', 'B', S, Pm, VL, VR); nothing
 )
 _strict_tgsen_probe(bk, sel, S, S0, Tm, T0, Q, Q0, Z, Z0, alpha, beta) =
     (
-    copyto!(S, S0); copyto!(Tm, T0); copyto!(Q, Q0); copyto!(Z, Z0);
+    _strict_seed!(S, S0); _strict_seed!(Tm, T0); _strict_seed!(Q, Q0); _strict_seed!(Z, Z0);
     tgsen!(bk, sel, S, Tm, Q, Z, alpha, beta); nothing
 )
 _strict_ggevr_probe(bk, A, A0, B, B0, alphar, alphai, beta, vl, vr) =
-    (copyto!(A, A0); copyto!(B, B0); ggev!(bk, 'N', 'V', A, B, alphar, alphai, beta, vl, vr); nothing)
+    (_strict_seed!(A, A0); _strict_seed!(B, B0); ggev!(bk, 'N', 'V', A, B, alphar, alphai, beta, vl, vr); nothing)
 _strict_ggevc_probe(bk, A, A0, B, B0, alpha, beta, vl, vr) =
-    (copyto!(A, A0); copyto!(B, B0); ggev!(bk, 'N', 'V', A, B, alpha, beta, vl, vr); nothing)
+    (_strict_seed!(A, A0); _strict_seed!(B, B0); ggev!(bk, 'N', 'V', A, B, alpha, beta, vl, vr); nothing)
 _strict_gges_probe(bk, A, A0, B, B0, alpha, beta, vsl, vsr) =
-    (copyto!(A, A0); copyto!(B, B0); gges!(bk, 'V', 'V', A, B, alpha, beta, vsl, vsr); nothing)
+    (_strict_seed!(A, A0); _strict_seed!(B, B0); gges!(bk, 'V', 'V', A, B, alpha, beta, vsl, vsr); nothing)
 
 _strict_gebd2_probe(bk, A, A0, d, e, tauq, taup) =
-    (copyto!(A, A0); gebd2!(bk, A, d, e, tauq, taup); nothing)
+    (_strict_seed!(A, A0); gebd2!(bk, A, d, e, tauq, taup); nothing)
 _strict_gebrd_probe(bk, A, A0, d, e, tauq, taup) =
-    (copyto!(A, A0); gebrd!(bk, A, d, e, tauq, taup); nothing)
+    (_strict_seed!(A, A0); gebrd!(bk, A, d, e, tauq, taup); nothing)
 _strict_bdsdc_probe(bk, d, d0, e, e0, Lvec, Rvec) =
-    (copyto!(d, d0); copyto!(e, e0); bdsdc!(bk, d, e, Lvec, Rvec); nothing)
+    (_strict_seed!(d, d0); _strict_seed!(e, e0); bdsdc!(bk, d, e, Lvec, Rvec); nothing)
 _strict_bdsqr_probe(bk, d, d0, e, e0, U, V) =
-    (copyto!(d, d0); copyto!(e, e0); bdsqr!(bk, d, e, U, V); nothing)
+    (_strict_seed!(d, d0); _strict_seed!(e, e0); bdsqr!(bk, d, e, U, V); nothing)
 _strict_bdsqrc_probe(bk, d, d0, e, e0, Vt, U, C) =
-    (copyto!(d, d0); copyto!(e, e0); bdsqr!(bk, 'U', d, e, Vt, U, C); nothing)
+    (_strict_seed!(d, d0); _strict_seed!(e, e0); bdsqr!(bk, 'U', d, e, Vt, U, C); nothing)
 _strict_ggsvd_probe(bk, A, A0, B, B0, U, V, Q, alpha, beta, R) =
     (
-    copyto!(A, A0); copyto!(B, B0);
+    _strict_seed!(A, A0); _strict_seed!(B, B0);
     ggsvd!(bk, 'U', 'V', 'Q', A, B, U, V, Q, alpha, beta, R); nothing
 )
 
-_strict_gels_probe(bk, A, A0, B, B0) = (copyto!(A, A0); copyto!(B, B0); gels!(bk, 'N', A, B); nothing)
+_strict_gels_probe(bk, A, A0, B, B0) = (_strict_seed!(A, A0); _strict_seed!(B, B0); gels!(bk, 'N', A, B); nothing)
 _strict_gelsy_probe(bk, A, A0, B, B0, jpvt, rcond) =
-    (copyto!(A, A0); copyto!(B, B0); fill!(jpvt, 0); gelsy!(bk, A, B, jpvt, rcond); nothing)
+    (_strict_seed!(A, A0); _strict_seed!(B, B0); fill!(jpvt, 0); gelsy!(bk, A, B, jpvt, rcond); nothing)
 _strict_gglse_probe(bk, A, A0, c, c0, B, B0, d, d0, x) =
     (
-    copyto!(A, A0); copyto!(c, c0); copyto!(B, B0); copyto!(d, d0);
+    _strict_seed!(A, A0); _strict_seed!(c, c0); _strict_seed!(B, B0); _strict_seed!(d, d0);
     gglse!(bk, A, c, B, d, x); nothing
 )
 # stebz!/stein! read d/e and write only their output buffers, so nothing needs re-seeding; the probes
@@ -250,7 +261,18 @@ end
 # the value-free IR scan — the very heuristic the paragraph above says flags EVERY contracted LAPACK
 # member at a measured 0 B. Minutes of precompile spent producing verdicts this file already documents as
 # worthless. `proofs_loaded()` is the exact translation of "a real backend is present".
+# Functions whose allocations the static no-allocation proof treats as expected: each only performs the
+# first touch of a task-local owner (the allocation is the one-time initialization of that task's slot,
+# and every later call is a lookup). Each must be `@noinline` and be the `:invoke` callee itself to be
+# recognized. Functions that grow a pool to a new high-water mark are not here — they allocate again at
+# each new mark, so they are `@strict_exempt :noalloc` (workspace.jl) and asserted by measurement.
+const _BARRIER_FUNCTIONS = (_m3ws, _gpackws, _strws, _opt)
+
 if StrictMode.proofs_loaded()
+    # The registry is process-global and not part of the saved image, so this registration covers only the
+    # `@verify_strict` below, which runs while PureBLAS precompiles. test/strictmode_tests.jl registers
+    # (and removes) its own barriers around each proof it runs in the test process.
+    foreach(StrictMode.register_alloc_barrier!, _BARRIER_FUNCTIONS)
     let bk = DEFAULT_BACKEND, n = 1000, m = 64,
             xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n),
             Ad = ones(m, m), Az = ones(ComplexF64, m, m), um = ones(m), vm = ones(m),
@@ -966,4 +988,62 @@ if StrictMode.proofs_loaded()
             one(ComplexF64), Az3, Bz3, zero(ComplexF64), Cz3, -1
         )
     end
+end
+
+# A heuristic check below reports by logging a `StrictViolation` warning instead of throwing. From here
+# to the end of this file the global logger is wrapped so each such message is also pushed onto
+# `_LOADTIME_WARNINGS`, which is saved in the package image; test/loadtime_warnings_tests.jl compares it
+# against a baseline. Messages still reach the original logger unchanged.
+const _LOADTIME_WARNINGS = String[]
+struct _WarnRecorder{L <: Base.CoreLogging.AbstractLogger} <: Base.CoreLogging.AbstractLogger
+    inner::L
+end
+Base.CoreLogging.min_enabled_level(r::_WarnRecorder) = Base.CoreLogging.min_enabled_level(r.inner)
+Base.CoreLogging.shouldlog(r::_WarnRecorder, args...) = Base.CoreLogging.shouldlog(r.inner, args...)
+Base.CoreLogging.catch_exceptions(r::_WarnRecorder) = Base.CoreLogging.catch_exceptions(r.inner)
+function Base.CoreLogging.handle_message(r::_WarnRecorder, level, message, args...; kwargs...)
+    if level == Base.CoreLogging.Warn && message isa AbstractString && startswith(message, "StrictViolation")
+        push!(_LOADTIME_WARNINGS, message)
+    end
+    return Base.CoreLogging.handle_message(r.inner, level, message, args...; kwargs...)
+end
+Base.CoreLogging.global_logger(_WarnRecorder(Base.CoreLogging.global_logger()))
+# Register pressure and vectorization of the gemm microkernels and the trsm side-R tile. A tile sized
+# past the register file spills vectors to the stack on every k step, which neither the type-stability
+# nor the allocation checks see; these scan the compiled native code. Each call also executes, so
+# every operand is a live buffer. The argtypes are the FULL method signature, trailing `Val{B0}`
+# included: the 9-argument `_microkernel_masked!` form is a default-argument forwarder whose native
+# code is a call and a return, which a scan passes without reaching the kernel. The α-scaled `_microkernel!` shares the tile with a different epilogue and
+# has its own `B0 = false` and `B0 = true` instances.
+let m = 64, kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
+        Ap = ones(mr * kc), Bp = ones(nr * kc), Ck = ones(mr, nr),
+        Lt = ones(m, m), Bt = ones(m, m)
+    GC.@preserve Ap Bp Ck Lt Bt begin
+        ap = pointer(Ap); bp = pointer(Bp); cp = pointer(Ck)
+        @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
+        @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
+        @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(false))
+        @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(false))
+        @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(true))
+        @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(true))
+        @assert_no_spill _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(false))
+        @assert_vectorized _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(false))
+        @assert_no_spill _trsm_tile_R_f64!(false, false, false, pointer(Lt), m, pointer(Bt), m, m, m)
+    end
+end
+# At load, outside any gate, only `@assert_no_spill` and `@assert_vectorized` above run. Guarantees not
+# asserted at load, and what each waits for:
+#   `@verify_strict` block (type stability, no allocation, `@assert_trim_compatible`): it runs only under
+#                       `StrictMode.proofs_loaded()` (see the `if` above), and running it at every
+#                       precompile waits for a measurement of the precompile time and memory it adds.
+#   `:inlined`, `:noboxing`, `:no_scalar_loops`, `:no_threadid_state`: each waits for a measurement of
+#                       the precompile time and memory it adds.
+#   `:owned`            inner functions take their per-task buffer as an argument.
+#   `:concurrency_safe` job operands reach chunk bodies as arguments, not through the shared pool.
+#   `:noescape`         StrictMode treats a borrowed handle passed to an out-of-line callee as escaping.
+#   `:trusted`          StrictMode does not track raw `Ptr` reads.
+
+# The checks are over: put back the logger `_WarnRecorder` wrapped.
+let lg = Base.CoreLogging.global_logger()
+    lg isa _WarnRecorder && Base.CoreLogging.global_logger(lg.inner)
 end

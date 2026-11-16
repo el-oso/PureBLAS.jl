@@ -9,19 +9,17 @@
 # dropped), so a leftover `static = false` reads as an unchanged test while its meaning has flipped.
 # Two properties, two tools, and they are not interchangeable:
 #   * leaf kernels must be alloc-free on EVERY path       → `@test_noalloc` (the proof)
-#   * drivers holding grow-once scratch are alloc-free in  → `@test_noalloc` under the pool-growth
-#     STEADY STATE, not on the first call                    barriers, which scope the exemption to
-#     exactly "a workspace reached a new high-water mark"
-# A DRIVER TAKES THE PROOF UNLESS IT STATICALLY REACHES THE SCHEDULER. Every L3 pool is grow-only and
-# grows through a `@noinline` function, so registering those functions makes the exemption state
-# something true and the per-site proof holds. What is left over is not PureBLAS scratch: the drivers
-# that still fail reach Julia's own task and lock machinery — `enable_finalizers`, `init_perthread`,
-# `SpinLock`, `notify`, `taskheap` — through a thread pool or a blocked reduction, and there is no
-# honest grow-only barrier to register for the scheduler. Those, and only those, keep a warmed runtime
-# reading inside a compiled barrier (never at testitem scope, where the window charges the caller's own
-# dispatch as well as the kernel's): `_syrk_blocked!`, `_symm!` and complex `qr_unblocked!`. That proof is the `gemm!` item at the end of this file; it registers the barriers,
-# proves, then unregisters, because the registration is session-wide and would otherwise weaken every
-# other `@test_noalloc` in the same worker.
+#   * drivers holding grow-once scratch are alloc-free in  → a warmed `@allocated` reading, inside a
+#     STEADY STATE, not on the first call                    function over typed operands
+# A pool that grows to a new high-water mark allocates again in the same process, thread and task, so
+# it is not a memoization scope and `register_alloc_barrier!` is not legitimate for it: those growth
+# functions (`_ws_grow!`, `_ws_slot!`, `_arena_grow!`, `_arena_coalesce!`, the LAPACK `_*_grow!`) are
+# `@strict_exempt :noalloc`, and a driver that reaches one cannot take the all-paths proof. What it can
+# take is the measurement: warm the call, then a second identical call must allocate 0 bytes. That is
+# the "pool growth is bounded" item near the end of this file. The only registered barriers are the
+# first-touch accessors of a per-task owner (`_m3ws`, `_gpackws`, `_strws`, `_opt`), whose allocation
+# is the one-time initialization of the task's slot. Registration is session-wide, so each item
+# unregisters afterwards; left in place it would weaken every other `@test_noalloc` in the same worker.
 
 @testitem "StrictMode dogfood: BLAS-1 strict contract" tags = [:checks] begin
     # StrictMode.TypeContracts: TypeContracts 0.14.0's @verify emits a `_seal_verified!(@__MODULE__,…)`
@@ -100,22 +98,16 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
-        # THE PROOF, NOT A MEASUREMENT, WHEREVER IT HOLDS. `@test_noalloc` is AllocCheck's static
-        # all-paths proof; a warmed runtime reading is strictly weaker and cannot see a path this shape
-        # does not take. Most drivers here are provable once the pool-growth functions are registered as
-        # barriers, which scopes the exemption to exactly "a workspace reached a new high-water mark" —
-        # `workspace.jl` states that contract and names the growth points.
+        # THE PROOF WHERE IT HOLDS, THE MEASUREMENT WHERE A DRIVER REACHES A GROWTH FUNCTION. A pool that
+        # grows to a new high-water mark is not a one-time initialization, so its growth functions
+        # (`workspace.jl`) are `@strict_exempt :noalloc` rather than registered barriers, and a driver
+        # that can reach one is asserted by a warmed `@allocated` reading instead — see the "pool growth
+        # is bounded" item at the end of this file.
         #
-        # `_arena_coalesce!` IS IN THE SET AND HAS TO BE. The arena's fold is the one allocation a scope
-        # can make, and while it was inlined into `_arena_exit!` it was not registrable, so every driver
-        # that borrows from the arena fell through to the per-site proof — which then reported the pool
-        # growth the other barriers already covered, 103 sites for `_trsm_base_invL!` and every one of
-        # them a high-water mark. The registration is process-global, so it is torn down in `finally`
-        # and the verdict cache cleared, exactly as the `gemm!` item at the end of this file does.
-        # `_symm_scr_mt` is a `OncePerTask` accessor, and `Base.OncePerTask` is deliberately NOT
-        # auto-recognized as a barrier, so it is registered explicitly the way `_m3ws` is.
-        _POOLS = (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._arena_coalesce!,
-            P._m3ws, P._gpackws, P._strws, P._symm_scr_mt)
+        # What is registered: the first-touch accessors of the per-task owners (`_m3ws`, `_gpackws`,
+        # `_strws`, `_opt`). `Base.OncePerTask` is deliberately NOT auto-recognized as a barrier. The
+        # registration is process-global, so it is torn down in `finally` and the verdict cache cleared.
+        _POOLS = (P._m3ws, P._gpackws, P._strws, P._opt)
         for f in _POOLS
             StrictMode.register_alloc_barrier!(f)
         end
@@ -151,9 +143,13 @@ end
             BL = randn(32, 256); BR = randn(256, 32)
             P._trsm_base_invL!(false, false, false, Atri, BL)
             P._trsm_base_invR!(false, false, false, Atri, BR)
-            # BROKEN: the check reports `jl_hrtime` from `time_ns()` in `_pool_barrier` as an allocation
-            # (an AllocCheck false positive, reported to StrictMode); the per-task scratch accessors on this
-            # path are not registered as barriers either. Fixed in #129. The assertion still runs, so it
+            # These reach pool growth functions (`@strict_exempt :noalloc`), so they take the warmed
+            # measurement; the typed wrappers keep `@allocated` inside a compiled function.
+            a_invL(A, B) = @allocated PureBLAS._trsm_base_invL!(false, false, false, A, B)
+            a_invR(A, B) = @allocated PureBLAS._trsm_base_invR!(false, false, false, A, B)
+            @test minimum(a_invL(Atri, BL) for _ in 1:8) == 0
+            @test minimum(a_invR(Atri, BR) for _ in 1:8) == 0
+            # BROKEN: the all-paths proof on the same two drivers. Each assertion still runs, so it
             # reports an unexpected pass once it holds.
             @test_broken (
                 try
@@ -164,7 +160,6 @@ end
                     false
                 end
             )
-            # BROKEN: same cause as `_trsm_base_invL!` above.
             @test_broken (
                 try
                     @test_noalloc P._trsm_base_invR!(false, false, false, Atri, BR)
@@ -184,7 +179,8 @@ end
             BF = randn(128, 256)
             P._trsm_fused_L!(false, Aup, BF)                                  # warm the ftrsm buffer
             @assert_typestable P._trsm_fused_L!(false, Aup, randn(128, 256))
-            @test_noalloc P._trsm_fused_L!(false, Aup, BF)
+            a_fusedL(A, B) = @allocated PureBLAS._trsm_fused_L!(false, A, B)
+            @test minimum(a_fusedL(Aup, BF) for _ in 1:8) == 0
             # Whole-k packed sweep (shared-panel restructure; default-off toggle) — same typestable + alloc-free
             # contract. Covers _pack_U_micro! + the packed slab/tail kernels reading the ftrsm buffer. AVX-512-f64
             # ONLY: `_trsm_fused_full_L!` is dispatched (trsm.jl:_trsm_left!) solely under `_GT_TRANSPOSE` and has
@@ -199,7 +195,8 @@ end
                 BFF = randn(512, 256)
                 P._trsm_fused_full_L!(false, Auf, BFF)                           # warm the ftrsm buffer
                 @assert_typestable P._trsm_fused_full_L!(false, Auf, randn(512, 256))
-                @test_noalloc P._trsm_fused_full_L!(false, Auf, BFF)
+                a_fusedFull(A, B) = @allocated PureBLAS._trsm_fused_full_L!(false, A, B)
+                @test minimum(a_fusedFull(Auf, BFF) for _ in 1:8) == 0
             end
             As = randn(512, 512); Bs = randn(512, 512); Cs = zeros(512, 512)
             # n=512 now takes the recursive route into gemm rather than the packed kernel, so it reaches
@@ -239,8 +236,13 @@ end
             # route is behind a function pointer (one dynamic dispatch), so it is the one that shows it.
             @test_throws StrictMode.StrictViolation @test_noalloc P._syrk_blocked!(false, false, false, 0.8, As32, Cs32, 32)
             @test steady(P._syrk_blocked!, false, false, false, 0.8, As32, Cs32, 32) == 0
-            @test_noalloc P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512)
-            # BROKEN: same cause as `_trsm_base_invL!` above (`_symm!` reaches the same pool barrier).
+            a_syr2kp(A, B, C, nn) = @allocated PureBLAS._syr2k_packed!(false, false, 0.8, 0.3, A, B, C, nn)
+            a_symm(A, B, C) = @allocated PureBLAS._symm!(true, false, false, 0.8, 0.3, A, B, C)
+            P._syr2k_packed!(false, false, 0.8, 0.3, As, Bs, Cs, 512)
+            P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)
+            @test minimum(a_syr2kp(As, Bs, Cs, 512) for _ in 1:8) == 0
+            @test minimum(a_symm(As, Bs, Cs) for _ in 1:8) == 0
+            # BROKEN: the all-paths proof on `_symm!`, as for `_trsm_base_invL!` above.
             @test_broken (
                 try
                     @test_noalloc P._symm!(true, false, false, 0.8, 0.3, As, Bs, Cs)
@@ -299,18 +301,11 @@ end
             @test_noalloc P._trsm_cmplx_dRC!(true, false, 48, Atr, Btr)
             @test true
             # POSITIVE CONTROL. `@test_noalloc` records nothing when it holds, so an item whose macros
-            # had gone inert would look identical to one whose proofs all passed. With the exemption
-            # off the pool growth counts again and the SAME proof must fail.
-            _threw = false
-            set_ignore_barrier!(false)
-            try
-                @test_noalloc P._trsm_base_invL!(false, false, false, Atri, BL)
-            catch
-                _threw = true
-            finally
-                set_ignore_barrier!(true)
-            end
-            @test _threw
+            # had gone inert would look identical to one whose proofs all passed. The all-paths proof
+            # must still report the pool growth a warmed call never takes: if this stops throwing, the
+            # growth moved out of the driver's call graph and the measured assertion above can become
+            # a proof.
+            @test_throws StrictMode.StrictViolation @test_noalloc P._trsm_base_invL!(false, false, false, Atri, BL)
         finally
             for f in _POOLS
                 delete!(StrictMode._ALLOC_BARRIERS, f)   # internal: no public unregister exists
@@ -333,14 +328,14 @@ end
         GC.@preserve Ap Bp C begin
             ap = pointer(Ap); bp = pointer(Bp); cptr = pointer(C); ldc = mr
             # register-blocked microkernel: the hot path — must be tight
-            @assert_typestable P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @test_noalloc P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
-            @test_trim_compatible P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            @assert_typestable P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
+            @test_noalloc P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
+            @test_trim_compatible P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
             # StrictMode 0.3.9 @assert_no_spill: the µarch-derived _MR×_NR tile must fit the register file
             # with no vector spill/reload. Verified clean on both AVX-512 (Zen4/Zen5, 32 zmm) and AVX2 (Zen3,
             # 16 ymm) — the packed hot path. (NB the SMALL-matrix `_microkernel_unpacked!` spills 3 vectors on
             # AVX2 with the same tile — a real register-pressure finding, tracked separately; not asserted here.)
-            @assert_no_spill P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR))
+            @assert_no_spill P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
             @test_noalloc P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             @assert_typestable P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             @test_trim_compatible P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
@@ -516,10 +511,8 @@ end
 # (src/contracts.jl:368-380) and src/verify.jl carries purpose-built probes for every one of them
 # (`_strict_gehrd_probe` &c, ~20 call sites). None of it has ever run. Those call sites live inside the
 # `if StrictMode.proofs_loaded()` block, and a package cannot have the proving tier loaded during its OWN
-# precompile — that is the one moment src/verify.jl executes. The block was equally dead under 0.3.10,
-# where the guard asked `backend_available()` about a weak-dep extension that is likewise never loaded
-# there. So the tiers are: src/ REPORTS (the value-free IR scan, all StrictMode has available to it), and
-# test/ PROVES — and the proving half simply had no home for this family until now.
+# precompile — that is the one moment src/verify.jl executes. So the tiers are: src/ REPORTS (the
+# value-free IR scan, all StrictMode has available to it), and test/ PROVES.
 #
 # `test_signatures` (StrictModeTest 0.4) is the right tool rather than a per-call macro, for two reasons
 # beyond not having to build valid eigen inputs. It takes SIGNATURES, so `Char` is a TYPE here: one entry
@@ -802,22 +795,24 @@ end
         # _pbtrf_work), not allocated per CALL. Assert the steady state is actually allocation-free —
         # that IS the point of the ownership, and a per-call `Matrix` would sail through every
         # correctness test.
-        # BOTH TAKE THE STATIC PROOF under the same pool-growth barriers the L3 item registers — the
-        # owned W and S reach new high-water marks through `_ws_grow!`/`_ws_slot!` and the arena folds
-        # through `_arena_coalesce!`, and nothing else on this path allocates. Registration is
-        # process-global, so it is scoped to these two assertions and torn down immediately.
+        # Measured, not proved: the owned W and S reach new high-water marks through `_ws_grow!`/
+        # `_ws_slot!` and the arena folds through `_arena_coalesce!`, which are `@strict_exempt :noalloc`
+        # growth functions, so the all-paths proof reports them. The warmed second call must allocate
+        # nothing; `pb_blocked` and `pb_blocked_U` keep `@allocated` inside a function over typed operands.
         Wpb = wideband(Float64, 64)
         WpbU = wideU(Float64, 64)
-        let pools = (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._arena_coalesce!,
-                P._m3ws, P._gpackws, P._strws)
-            for f in pools
-                StrictMode.register_alloc_barrier!(f)
-            end
+        pb_blocked(W, nn) = @allocated P._pbtrf_blocked!(W, nn, 64)
+        pb_blocked_U(W, nn) = @allocated P._pbtrf_blocked_U!(W, nn, 64)
+        for (f, W0) in ((pb_blocked, Wpb), (pb_blocked_U, WpbU))
+            W = copy(W0)
+            f(W, n)                               # warm: grow the owned scratch once
+            @test minimum(f(copyto!(W, W0), n) for _ in 1:8) == 0
+        end
+        # BROKEN: the all-paths proof on the same two drivers, with the per-task accessors registered as
+        # barriers. Each assertion still runs, so it reports an unexpected pass once it holds.
+        let pools = (P._m3ws, P._gpackws, P._strws, P._opt)
+            foreach(StrictMode.register_alloc_barrier!, pools)
             try
-                # BROKEN: the check reports `jl_hrtime` from `time_ns()` in `_pool_barrier` as an
-                # allocation (an AllocCheck false positive, reported to StrictMode); the per-task
-                # accessors on this path are not registered as barriers either. Fixed in #129. The
-                # assertion still runs, so it reports an unexpected pass once it holds.
                 @test_broken (
                     try
                         @test_noalloc P._pbtrf_blocked!(Wpb, n, 64)
@@ -827,7 +822,6 @@ end
                         false
                     end
                 )
-                # BROKEN: same cause as `_pbtrf_blocked!` above.
                 @test_broken (
                     try
                         @test_noalloc P._pbtrf_blocked_U!(WpbU, n, 64)
@@ -837,21 +831,8 @@ end
                         false
                     end
                 )
-                # POSITIVE CONTROL: with the exemption off the pool growth counts and this must fail.
-                threw_pb = false
-                set_ignore_barrier!(false)
-                try
-                    @test_noalloc P._pbtrf_blocked!(Wpb, n, 64)
-                catch
-                    threw_pb = true
-                finally
-                    set_ignore_barrier!(true)
-                end
-                @test threw_pb
             finally
-                for f in pools
-                    delete!(StrictMode._ALLOC_BARRIERS, f)
-                end
+                foreach(f -> delete!(StrictMode._ALLOC_BARRIERS, f), pools)
                 StrictMode.clear_cache!()
             end
         end
@@ -864,25 +845,154 @@ end
     end
 end
 
-# `gemm!` IS allocation-free on every path, and this proves it rather than warming a counter.
+# POOL GROWTH IS BOUNDED: a warmed second call of every entry that reaches a growth function (`_ws_grow!`,
+# `_ws_slot!`, `_arena_grow!`, `_arena_coalesce!`, the LAPACK `_*_grow!`, the QR/LU pad growers)
+# allocates 0 bytes. Those functions are `@strict_exempt :noalloc` because a grow-only pool allocates
+# again at each new high-water mark, so "finitely many growths, then none" is a property of the call
+# sequence that an all-paths proof cannot state. It is asserted here the way req#10 prescribes: warm the
+# entry, then `@allocated` inside a function over typed operands (at testitem scope the globals are
+# `Any`-typed and the window would measure dispatch), minimum over several windows because the counter
+# is process-wide and a threaded call has other threads in it. A per-call leak allocates in EVERY
+# window, so the minimum cannot hide one.
 #
-# AllocCheck's all-paths proof has exactly two escapes: delete the allocation site, or route it through
-# a registered barrier. `5f4a2eae` made the second one TRUE for the L3 pools — every pool (gemm/syr2k
-# packs, the 3M buffers, the Strassen level/pad slots, `strbt`) is grow-only and grows through ONE
-# `@noinline` function, `_ws_grow!`/`_ws_slot!`; the arena's own growth is `_arena_grow!`. A registered
-# barrier must BE the `:invoke` callee, which is why those are `@noinline` at their definitions.
-# `_m3ws` joined the list when the 3M/dual planes left `L3Workspace` for a per-TASK owner: its only
-# allocation is a new task's first touch (`OncePerTask`'s task-local IdDict entry + nine empty vectors),
-# after which every byte grows through `_ws_grow!` like the rest — see its definition in workspace.jl.
-# `_gpackws` joined it for the same reason and by the same mechanism: cooperative A-packing yields at a
-# barrier while the packed B panel is live, so the gemm pack buffers had to leave the per-THREAD owner
-# (see `test/yield_lint_baseline.txt`). Its only allocation is likewise a new task's first touch.
-# `_strws` joined on the same grounds: the Winograd recursion now hands each leaf to the threaded
-# classical path, so it holds its level slots across a yield and its pool left the per-THREAD owner
-# too. Its only allocation is a new task first touching the pair.
-#
-# The registration is session-wide and keyed on function identity, so this item UNREGISTERS afterwards:
-# left in place it would exempt those functions from every other `@test_noalloc` in the same worker.
+# Entries are the ones the strict-contract block in src/verify.jl reaches growth through: trsm!, trmm!,
+# symv!, trmv!, syr2k!, getrf!, geqrf!, gesvd!, sygvd!, geev!, gees!, plus gemm! and the complex 3M path. The threaded
+# arm re-runs the L3 entries and the vector kernels with the pool enabled, sleeping between the warm-up
+# calls so a wake from a real park is warmed too.
+@testitem "Pool growth is bounded: a warmed second call allocates 0 bytes" tags = [:checks] begin
+    using LinearAlgebra, ForwardDiff
+    const P = PureBLAS
+    a_gemm(C, A, B) = @allocated P.gemm!(C, A, B)
+    a_gemm_kw(C, A, B, al, be) = @allocated P.gemm!(C, A, B; alpha = al, beta = be, transB = 'T')
+    a_trsm(B, A, side, tr, al) = @allocated P.trsm!(B, A; side = side, uplo = 'L', transA = tr, diag = 'N', alpha = al)
+    a_trmm(B, A, side, tr, al) = @allocated P.trmm!(B, A; side = side, uplo = 'L', transA = tr, diag = 'N', alpha = al)
+    a_syr2k(C, A, B, al, be) = @allocated P.syr2k!(C, A, B; uplo = 'L', trans = 'N', alpha = al, beta = be)
+    a_symv(y, A, x) = @allocated P.symv!(y, A, x; uplo = 'L', alpha = 1.5, beta = 0.5)
+    a_trmv(A, x, tr) = @allocated P.trmv!(A, x; uplo = 'L', trans = tr, diag = 'N')
+    a_getrf(A, A0, ip) = (copyto!(A, A0); @allocated P.getrf!(A, ip))
+    a_geqrf(A, A0, tau) = (copyto!(A, A0); @allocated P.geqrf!(A, tau))
+    a_gesvd(A, A0, U, S, Vt) = (copyto!(A, A0); @allocated P.gesvd!(A, U, S, Vt))
+    a_sygvd(A, A0, B, B0, w) = (copyto!(A, A0); copyto!(B, B0); @allocated P.sygvd!(1, 'V', 'L', A, B, w))
+    a_hegvd(A, A0, B, B0, w) = (copyto!(A, A0); copyto!(B, B0); @allocated P.hegvd!(1, 'V', 'L', A, B, w))
+    a_pocon(nrm, F) = @allocated P.pocon!(nrm, F; uplo = 'L')
+    a_geev(A, A0, wr, wi, VL, VR, sc) = (copyto!(A, A0); @allocated P.geev!('N', 'V', A, wr, wi, VL, VR, sc))
+    a_gees(A, A0, w, VS, sc) = (copyto!(A, A0); @allocated P.gees!('V', A, w, VS, sc))
+
+    tri(T, s) = (M = tril(randn(T, s, s)); for i in 1:s
+        M[i, i] += s
+    end; M)
+    spd(T, s) = (M = randn(T, s, s); M * M' + s * I)
+    zero_after(a, args...) = minimum(a(args...) for _ in 1:8) == 0
+
+    # The same entries serially and with the pool enabled. `n` is large enough that the pool admits the
+    # L3 entries; whether a given op threads at it is the library's choice, and either way the
+    # measurement applies.
+    function run_entries(n)
+        A = randn(n, n); B = randn(n, n); C = zeros(n, n)
+        T1 = tri(Float64, n)
+        # gemm!, keyword form, and a Dual element type (the open-type fallback owners)
+        P.gemm!(C, A, B); sleep(0.02); P.gemm!(C, A, B)
+        @test zero_after(a_gemm, C, A, B)
+        P.gemm!(C, A, B; alpha = 2.5, beta = 0.5, transB = 'T')
+        @test zero_after(a_gemm_kw, C, A, B, 2.5, 0.5)
+        # trsm!/trmm!: both sides, a transposed operand, and alpha != 1 (a narrow B takes the prescale path)
+        for side in ('L', 'R'), tr in ('N', 'T')
+            Bw = copy(B)
+            P.trsm!(Bw, T1; side = side, uplo = 'L', transA = tr, diag = 'N', alpha = 1.0)
+            @test zero_after(a_trsm, Bw, T1, side, tr, 1.0)
+            P.trmm!(Bw, T1; side = side, uplo = 'L', transA = tr, diag = 'N', alpha = 1.0)
+            @test zero_after(a_trmm, Bw, T1, side, tr, 1.0)
+        end
+        Bn = randn(n, 2)
+        P.trsm!(Bn, T1; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 2.0)
+        @test zero_after(a_trsm, Bn, T1, 'L', 'N', 2.0)
+        # syr2k!
+        P.syr2k!(C, A, B; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
+        @test zero_after(a_syr2k, C, A, B, 1.0, 1.0)
+        # level 2: symv!, trmv!
+        x = randn(n); y = zeros(n)
+        P.symv!(y, A, x; uplo = 'L', alpha = 1.5, beta = 0.5)
+        @test zero_after(a_symv, y, A, x)
+        for tr in ('N', 'T')
+            xw = copy(x)
+            P.trmv!(T1, xw; uplo = 'L', trans = tr, diag = 'N')
+            @test zero_after(a_trmv, T1, xw, tr)
+        end
+        # complex 3M path
+        Cz = zeros(ComplexF64, n, n); Az = randn(ComplexF64, n, n); Bz = randn(ComplexF64, n, n)
+        P.gemm!(Cz, Az, Bz); sleep(0.02); P.gemm!(Cz, Az, Bz)
+        @test zero_after(a_gemm, Cz, Az, Bz)
+        Tz = tri(ComplexF64, n)
+        Bzw = copy(Bz)
+        P.trsm!(Bzw, Tz; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0 + 0im)
+        @test zero_after(a_trsm, Bzw, Tz, 'L', 'N', 1.0 + 0im)
+        P.trmm!(Bzw, Tz; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0 + 0im)
+        @test zero_after(a_trmm, Bzw, Tz, 'L', 'N', 1.0 + 0im)
+    end
+
+    # LAPACK drivers that grow an owned workspace. Warmed once at the shape, then re-seeded per call.
+    function run_lapack()
+        for n in (64, 512)       # 512 takes the padded-LU scratch and the blocked QR path
+            A0 = randn(n, n); A = similar(A0); ip = Vector{Int}(undef, n); tau = Vector{Float64}(undef, n)
+            a_getrf(A, A0, ip)
+            @test zero_after(a_getrf, A, A0, ip)
+            a_geqrf(A, A0, tau)
+            @test zero_after(a_geqrf, A, A0, tau)
+        end
+        Az0 = randn(ComplexF64, 256, 256); Az = similar(Az0); ipz = Vector{Int}(undef, 256); tauz = Vector{ComplexF64}(undef, 256)
+        a_getrf(Az, Az0, ipz); @test zero_after(a_getrf, Az, Az0, ipz)
+        a_geqrf(Az, Az0, tauz); @test zero_after(a_geqrf, Az, Az0, tauz)
+        n = 64
+        A0 = randn(n, n); A = similar(A0); U = zeros(n, n); S = zeros(n); Vt = zeros(n, n)
+        a_gesvd(A, A0, U, S, Vt)
+        @test zero_after(a_gesvd, A, A0, U, S, Vt)
+        G0 = spd(Float64, n); B0 = spd(Float64, n); G = similar(G0); Bg = similar(B0); w = zeros(n)
+        a_sygvd(G, G0, Bg, B0, w)
+        @test zero_after(a_sygvd, G, G0, Bg, B0, w)
+        Gz0 = spd(ComplexF64, n); Bz0 = spd(ComplexF64, n); Gz = similar(Gz0); Bgz = similar(Bz0)
+        a_hegvd(Gz, Gz0, Bgz, Bz0, w)
+        @test zero_after(a_hegvd, Gz, Gz0, Bgz, Bz0, w)
+        F = copy(G0); P.potrf!(F; uplo = 'L')
+        P.pocon!(opnorm(G0, 1), F; uplo = 'L')
+        @test zero_after(a_pocon, opnorm(G0, 1), F)
+        # The Francis bulge-chase scratch (`_dlahqr!`, `_dlaqr5!`) must stay off the heap under
+        # `--check-bounds=yes`, which `Pkg.test` forces: n = 32 takes the unblocked sweep, n = 256 the multishift one.
+        for ne in (32, 256)
+            E0 = randn(ne, ne); E = similar(E0); ewr = zeros(ne); ewi = zeros(ne); EVL = zeros(ne, 0)
+            EVR = zeros(ne, ne); esc = zeros(ne); ew = Vector{ComplexF64}(undef, ne)
+            a_geev(E, E0, ewr, ewi, EVL, EVR, esc)
+            @test zero_after(a_geev, E, E0, ewr, ewi, EVL, EVR, esc)
+            a_gees(E, E0, ew, EVR, esc)
+            @test zero_after(a_gees, E, E0, ew, EVR, esc)
+        end
+        # the open-type fallback owners: a Dual element type
+        n = 32
+        Ad = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n)); Bd = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n))
+        Cd = zeros(eltype(Ad), n, n)
+        P.gemm!(Cd, Ad, Bd)
+        @test zero_after(a_gemm, Cd, Ad, Bd)
+    end
+
+    P.set_num_threads(1)
+    run_entries(128)
+    run_lapack()
+    nt = Threads.nthreads()
+    if nt >= 2
+        P.set_num_threads(nt) > 1 || error("no pool")
+        try
+            run_entries(768)
+            run_lapack()
+        finally
+            P.set_num_threads(1)
+        end
+    else
+        @test_skip nt >= 2
+    end
+end
+
+# The all-paths proof on `gemm!`, with the per-task accessors registered as barriers. Each assertion is
+# marked broken and still runs, so it reports an unexpected pass once it holds. The registration is
+# session-wide and keyed on function identity, so this item unregisters afterwards.
 @testitem "StrictMode dogfood: gemm! is statically allocation-free (barrier-exempt pools)" tags = [:checks] begin
     using StrictModeTest, StrictMode, LinearAlgebra, ForwardDiff
     if !StrictMode.checks_enabled()
@@ -890,16 +1000,12 @@ end
         @test_skip StrictMode.checks_enabled()
     else
         P = PureBLAS
-        for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._m3ws, P._gpackws, P._strws)
-            StrictMode.register_alloc_barrier!(f)
-        end
+        pools = (P._m3ws, P._gpackws, P._strws, P._opt)
+        foreach(StrictMode.register_alloc_barrier!, pools)
         try
             n = 64
             A = randn(n, n); B = randn(n, n); C = zeros(n, n)
             P.gemm!(C, A, B)                                   # warm: grow every pool once
-            # BROKEN: the check reports `jl_hrtime` from `time_ns()` in `_pool_barrier` as an allocation
-            # (an AllocCheck false positive, reported to StrictMode). Fixed in #129. The assertion still
-            # runs, so it reports an unexpected pass once it holds.
             @test_broken (
                 try
                     @test_noalloc P.gemm!(C, A, B)
@@ -913,7 +1019,6 @@ end
             # callers use it. Values come from variables, so nothing const-folds the keywords away.
             al = 2.5; be = 0.5
             P.gemm!(C, A, B; alpha = al, beta = be, transB = 'T')
-            # BROKEN: same cause as `gemm!(C, A, B)` above.
             @test_broken (
                 try
                     @test_noalloc P.gemm!(C, A, B; alpha = al, beta = be, transB = 'T')
@@ -928,7 +1033,6 @@ end
             Bd = ForwardDiff.Dual{Nothing}.(randn(n, n), randn(n, n))
             Cd = zeros(D, n, n)
             P.gemm!(Cd, Ad, Bd)
-            # BROKEN: same cause as `gemm!(C, A, B)` above.
             @test_broken (
                 try
                     @test_noalloc P.gemm!(Cd, Ad, Bd)
@@ -938,24 +1042,9 @@ end
                     false
                 end
             )
-            # POSITIVE CONTROL. `@test_noalloc` throws instead of recording a result, so a silent item
-            # would look identical to a vacuous one. With the exemption off, the pools' growth counts
-            # again and the SAME proof must fail — if this stops failing, the item proves nothing.
-            threw = false
-            set_ignore_barrier!(false)
-            try
-                @test_noalloc P.gemm!(C, A, B)
-            catch
-                threw = true
-            finally
-                set_ignore_barrier!(true)
-            end
-            @test threw
         finally
-            for f in (P._ws_grow!, P._ws_slot!, P._arena_grow!, P._m3ws, P._gpackws, P._strws)
-                delete!(StrictMode._ALLOC_BARRIERS, f)         # internal: no public unregister exists
-            end
-            StrictMode.clear_cache!()                          # the registration cached verdicts
+            foreach(f -> delete!(StrictMode._ALLOC_BARRIERS, f), pools)   # internal: no public unregister exists
+            StrictMode.clear_cache!()                                      # the registration cached verdicts
         end
     end
 end
@@ -1027,4 +1116,63 @@ end
     # type multiplier like `_trsv_reg!`'s — not what number makes the line green.
     @test_broken isempty(specialization_report(PureBLAS;
         max_specializations = 1024, max_type_depth = typemax(Int)))
+end
+
+# RETURN ANNOTATIONS ON CONTRACT MEMBERS. `@verify` proves a member's declared return type from the
+# method's own `::T` annotation when it can read one, and falls back to inference of the abstract
+# signature when it cannot; for the 78 members of the SIMDBackend contracts that fallback costs
+# minutes of precompile time. This item fails when any mandatory member loses its annotation, or has
+# one that is not a subtype of the declared return type.
+#
+# It reads TypeContracts internals (`_contract_specs`, `_registry_key`, `_build_sig`,
+# `_resolve_rt_spec`, `_method_annotation`) because the annotation reader is not public. The invariant
+# those calls implement: every method applicable to a spec's signature has a return annotation `R`
+# with `R <: declared`; a spec whose declared type is `Any` constrains nothing and is skipped.
+@testitem "Contract members carry return annotations" tags = [:checks] begin
+    using StrictMode, StrictMode.TypeContracts, InteractiveUtils
+    const TC = StrictMode.TypeContracts
+
+    # Descriptions of the mandatory specs of `T` (over its supertype chain) that are not proven by annotation.
+    function unannotated_specs(T::Type)
+        bad = String[]
+        for S in supertypes(T)
+            for spec in TC._contract_specs(TC._registry_key(S))
+                spec.optional && continue
+                expected = TC._resolve_rt_spec(T, spec)
+                expected === Any && continue
+                sig = TC._build_sig(spec.arg_types, T)
+                ms = methods(spec.f, sig)
+                if isempty(ms)
+                    push!(bad, "$(spec.description): no method")
+                    continue
+                end
+                for m in ms
+                    ann = TC._method_annotation(m)
+                    (!isnothing(ann) && ann <: expected) || push!(bad, "$(spec.description): $m has annotation $ann")
+                end
+            end
+        end
+        return bad
+    end
+
+    # Positive control: the same check must report a missing annotation and a wrong one.
+    abstract type Toy end
+    function toyf end
+    @contract Toy begin
+        toyf(::Self)::Int => "toy member"
+    end
+    struct ToyAnnotated <: Toy end
+    struct ToyBare <: Toy end
+    struct ToyWrong <: Toy end
+    toyf(::ToyAnnotated)::Int = 1
+    toyf(::ToyBare) = 1
+    toyf(::ToyWrong)::Float64 = 1.0
+    @test isempty(unannotated_specs(ToyAnnotated))
+    @test length(unannotated_specs(ToyBare)) == 1
+    @test length(unannotated_specs(ToyWrong)) == 1
+
+    @test sum(S -> length(TC._contract_specs(TC._registry_key(S))), supertypes(PureBLAS.SIMDBackend)) > 70
+    bad = unannotated_specs(PureBLAS.SIMDBackend)
+    @test isempty(bad)
+    isempty(bad) || foreach(b -> @info(b), bad)
 end

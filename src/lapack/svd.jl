@@ -645,20 +645,20 @@ end
 
 # One workspace per thread (written during the call) — see `_l3ws`.
 const _SVDWS = Base.OncePerTask{SVDWorkspace{Float64}}(SVDWorkspace{Float64})
-@inline _svdws() = _SVDWS()
+@inline _svdws() = _opt(_SVDWS)
 # Type-keyed form of the owner, so generic code can write `_svdws(T)` for real AND complex alike
 # (GKH ownership: resolved at compile time per type, never a runtime lookup).
-@inline _svdws(::Type{Float64}) = _SVDWS()
+@inline _svdws(::Type{Float64}) = _opt(_SVDWS)
 # Complex SVD values path: a separate owned workspace. Only the blocked-bidiag panels (gebrd_X/Y,
 # labrd_arow/tmp) are ever grown/used here — the singular-VECTOR buffers stay empty (vectors are the
 # follow-up). d,e stay real (local to the values entry), so they don't live in this complex workspace.
 const _SVDWS_C = Base.OncePerTask{SVDWorkspace{ComplexF64}}(SVDWorkspace{ComplexF64})
 const _SVDWS_C32 = Base.OncePerTask{SVDWorkspace{ComplexF32}}(SVDWorkspace{ComplexF32})
-@inline _svdws(::Type{ComplexF64}) = _SVDWS_C()
-@inline _svdws(::Type{ComplexF32}) = _SVDWS_C32()
+@inline _svdws(::Type{ComplexF64}) = _opt(_SVDWS_C)
+@inline _svdws(::Type{ComplexF32}) = _opt(_SVDWS_C32)
 
 # Grow only the blocked-bidiag panels (complex values path; vectors buffers untouched).
-function _svd_grow_bidiag!(ws::SVDWorkspace{T}, M::Int, N::Int) where {T}
+@noinline function _svd_grow_bidiag!(ws::SVDWorkspace{T}, M::Int, N::Int) where {T}
     nbb = _BRD_NB_MAX                # the CANDIDATE bound, so any nb the tuner/force-hook picks fits
     ws.gebrd_X = _gm(ws.gebrd_X, M, nbb); ws.gebrd_Y = _gm(ws.gebrd_Y, N, nbb)
     ws.labrd_arow = _gv(ws.labrd_arow, max(N, 1)); ws.labrd_tmp = _gv(ws.labrd_tmp, max(N, 4 * nbb))  # 4·nb: fused _labrd!
@@ -666,12 +666,14 @@ function _svd_grow_bidiag!(ws::SVDWorkspace{T}, M::Int, N::Int) where {T}
     return ws
 end
 
-@inline _gm(b::Matrix{T}, r::Int, c::Int) where {T} = (size(b, 1) < r || size(b, 2) < c) ? Matrix{T}(undef, r, c) : b
-@inline _gv(b::Vector{T}, n::Int) where {T} = length(b) < n ? Vector{T}(undef, n) : b
+@noinline _gm(b::Matrix{T}, r::Int, c::Int) where {T} = (size(b, 1) < r || size(b, 2) < c) ? Matrix{T}(undef, r, c) : b
+@noinline _gv(b::Vector{T}, n::Int) where {T} = length(b) < n ? Vector{T}(undef, n) : b
+@strict_exempt _gm guarantees = (:noalloc,) reason = "replaces a workspace matrix that is too small; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
+@strict_exempt _gv guarantees = (:noalloc,) reason = "replaces a workspace vector that is too small; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # Grow ONLY the divide-and-conquer staging buffers `bdsdc!` reads (`_svd_grow!` also grows them, but it
 # sizes the whole m≥n vector path — far more than the bidiagonal-SVD entry needs on its own).
-function _svd_grow_dc!(ws::SVDWorkspace{T}, N::Int) where {T}
+@noinline function _svd_grow_dc!(ws::SVDWorkspace{T}, N::Int) where {T}
     ws.dc_diag = _gv(ws.dc_diag, N); ws.dc_subdiag = _gv(ws.dc_subdiag, N)
     ws.dc_U = _gm(ws.dc_U, N + 1, N + 1)
     return ws
@@ -679,7 +681,7 @@ end
 
 # Grow every m≥n-path buffer to fit a reduced M×N problem forming `nu` U-columns. Buffers are pure scratch
 # (fully re-initialized per call), so growth just reallocates when too small — nothing to preserve.
-function _svd_grow!(ws::SVDWorkspace{T}, M::Int, N::Int, nu::Int) where {T}
+@noinline function _svd_grow!(ws::SVDWorkspace{T}, M::Int, N::Int, nu::Int) where {T}
     nbb = _BRD_NB_MAX; nbt = _fh_bt_nb()   # candidate bound, not the chosen width (see _BRD_NB_MAX)
     ldu = M % 256 == 0 ? M + 8 : M
     ldv = N % 256 == 0 ? N + 8 : N
@@ -695,6 +697,10 @@ function _svd_grow!(ws::SVDWorkspace{T}, M::Int, N::Int, nu::Int) where {T}
     ws.dqds_Z = _gv(ws.dqds_Z, 4 * N + 4)
     return ws
 end
+
+@strict_exempt _svd_grow! guarantees = (:noalloc,) reason = "grows the SVD workspace to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
+@strict_exempt _svd_grow_bidiag! guarantees = (:noalloc,) reason = "grows the SVD bidiagonalization panels to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
+@strict_exempt _svd_grow_dc! guarantees = (:noalloc,) reason = "grows the SVD divide-and-conquer staging to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # Workspace-free arity — THE contracted entry point. The 6-arg forms below take a `SVDWorkspace`
 # positionally, which is a PureBLAS-internal scratch type: contracting that arity would pin the backend

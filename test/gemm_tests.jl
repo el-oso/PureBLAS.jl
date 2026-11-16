@@ -231,6 +231,85 @@ end
     @test iszero(nbad[])
 end
 
+# A route must not read process history. The pool's flop floor is `typemax(Int)` until a pool exists
+# and a measured value afterwards, and `set_num_threads(1)` leaves it measured, so a route keyed on it
+# changes the bits of one call depending on whether a pool was ever created. Both states are set here
+# directly, so the item does not depend on what ran before it in this process. The few-row split also
+# threads by column bands (`_MT_KIND_ROWSPLIT`), so the same bits are required at every thread count
+# and from a caller that loses the pool claim.
+@testitem "gemm: few-row routes do not depend on the pool floor or thread count" tags = [:checks] begin
+    # liveness-ok: the pooled half sets `_MT_FLOOR[] = 1`, under which `_gemm_workers` admits every
+    # case with n >= _NR; the witness asserts that admission for its own shape before reading `p.gen`.
+    using PureBLAS, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+    cases = vec(
+        [
+            (T, tB, m, k, n) for T in (Float32, Float64), tB in ('N', 'T'), m in 1:P._GEMM_MR1_MAX,
+                k in (1, 33, 100), n in (40, 150, 600)
+        ]
+    )
+    function call1(i, (T, tB, m, k, n))
+        Random.seed!(i)
+        A = randn(T, m, k); B = tB == 'N' ? randn(T, k, n) : randn(T, n, k); C = randn(T, m, n)
+        P.gemm!(C, A, B; alpha = T(1.3), beta = T(0.7), transB = tB)
+        return C
+    end
+    run(cases) = [call1(i, c) for (i, c) in enumerate(cases)]
+    dottail(T, tB, m, k) = (
+        W = P._vwidth(T); r = m % W;
+        tB == 'N' && m > W && r > 0 && P._rows_dot_tail_ok(T, r) && k >= P._rows_dot_kmin(T, r)
+    )
+    # Witness: the dot-product tail is reached, so the comparison below covers the route it guards.
+    iw = findfirst(((T, tB, m, k, n),) -> T === Float64 && n == 600 && dottail(T, tB, m, k), cases)
+    @test !isnothing(iw)
+    old = P.get_num_threads(); oldfloor = P._MT_FLOOR[]
+    try
+        P.set_num_threads(1)
+        P._MT_FLOOR[] = typemax(Int)       # the state before any pool exists
+        fresh = run(cases)
+        P._MT_FLOOR[] = 1                  # a measured floor that every case clears
+        @test all(map(bitsame, fresh, run(cases)))
+        if nthreads() >= 2
+            (_, _, mw, kw, nw) = cases[iw]
+            for t in unique((2, nthreads()))
+                P.set_num_threads(t)       # creates the pool and measures the floor
+                # Only now: `_gemm_pool` indexes the pool vector unchecked, and it is empty until a pool exists.
+                p = P._gemm_pool(Float64)
+                @test all(map(bitsame, fresh, run(cases)))
+                P._MT_FLOOR[] = 1          # every case with n >= _NR is admitted
+                @test P._gemm_workers(mw, nw, kw) > 1
+                # The split threaded, through its own job kind, whose chunks run the dot-product tail.
+                g0 = @atomic p.gen
+                @test bitsame(call1(iw, cases[iw]), fresh[iw])
+                @test (@atomic p.gen) != g0
+                @test p.kind == P._MT_KIND_ROWSPLIT
+                @test all(map(bitsame, fresh, run(cases)))
+                # FORCED LOSS: holding the claim makes the serial fallback certain.
+                lost0 = P._MT_LOST[]
+                held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
+                @test held
+                local Cl
+                held && try
+                    Cl = call1(iw, cases[iw])
+                finally
+                    P._MT_CLAIM[] = false
+                end
+                @test P._MT_LOST[] == lost0 + 1
+                @test bitsame(Cl, fresh[iw])
+            end
+            P.set_num_threads(1)
+            @test all(map(bitsame, fresh, run(cases)))
+        else
+            @test_skip "the pooled half needs >= 2 julia threads"
+        end
+    finally
+        P.set_num_threads(old)
+        P._MT_FLOOR[] = oldfloor
+    end
+end
+
 @testitem "GEMM beta=0 ignores NaN in C (BLAS semantics)" setup = [GemmOracle] begin
     using PureBLAS
     A = randn(64, 48); B = randn(48, 32)
