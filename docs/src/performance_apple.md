@@ -29,7 +29,7 @@ individual samples inside a round is far wider in the small BLAS-3 cells — 1.1
 is not a usable figure.
 
 **Machine:** Apple M6 (`_vwidth(Float64)=2`, `sme_max_svl_b=64` ⇒ 8 FP64 lanes in a ZA tile), unlocked
-clock. The PureBLAS arm of every cell was measured at commit `076b102a` on 2026-11-09; the OpenBLAS
+clock. The PureBLAS arm of every cell was measured at commit `11f9f346d` on 2026-11-16; the OpenBLAS
 and Accelerate arms are reused from runs between 2026-09-22 and 2026-09-28. Full provenance:
 [`provenance.md`](assets/apple/provenance.md).
 
@@ -54,10 +54,11 @@ quiet-box re-measure is what would settle them.
 ## Headline
 
 **The median and the worst cell tell opposite stories here, and the gate reports the worst cell.**
-On the median PureBLAS beats Accelerate on `nrm2` (2.09x), `symv` (1.71x), `gesvd` (1.24x), `iamax`
-(1.13x), `getrf` (1.11x), `axpy` (1.04x) and `spmv` (1.02x), ties it on `dot`, `asum` and `trsvLT`,
-and beats OpenBLAS on the median of every BLAS-3 and LAPACK op measured. Only `nrm2` passes the
-gate; every other op has at least one size where it does not.
+On the median PureBLAS beats Accelerate on `nrm2` (2.20x), `symv` (1.63x), `getrf` (1.43x), `gesvd`
+(1.35x), `dot` (1.21x), `axpy` and `iamax` (1.20x), `geqrf` (1.08x), `trsvLT` (1.06x), `spmv`
+(1.05x), `gemm` (1.04x) and `gemvT` (1.01x), ties it on `asum`, and beats OpenBLAS on the median of
+every BLAS-3 and LAPACK op measured. Only `dot` and `nrm2` pass the gate; every other op has at
+least one size where it does not.
 
 Where the remaining gap lives, by op family:
 
@@ -170,41 +171,41 @@ Ratio is PB / reference, **median (worst cell)** across the measured size ladder
 reach n = 4096, LAPACK caps at n = 2048, and BLAS-1 runs the full 1e3..1e6 measured `cold` (see
 above). Gate is PB / max(OpenBLAS, Accelerate) — the same two-significant-digit rounding rule as
 the [main fleet](methodology.md#the-gate) (`bench/gatecrit.jl`). The gate is a **worst-cell** figure, so a
-FAIL can still have a winning median — true below for every op except `asum`, `scal` and `gbmvN`.
+FAIL can still have a winning median — true below for every op except `scal` and `gbmvN`.
 
 | level | op | vs OpenBLAS | vs Accelerate | gate | verdict |
 |---|---|---|---|---|---|
-| L1 | `axpy` | 1.00 (0.97) | **1.04** (0.65) | 0.648 | FAIL |
-| L1 | `dot` | **1.07** (1.00) | 1.00 (0.96) | 0.961 | FAIL |
-| L1 | `nrm2` | **8.83** (7.00) | **2.09** (1.67) | 1.672 | **PASS** |
-| L1 | `asum` | 1.00 (0.96) | 1.00 (0.51) | 0.506 | FAIL |
-| L1 | `scal` | 1.00 (0.92) | 0.85 (0.38) | 0.377 | FAIL |
-| L1 | `iamax` | 0.61 (0.50) | **1.13** (0.99) | 0.503 | FAIL |
-| L2 | `gemvN` | **6.41** (1.73) | 0.78 (0.49) | 0.489 | FAIL |
-| L2 | `gemvT` | **2.01** (1.47) | 0.83 (0.32) | 0.318 | FAIL |
-| L2 | `ger` | **2.34** (0.91) | 0.87 (0.58) | 0.579 | FAIL |
-| L2 | `symv` | **1.38** (0.66) | **1.71** (0.83) | 0.660 | FAIL |
-| L2 | `trmv` | **1.84** (1.51) | 0.62 (0.36) | 0.359 | FAIL |
-| L2 | `trsv` | **1.44** (1.23) | 0.80 (0.65) | 0.652 | FAIL |
-| L2 | `trsvLN` | **1.35** (1.19) | 0.79 (0.65) | 0.653 | FAIL |
-| L2 | `trsvLT` | **2.05** (1.39) | 1.00 (0.79) | 0.793 | FAIL |
-| L2 | `spmv` | **1.44** (1.03) | **1.02** (0.62) | 0.615 | FAIL |
-| L2 | `gbmvN` | 0.79 (0.74) | 0.73 (0.65) | 0.649 | FAIL |
-| L2 | `sbmv` | **2.79** (2.73) | 0.71 (0.62) | 0.619 | FAIL |
-| L3 | `gemm` | **6.28** (2.18) | 0.90 (0.69) | 0.688 | FAIL |
-| L3 | `symm` | **3.15** (1.03) | 0.56 (0.42) | 0.417 | FAIL |
-| L3 | `syrk` | **3.50** (0.77) | 0.47 (0.14) | 0.140 | FAIL |
-| L3 | `syr2k` | **4.19** (1.27) | 0.63 (0.33) | 0.327 | FAIL |
-| L3 | `trmm` | **1.40** (0.54) | 0.32 (0.16) | 0.156 | FAIL |
-| L3 | `trmmR` | **2.27** (0.50) | 0.39 (0.14) | 0.142 | FAIL |
-| L3 | `trsm` | **2.04** (1.03) | 0.50 (0.32) | 0.321 | FAIL |
-| L3 | `trsmR` | **2.45** (1.22) | 0.56 (0.43) | 0.431 | FAIL |
-| LP | `potrf` | **1.97** (1.53) | 0.55 (0.36) | 0.358 | FAIL |
-| LP | `getrf` | **1.90** (0.89) | **1.11** (0.52) | 0.515 | FAIL |
-| LP | `geqrf` | **1.21** (1.13) | 0.98 (0.26) | 0.264 | FAIL |
-| LP | `gesvd` | **1.89** (1.02) | **1.24** (0.88) | 0.878 | FAIL |
+| L1 | `axpy` | **1.07** (1.00) | **1.20** (0.68) | 0.685 | FAIL |
+| L1 | `dot` | **1.14** (1.00) | **1.21** (1.01) | 1.000 | **PASS** |
+| L1 | `nrm2` | **9.52** (7.00) | **2.20** (1.67) | 1.672 | **PASS** |
+| L1 | `asum` | **1.06** (1.00) | 1.00 (0.54) | 0.542 | FAIL |
+| L1 | `scal` | 1.00 (0.99) | 0.98 (0.39) | 0.388 | FAIL |
+| L1 | `iamax` | 0.64 (0.51) | **1.20** (1.00) | 0.506 | FAIL |
+| L2 | `gemvN` | **7.48** (1.90) | 0.89 (0.50) | 0.500 | FAIL |
+| L2 | `gemvT` | **2.15** (1.81) | **1.01** (0.34) | 0.343 | FAIL |
+| L2 | `ger` | **2.55** (1.03) | 0.95 (0.66) | 0.657 | FAIL |
+| L2 | `symv` | **1.29** (0.74) | **1.63** (0.94) | 0.742 | FAIL |
+| L2 | `trmv` | **2.49** (1.64) | 0.88 (0.40) | 0.396 | FAIL |
+| L2 | `trsv` | **1.64** (1.36) | 0.94 (0.68) | 0.678 | FAIL |
+| L2 | `trsvLN` | **1.43** (1.29) | 0.85 (0.69) | 0.690 | FAIL |
+| L2 | `trsvLT` | **2.14** (1.41) | **1.06** (0.82) | 0.823 | FAIL |
+| L2 | `spmv` | **1.60** (1.05) | **1.05** (0.68) | 0.677 | FAIL |
+| L2 | `gbmvN` | 0.81 (0.77) | 0.77 (0.66) | 0.657 | FAIL |
+| L2 | `sbmv` | **3.06** (3.02) | 0.77 (0.68) | 0.684 | FAIL |
+| L3 | `gemm` | **7.36** (2.30) | **1.04** (0.88) | 0.882 | FAIL |
+| L3 | `symm` | **4.91** (1.15) | 0.79 (0.39) | 0.390 | FAIL |
+| L3 | `syrk` | **3.91** (0.97) | 0.59 (0.18) | 0.175 | FAIL |
+| L3 | `syr2k` | **5.14** (1.41) | 0.79 (0.36) | 0.363 | FAIL |
+| L3 | `trmm` | **1.92** (0.69) | 0.42 (0.21) | 0.207 | FAIL |
+| L3 | `trmmR` | **3.01** (0.64) | 0.47 (0.18) | 0.181 | FAIL |
+| L3 | `trsm` | **2.30** (1.22) | 0.58 (0.35) | 0.354 | FAIL |
+| L3 | `trsmR` | **3.05** (1.44) | 0.74 (0.49) | 0.492 | FAIL |
+| LP | `potrf` | **2.22** (1.71) | 0.61 (0.42) | 0.420 | FAIL |
+| LP | `getrf` | **2.17** (1.17) | **1.43** (0.75) | 0.746 | FAIL |
+| LP | `geqrf` | **1.34** (1.18) | **1.08** (0.28) | 0.284 | FAIL |
+| LP | `gesvd` | **1.95** (1.07) | **1.35** (0.90) | 0.903 | FAIL |
 
-203 of 281 measured cells sit below the gate. The worst are `syrk` at n = 32-100, `trmmR` at
+179 of 281 measured cells sit below the gate. The worst are `syrk` at n = 32-100, `trmmR` at
 n = 50-100 and `trmm` at n = 50-128. The two binding cells carry a q10-q90 sample spread of 1.15x
 (`syrk` at n = 50) and 1.13x (`trmmR` at n = 100), with their Accelerate arms at 1.14x and 1.10x, so
 a tuning change worth less than about 15% in those cells is not separable from round-to-round noise

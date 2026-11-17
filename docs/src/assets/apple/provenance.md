@@ -4,4 +4,4 @@ The caches behind `bench/gen_table*.md`, `docs/src/assets/perf_*.svg` and the ge
 
 | µarch | CPU | commit | measured |
 |---|---|---|---|
-| ARM · NEON | Apple M6 | `076b102a` | 2026-11-09T16:31 |
+| ARM · NEON | Apple M6 | `11f9f346d` | 2026-11-16T23:46 |
