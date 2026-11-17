@@ -33,23 +33,24 @@ clock. The PureBLAS arm of every cell was measured at commit `11f9f346d` on 2026
 and Accelerate arms are reused from runs between 2026-09-22 and 2026-09-28. Full provenance:
 [`provenance.md`](assets/apple/provenance.md).
 
-⚠ **The two arms of this cache are six weeks apart, and the box moved between them.** Across the 591
-cells the two PureBLAS runs share, PureBLAS absolute times are **5.3% higher** in the later run; the
-anchor workload — a fixed kernel measured once per run, independent of any op here — reads 5-6%
-higher by the same comparison. So the near-uniform fall in every ratio below, about 9% on the median
-op against *both* references at once, is machine state rather than code. 75 of 281 comparison cells
-carry arm anchors more than 5% apart (worst 5.8%, `bench/check_arm_anchors.sh`), and against the
-gate's own 2% tolerance 15 ops have a binding cell that is not adjudicable at all. **Read any single
-ratio here as carrying a 5-10% machine-state term**; only a run that measures all three arms in one
-pass removes it. The box also has no frequency pin, so `bench/check_arm_clocks.sh` has nothing to
-compare against and `bench/check_cache_busy.sh` has no busy field to read — on macOS `plots.jl`'s
-contention guard needs `/proc` and skips.
+⚠ **The two arms of this cache are seven weeks apart.** The OpenBLAS and Accelerate arms date from
+2026-09-22 to 2026-09-28 and the PureBLAS arm from 2026-11-16. The anchor workload — a fixed kernel
+measured once per run, independent of any op here — reads within 1% between the two on the median,
+but 40 of 281 comparison cells carry arm anchors more than 5% apart (worst 6.3%, `gemvT` at n = 50;
+all of them in `asum`, `gemvN`, `gemvT` and `symv`; `bench/check_arm_anchors.sh`), and against the
+gate's own 2% tolerance 11 ops have a binding cell that is not adjudicable at all. **Read any single
+ratio here as carrying a machine-state term of up to about 6%**; only a run that measures all three
+arms in one pass removes it. The box also has no frequency pin, so `bench/check_arm_clocks.sh` has
+nothing to compare against and `bench/check_cache_busy.sh` has no busy field to read — on macOS
+`plots.jl`'s contention guard needs `/proc` and skips.
 
-Six ops moved further than that term, measured PureBLAS-against-PureBLAS with no reference involved:
-`iamax` is 60% slower than in September, `trmv` and `pstrfU` 25%, `symm`, `potrsL` and `potri` 20%,
-against a 5.3% median. `nrm2` is 6% faster. Those are regression candidates, not confirmed
-regressions: two foreign processes held about one core busy throughout the 2026-11-09 run, so a
-quiet-box re-measure is what would settle them.
+Measured PureBLAS-against-PureBLAS, with no reference involved, the 2026-11-16 run is 8.6% faster
+than the 2026-11-09 one on the median of the 629 cells they share, while the anchor moved 1.2%. Six
+ops gained more than 25%: `potri` 46%, `potrsL` 35%, `pstrfU` 30%, `syrk` 29%, `symm` 28% and
+`trmm` 27%. `nrm2` reads 25% slower only because its 2026-11-09 cells were measured on the kernel
+of #131, which master does not carry. A few single cells moved the other way — `symm` at n = 32
+(0.74x), `trmv` at n = 256 and `gemvNrect` at n = 2880 (0.84x), `syr2k` at n = 32 (0.85x). Those
+are regression candidates, not confirmed regressions, until a re-measure settles them.
 
 ## Headline
 
@@ -64,25 +65,22 @@ Where the remaining gap lives, by op family:
 
 | family | shape of the gap |
 |---|---|
-| BLAS-3 `gemm`-fed | parity at n = 2048-2100; the loss is concentrated at n ≤ 1000, and n = 4096 reads 0.76 |
-| `syrk` / `syr2k` | the largest open gap: `syrk` is 0.14 at n = 50 and 0.47 on the median |
-| `trmm` / `trmmR` | both bottom at n = 100 — 0.16 side L, 0.14 side R — on medians of 0.32 and 0.39 |
-| BLAS-2 | closed at mid and large n; `gemvT`, `trmv` dip where their routing cuts sit |
-| BLAS-1 | parity with OpenBLAS; Accelerate leads at the largest sizes, where DRAM binds |
+| BLAS-3 `gemm`-fed | ahead from n = 2048 (1.07-1.11); the loss sits at n = 50-1000, 0.88-0.97 |
+| `syrk` / `syr2k` | the largest open gap: `syrk` is 0.18 at n = 50 and 0.59 on the median |
+| `trmm` / `trmmR` | both bottom at n = 100 — 0.21 side L, 0.18 side R — on medians of 0.42 and 0.47 |
+| BLAS-2 | the losses sit at n = 64-128 (`gemvN` 0.50 at n = 64, `gemvT` 0.34 at n = 128), at `trmv`'s hand-off to `gemv` (0.40-0.49 at n = 512-1024), and in banded `gbmvN` and `sbmv` at most sizes |
+| BLAS-1 | at or above OpenBLAS except `iamax` (0.62-0.77); against Accelerate the loss sits at n = 1e5 — `axpy` 0.68, `asum` 0.54, `scal` 0.39 — and is within 5% by n = 1e6 |
 
 `gemm` against Accelerate across the ladder:
 
 | n | 8 | 32 | 50 | 100 | 128 | 256 | 512 | 1000 | 2048 | 2100 | 4096 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| ratio | 2.21 | 0.96 | 0.79 | **0.69** | 0.88 | 0.88 | 0.93 | 0.83 | 1.03 | 1.02 | 0.76 |
+| ratio | 2.33 | 1.28 | 0.94 | **0.88** | 0.97 | 1.02 | 0.97 | 0.96 | 1.07 | 1.11 | 1.10 |
 
-n = 100 is the binding cell and is what the `gemm` gate figure reports. n = 1024 reads 1.67, but
-Accelerate's own q10-q90 spread in that one cell is 2.15x, so it is not a usable number — the cells
-either side of it read 0.83 and 1.03, and both sit under a 1.02 spread. **n = 4096 fell from 1.10 to
-0.76 between the two PureBLAS runs**, and the cause is the box, not the code: the 2026-09 source
-(`52332de7`) and the current one, run alternately on the same box the same day, differ by 3% at
-n = 4096 and 1% at n = 100, while both take 0.39-0.43 s at n = 4096 against 0.27 s in the September
-cache. Treat the n = 4096 ratio as invalid until a quiet-box re-measure.
+n = 100 is the binding cell and is what the `gemm` gate figure reports. n = 1024 reads 1.84, but
+Accelerate's own q10-q90 spread in that one cell is 2.17x, so it is not a usable number — the cells
+either side of it read 0.96 and 1.07, and both sit under a 1.17x spread. From n = 2048 up PureBLAS
+leads by 7-11%.
 
 ## What reaches SME, and when
 
@@ -92,7 +90,7 @@ qualifies from **two whole tiles, n = 32**. A shape with a remainder must also a
 block, and qualifies from **n = 48**. So `_sme_tile_ok(32,32)` and `(48,48)` and `(49,49)` are true
 while `(33,33)` and `(40,40)` are false; n = 33 and n = 40 measure 0.66x and 0.93x of the NEON path
 they stay on (those two figures come from the earlier probe run and were not re-measured on
-2026-11-09).
+2026-11-09 or 2026-11-16).
 
 The Float32 twin `_sme_tile_ok32` admits **one** whole register tile each way where the Float64 path
 requires two, over a 32-row tile rather than a 16-row one: it takes `min(m,n) ≥ 32`, passes any
@@ -205,11 +203,12 @@ FAIL can still have a winning median — true below for every op except `scal` a
 | LP | `geqrf` | **1.34** (1.18) | **1.08** (0.28) | 0.284 | FAIL |
 | LP | `gesvd` | **1.95** (1.07) | **1.35** (0.90) | 0.903 | FAIL |
 
-179 of 281 measured cells sit below the gate. The worst are `syrk` at n = 32-100, `trmmR` at
-n = 50-100 and `trmm` at n = 50-128. The two binding cells carry a q10-q90 sample spread of 1.15x
-(`syrk` at n = 50) and 1.13x (`trmmR` at n = 100), with their Accelerate arms at 1.14x and 1.10x, so
-a tuning change worth less than about 15% in those cells is not separable from round-to-round noise
-in this cache.
+179 of 281 measured cells sit below the gate. The worst are `syrk` at n = 32-100 (0.18-0.26),
+`trmmR` at n = 50-100 (0.18-0.23) and `trmm` at n = 50-128 (0.21-0.31). In the two binding cells
+PureBLAS's own q10-q90 sample spread is 1.01x (`syrk` at n = 50) and 1.02x (`trmmR` at n = 100),
+while their Accelerate arms spread 1.15x and 1.10x, so the noise in those ratios, about 10-15%,
+comes from the reference arm, and a tuning change smaller than that is not separable from it in
+this cache.
 
 Full machine-readable tables: [`gen_table.md`](assets/apple/gen_table.md) (vs OpenBLAS),
 [`gen_table_accelerate.md`](assets/apple/gen_table_accelerate.md) (vs Accelerate).
@@ -246,7 +245,7 @@ julia --project=bench bench/plots.jl outdir=docs/src/assets/apple
 ```
 
 That is the full-arm form, and it is the only one whose ratios are free of the machine-state term
-above. The 2026-11-09 figures came from a PureBLAS-only refresh over the September reference arms,
+above. The 2026-11-16 figures came from a PureBLAS-only refresh over the September reference arms,
 one launch per group because `group=` is an exact match and a comma list matches nothing:
 
 ```
