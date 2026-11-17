@@ -336,7 +336,16 @@ end
     # The signatures src/verify.jl declares with `@strict_function guarantees = …` (the microkernels'
     # `:vectorized`/`:no_spill`, the trsm side-R tile's `:no_spill`), re-proved here with each one's
     # own guarantees.
-    fs = test_registered(; modules = [P])
+    # The per-task first-touch accessors are allocation barriers for the proofs, as in
+    # strictmode_tests.jl; the registration is process-global, so it is removed again afterwards.
+    pools = (P._m3ws, P._gpackws, P._strws, P._opt)
+    foreach(StrictMode.register_alloc_barrier!, pools)
+    fs = try
+        test_registered(; modules = [P])
+    finally
+        foreach(f -> delete!(StrictMode._ALLOC_BARRIERS, f), pools)   # internal: no public unregister exists
+        StrictMode.clear_cache!()
+    end
     @test count(f -> f.status === :pass, fs) >= 9
     # Every kernel in the table. A wide (ymm/zmm) spill anywhere, or inside a loop, is the real defect.
     # `spill_report` also counts xmm lines: on a kernel that takes scalar alpha/beta arguments those
