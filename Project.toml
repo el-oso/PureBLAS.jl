@@ -14,9 +14,6 @@ Scratch = "6c6a2e73-6563-6170-7368-637461726353"
 StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
 TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 
-[sources]
-StrictMode = {url = "https://github.com/el-oso/StrictMode.jl", rev = "4255cf43c6718cbe483cb2571961293c7dd2f724", subdir = "StrictMode"}
-
 [weakdeps]
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 
