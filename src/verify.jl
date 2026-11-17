@@ -326,7 +326,9 @@ let bk = DEFAULT_BACKEND, n = 1000, m = 64,
     vlsBP = ones(svm + 8, nrhs + 4); vlsB = view(vlsBP, 1:svm, 1:nrhs)
     vlsB0 = ones(svm, nrhs); vlsjp = view(vipP, 1:svn)
     vstP = ones(ms + 8, stm + 4); vstZ = view(vstP, 1:ms, 1:stm)
-    @verify_strict SIMDBackend begin
+    # The guarantees are named so every listed signature is also registered, and
+    # test_registered (StrictModeTest) re-proves them in the test environment.
+    @verify_strict SIMDBackend guarantees = (:typestable, :noalloc, :owned) begin
         # ── Level 1 (bandwidth-bound; SIMD real path + generic complex path)
         axpy!(bk, yd, 2.0, xd)
         scal!(bk, 2.0, xd)
