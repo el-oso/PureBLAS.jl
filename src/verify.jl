@@ -22,201 +22,11 @@
 # (bench/probes/strict_contract_eligibility.jl, strict_contract_dryrun.jl).
 #
 # Values live in a `let` — only their types matter, so `ones` (no Random dep).
-# The probes below are statically resolved functions over the operands a call needs, returning
-# `nothing` so a multi-output tuple is not charged to the call site. Each re-seeds the arguments the
-# routine overwrites before calling it (in-place copyto!, no allocation), so the same probe is also a
-# valid, repeatable call when a test executes it.
-_strict_potrf_probe(bk, Aw, Apd) = (copyto!(Aw, Apd); potrf!(bk, Aw; uplo = 'L'))
-# getrf!/geqrf! are 0-alloc through their IN-PLACE (pre-allocated ipiv/τ) forms — the convenience forms
-# allocate the pivot/τ output, which is inherent, not a bug. These probes re-seed the source and call the
-# in-place kernel; being proper (statically-resolved) functions they also avoid the call-site tuple box a
-# dynamically-dispatched call would add. Return nothing so the (A,ipiv,info)/(A,τ) tuple never escapes.
-_strict_getrf_probe(Gw, G0, ipiv) = (copyto!(Gw, G0); getrf!(Gw, ipiv); nothing)
-_strict_geqrf_probe(Gw, G0, tau) = (copyto!(Gw, G0); geqrf!(Gw, tau); nothing)
-# gesvd! is 0-alloc through its IN-PLACE form (caller-provided U/S/Vᵀ + a cached SVDWorkspace for the
-# bidiagonalization scratch); the convenience gesvd!(A; want_vectors) allocates the outputs. Re-seed A.
-_strict_gesvd_probe(Gw, G0, U, S, Vt) = (copyto!(Gw, G0); gesvd!(Gw, U, S, Vt); nothing)
+# getrf!/geqrf!/gesvd! are listed at their IN-PLACE forms (caller-provided ipiv/τ, U/S/Vᵀ): the
+# convenience forms allocate those outputs, which is inherent, not a bug.
 
-# ── AbstractLAPACKSolve probes (contracts.jl). Same re-seeding discipline as the four factorization
-# probes above, and for the same reason — but it applies to the WHOLE contract here rather than to a
-# couple of members: every one of these 24 either overwrites its factor/band/tridiagonal input or its
-# right-hand side, and a probe must stay valid when invoked repeatedly. A direct call would re-factor an
-# already-factored matrix on the second invocation (PosDefException from pptrf!/pbtrf!, a zero pivot
-# from gttrf!) or, worse, keep solving against a solution it just produced and pass on garbage. The
-# three condition estimators (pocon!/gecon!/trcon!) read their factor without touching it, so those
-# alone are called directly in the block below. Every probe returns nothing so the multi-output tuples
-# — (piv, rank, info), (dl, d, du, du2, ipiv), gesvx's 6-tuple — never escape the checked call and
-# get charged as an allocation that belongs to the call site rather than to the routine.
-_strict_potrs_probe(bk, Bw, B0, Ac) = (copyto!(Bw, B0); potrs!(bk, Ac, Bw; uplo = 'L'); nothing)
-_strict_potri_probe(bk, Aw, Ac) = (copyto!(Aw, Ac); potri!(bk, Aw; uplo = 'L'); nothing)
-_strict_pptrf_probe(bk, APw, AP0) = (copyto!(APw, AP0); pptrf!(bk, APw; uplo = 'L'); nothing)
-_strict_pptrs_probe(bk, Bw, B0, APc) = (copyto!(Bw, B0); pptrs!(bk, APc, Bw; uplo = 'L'); nothing)
-_strict_pbtrf_probe(bk, ABw, AB0, kd) = (copyto!(ABw, AB0); pbtrf!(bk, ABw; uplo = 'L', kd = kd); nothing)
-_strict_pbtrs_probe(bk, Bw, B0, ABc) = (copyto!(Bw, B0); pbtrs!(bk, ABc, Bw; uplo = 'L'); nothing)
-_strict_pstrf_probe(bk, Aw, A0, piv) = (copyto!(Aw, A0); pstrf!(bk, Aw, piv, -1.0; uplo = 'L'); nothing)
-_strict_getrs_probe(bk, Bw, B0, Alu, ipiv) = (copyto!(Bw, B0); getrs!(bk, Alu, ipiv, Bw; trans = 'N'); nothing)
-_strict_getri_probe(bk, Aw, Alu, ipiv) = (copyto!(Aw, Alu); getri!(bk, Aw, ipiv); nothing)
-_strict_trtrs_probe(bk, Bw, B0, At) = (copyto!(Bw, B0); trtrs!(bk, At, Bw; uplo = 'L', trans = 'N', diag = 'N'); nothing)
-_strict_trtri_probe(bk, Aw, At) = (copyto!(Aw, At); trtri!(bk, Aw; uplo = 'L', diag = 'N'); nothing)
-# trrfs! reads A/B/X and writes only Ferr/Berr, so it needs no re-seeding — the probe exists purely to
-# swallow the (Ferr, Berr) tuple.
-_strict_trrfs_probe(bk, At, B, X, fe, be) = (trrfs!(bk, 'L', 'N', 'N', At, B, X, fe, be); nothing)
-_strict_gbtrf_probe(bk, ABw, AB0, kl, ku, m, ipiv) = (copyto!(ABw, AB0); gbtrf!(bk, kl, ku, m, ABw, ipiv); nothing)
-_strict_gbtrs_probe(bk, Bw, B0, kl, ku, m, ABc, ipiv) = (copyto!(Bw, B0); gbtrs!(bk, 'N', kl, ku, m, ABc, ipiv, Bw); nothing)
-_strict_gtsv_probe(bk, dl, d, du, dl0, d0, du0, Bw, B0) =
-    (copyto!(dl, dl0); copyto!(d, d0); copyto!(du, du0); copyto!(Bw, B0); gtsv!(bk, dl, d, du, Bw); nothing)
-_strict_gttrf_probe(bk, dl, d, du, du2, ipiv, dl0, d0, du0) =
-    (copyto!(dl, dl0); copyto!(d, d0); copyto!(du, du0); gttrf!(bk, dl, d, du, du2, ipiv); nothing)
-_strict_gttrs_probe(bk, Bw, B0, dl, d, du, du2, ipiv) =
-    (copyto!(Bw, B0); gttrs!(bk, 'N', dl, d, du, du2, ipiv, Bw); nothing)
-_strict_pttrf_probe(bk, D, E, D0, E0) = (copyto!(D, D0); copyto!(E, E0); pttrf!(bk, D, E); nothing)
-_strict_pttrs_probe(bk, Bw, B0, Df, Ef) = (copyto!(Bw, B0); pttrs!(bk, Df, Ef, Bw; uplo = 'L'); nothing)
-_strict_ptsv_probe(bk, D, E, D0, E0, Bw, B0) =
-    (copyto!(D, D0); copyto!(E, E0); copyto!(Bw, B0); ptsv!(bk, D, E, Bw; uplo = 'L'); nothing)
-# gesvx! with fact='N'/equed='N' leaves A and B alone, but the contract's in-place form owns AF/ipiv/X
-# and the driver re-factors A into AF on every call — re-seed all three inputs so a repeated invocation
-# sees the same problem, not the previous call's scaled/refined state.
-_strict_gesvx_probe(bk, A, A0, AF, ipiv, R, C, Bw, B0, X, fe, be) =
-    (
-    copyto!(A, A0); copyto!(AF, A0); copyto!(Bw, B0);
-    gesvx!(bk, 'N', 'N', A, AF, ipiv, 'N', R, C, Bw, X, fe, be); nothing
-)
-
-# ── QR/LQ/QL/RZ probes. Every one of these overwrites its input, and a probe must stay valid when
-# invoked repeatedly, so each re-seeds from a pristine source with `copyto!` (allocation-free) and returns
-# `nothing` so the multi-output tuples never escape to the call site.
-_strict_qrfac_probe(f, Aw, A0, tau) = (copyto!(Aw, A0); f(Aw, tau); nothing)
-_strict_qp3_probe(Aw, A0, jp, tau) = (copyto!(Aw, A0); fill!(jp, 0); geqp3!(Aw, jp, tau); nothing)
-# Q-generators consume a FACTORED source, so the pristine copy is the factorization, not the raw A.
-_strict_orgq_probe(f, Aw, Af, tau) = (copyto!(Aw, Af); f(Aw, tau); nothing)
-# Q-appliers leave A alone and overwrite C.
-_strict_ormq_probe(f, Cw, C0, Af, tau) = (copyto!(Cw, C0); f('L', 'N', Af, tau, Cw); nothing)
-
-# orgtr!/ungtr! read A/tau and OVERWRITE the caller-supplied Q, so only Q needs re-seeding — and it does
-# need it: the in-place form zeroes Q itself (its off-diagonal zeros are READ by the block-reflector
-# gemms), so a repeated call must not inherit the previous call's Q. Return nothing so Q does
-# not escape and get charged to the call site.
-_strict_orgtr_probe(bk, A, tau, Q) = (orgtr!(bk, 'L', A, tau, Q); nothing)
-_strict_ungtr_probe(bk, A, tau, Q) = (ungtr!(bk, 'L', A, tau, Q); nothing)
-
-# ── Probes for the 34 members added when the nonsymmetric-eigen / Bunch-Kaufman / QZ / SVD-front /
-# least-squares families moved to owned workspace. Same discipline as everything above: re-seed every
-# overwritten input with `copyto!` (allocation-free) so a repeated invocation sees the same problem, and
-# return `nothing` so the multi-output tuples are never charged to the call site. Each is routed through
-# the BACKEND method, since that is the method the contract actually binds. The `job`/`uplo`/`side`/
-# `trans` characters are passed as ARGUMENTS rather than baked in, so one probe covers every arm and the
-# strict block can list the arms it wants without a probe per combination.
-# Elementwise seed, used where the destination may be a `view` of a larger parent. `copyto!(view, array)`
-# first asks whether the two might alias and, if so, copies the source into a temporary — a runtime
-# allocation path the probed call would be charged for. This loop has none, and takes the same
-# `Matrix`/`Vector`/`SubArray` operand types the probes are called with.
-function _strict_seed!(dst::AbstractArray, src::AbstractArray)
-    axes(dst) == axes(src) || throw(DimensionMismatch("_strict_seed!: $(axes(dst)) vs $(axes(src))"))
-    for I in eachindex(dst, src)
-        dst[I] = src[I]
-    end
-    return dst
-end
-_strict_gebal_probe(bk, A, A0, scale) = (_strict_seed!(A, A0); gebal!(bk, A, scale; job = 'B'); nothing)
-_strict_gebak_probe(bk, V, V0, scale, ilo, ihi) =
-    (_strict_seed!(V, V0); gebak!(bk, 'B', 'R', ilo, ihi, scale, V); nothing)
-_strict_gehrd_probe(bk, A, A0, ilo, ihi, tau) = (_strict_seed!(A, A0); gehrd!(bk, A, ilo, ihi, tau); nothing)
-# orghr! consumes the FACTORED source (gehrd's reflectors), not the raw A, and overwrites it with Q.
-_strict_orghr_probe(bk, A, Af, ilo, ihi, tau) = (_strict_seed!(A, Af); orghr!(bk, A, ilo, ihi, tau); nothing)
-# ormhr! leaves A/tau alone (read-only, as in reference LAPACK) and overwrites C.
-_strict_ormhr_probe(bk, C, C0, side, trans, ilo, ihi, Af, tau) =
-    (_strict_seed!(C, C0); ormhr!(bk, side, trans, ilo, ihi, Af, tau, C); nothing)
-_strict_hseqr_probe(bk, H, H0, job, compz, ilo, ihi, w, Z) =
-    (_strict_seed!(H, H0); hseqr!(bk, job, compz, H, ilo, ihi, w, Z); nothing)
-_strict_trevc_probe(bk, Tw, T0, VL, VR, VR0) =
-    (_strict_seed!(Tw, T0); _strict_seed!(VR, VR0); trevc!(bk, 'R', 'B', Tw, VL, VR); nothing)
-_strict_trexc_probe(bk, Tw, T0, Q, Q0, ifst, ilst) =
-    (_strict_seed!(Tw, T0); _strict_seed!(Q, Q0); trexc!(bk, 'V', Tw, Q, ifst, ilst); nothing)
-_strict_trsen_probe(bk, Tw, T0, Q, Q0, job, sel, w) =
-    (_strict_seed!(Tw, T0); _strict_seed!(Q, Q0); trsen!(bk, job, 'V', sel, Tw, Q, w); nothing)
-_strict_sygvd_probe(bk, Aw, A0, Bw, B0, it, jobz, uplo, w) =
-    (_strict_seed!(Aw, A0); _strict_seed!(Bw, B0); sygvd!(bk, it, jobz, uplo, Aw, Bw, w); nothing)
-_strict_hegvd_probe(bk, Aw, A0, Bw, B0, it, jobz, uplo, w) =
-    (_strict_seed!(Aw, A0); _strict_seed!(Bw, B0); hegvd!(bk, it, jobz, uplo, Aw, Bw, w); nothing)
-_strict_trsyl_probe(bk, C, C0, transa, transb, A, B) =
-    (_strict_seed!(C, C0); trsyl!(bk, transa, transb, 1, A, B, C); nothing)
-_strict_geevr_probe(bk, A, A0, wr, wi, VL, VR, scale) =
-    (_strict_seed!(A, A0); geev!(bk, 'N', 'V', A, wr, wi, VL, VR, scale); nothing)
-_strict_geevc_probe(bk, A, A0, w, VL, VR, scale) =
-    (_strict_seed!(A, A0); geev!(bk, 'N', 'V', A, w, VL, VR, scale); nothing)
-_strict_gees_probe(bk, A, A0, w, VS, scale) = (_strict_seed!(A, A0); gees!(bk, 'V', A, w, VS, scale); nothing)
-
-_strict_sytrf_probe(bk, A, A0, ipiv, uplo) = (_strict_seed!(A, A0); sytrf!(bk, A, ipiv; uplo = uplo); nothing)
-_strict_hetrf_probe(bk, A, A0, ipiv, uplo) = (_strict_seed!(A, A0); hetrf!(bk, A, ipiv; uplo = uplo); nothing)
-_strict_sytrs_probe(bk, B, B0, Af, ipiv, uplo) =
-    (_strict_seed!(B, B0); sytrs!(bk, Af, ipiv, B; uplo = uplo); nothing)
-_strict_hetrs_probe(bk, B, B0, Af, ipiv, uplo) =
-    (_strict_seed!(B, B0); hetrs!(bk, Af, ipiv, B; uplo = uplo); nothing)
-# sytri!/hetri! take the FACTOR and overwrite it with the inverse — re-seed from the factorization.
-_strict_sytri_probe(bk, A, Af, ipiv, uplo) = (_strict_seed!(A, Af); sytri!(bk, A, ipiv; uplo = uplo); nothing)
-_strict_hetri_probe(bk, A, Af, ipiv, uplo) = (_strict_seed!(A, Af); hetri!(bk, A, ipiv; uplo = uplo); nothing)
-_strict_sysv_probe(bk, A, A0, B, B0, ipiv, uplo) =
-    (_strict_seed!(A, A0); _strict_seed!(B, B0); sysv!(bk, uplo, A, B, ipiv); nothing)
-_strict_hesv_probe(bk, A, A0, B, B0, ipiv, uplo) =
-    (_strict_seed!(A, A0); _strict_seed!(B, B0); hesv!(bk, uplo, A, B, ipiv); nothing)
-_strict_syconv_probe(bk, A, Af, ipiv, work, uplo) =
-    (_strict_seed!(A, Af); syconv!(bk, uplo, A, ipiv, work); nothing)
-
-_strict_gghrd_probe(bk, A, A0, B, B0, Q, Z) =
-    (_strict_seed!(A, A0); _strict_seed!(B, B0); gghrd!(bk, 'I', 'I', A, B, Q, Z); nothing)
-_strict_hgeqz_probe(bk, H, H0, Tm, T0, alpha, beta, Q, Z) =
-    (_strict_seed!(H, H0); _strict_seed!(Tm, T0); hgeqz!(bk, 'S', 'I', 'I', H, Tm, alpha, beta, Q, Z); nothing)
-_strict_tgevc_probe(bk, S, S0, Pm, P0, VL, VR, VR0) =
-    (
-    _strict_seed!(S, S0); _strict_seed!(Pm, P0); _strict_seed!(VR, VR0);
-    tgevc!(bk, 'R', 'B', S, Pm, VL, VR); nothing
-)
-_strict_tgsen_probe(bk, sel, S, S0, Tm, T0, Q, Q0, Z, Z0, alpha, beta) =
-    (
-    _strict_seed!(S, S0); _strict_seed!(Tm, T0); _strict_seed!(Q, Q0); _strict_seed!(Z, Z0);
-    tgsen!(bk, sel, S, Tm, Q, Z, alpha, beta); nothing
-)
-_strict_ggevr_probe(bk, A, A0, B, B0, alphar, alphai, beta, vl, vr) =
-    (_strict_seed!(A, A0); _strict_seed!(B, B0); ggev!(bk, 'N', 'V', A, B, alphar, alphai, beta, vl, vr); nothing)
-_strict_ggevc_probe(bk, A, A0, B, B0, alpha, beta, vl, vr) =
-    (_strict_seed!(A, A0); _strict_seed!(B, B0); ggev!(bk, 'N', 'V', A, B, alpha, beta, vl, vr); nothing)
-_strict_gges_probe(bk, A, A0, B, B0, alpha, beta, vsl, vsr) =
-    (_strict_seed!(A, A0); _strict_seed!(B, B0); gges!(bk, 'V', 'V', A, B, alpha, beta, vsl, vsr); nothing)
-
-_strict_gebd2_probe(bk, A, A0, d, e, tauq, taup) =
-    (_strict_seed!(A, A0); gebd2!(bk, A, d, e, tauq, taup); nothing)
-_strict_gebrd_probe(bk, A, A0, d, e, tauq, taup) =
-    (_strict_seed!(A, A0); gebrd!(bk, A, d, e, tauq, taup); nothing)
-_strict_bdsdc_probe(bk, d, d0, e, e0, Lvec, Rvec) =
-    (_strict_seed!(d, d0); _strict_seed!(e, e0); bdsdc!(bk, d, e, Lvec, Rvec); nothing)
-_strict_bdsqr_probe(bk, d, d0, e, e0, U, V) =
-    (_strict_seed!(d, d0); _strict_seed!(e, e0); bdsqr!(bk, d, e, U, V); nothing)
-_strict_bdsqrc_probe(bk, d, d0, e, e0, Vt, U, C) =
-    (_strict_seed!(d, d0); _strict_seed!(e, e0); bdsqr!(bk, 'U', d, e, Vt, U, C); nothing)
-_strict_ggsvd_probe(bk, A, A0, B, B0, U, V, Q, alpha, beta, R) =
-    (
-    _strict_seed!(A, A0); _strict_seed!(B, B0);
-    ggsvd!(bk, 'U', 'V', 'Q', A, B, U, V, Q, alpha, beta, R); nothing
-)
-
-_strict_gels_probe(bk, A, A0, B, B0) = (_strict_seed!(A, A0); _strict_seed!(B, B0); gels!(bk, 'N', A, B); nothing)
-_strict_gelsy_probe(bk, A, A0, B, B0, jpvt, rcond) =
-    (_strict_seed!(A, A0); _strict_seed!(B, B0); fill!(jpvt, 0); gelsy!(bk, A, B, jpvt, rcond); nothing)
-_strict_gglse_probe(bk, A, A0, c, c0, B, B0, d, d0, x) =
-    (
-    _strict_seed!(A, A0); _strict_seed!(c, c0); _strict_seed!(B, B0); _strict_seed!(d, d0);
-    gglse!(bk, A, c, B, d, x); nothing
-)
-# stebz!/stein! read d/e and write only their output buffers, so nothing needs re-seeding; the probes
-# exist to swallow the (m, nsplit, info) tuple and the returned Z.
-_strict_stebz_probe(bk, d, e, w, iblock, isplit) =
-    (stebz!(bk, 'A', 'B', 0.0, 0.0, 1, 1, -1.0, d, e, w, iblock, isplit); nothing)
-_strict_stein_probe(bk, d, e, w, iblock, isplit, Z) =
-    (stein!(bk, d, e, w, iblock, isplit, Z); nothing)
-
-# Source builders for the operands those probes take. Deterministic and Random-free (same reason the
-# rest of this file uses `ones`), well-separated and diagonally dominant, so a probe executed on them
-# cannot raise.
+# Builders for the operands below. Deterministic and Random-free (same reason the rest of this file
+# uses `ones`), well-separated and diagonally dominant.
 _strict_nonsym(::Type{T}, n) where {T} = T[i == j ? T(i) : T(1) / T(2 * (i + j)) for i in 1:n, j in 1:n]
 _strict_ddom(::Type{T}, n, dg) where {T} = T[i == j ? T(dg) : T(1) / T(4 * (i + j)) for i in 1:n, j in 1:n]
 _strict_utri(::Type{T}, n) where {T} =
@@ -605,102 +415,92 @@ let bk = DEFAULT_BACKEND, n = 1000, m = 64,
         gemm!(bk, C3v, A3v, B3v)
         syrk!(bk, C3v, A3v; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
         # ── LAPACK: potrf!/getrf!/geqrf! are 0-alloc (potrf via its own pointer kernels; LU/QR via
-        # their in-place pre-allocated-output forms). Via re-seeding probes so repeated calls
-        # always factor a fresh source (potrf would otherwise throw PosDefException on its L-output).
-        # All four LAPACK factorizations are strict now: gesvd! reaches 0-alloc via the in-place
+        # their in-place pre-allocated-output forms). gesvd! reaches 0-alloc via the in-place
         # gesvd!(A,U,S,Vᵀ) form + a cached SVDWorkspace for the bidiagonalization scratch.
-        _strict_potrf_probe(bk, Aw, Apd)
-        _strict_getrf_probe(Aw, Apd, ipiv)
-        _strict_geqrf_probe(Aw, Apd, tau)
-        _strict_gesvd_probe(Aw, Apd, Usv, Ssv, Vtsv)
+        potrf!(bk, Aw; uplo = 'L')
+        getrf!(Aw, ipiv)
+        geqrf!(Aw, tau)
+        gesvd!(Aw, Usv, Ssv, Vtsv)
         # COMPLEX factorizations — a wholly separate kernel set (`_cpotrf_lower!`, `_cgetf2_simd!`,
-        # the complex QR panel), previously outside the contract entirely. Same re-seeding probes so
-        # repeated invocations stay 0-alloc and type-stable rather than re-factoring in place.
+        # the complex QR panel).
         # gesvd is deliberately NOT included for complex: its in-place form caches a Float64
         # SVDWorkspace and the complex path has not been shown 0-alloc — asserting it here without
         # that evidence would be guessing, so it stays an open item rather than a silent pass.
-        _strict_potrf_probe(bk, Awz3, Apdz)
-        _strict_getrf_probe(Awz3, Apdz, ipiv)
-        _strict_geqrf_probe(Awz3, Apdz, tauz)
+        potrf!(bk, Awz3; uplo = 'L')
+        getrf!(Awz3, ipiv)
+        geqrf!(Awz3, tauz)
         # ── AbstractLAPACKSolve (contracts.jl): the solve/inverse/condition surface built on those
         # four factorizations. Declaring the contract only fixes the method signatures; it is THIS
         # block that makes "type-stable AND allocation-free" true, and eight of these were breaking
         # it before the owned-workspace conversion. Grouped by the factorization they hang off.
         #
         # Cholesky family: solve, explicit inverse (potri! takes the FACTOR, not the SPD matrix,
-        # and overwrites it with A⁻¹ — hence the re-seed from the pre-factored Achol), packed and
-        # banded factor+solve, the rank-revealing pivoted factor, and the condition estimate.
-        _strict_potrs_probe(bk, Bsw, Bs0, Achol)
-        _strict_potri_probe(bk, Asw, Achol)
+        # and overwrites it with A⁻¹), packed and banded factor+solve, the rank-revealing pivoted
+        # factor, and the condition estimate.
+        potrs!(bk, Achol, Bsw; uplo = 'L')
+        potri!(bk, Asw; uplo = 'L')
         # pptrf! is verified at order 32, i.e. ABOVE `_PPTRF_BLK_MIN` (16), so the arm under test is
-        # `_pptrf_lower_blocked!`. That used to be the opposite: the probe ran at order 8 because the
-        # blocked path built two `Matrix{T}(undef, n, nb)` scratch buffers per call (16 560 B at
-        # n=32), so the one arm that broke the contract was the one arm the contract never saw. 7d2f44d
-        # moved W/V onto `_pptrf_lower_work`'s owned scratch and closed that; re-measured here at
-        # n ∈ {8, 16, 32, 64} — 0 B at every order, blocked and unblocked alike.
-        _strict_pptrf_probe(bk, APuw, APu0)
-        _strict_pptrs_probe(bk, Bsw, Bs0, APc)
-        _strict_pbtrf_probe(bk, ABpw, ABp0, kdS)
-        _strict_pbtrs_probe(bk, Bsw, Bs0, ABpc)
-        _strict_pstrf_probe(bk, Asw, Aspd, pivs)
+        # `_pptrf_lower_blocked!`, the arm that holds W/V in `_pptrf_lower_work`'s owned scratch.
+        # Measured 0 B at n ∈ {8, 16, 32, 64}, blocked and unblocked alike.
+        pptrf!(bk, APuw; uplo = 'L')
+        pptrs!(bk, APc, Bsw; uplo = 'L')
+        pbtrf!(bk, ABpw; uplo = 'L', kd = kdS)
+        pbtrs!(bk, ABpc, Bsw; uplo = 'L')
+        pstrf!(bk, Asw, pivs, -1.0; uplo = 'L')
         pocon!(bk, float(2 * ms), Achol; uplo = 'L')
-        # LU family: solve against the factors and the explicit inverse. getri! is the one that used
-        # to allocate an n×n identity plus scratch; it now runs LAPACK's block-column algorithm over
-        # an owned n×nb buffer, which is exactly what this line holds it to.
-        _strict_getrs_probe(bk, Bsw, Bs0, Alu, ipivs)
-        _strict_getri_probe(bk, Asw, Alu, ipivs)
-        # Triangular: solve, in-place inverse, condition estimate, and the trrfs! error bounds. The
-        # three estimators (pocon!/gecon!/trcon!) are called DIRECTLY — they only read their factor,
-        # so there is nothing to re-seed, and a probe would hide the closure-capture that is the
-        # plausible failure mode for a Higham–Hager estimator driving a callback.
-        _strict_trtrs_probe(bk, Bsw, Bs0, Achol)
-        _strict_trtri_probe(bk, Asw, Achol)
+        # LU family: solve against the factors and the explicit inverse. getri! runs LAPACK's
+        # block-column algorithm over an owned n×nb buffer, which is exactly what this line holds it to.
+        getrs!(bk, Alu, ipivs, Bsw; trans = 'N')
+        getri!(bk, Asw, ipivs)
+        # Triangular: solve, in-place inverse, condition estimate, and the trrfs! error bounds.
+        trtrs!(bk, Achol, Bsw; uplo = 'L', trans = 'N', diag = 'N')
+        trtri!(bk, Asw; uplo = 'L', diag = 'N')
         gecon!(bk, float(2 * ms), Alu, ipivs; norm = '1')
         trcon!(bk, Achol; uplo = 'L', diag = 'N', norm = '1')
-        _strict_trrfs_probe(bk, Achol, Bs0, Xs, ferrs, berrs)
+        trrfs!(bk, 'L', 'N', 'N', Achol, Bs0, Xs, ferrs, berrs)
         # Banded LU: the IN-PLACE gbtrf!(kl, ku, m, AB, ipiv) form, not the convenience form that
         # allocates ipiv — the contract binds the former precisely so it cannot be satisfied by a
         # method that allocates its own output. TWO shapes, for the same reason pptrf! moved above
         # its blocking threshold: kl=ku=1 reaches `_gbtf2!` and nothing else, so the blocked kernel
         # and the `_gbtrf_work` W13/W31/S scratch behind it went unverified. kl=64 clears
         # `_gbtrf_cross(Float64)` on every µarch (32 wide-SIMD / 64 otherwise). Both measure 0 B.
-        _strict_gbtrf_probe(bk, ABgw, ABg0, klS, kuS, ms, ipivgw)
-        _strict_gbtrf_probe(bk, ABbw, ABb0, klB, kuB, msB, ipivb)
-        _strict_gbtrs_probe(bk, Bsw, Bs0, klS, kuS, ms, ABgc, ipivg)
+        gbtrf!(bk, klS, kuS, ms, ABgw, ipivgw)
+        gbtrf!(bk, klB, kuB, msB, ABbw, ipivb)
+        gbtrs!(bk, 'N', klS, kuS, ms, ABgc, ipivg, Bsw)
         # Tridiagonal: the fused driver, the split factor/solve pair, and their SPD counterparts.
         # These are pure recurrences with no BLAS underneath, so an allocation here would be a
         # bounds-check or boxing artefact rather than a workspace — worth pinning for that reason.
-        _strict_gtsv_probe(bk, dlw, dw, duw, dl0, d0, du0, Bsw, Bs0)
-        _strict_gttrf_probe(bk, dlw, dw, duw, du2w, ipivtw, dl0, d0, du0)
-        _strict_gttrs_probe(bk, Bsw, Bs0, dlf, df, duf, du2f, ipivt)
-        _strict_pttrf_probe(bk, Dpw, Epw, Dp0, Ep0)
-        _strict_pttrs_probe(bk, Bsw, Bs0, Dpf, Epf)
-        _strict_ptsv_probe(bk, Dpw, Epw, Dp0, Ep0, Bsw, Bs0)
+        gtsv!(bk, dlw, dw, duw, Bsw)
+        gttrf!(bk, dlw, dw, duw, du2w, ipivtw)
+        gttrs!(bk, 'N', dlf, df, duf, du2f, ipivt, Bsw)
+        pttrf!(bk, Dpw, Epw)
+        pttrs!(bk, Dpf, Epf, Bsw; uplo = 'L')
+        ptsv!(bk, Dpw, Epw, Bsw; uplo = 'L')
         # Expert driver — the deepest composition in the contract (equilibrate → getrf → solve →
         # gecon ×2 → iterative refinement), so it is also the one most likely to leak an allocation
         # from a callee. fact='N'/equed='N' skips equilibration, keeping the arm under test the
         # factor-solve-refine chain rather than the scaling. Again the IN-PLACE form: X/ferr/berr
         # come from the caller, which is what netlib's OUT arguments always implied.
-        _strict_gesvx_probe(bk, Asw, Aspd, AFx, ipivx, Rq, Cq, Bsw, Bs0, Xs, ferrs, berrs)
+        gesvx!(bk, 'N', 'N', Asw, AFx, ipivx, 'N', Rq, Cq, Bsw, Xs, ferrs, berrs)
         # ── QR / LQ / QL / RZ. 14 distinct implementations; the nine `un*!` names are `const`
         # aliases of these same function objects, so verifying `or*!` verifies them too.
         # orgtr!/ungtr! are absent — they allocate their output Q (see contracts.jl).
-        _strict_qrfac_probe(gelqf!, Aqw, Aqr, tauq)
-        _strict_qrfac_probe(geqlf!, Aqw, Aqr, tauq)
-        _strict_qrfac_probe(gerqf!, Aqw, Aqr, tauq)
-        _strict_qrfac_probe(tzrzf!, Aqw, Aqr, tauq)
-        _strict_qp3_probe(Aqw, Aqr, jpq, tauq)
-        _strict_orgq_probe(orgqr!, Aqw, Afqr, tauq)
-        _strict_orgq_probe(orglq!, Aqw, Aflq, taul)
-        _strict_orgq_probe(orgql!, Aqw, Afql, tauql)
-        _strict_orgq_probe(orgrq!, Aqw, Afrq, taurq)
-        _strict_ormq_probe(ormqr!, Cqw, Cqr, Afqr, tauq)
-        _strict_ormq_probe(ormlq!, Cqw, Cqr, Aflq, taul)
-        _strict_ormq_probe(ormql!, Cqw, Cqr, Afql, tauql)
-        _strict_ormq_probe(ormrq!, Cqw, Cqr, Afrq, taurq)
-        _strict_ormq_probe(ormrz!, Cqw, Cqr, Afrz, taurz)
-        _strict_orgtr_probe(bk, Aqtr, tautr, Qtr)
-        _strict_ungtr_probe(bk, Aztr, tauztr, Qztr)
+        gelqf!(Aqw, tauq)
+        geqlf!(Aqw, tauq)
+        gerqf!(Aqw, tauq)
+        tzrzf!(Aqw, tauq)
+        geqp3!(Aqw, jpq, tauq)
+        orgqr!(Aqw, tauq)
+        orglq!(Aqw, taul)
+        orgql!(Aqw, tauql)
+        orgrq!(Aqw, taurq)
+        ormqr!('L', 'N', Afqr, tauq, Cqw)
+        ormlq!('L', 'N', Aflq, taul, Cqw)
+        ormql!('L', 'N', Afql, tauql, Cqw)
+        ormrq!('L', 'N', Afrq, taurq, Cqw)
+        ormrz!('L', 'N', Afrz, taurz, Cqw)
+        orgtr!(bk, 'L', Aqtr, tautr, Qtr)
+        ungtr!(bk, 'L', Aztr, tauztr, Qztr)
         # ── Nonsymmetric eigen: balance, Hessenberg reduction, Schur, eigenvectors, drivers.
         # REAL and COMPLEX arms both, because they are separate kernel sets throughout (dlahqr vs
         # zlahqr, the real quasi-triangular 2×2 machinery vs plain triangular back-substitution), and
@@ -709,169 +509,169 @@ let bk = DEFAULT_BACKEND, n = 1000, m = 64,
         # `Base.RefValue` carrying `_dtrsyl!`'s scale out of the `_lacn2_estimate` callback. It goes
         # in when that Ref does; asserting it now would fail the build, and dropping the failing jobs
         # would make the member's guarantee a lie.
-        _strict_gebal_probe(bk, evW1, evA, evsc)
-        _strict_gebak_probe(bk, evV, evV0, evsc, evilo, evihi)
-        _strict_gehrd_probe(bk, evW1, evA, evilo, evihi, evtau)
-        _strict_orghr_probe(bk, evW1, evAf, evilo, evihi, evtau)
+        gebal!(bk, evW1, evsc; job = 'B')
+        gebak!(bk, 'B', 'R', evilo, evihi, evsc, evV)
+        gehrd!(bk, evW1, evilo, evihi, evtau)
+        orghr!(bk, evW1, evilo, evihi, evtau)
         # Both sides AND both trans arms: side='R' is a different gemm! shape, and it is the arm the
         # L3 block's own SubArray note records as the one that boxed when only side='L' was checked.
-        _strict_ormhr_probe(bk, evW2, evC, 'L', 'N', evilo, evihi, evAf, evtau)
-        _strict_ormhr_probe(bk, evW2, evC, 'R', 'T', evilo, evihi, evAf, evtau)
+        ormhr!(bk, 'L', 'N', evilo, evihi, evAf, evtau, evW2)
+        ormhr!(bk, 'R', 'T', evilo, evihi, evAf, evtau, evW2)
         # job='S'/compz='I' is the full Schur arm (T and Z formed); job='E'/compz='N' the
         # eigenvalues-only arm, which skips the Z accumulation entirely.
-        _strict_hseqr_probe(bk, evW1, evH, 'S', 'I', evilo, evihi, evw, evW3)
-        _strict_hseqr_probe(bk, evW1, evH, 'E', 'N', evilo, evihi, evw, evW3)
-        _strict_trevc_probe(bk, evW1, evT, evVL, evW2, evQI)
-        _strict_trexc_probe(bk, evW1, evT, evW2, evQI, 5, 1)
+        hseqr!(bk, 'S', 'I', evW1, evilo, evihi, evw, evW3)
+        hseqr!(bk, 'E', 'N', evW1, evilo, evihi, evw, evW3)
+        trevc!(bk, 'R', 'B', evW1, evVL, evW2)
+        trexc!(bk, 'V', evW1, evW2, 5, 1)
         # trsen! at all four jobs: 'N'/'E' skip the sep estimate entirely, while 'V'/'B' run the
         # `_lacn2_estimate` reverse-communication loop — the arm that carried the 16 B Ref.
-        _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'N', tsnsel, tsnw)
-        _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'E', tsnsel, tsnw)
-        _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'V', tsnsel, tsnw)
-        _strict_trsen_probe(bk, evW1, evT, evW2, evQI, 'B', tsnsel, tsnw)
+        trsen!(bk, 'N', 'V', tsnsel, evW1, evW2, tsnw)
+        trsen!(bk, 'E', 'V', tsnsel, evW1, evW2, tsnw)
+        trsen!(bk, 'V', 'V', tsnsel, evW1, evW2, tsnw)
+        trsen!(bk, 'B', 'V', tsnsel, evW1, evW2, tsnw)
         # sygvd!/hegvd!: itype 1 vs 2/3 are different REDUCTIONS (trsm vs trmm) and itype 3 a
         # different BACK-TRANSFORM (trmm vs trsm); jobz 'V' vs 'N' are different eigensolvers
         # (_stedc! divide-and-conquer vs _sterf!). Both uplos: 'U' takes the mirror-to-lower path.
-        _strict_sygvd_probe(bk, gvAw, gvA, gvBw, gvB, 1, 'V', 'L', gvw)
-        _strict_sygvd_probe(bk, gvAw, gvA, gvBw, gvB, 2, 'V', 'U', gvw)
-        _strict_sygvd_probe(bk, gvAw, gvA, gvBw, gvB, 3, 'V', 'L', gvw)
-        _strict_sygvd_probe(bk, gvAw, gvA, gvBw, gvB, 1, 'N', 'U', gvw)
-        _strict_hegvd_probe(bk, gvzAw, gvzA, gvzBw, gvzB, 1, 'V', 'L', gvw)
-        _strict_hegvd_probe(bk, gvzAw, gvzA, gvzBw, gvzB, 3, 'V', 'U', gvw)
-        _strict_hegvd_probe(bk, gvzAw, gvzA, gvzBw, gvzB, 1, 'N', 'L', gvw)
+        sygvd!(bk, 1, 'V', 'L', gvAw, gvBw, gvw)
+        sygvd!(bk, 2, 'V', 'U', gvAw, gvBw, gvw)
+        sygvd!(bk, 3, 'V', 'L', gvAw, gvBw, gvw)
+        sygvd!(bk, 1, 'N', 'U', gvAw, gvBw, gvw)
+        hegvd!(bk, 1, 'V', 'L', gvzAw, gvzBw, gvw)
+        hegvd!(bk, 3, 'V', 'U', gvzAw, gvzBw, gvw)
+        hegvd!(bk, 1, 'N', 'L', gvzAw, gvzBw, gvw)
         # transa='N' and 'T' are separate back-substitution orders; the third call feeds trsyl! a
         # quasi-triangular A so the `_syl_dlasy2` 2×2 arm (and its `t16` scratch) is on the path.
-        _strict_trsyl_probe(bk, evW2, evC, 'N', 'N', evU, evU)
-        _strict_trsyl_probe(bk, evW2, evC, 'T', 'N', evU, evU)
-        _strict_trsyl_probe(bk, evW2, evC, 'N', 'N', evT, evU)
-        _strict_geevr_probe(bk, evW1, evA, evwr, evwi, evVL, evW2, evsc)
-        _strict_gees_probe(bk, evW1, evA, evw, evW2, evsc)
-        _strict_gebal_probe(bk, ezW1, ezA, ezsc)
-        _strict_gebak_probe(bk, ezV, ezV0, ezsc, ezilo, ezihi)
-        _strict_gehrd_probe(bk, ezW1, ezA, ezilo, ezihi, eztau)
-        _strict_orghr_probe(bk, ezW1, ezAf, ezilo, ezihi, eztau)
-        _strict_ormhr_probe(bk, ezW2, ezC, 'L', 'N', ezilo, ezihi, ezAf, eztau)
-        _strict_ormhr_probe(bk, ezW2, ezC, 'R', 'C', ezilo, ezihi, ezAf, eztau)
-        _strict_hseqr_probe(bk, ezW1, ezH, 'S', 'I', ezilo, ezihi, ezw, ezW3)
-        _strict_hseqr_probe(bk, ezW1, ezH, 'E', 'N', ezilo, ezihi, ezw, ezW3)
-        _strict_trevc_probe(bk, ezW1, ezU, ezVL, ezW2, ezQI)
-        _strict_trexc_probe(bk, ezW1, ezU, ezW2, ezQI, 5, 1)
-        _strict_trsen_probe(bk, ezW1, ezU, ezW2, ezQI, 'N', tsnsel, tsnw)
-        _strict_trsen_probe(bk, ezW1, ezU, ezW2, ezQI, 'B', tsnsel, tsnw)
-        _strict_trsyl_probe(bk, ezW2, ezC, 'N', 'N', ezU, ezU)
-        _strict_trsyl_probe(bk, ezW2, ezC, 'C', 'N', ezU, ezU)
-        _strict_geevc_probe(bk, ezW1, ezA, ezw, ezVL, ezW2, ezsc)
-        _strict_gees_probe(bk, ezW1, ezA, ezw, ezW2, ezsc)
+        trsyl!(bk, 'N', 'N', 1, evU, evU, evW2)
+        trsyl!(bk, 'T', 'N', 1, evU, evU, evW2)
+        trsyl!(bk, 'N', 'N', 1, evT, evU, evW2)
+        geev!(bk, 'N', 'V', evW1, evwr, evwi, evVL, evW2, evsc)
+        gees!(bk, 'V', evW1, evw, evW2, evsc)
+        gebal!(bk, ezW1, ezsc; job = 'B')
+        gebak!(bk, 'B', 'R', ezilo, ezihi, ezsc, ezV)
+        gehrd!(bk, ezW1, ezilo, ezihi, eztau)
+        orghr!(bk, ezW1, ezilo, ezihi, eztau)
+        ormhr!(bk, 'L', 'N', ezilo, ezihi, ezAf, eztau, ezW2)
+        ormhr!(bk, 'R', 'C', ezilo, ezihi, ezAf, eztau, ezW2)
+        hseqr!(bk, 'S', 'I', ezW1, ezilo, ezihi, ezw, ezW3)
+        hseqr!(bk, 'E', 'N', ezW1, ezilo, ezihi, ezw, ezW3)
+        trevc!(bk, 'R', 'B', ezW1, ezVL, ezW2)
+        trexc!(bk, 'V', ezW1, ezW2, 5, 1)
+        trsen!(bk, 'N', 'V', tsnsel, ezW1, ezW2, tsnw)
+        trsen!(bk, 'B', 'V', tsnsel, ezW1, ezW2, tsnw)
+        trsyl!(bk, 'N', 'N', 1, ezU, ezU, ezW2)
+        trsyl!(bk, 'C', 'N', 1, ezU, ezU, ezW2)
+        geev!(bk, 'N', 'V', ezW1, ezw, ezVL, ezW2, ezsc)
+        gees!(bk, 'V', ezW1, ezw, ezW2, ezsc)
         # ── Bunch-Kaufman. uplo='L' and 'U' are separate kernels throughout (`_sytri_lower!` /
         # `_sytri_upper!`, `_sytrs_lower!` / `_sytrs_upper!`), so both are asserted for COMPLEX,
         # where the Hermitian arm is genuinely distinct. For REAL eltype `hetrf!`/`hetrs!`/`hetri!`/
         # `hesv!` ARE `sytrf!`/… (herm=false), so their real arms are pinned once, at uplo='L', to
         # hold the dispatch rather than to re-verify the same kernel a second time.
-        _strict_sytrf_probe(bk, evW1, bkfA, bkfip, 'L')
-        _strict_sytrf_probe(bk, evW1, bkfA, bkfip, 'U')
-        _strict_hetrf_probe(bk, evW1, bkfA, bkfiph, 'L')
-        _strict_sytrs_probe(bk, Bsw, Bs0, bkfLs, bkfLsp, 'L')
-        _strict_sytrs_probe(bk, Bsw, Bs0, bkfUs, bkfUsp, 'U')
-        # VECTOR right-hand side. `sytrs!` used to `reshape(B, n, 1)` a vector RHS — 48 B/call of
+        sytrf!(bk, evW1, bkfip; uplo = 'L')
+        sytrf!(bk, evW1, bkfip; uplo = 'U')
+        hetrf!(bk, evW1, bkfiph; uplo = 'L')
+        sytrs!(bk, bkfLs, bkfLsp, Bsw; uplo = 'L')
+        sytrs!(bk, bkfUs, bkfUsp, Bsw; uplo = 'U')
+        # VECTOR right-hand side: `sytrs!` must not `reshape(B, n, 1)` it — that is 48 B/call of
         # Array header, and a `Base.ReshapedArray` (the trim-hostile `_throw_dmrs` path) when the RHS
-        # was itself a view. The reshape is gone; this is the line that keeps it gone.
-        _strict_sytrs_probe(bk, bkfbw, bkfb0, bkfLs, bkfLsp, 'L')
-        _strict_hetrs_probe(bk, Bsw, Bs0, bkfLh, bkfLhp, 'L')
-        _strict_sytri_probe(bk, evW1, bkfLs, bkfLsp, 'L')
-        _strict_sytri_probe(bk, evW1, bkfUs, bkfUsp, 'U')
-        _strict_hetri_probe(bk, evW1, bkfLh, bkfLhp, 'L')
-        _strict_sysv_probe(bk, evW1, bkfA, Bsw, Bs0, bkfip, 'L')
-        _strict_sysv_probe(bk, evW1, bkfA, Bsw, Bs0, bkfip, 'U')
-        _strict_hesv_probe(bk, evW1, bkfA, Bsw, Bs0, bkfiph, 'L')
-        _strict_syconv_probe(bk, evW1, bkfLs, bkfLsp, bkfwk, 'L')
-        _strict_syconv_probe(bk, evW1, bkfUs, bkfUsp, bkfwk, 'U')
-        _strict_sytrf_probe(bk, ezW1, bkzA, bkzip, 'L')
-        _strict_sytrf_probe(bk, ezW1, bkzA, bkzip, 'U')
-        _strict_hetrf_probe(bk, ezW1, bkzA, bkziph, 'L')
-        _strict_hetrf_probe(bk, ezW1, bkzA, bkziph, 'U')
-        _strict_sytrs_probe(bk, bkzBw, bkzB0, bkzLs, bkzLsp, 'L')
-        _strict_sytrs_probe(bk, bkzBw, bkzB0, bkzUs, bkzUsp, 'U')
-        _strict_sytrs_probe(bk, bkzbw, bkzb0, bkzLs, bkzLsp, 'L')
-        _strict_hetrs_probe(bk, bkzBw, bkzB0, bkzLh, bkzLhp, 'L')
-        _strict_hetrs_probe(bk, bkzBw, bkzB0, bkzUh, bkzUhp, 'U')
-        _strict_sytri_probe(bk, ezW1, bkzLs, bkzLsp, 'L')
-        _strict_sytri_probe(bk, ezW1, bkzUs, bkzUsp, 'U')
-        _strict_hetri_probe(bk, ezW1, bkzLh, bkzLhp, 'L')
-        _strict_hetri_probe(bk, ezW1, bkzUh, bkzUhp, 'U')
-        _strict_sysv_probe(bk, ezW1, bkzA, bkzBw, bkzB0, bkzip, 'L')
-        _strict_hesv_probe(bk, ezW1, bkzA, bkzBw, bkzB0, bkziph, 'L')
-        _strict_hesv_probe(bk, ezW1, bkzA, bkzBw, bkzB0, bkziph, 'U')
-        _strict_syconv_probe(bk, ezW1, bkzLs, bkzLsp, bkzwk, 'L')
-        _strict_syconv_probe(bk, ezW1, bkzUs, bkzUsp, bkzwk, 'U')
+        # is itself a view.
+        sytrs!(bk, bkfLs, bkfLsp, bkfbw; uplo = 'L')
+        hetrs!(bk, bkfLh, bkfLhp, Bsw; uplo = 'L')
+        sytri!(bk, evW1, bkfLsp; uplo = 'L')
+        sytri!(bk, evW1, bkfUsp; uplo = 'U')
+        hetri!(bk, evW1, bkfLhp; uplo = 'L')
+        sysv!(bk, 'L', evW1, Bsw, bkfip)
+        sysv!(bk, 'U', evW1, Bsw, bkfip)
+        hesv!(bk, 'L', evW1, Bsw, bkfiph)
+        syconv!(bk, 'L', evW1, bkfLsp, bkfwk)
+        syconv!(bk, 'U', evW1, bkfUsp, bkfwk)
+        sytrf!(bk, ezW1, bkzip; uplo = 'L')
+        sytrf!(bk, ezW1, bkzip; uplo = 'U')
+        hetrf!(bk, ezW1, bkziph; uplo = 'L')
+        hetrf!(bk, ezW1, bkziph; uplo = 'U')
+        sytrs!(bk, bkzLs, bkzLsp, bkzBw; uplo = 'L')
+        sytrs!(bk, bkzUs, bkzUsp, bkzBw; uplo = 'U')
+        sytrs!(bk, bkzLs, bkzLsp, bkzbw; uplo = 'L')
+        hetrs!(bk, bkzLh, bkzLhp, bkzBw; uplo = 'L')
+        hetrs!(bk, bkzUh, bkzUhp, bkzBw; uplo = 'U')
+        sytri!(bk, ezW1, bkzLsp; uplo = 'L')
+        sytri!(bk, ezW1, bkzUsp; uplo = 'U')
+        hetri!(bk, ezW1, bkzLhp; uplo = 'L')
+        hetri!(bk, ezW1, bkzUhp; uplo = 'U')
+        sysv!(bk, 'L', ezW1, bkzBw, bkzip)
+        hesv!(bk, 'L', ezW1, bkzBw, bkziph)
+        hesv!(bk, 'U', ezW1, bkzBw, bkziph)
+        syconv!(bk, 'L', ezW1, bkzLsp, bkzwk)
+        syconv!(bk, 'U', ezW1, bkzUsp, bkzwk)
         # ── QZ / generalized eigen. hgeqz!/tgevc!/tgsen! take a GENUINE Hessenberg-triangular or
         # generalized-Schur pair (built above): handing the QZ iteration a raw pencil would run a
         # different, shorter path and "succeed" on nonsense. `ggev!` appears at both arities — the
         # contract can only declare the real one (alphar, alphai, beta), so the complex form is held
         # to the guarantee here.
-        _strict_gghrd_probe(bk, evW1, evA, evW2, evB, evW3, evW4)
-        _strict_hgeqz_probe(bk, evW1, qzA, evW2, qzB, qzal, qzbe, evW3, evW4)
-        _strict_tgevc_probe(bk, evW1, qzS, evW2, qzP, evVL, evW3, qzZ)
-        _strict_tgsen_probe(bk, qzsel, evW1, qzS, evW2, qzP, evW3, qzZ, evW4, qzZ, qzal, qzbe)
-        _strict_ggevr_probe(bk, evW1, evA, evW2, evB, evwr, evwi, qzbe, evVL, evW3)
-        _strict_gges_probe(bk, evW1, evA, evW2, evB, qzal, qzbe, evW3, evW4)
-        _strict_gghrd_probe(bk, ezW1, ezA, ezW2, ezB, ezW3, ezW4)
-        _strict_hgeqz_probe(bk, ezW1, qzzA, ezW2, qzzB, qzzal, qzzbe, ezW3, ezW4)
-        _strict_tgevc_probe(bk, ezW1, qzzS, ezW2, qzzP, ezVL, ezW3, qzzZ)
-        _strict_tgsen_probe(bk, qzsel, ezW1, qzzS, ezW2, qzzP, ezW3, qzzZ, ezW4, qzzZ, qzzal, qzzbe)
-        _strict_ggevc_probe(bk, ezW1, ezA, ezW2, ezB, qzzal, qzzbe, ezVL, ezW3)
-        _strict_gges_probe(bk, ezW1, ezA, ezW2, ezB, ezw, qzzbe, ezW3, ezW4)
+        gghrd!(bk, 'I', 'I', evW1, evW2, evW3, evW4)
+        hgeqz!(bk, 'S', 'I', 'I', evW1, evW2, qzal, qzbe, evW3, evW4)
+        tgevc!(bk, 'R', 'B', evW1, evW2, evVL, evW3)
+        tgsen!(bk, qzsel, evW1, evW2, evW3, evW4, qzal, qzbe)
+        ggev!(bk, 'N', 'V', evW1, evW2, evwr, evwi, qzbe, evVL, evW3)
+        gges!(bk, 'V', 'V', evW1, evW2, qzal, qzbe, evW3, evW4)
+        gghrd!(bk, 'I', 'I', ezW1, ezW2, ezW3, ezW4)
+        hgeqz!(bk, 'S', 'I', 'I', ezW1, ezW2, qzzal, qzzbe, ezW3, ezW4)
+        tgevc!(bk, 'R', 'B', ezW1, ezW2, ezVL, ezW3)
+        tgsen!(bk, qzsel, ezW1, ezW2, ezW3, ezW4, qzzal, qzzbe)
+        ggev!(bk, 'N', 'V', ezW1, ezW2, qzzal, qzzbe, ezVL, ezW3)
+        gges!(bk, 'V', 'V', ezW1, ezW2, ezw, qzzbe, ezW3, ezW4)
         # ── SVD front half + generalized SVD. `gebrd!`/`bdsdc!` are now asserted at their
         # workspace-free arity (the `ws`-taking forms stay internal); see contracts.jl. `bdsqr!` is
         # asserted at all three shapes it actually gets: real with U/V, real with `nothing`/`nothing`
         # (the values-only path, a Union argument and so the one that could union-split), and the
         # complex 6-argument kernel, which shares no code with either.
-        _strict_gebd2_probe(bk, svAw, svA, svd, sve, svtq, svtp)
-        _strict_gebd2_probe(bk, svzAw, svzA, svd, sve, svztq, svztp)
-        _strict_gebrd_probe(bk, svAw, svA, svd, sve, svtq, svtp)
-        _strict_gebrd_probe(bk, svzAw, svzA, svd, sve, svztq, svztp)
-        _strict_bdsdc_probe(bk, bqd, bqd0, bqe, bqe0, bdLv, bdRv)
-        _strict_bdsqr_probe(bk, bqd, bqd0, bqe, bqe0, bqU, bqV)
-        _strict_bdsqr_probe(bk, bqd, bqd0, bqe, bqe0, nothing, nothing)
-        _strict_bdsqrc_probe(bk, bqd, bqd0, bqe, bqe0, bqVt, bqUz, bqC)
-        _strict_ggsvd_probe(bk, ggAw, ggA, ggBw, ggB, ggU, ggV, ggQ, ggal, ggbe, ggR)
-        _strict_ggsvd_probe(bk, ggzAw, ggzA, ggzBw, ggzB, ggzU, ggzV, ggzQ, ggal, ggbe, ggzR)
+        gebd2!(bk, svAw, svd, sve, svtq, svtp)
+        gebd2!(bk, svzAw, svd, sve, svztq, svztp)
+        gebrd!(bk, svAw, svd, sve, svtq, svtp)
+        gebrd!(bk, svzAw, svd, sve, svztq, svztp)
+        bdsdc!(bk, bqd, bqe, bdLv, bdRv)
+        bdsqr!(bk, bqd, bqe, bqU, bqV)
+        bdsqr!(bk, bqd, bqe, nothing, nothing)
+        bdsqr!(bk, 'U', bqd, bqe, bqVt, bqUz, bqC)
+        ggsvd!(bk, 'U', 'V', 'Q', ggAw, ggBw, ggU, ggV, ggQ, ggal, ggbe, ggR)
+        ggsvd!(bk, 'U', 'V', 'Q', ggzAw, ggzBw, ggzU, ggzV, ggzQ, ggal, ggbe, ggzR)
         # ── Least squares. `gelsd!` is absent: MEASURED 100 096 B/call at ComplexF64 because its
         # complex arm goes through the complex `gesvd!`, the one factorization this file already
         # documents as not shown 0-alloc. Its Float64 arm is 0 B, so it becomes eligible the moment
         # complex gesvd! does — the same open item, not a second one.
-        _strict_gels_probe(bk, svAw, svA, lsBw, lsB0)
-        _strict_gels_probe(bk, svzAw, svzA, lszBw, lszB0)
-        _strict_gelsy_probe(bk, svAw, svA, lsBw, lsB0, lsjp, 1.0e-12)
-        _strict_gelsy_probe(bk, svzAw, svzA, lszBw, lszB0, lsjp, 1.0e-12)
-        _strict_gglse_probe(bk, ggAw, ggA, lscw, lsc0, ggBw, ggB, lsdw, lsd0, lsx)
-        _strict_gglse_probe(bk, ggzAw, ggzA, lszcw, lszc0, ggzBw, ggzB, lszdw, lszd0, lszx)
+        gels!(bk, 'N', svAw, lsBw)
+        gels!(bk, 'N', svzAw, lszBw)
+        gelsy!(bk, svAw, lsBw, lsjp, 1.0e-12)
+        gelsy!(bk, svzAw, lszBw, lsjp, 1.0e-12)
+        gglse!(bk, ggAw, lscw, ggBw, lsdw, lsx)
+        gglse!(bk, ggzAw, lszcw, ggzBw, lszdw, lszx)
         # ── Symmetric-tridiagonal eigen. stein! is fed stebz!'s OWN w/iblock/isplit, trimmed to the
         # m eigenvalues and nsplit blocks found — views, therefore, which is also the SubArray shape
         # its five read-per-column inputs actually arrive in.
-        _strict_stebz_probe(bk, std, ste, stw, stib, stisp)
-        _strict_stein_probe(bk, std, ste, stwv, stibv, stispv, stZ)
+        stebz!(bk, 'A', 'B', 0.0, 0.0, 1, 1, -1.0, std, ste, stw, stib, stisp)
+        stein!(bk, std, ste, stwv, stibv, stispv, stZ)
         # ── SubArray arguments for the new families, same rationale as the L3 SubArray block above:
         # every assertion so far in this section passes a `Matrix`/`Vector`, and that is precisely the
         # gap that let `_trsm_right!`'s union-typed slot box 64 B/call while every Matrix-only
         # assertion passed. Parents are LARGER than the views, so `lda != nrows`.
-        _strict_gebal_probe(bk, vA, evA, vsc)
-        _strict_gehrd_probe(bk, vA, evA, 1, ms, vtau)
-        _strict_orghr_probe(bk, vA, vAf, 1, ms, vtauf)
-        _strict_ormhr_probe(bk, vC, evC, 'L', 'N', 1, ms, vAf, vtauf)
-        _strict_hseqr_probe(bk, vA, vH, 'S', 'I', 1, ms, vwc, vB)
-        _strict_trevc_probe(bk, vA, evT, evVL, vB, evQI)
-        _strict_trexc_probe(bk, vA, evT, vB, evQI, 5, 1)
-        _strict_trsyl_probe(bk, vC, evC, 'N', 'N', evU, evU)
-        _strict_geevr_probe(bk, vA, evA, vwr, vwi, evVL, vB, vsc)
-        _strict_gees_probe(bk, vA, evA, vwc, vB, vsc)
-        _strict_gghrd_probe(bk, vA, evA, vB, evB, vC, vD)
-        _strict_sytrf_probe(bk, vA, bkfA, vip, 'L')
-        _strict_sytrs_probe(bk, vBv, vB0, vbkf, vip, 'L')
-        _strict_sytri_probe(bk, vA, vbkf, vip, 'L')
-        _strict_syconv_probe(bk, vA, vbkf, vip, vwk, 'L')
-        _strict_gels_probe(bk, vlsA, svA, vlsB, vlsB0)
-        _strict_gelsy_probe(bk, vlsA, svA, vlsB, vlsB0, vlsjp, 1.0e-12)
-        _strict_stein_probe(bk, std, ste, stwv, stibv, stispv, vstZ)
+        gebal!(bk, vA, vsc; job = 'B')
+        gehrd!(bk, vA, 1, ms, vtau)
+        orghr!(bk, vA, 1, ms, vtauf)
+        ormhr!(bk, 'L', 'N', 1, ms, vAf, vtauf, vC)
+        hseqr!(bk, 'S', 'I', vA, 1, ms, vwc, vB)
+        trevc!(bk, 'R', 'B', vA, evVL, vB)
+        trexc!(bk, 'V', vA, vB, 5, 1)
+        trsyl!(bk, 'N', 'N', 1, evU, evU, vC)
+        geev!(bk, 'N', 'V', vA, vwr, vwi, evVL, vB, vsc)
+        gees!(bk, 'V', vA, vwc, vB, vsc)
+        gghrd!(bk, 'I', 'I', vA, vB, vC, vD)
+        sytrf!(bk, vA, vip; uplo = 'L')
+        sytrs!(bk, vbkf, vip, vBv; uplo = 'L')
+        sytri!(bk, vA, vip; uplo = 'L')
+        syconv!(bk, 'L', vA, vip, vwk)
+        gels!(bk, 'N', vlsA, vlsB)
+        gelsy!(bk, vlsA, vlsB, vlsjp, 1.0e-12)
+        stein!(bk, std, ste, stwv, stibv, stispv, vstZ)
     end
 end
 
