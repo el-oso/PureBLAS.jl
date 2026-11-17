@@ -249,8 +249,9 @@ const _BARRIER_FUNCTIONS = (_m3ws, _gpackws, _strws, _opt)
 # removes) its own barriers around each proof it runs in the test process.
 foreach(StrictMode.register_alloc_barrier!, _BARRIER_FUNCTIONS)
 
-# A heuristic check below reports by logging a `StrictViolation` warning instead of throwing. From here
-# to the end of this file the global logger is wrapped so each such message is also pushed onto
+# A heuristic check below reports by logging a warning instead of throwing: a per-call check logs a
+# message starting `StrictViolation`, a module policy one starting `StrictMode:`. From here to the end
+# of this file the global logger is wrapped so each such message is also pushed onto
 # `_LOADTIME_WARNINGS`, which is saved in the package image; test/loadtime_warnings_tests.jl compares it
 # against a baseline. Messages still reach the original logger unchanged.
 const _LOADTIME_WARNINGS = String[]
@@ -261,7 +262,8 @@ Base.CoreLogging.min_enabled_level(r::_WarnRecorder) = Base.CoreLogging.min_enab
 Base.CoreLogging.shouldlog(r::_WarnRecorder, args...) = Base.CoreLogging.shouldlog(r.inner, args...)
 Base.CoreLogging.catch_exceptions(r::_WarnRecorder) = Base.CoreLogging.catch_exceptions(r.inner)
 function Base.CoreLogging.handle_message(r::_WarnRecorder, level, message, args...; kwargs...)
-    if level == Base.CoreLogging.Warn && message isa AbstractString && startswith(message, "StrictViolation")
+    if level == Base.CoreLogging.Warn && message isa AbstractString &&
+            (startswith(message, "StrictViolation") || startswith(message, "StrictMode:"))
         push!(_LOADTIME_WARNINGS, message)
     end
     return Base.CoreLogging.handle_message(r.inner, level, message, args...; kwargs...)
@@ -854,16 +856,17 @@ if StrictMode.checks_enabled()
     end
 end
 
-# Register pressure and vectorization of the gemm microkernels. A tile sized past the register file
+# Register pressure and vectorization of the gemm microkernels and the trsm side-R tile. A tile sized past the register file
 # spills vectors to the stack on every k step, which neither the type-stability nor the allocation
 # checks see; these scan the compiled native code. Each call also executes, so every operand is a live
 # buffer. The argtypes are the FULL method signature, trailing `Val{B0}` included: the 9-argument
 # `_microkernel_masked!` form is a default-argument forwarder whose native code is a call and a return,
 # which a scan passes without reaching the kernel. The α-scaled `_microkernel!` shares the tile with a
 # different epilogue and has its own `B0 = false` and `B0 = true` instances.
-let kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
-        Ap = ones(mr * kc), Bp = ones(nr * kc), Ck = ones(mr, nr)
-    GC.@preserve Ap Bp Ck begin
+let m = 64, kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
+        Ap = ones(mr * kc), Bp = ones(nr * kc), Ck = ones(mr, nr),
+        Lt = ones(m, m), Bt = ones(m, m)
+    GC.@preserve Ap Bp Ck Lt Bt begin
         ap = pointer(Ap); bp = pointer(Bp); cp = pointer(Ck)
         @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
         @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
@@ -873,18 +876,15 @@ let kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
         @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(true))
         @assert_no_spill _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(false))
         @assert_vectorized _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(false))
+        @assert_no_spill _trsm_tile_R_f64!(false, false, false, pointer(Lt), m, pointer(Bt), m, m, m)
     end
 end
 
-# Module-level policies. Each checks, here at load, every method above whose own signature is concrete
-# and whose name it selects; a policy cannot reach a parametric method (its signature names no concrete
-# types). `:no_spill` gates; `:trim_compatible` is StrictMode's static scan and reports.
-#   The trsm side-R tile (`_trsm_tile_R_f64!`, concrete) must not spill: same register-pressure check as
-# the microkernels above.
-@strict_policy :no_spill only = [:_trsm_tile_R_f64!]
-#   The C-ABI entry points (`*_64_`, the roots `juliac --trim` builds from): concrete inferred return
-# type, and no trim-hostile construct the static scan can see. test/trim_tests.jl runs juliac's
-# verifier over the same roots.
+# Module policy: checks, here at load, every method above whose own signature is concrete and whose
+# name it selects — a policy cannot reach a parametric method, whose signature names no concrete types.
+# It selects the C-ABI entry points (`*_64_`, the roots `juliac --trim` builds from): concrete inferred
+# return type (gates), and no trim-hostile construct StrictMode's static scan can see (reports).
+# test/trim_tests.jl runs juliac's verifier over the same roots. A module holds one policy.
 @strict_policy (:typestable, :trim_compatible) only = r"_64_$"
 # Guarantees not checked at load, and why:
 #   `:noalloc` on the C-ABI entries: the value-free scan reports about a third of them as allocating

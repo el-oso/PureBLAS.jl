@@ -15,9 +15,8 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 StrictMode = "0e98b4f4-d0e6-42ac-af0a-707c24852f32"
 # StrictMode 0.4 split the PROVING half out into this package: AllocCheck, JET and TrimCheck are
-# ITS dependencies now, not StrictMode's. The `@assert_*` macros still exist and still compile, but
-# in 0.4 they only REPORT — the `@test_*` forms are what gate the build. That split is what makes
-# 0.4 breaking, and why this dep must exist even though no `using StrictModeTest` existed before.
+# ITS dependencies now, not StrictMode's. StrictMode's own checks use the value-free engine; the
+# `@test_*` forms and `test_signatures` are the proofs, and they are what gate the suite.
 # AllocCheck and JET were dropped from [deps] with it: in 0.3 they were StrictMode WEAK deps that had
 # to be `using`-ed to activate the analysis extension, and in 0.4 they are StrictModeTest's ordinary
 # deps, loaded with it. Nothing here calls either package's own API. TrimCheck stays because

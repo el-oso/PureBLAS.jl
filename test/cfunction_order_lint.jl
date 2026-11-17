@@ -8,7 +8,7 @@
 #
 #   * The static trampolines live behind `@static if ... elseif _SME_STATIC`, and `_SME_STATIC` is true
 #     only when the CPU target names `+sme` — which only the juliac build passes. In a normal session
-#     the branch is never compiled, so there is no code for StrictMode's `@assert_trim_safe` or
+#     the branch is never compiled, so there is no code for StrictMode's `:trim_compatible` scan or
 #     `explain_trim` to inspect. They answer "is this function's compiled output trim-safe"; they cannot
 #     answer "does a differently-configured build of this module load at all".
 #   * The authoritative check, `test/juliac_build_test.jl`, is gated on `PUREBLAS_JULIAC_BUILD=1` and

@@ -1803,7 +1803,7 @@ const _CGEMVN_NC_BIG = @load_preference("cgemvn_nc_big", 3 * _vwidth(Float64) ÷
 end
 
 # ⚠ THE MEASURED KNOB LIVES HERE AND NOWHERE UPSTREAM OF A @noalloc CONTRACT. `Base.OncePerProcess`'s
-# first-call init allocates (`jl_set_precompile_field_replace`), and `@assert_noalloc` is an ALL-PATHS
+# first-call init allocates (`jl_set_precompile_field_replace`), and `@test_noalloc` is an ALL-PATHS
 # static proof — it does not care that a branch is dynamically unreachable. `trmv!`/`trsv!` carry that
 # contract and reach the complex gemvN kernel through `_tri_scat_cmplx!`, so routing them through this
 # function put 72 allocation sites into their proof and failed StrictMode. Same class as the axpy

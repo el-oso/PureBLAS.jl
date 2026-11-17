@@ -6767,7 +6767,7 @@ end
 # container combination — the same reason the unpacked route normalizes (see `_pm`/`_root` above, and
 # the specialization census that motivated it). It is not only compile time: leaving this generic made
 # the inference graph reachable from a dual `trmm!` large enough that two calls in it fell back to
-# runtime dispatch, and `test/dual_tests.jl`'s `@assert_typestable` dogfood caught it.
+# runtime dispatch, and `test/dual_tests.jl`'s `@test_typestable` dogfood caught it.
 @noinline function _gemm_threaded!(
         C::PtrMatrix{T}, A::PtrMatrix{T}, B::PtrMatrix{T},
         alpha::T, beta::T, tA::Bool, tB::Bool, cA::Bool, cB::Bool, nw::Int,
@@ -6807,7 +6807,7 @@ end
     # `_gemm_core!` returns different things on different routes, so its value is discarded and every path
     # here returns a `T` instead — `zero(T)` where the result is in `C`, the fold for a reduction. What
     # matters is that the type is the SAME on both paths: a union return propagates into every caller's
-    # inference (it failed trmm!'s `@assert_typestable` dogfood exactly that way).
+    # inference (it failed trmm!'s type-stability dogfood exactly that way).
     if !won
         # WITNESS THAT THE CLAIM WAS ACTUALLY LOST. A concurrency test that only asserts "both answers
         # agree" passes when the scheduler happens to serialise its tasks, every caller wins, and this

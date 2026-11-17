@@ -295,11 +295,10 @@ end
             # the registration. `alpha`'s type selects the kernel arm, so both arms are asserted rather
             # than assumed to share one.
             #
-            # NOT `test_registered()`, THOUGH IT IS THE DRIVER BUILT FOR THIS. It re-proves whatever `src/`
-            # declared, and it can see nothing here: the mark-once registry is populated at declaration
-            # time and that cross-package `Dict` insert does not survive a cached pkgimage load, so this
-            # test process reads ZERO registered signatures however many declarations `src/` carries.
-            # `@test_noalloc` and `test_signatures` enumerate directly and are unaffected.
+            # NOT `test_registered()`: it re-proves the signatures `src/` declared with `@strict_function`
+            # or `register_strict!`, and PureBLAS's `src/` declares through `@verify_strict` and
+            # `@strict_policy`, which register none. `@test_noalloc` and `test_signatures` enumerate
+            # directly.
             @test_noalloc P._ctri_unpacked!(true, true, 1.0, Awz, Cwz, 40)
             @test_noalloc P._ctri_unpacked!(false, false, 1.2 + 0.3im, Awz, Cwz, 40)
             @test_noalloc P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, Cwz, 40)
@@ -514,14 +513,13 @@ end
     end
 end
 
-# Eigen family — the contract members that were DECLARED but never proved anywhere.
+# Eigen family — the contract members, proved.
 #
 # `gebal!`, `gehrd!`, `orghr!`, `ormhr!`, `hseqr!` and `geev!` are all @strict_contract members
-# (src/contracts.jl:368-380) and src/verify.jl carries purpose-built probes for every one of them
-# (`_strict_gehrd_probe` &c, ~20 call sites). None of it has ever run. Those call sites live inside the
-# `if StrictMode.proofs_loaded()` block, and a package cannot have the proving tier loaded during its OWN
-# precompile — that is the one moment src/verify.jl executes. So the tiers are: src/ REPORTS (the
-# value-free IR scan, all StrictMode has available to it), and test/ PROVES.
+# (src/contracts.jl:368-380) and src/verify.jl's `@verify_strict` block lists purpose-built probes for
+# every one of them (`_strict_gehrd_probe` &c, ~20 call sites). That block runs at PureBLAS's own
+# precompile, where the proving tier cannot load, so it checks with the value-free engine: inference
+# for stability (gates), the IR scan for allocation (reports). test/ PROVES.
 #
 # `test_signatures` (StrictModeTest 0.4) is the right tool rather than a per-call macro, for two reasons
 # beyond not having to build valid eigen inputs. It takes SIGNATURES, so `Char` is a TYPE here: one entry
@@ -1184,4 +1182,85 @@ end
     bad = unannotated_specs(PureBLAS.SIMDBackend)
     @test isempty(bad)
     isempty(bad) || foreach(b -> @info(b), bad)
+end
+
+# FAILING CONTROLS. A declaration that cannot fail checks nothing, so every mechanism a guarantee is
+# declared through — in src/verify.jl and in this suite — is fed a known-bad target here, and the item
+# asserts it fails. Each target is a toy whose defect is built in: a `Union` return, a `copy`, a
+# dynamic `invokelatest`, a loop of accumulators past the register file, a strict-order reduction, an
+# `IdDict` lookup.
+@testitem "StrictMode controls: every declaration fails on a known-bad target" tags = [:checks] setup = [KernelChecks] begin
+    using StrictModeTest, StrictMode, StrictMode.TypeContracts, TrimCheck, Test
+    using .KernelChecks: toy_spill_body, NVREG
+    SV = StrictMode.StrictViolation
+    abstract type CtlIface end
+    function ctl_op end
+    @strict_contract CtlIface begin
+        ctl_op(::Self, x::Vector{Float64})::Vector{Float64}
+    end
+    struct CtlImpl <: CtlIface end
+    ctl_op(::CtlImpl, x::Vector{Float64})::Vector{Float64} = x
+    ctl_unstable(x::Vector{Float64}) = x[1] > 0 ? 1 : "negative"
+    ctl_alloc(x::Vector{Float64}) = copy(x)
+    ctl_dyn(x::Int) = Base.invokelatest(identity, x)
+    function ctl_sum(p::Ptr{Float64}, n::Int)
+        s = 0.0
+        for i in 1:n
+            s += unsafe_load(p, i)
+        end
+        return s
+    end
+    const CTL_SCRATCH = IdDict{DataType, Vector{Float64}}(Float64 => zeros(2))
+    ctl_lookup(::Type{T}) where {T} = CTL_SCRATCH[T]
+    t = CtlImpl(); x = [1.0, 2.0]
+
+    # `@verify_strict` (src/verify.jl): stability gates, allocation reports, a clean call passes.
+    @test_throws SV @verify_strict CtlImpl begin
+        ctl_unstable(x)
+    end
+    @test_logs (:warn, r"StrictViolation") match_mode = :any @verify_strict CtlImpl begin
+        ctl_alloc(x)
+    end
+    @verify_strict CtlImpl begin
+        ctl_op(t, x)
+    end
+
+    # `@strict_policy` (src/verify.jl): `:typestable` and `:no_spill` gate at the module's load,
+    # `:trim_compatible` reports. Each toy module holds one concrete method the policy selects.
+    @test_throws SV @eval module CtlPolicyStable
+        using StrictMode
+        ctlp_unstable(x::Int) = x > 0 ? 1 : "negative"
+        @strict_policy :typestable only = r"^ctlp_"
+    end
+    @test_throws SV @eval module CtlPolicySpill
+        using StrictMode
+        ctlp_spill!(p::Ptr{Float64}, n::Int) = $(toy_spill_body(3 * NVREG))
+        @strict_policy :no_spill only = r"^ctlp_"
+    end
+    @test_throws SV @eval module CtlPolicyVectorized
+        using StrictMode
+        function ctlp_sum(p::Ptr{Float64}, n::Int)
+            s = 0.0
+            for i in 1:n
+                s += unsafe_load(p, i)
+            end
+            return s
+        end
+        @strict_policy :vectorized only = r"^ctlp_"
+    end
+    @test_logs (:warn, r"trim_compatible") match_mode = :any @eval module CtlPolicyTrim
+        using StrictMode
+        ctlp_dyn(x::Int) = Base.invokelatest(identity, x)
+        @strict_policy :trim_compatible only = r"^ctlp_"
+    end
+
+    # The proving forms this suite uses.
+    @test_throws SV @test_typestable ctl_unstable(x)
+    @test_throws SV @test_noalloc ctl_alloc(x)
+    @test_throws SV @test_trim_compatible ctl_dyn(1)
+    @test_throws SV test_signatures([(ctl_unstable, (Vector{Float64},))]; guarantees = (:typestable,))
+    @test_throws SV test_signatures([(ctl_alloc, (Vector{Float64},))]; guarantees = (:noalloc,))
+    @test_throws SV test_signatures([(ctl_sum, (Ptr{Float64}, Int))]; guarantees = (:vectorized,))
+    @test_throws SV test_signatures([(ctl_lookup, (Type{Float64},))]; guarantees = (:owned,))
+    # `:no_spill` and `:no_scalar_loops` under `test_signatures`: test/strict_kernel_tests.jl.
 end

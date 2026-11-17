@@ -196,8 +196,9 @@ const FMA_FREE = Set(
 
 # --- positive controls ----------------------------------------------------------------------------
 # N vector accumulators that all stay live across the loop: more than the register file holds, so the
-# allocator must spill them inside the loop.
-@generated function toy_spill!(p::Ptr{Float64}, n::Int, ::Val{N}) where {N}
+# allocator must spill them inside the loop. The body is also spliced into a concrete method by the
+# `@strict_policy :no_spill` control in test/strictmode_tests.jl.
+function toy_spill_body(N)
     V = P.Vec{W, Float64}
     accs = [Symbol(:a, i) for i in 1:N]
     init = [:($(a) = zero($V)) for a in accs]
@@ -214,6 +215,8 @@ const FMA_FREE = Set(
         return nothing
     end
 end
+# Defined after its generator: a `@generated` body runs in the world where the method was defined.
+@generated toy_spill!(p::Ptr{Float64}, n::Int, ::Val{N}) where {N} = toy_spill_body(N)
 
 # A loop-carried recurrence: no vector form exists, so this is a scalar FP loop and nothing vectorizes.
 function toy_recurrence!(p::Ptr{Float64}, n::Int, a::Float64)

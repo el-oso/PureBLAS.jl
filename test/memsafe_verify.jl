@@ -1,10 +1,10 @@
-# Guard-page memory-safety regression check for the DIRECT-READ gemm microkernels — StrictMode 0.3.9's
-# @assert_memsafe / memsafe_report (issue #15), a PROT_NONE electric-fence harness built for exactly this
+# Guard-page memory-safety regression check for the DIRECT-READ gemm microkernels — StrictMode's
+# `memsafe_report` (issue #15), a PROT_NONE electric-fence harness built for exactly this
 # bug class. Run STANDALONE under the package's own project (NOT the ReTestItems suite):
 #
 #     julia --project=. test/memsafe_verify.jl
 #
-# It is kept OUT of `Pkg.test()` on purpose: @assert_memsafe's `isolate=true` spawns a fresh julia subprocess
+# It is kept OUT of `Pkg.test()` on purpose: `memsafe_report`'s `isolate=true` spawns a fresh julia subprocess
 # with `--project=$(Base.active_project())` that must `using Serialization` (StrictMode's arg-marshaling dep) —
 # resolvable here (a direct/transitive dep of THIS project) but NOT under Pkg.test's merged temp env, where
 # Serialization is only transitive. Running under `--project=.` sidesteps that (and keeps the ~subprocess cost
