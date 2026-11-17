@@ -1248,6 +1248,34 @@ end
         end
         @strict_policy :vectorized only = r"^ctlp_"
     end
+    # `@strict_function guarantees = … signatures = … name` (src/verify.jl, on the `@generated` gemm
+    # microkernels): `:no_spill` and `:vectorized` gate at the module's load, on a `@generated` method.
+    @test_throws SV @eval module CtlFnSpill
+        using StrictMode
+        @generated ctlg_spill!(p::Ptr{Float64}, n::Int, ::Val{N}) where {N} = $(toy_spill_body)(N)
+        @strict_function guarantees = (:no_spill,) signatures = [(Ptr{Float64}, Int, Val{$(3 * NVREG)})] ctlg_spill!
+    end
+    @test_throws SV @eval module CtlFnVectorized
+        using StrictMode
+        @generated function ctlg_sum(p::Ptr{Float64}, n::Int, ::Val{U}) where {U}
+            return quote
+                s = 0.0
+                for i in 1:n
+                    s += unsafe_load(p, i)
+                end
+                return s
+            end
+        end
+        @strict_function guarantees = (:vectorized,) signatures = [(Ptr{Float64}, Int, Val{1})] ctlg_sum
+    end
+    # A second, scoped policy in one module (src/verify.jl holds two) checks its own matches.
+    @test_throws SV @eval module CtlPolicySecond
+        using StrictMode
+        ctlp_clean(x::Int) = x + 1
+        ctlq_spill!(p::Ptr{Float64}, n::Int) = $(toy_spill_body(3 * NVREG))
+        @strict_policy :typestable only = r"^ctlp_"
+        @strict_policy :no_spill only = [:ctlq_spill!]
+    end
     @test_logs (:warn, r"trim_compatible") match_mode = :any @eval module CtlPolicyTrim
         using StrictMode
         ctlp_dyn(x::Int) = Base.invokelatest(identity, x)

@@ -856,36 +856,33 @@ if StrictMode.checks_enabled()
     end
 end
 
-# Register pressure and vectorization of the gemm microkernels and the trsm side-R tile. A tile sized
+# Register pressure and vectorization of the gemm microkernels. A tile sized
 # past the register file spills vectors to the stack on every k step, which neither the type-stability
-# nor the allocation checks see; these scan the compiled native code. Each call also executes, so
-# every operand is a live buffer. The argtypes are the FULL method signature, trailing `Val{B0}`
-# included: the 9-argument `_microkernel_masked!` form is a default-argument forwarder whose native
-# code is a call and a return, which a scan passes without reaching the kernel. The α-scaled `_microkernel!` shares the tile with a different epilogue and
-# has its own `B0 = false` and `B0 = true` instances.
-let m = 64, kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
-        Ap = ones(mr * kc), Bp = ones(nr * kc), Ck = ones(mr, nr),
-        Lt = ones(m, m), Bt = ones(m, m)
-    GC.@preserve Ap Bp Ck Lt Bt begin
-        ap = pointer(Ap); bp = pointer(Bp); cp = pointer(Ck)
-        @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
-        @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
-        @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(false))
-        @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(false))
-        @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(true))
-        @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(true))
-        @assert_no_spill _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(false))
-        @assert_vectorized _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(false))
-        @assert_no_spill _trsm_tile_R_f64!(false, false, false, pointer(Lt), m, pointer(Bt), m, m, m)
-    end
-end
+# nor the allocation checks see; these scan the compiled native code of each listed signature, and
+# both `:vectorized` and `:no_spill` gate. The signatures are the FULL method signatures, trailing
+# `Val{B0}` included: the 9-argument `_microkernel_masked!` form is a default-argument forwarder whose
+# native code is a call and a return, which a scan passes without reaching the kernel. The α-scaled
+# `_microkernel!` shares the tile with a different epilogue and has its own `B0 = false` and
+# `B0 = true` instances.
+@strict_function guarantees = (:vectorized, :no_spill) signatures = [
+    (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Val{_MR}, Val{_NR}, Val{false}),
+    (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Float64, Val{_MR}, Val{_NR}, Val{false}),
+    (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Float64, Val{_MR}, Val{_NR}, Val{true}),
+] _microkernel!
+@strict_function guarantees = (:vectorized, :no_spill) signatures = [
+    (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Int, Int, Val{_MR}, Val{_NR}, Val{false}),
+] _microkernel_masked!
 
 # Module policy: checks, here at load, every method above whose own signature is concrete and whose
 # name it selects — a policy cannot reach a parametric method, whose signature names no concrete types.
 # It selects the C-ABI entry points (`*_64_`, the roots `juliac --trim` builds from): concrete inferred
 # return type (gates), and no trim-hostile construct StrictMode's static scan can see (reports).
-# test/trim_tests.jl runs juliac's verifier over the same roots. A module holds one policy.
+# test/trim_tests.jl runs juliac's verifier over the same roots. A module holds one policy, set by the
+# first `@strict_policy`; a later SCOPED one checks its own guarantees on its matches.
 @strict_policy (:typestable, :trim_compatible) only = r"_64_$"
+# The trsm side-R tile is concrete, so a scoped policy reaches it: the same register-pressure check as
+# the microkernels above (`:no_spill` gates).
+@strict_policy :no_spill only = [:_trsm_tile_R_f64!]
 # Guarantees not checked at load, and why:
 #   `:noalloc` on the C-ABI entries: the value-free scan reports about a third of them as allocating
 #                       (151 of 492 on Zen4), each a warning at every precompile. The backend calls
