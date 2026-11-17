@@ -668,8 +668,6 @@ end
 
 @noinline _gm(b::Matrix{T}, r::Int, c::Int) where {T} = (size(b, 1) < r || size(b, 2) < c) ? Matrix{T}(undef, r, c) : b
 @noinline _gv(b::Vector{T}, n::Int) where {T} = length(b) < n ? Vector{T}(undef, n) : b
-@strict_exempt _gm guarantees = (:noalloc,) reason = "replaces a workspace matrix that is too small; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
-@strict_exempt _gv guarantees = (:noalloc,) reason = "replaces a workspace vector that is too small; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # Grow ONLY the divide-and-conquer staging buffers `bdsdc!` reads (`_svd_grow!` also grows them, but it
 # sizes the whole m≥n vector path — far more than the bidiagonal-SVD entry needs on its own).
@@ -698,9 +696,6 @@ end
     return ws
 end
 
-@strict_exempt _svd_grow! guarantees = (:noalloc,) reason = "grows the SVD workspace to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
-@strict_exempt _svd_grow_bidiag! guarantees = (:noalloc,) reason = "grows the SVD bidiagonalization panels to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
-@strict_exempt _svd_grow_dc! guarantees = (:noalloc,) reason = "grows the SVD divide-and-conquer staging to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # Workspace-free arity — THE contracted entry point. The 6-arg forms below take a `SVDWorkspace`
 # positionally, which is a PureBLAS-internal scratch type: contracting that arity would pin the backend

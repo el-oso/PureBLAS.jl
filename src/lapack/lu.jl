@@ -375,7 +375,6 @@ end
 # already in the millisecond range.
 const _LU_PAD = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matrix{Float64}(undef, 0, 0)))
 @noinline _lu_pad_grow!(pad::Base.RefValue{Matrix{Float64}}, R::Int, n::Int) = (pad[] = Matrix{Float64}(undef, R, n))
-@strict_exempt _lu_pad_grow! guarantees = (:noalloc,) reason = "replaces the LU pad scratch at a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 @inline _lu_needs_pad(A, m) = m >= 512 && stride(A, 2) % 512 == 0
 
 # Blocked right-looking LU (LAPACK dgetrf's algorithm — the reference, faster here than a recursive LU
@@ -798,7 +797,6 @@ end
 const _CLU_PAD64 = Base.OncePerTask{Base.RefValue{Matrix{ComplexF64}}}(() -> Ref(Matrix{ComplexF64}(undef, 0, 0)))
 const _CLU_PAD32 = Base.OncePerTask{Base.RefValue{Matrix{ComplexF32}}}(() -> Ref(Matrix{ComplexF32}(undef, 0, 0)))
 @noinline _clu_pad_grow!(pad::Base.RefValue{Matrix{T}}, R::Int, n::Int) where {T} = (pad[] = Matrix{T}(undef, R, n))
-@strict_exempt _clu_pad_grow! guarantees = (:noalloc,) reason = "replaces the complex LU pad scratch at a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 @inline _clu_pad(::Type{ComplexF64}) = _opt(_CLU_PAD64)
 @inline _clu_pad(::Type{ComplexF32}) = _opt(_CLU_PAD32)
 @inline _clu_needs_pad(A, m, ::Type{T}) where {T} =
