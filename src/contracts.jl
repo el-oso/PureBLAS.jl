@@ -124,10 +124,10 @@ function trsm! end   # B := α·op(A)⁻¹·B / α·B·op(A)⁻¹,  A triangular
 # `@verify_strict SIMDBackend` (verify.jl). It ALSO carries a TRIM-COMPATIBILITY guarantee — the C-ABI
 # entry points that export these ops (cabi.jl: s/d/c/z `gemm_64_` …) must compile under juliac --trim for
 # the Mode-1 LBT `.so`, a hard requirement. The trim-critical path is the complex unpacked gemm kernel
-# (`_gemm_cmplx_unpacked!`): it is asserted `@assert_trim_compatible` in the strict-verify pass — heuristic
-# in :fast (dev, verify.jl) and juliac's authoritative verify_typeinf_trim in :full (tests, the strictmode
-# dogfood, TrimCheck loaded). trim_tests.jl keeps the exhaustive ccallable-rooted belt (strict isn't perfect
-# yet; StrictMode 0.3.9 logs a one-time caveat on the fast/full heuristic-vs-authoritative trim gap, issue #13).
+# (`_gemm_cmplx_unpacked!`): test/strictmode_tests.jl proves it with `@test_trim_compatible` (juliac's
+# verify_typeinf_trim, TrimCheck loaded), and verify.jl's `@strict_policy` scans every C-ABI entry point
+# for `:trim_compatible` at precompile (StrictMode's static scan, which reports). trim_tests.jl keeps the
+# exhaustive ccallable-rooted belt.
 # The rank-k/hemm family's divide-and-conquer drivers were
 # refactored to carry integer offsets into the original arrays (not fresh sub-block SubArrays, which
 # are non-isbits and heap-box when passed to the non-inlined recursive call — the sub-block views are

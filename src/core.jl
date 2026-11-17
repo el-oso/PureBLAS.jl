@@ -277,7 +277,7 @@ end
 #
 # WHY THE REAL BUILD WAS ALWAYS FINE: `juliac --trim=safe` includes `juliac-trim-base.jl` /
 # `juliac-trim-stdlib.jl`, which raise `print_to_string`'s `max_args` so no despecialization happens.
-# StrictMode's `@assert_trim_compatible` verifies STOCK Base and therefore a DIFFERENT program — the
+# StrictModeTest's `@test_trim_compatible` verifies STOCK Base and therefore a DIFFERENT program — the
 # `.so` builds clean on 1.13 (verified: exit 0, 48.5 MB) while the assertion fails. That is a StrictMode
 # bug, tracked separately; `lazy"…"` makes these paths clean under BOTH configurations so PureBLAS does
 # not depend on that fix landing. `@noinline` is kept purely for cold-path hygiene (Base does the same),
