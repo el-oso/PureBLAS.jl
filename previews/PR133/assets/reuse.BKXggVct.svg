@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 500" font-family="sans-serif">
+<title>Block view of y = A·x and C = A·B</title>
+<defs><marker id="ah" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#222"/></marker><marker id="ahd" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#7f6000"/></marker></defs>
+<rect width="640" height="500" rx="8" fill="#fafafa" stroke="#cfcfcf"/>
+<text x="20" y="30" text-anchor="start" font-size="15" fill="#222" font-weight="bold">y = A · x   (gemv)</text>
+<rect x="20" y="222" width="48" height="48" fill="#8ab4f8" stroke="#000" stroke-width="3"/>
+<text x="44.0" y="244" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A11</text>
+<text x="44.0" y="260" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 1×</text>
+<rect x="68" y="222" width="48" height="48" fill="#f6b26b" stroke="#000" stroke-width="3"/>
+<text x="92.0" y="244" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A12</text>
+<text x="92.0" y="260" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 1×</text>
+<rect x="116" y="222" width="48" height="48" fill="#93c47d" stroke="#000" stroke-width="3"/>
+<text x="140.0" y="244" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A13</text>
+<text x="140.0" y="260" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 1×</text>
+<rect x="20" y="270" width="48" height="48" fill="#8ab4f8" stroke="#555" stroke-width="1.5"/>
+<text x="44.0" y="292" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A21</text>
+<text x="44.0" y="308" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 1×</text>
+<rect x="68" y="270" width="48" height="48" fill="#f6b26b" stroke="#555" stroke-width="1.5"/>
+<text x="92.0" y="292" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A22</text>
+<text x="92.0" y="308" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 1×</text>
+<rect x="116" y="270" width="48" height="48" fill="#93c47d" stroke="#555" stroke-width="1.5"/>
+<text x="140.0" y="292" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A23</text>
+<text x="140.0" y="308" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 1×</text>
+<rect x="20" y="318" width="48" height="48" fill="#8ab4f8" stroke="#555" stroke-width="1.5"/>
+<text x="44.0" y="340" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A31</text>
+<text x="44.0" y="356" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 1×</text>
+<rect x="68" y="318" width="48" height="48" fill="#f6b26b" stroke="#555" stroke-width="1.5"/>
+<text x="92.0" y="340" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A32</text>
+<text x="92.0" y="356" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 1×</text>
+<rect x="116" y="318" width="48" height="48" fill="#93c47d" stroke="#555" stroke-width="1.5"/>
+<text x="140.0" y="340" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A33</text>
+<text x="140.0" y="356" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 1×</text>
+<rect x="192" y="50" width="48" height="48" fill="#8ab4f8" stroke="#000" stroke-width="3"/>
+<text x="216.0" y="78" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">x1</text>
+<rect x="192" y="98" width="48" height="48" fill="#f6b26b" stroke="#000" stroke-width="3"/>
+<text x="216.0" y="126" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">x2</text>
+<rect x="192" y="146" width="48" height="48" fill="#93c47d" stroke="#000" stroke-width="3"/>
+<text x="216.0" y="174" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">x3</text>
+<rect x="192" y="222" width="48" height="48" fill="#ffe599" stroke="#000" stroke-width="3"/>
+<text x="216.0" y="250" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">y1</text>
+<rect x="192" y="270" width="48" height="48" fill="#eeeeee" stroke="#555" stroke-width="1.5"/>
+<text x="216.0" y="298" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">y2</text>
+<rect x="192" y="318" width="48" height="48" fill="#eeeeee" stroke="#555" stroke-width="1.5"/>
+<text x="216.0" y="346" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">y3</text>
+<line x1="166" y1="246.0" x2="189" y2="246.0" stroke="#222" stroke-width="3" stroke-dasharray="" marker-end="url(#ah)"/>
+<line x1="216.0" y1="196" x2="216.0" y2="219" stroke="#222" stroke-width="3" stroke-dasharray="" marker-end="url(#ah)"/>
+<text x="20" y="388" text-anchor="start" font-size="12" fill="#222" font-weight="normal">y1 = A11·x1 + A12·x2 + A13·x3</text>
+<text x="20" y="408" text-anchor="start" font-size="12" fill="#444" font-weight="normal">Each block of A takes part in one</text>
+<text x="20" y="428" text-anchor="start" font-size="12" fill="#444" font-weight="normal">product and is not needed again.</text>
+<text x="290" y="30" text-anchor="start" font-size="15" fill="#222" font-weight="bold">C = A · B   (gemm)</text>
+<rect x="290" y="222" width="48" height="48" fill="#8ab4f8" stroke="#000" stroke-width="3"/>
+<text x="314.0" y="244" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A11</text>
+<text x="314.0" y="260" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 3×</text>
+<rect x="338" y="222" width="48" height="48" fill="#f6b26b" stroke="#000" stroke-width="3"/>
+<text x="362.0" y="244" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A12</text>
+<text x="362.0" y="260" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 3×</text>
+<rect x="386" y="222" width="48" height="48" fill="#93c47d" stroke="#000" stroke-width="3"/>
+<text x="410.0" y="244" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A13</text>
+<text x="410.0" y="260" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 3×</text>
+<rect x="290" y="270" width="48" height="48" fill="#8ab4f8" stroke="#555" stroke-width="1.5"/>
+<text x="314.0" y="292" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A21</text>
+<text x="314.0" y="308" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 3×</text>
+<rect x="338" y="270" width="48" height="48" fill="#f6b26b" stroke="#555" stroke-width="1.5"/>
+<text x="362.0" y="292" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A22</text>
+<text x="362.0" y="308" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 3×</text>
+<rect x="386" y="270" width="48" height="48" fill="#93c47d" stroke="#555" stroke-width="1.5"/>
+<text x="410.0" y="292" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A23</text>
+<text x="410.0" y="308" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 3×</text>
+<rect x="290" y="318" width="48" height="48" fill="#8ab4f8" stroke="#555" stroke-width="1.5"/>
+<text x="314.0" y="340" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A31</text>
+<text x="314.0" y="356" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 3×</text>
+<rect x="338" y="318" width="48" height="48" fill="#f6b26b" stroke="#555" stroke-width="1.5"/>
+<text x="362.0" y="340" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A32</text>
+<text x="362.0" y="356" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 3×</text>
+<rect x="386" y="318" width="48" height="48" fill="#93c47d" stroke="#555" stroke-width="1.5"/>
+<text x="410.0" y="340" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">A33</text>
+<text x="410.0" y="356" text-anchor="middle" font-size="10" fill="#444" font-weight="normal">used 3×</text>
+<rect x="462" y="50" width="48" height="48" fill="#8ab4f8" stroke="#000" stroke-width="3"/>
+<text x="486.0" y="78" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">B11</text>
+<rect x="510" y="50" width="48" height="48" fill="#8ab4f8" stroke="#555" stroke-width="1.5"/>
+<text x="534.0" y="78" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">B12</text>
+<rect x="558" y="50" width="48" height="48" fill="#8ab4f8" stroke="#555" stroke-width="1.5"/>
+<text x="582.0" y="78" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">B13</text>
+<rect x="462" y="98" width="48" height="48" fill="#f6b26b" stroke="#000" stroke-width="3"/>
+<text x="486.0" y="126" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">B21</text>
+<rect x="510" y="98" width="48" height="48" fill="#f6b26b" stroke="#555" stroke-width="1.5"/>
+<text x="534.0" y="126" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">B22</text>
+<rect x="558" y="98" width="48" height="48" fill="#f6b26b" stroke="#555" stroke-width="1.5"/>
+<text x="582.0" y="126" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">B23</text>
+<rect x="462" y="146" width="48" height="48" fill="#93c47d" stroke="#000" stroke-width="3"/>
+<text x="486.0" y="174" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">B31</text>
+<rect x="510" y="146" width="48" height="48" fill="#93c47d" stroke="#555" stroke-width="1.5"/>
+<text x="534.0" y="174" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">B32</text>
+<rect x="558" y="146" width="48" height="48" fill="#93c47d" stroke="#555" stroke-width="1.5"/>
+<text x="582.0" y="174" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">B33</text>
+<rect x="462" y="222" width="48" height="48" fill="#ffe599" stroke="#000" stroke-width="3"/>
+<text x="486.0" y="244" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">C11</text>
+<rect x="510" y="222" width="48" height="48" fill="#eeeeee" stroke="#555" stroke-width="1.5"/>
+<text x="534.0" y="244" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">C12</text>
+<rect x="558" y="222" width="48" height="48" fill="#eeeeee" stroke="#555" stroke-width="1.5"/>
+<text x="582.0" y="244" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">C13</text>
+<rect x="462" y="270" width="48" height="48" fill="#eeeeee" stroke="#555" stroke-width="1.5"/>
+<text x="486.0" y="292" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">C21</text>
+<rect x="510" y="270" width="48" height="48" fill="#eeeeee" stroke="#555" stroke-width="1.5"/>
+<text x="534.0" y="292" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">C22</text>
+<rect x="558" y="270" width="48" height="48" fill="#eeeeee" stroke="#555" stroke-width="1.5"/>
+<text x="582.0" y="292" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">C23</text>
+<rect x="462" y="318" width="48" height="48" fill="#eeeeee" stroke="#555" stroke-width="1.5"/>
+<text x="486.0" y="340" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">C31</text>
+<rect x="510" y="318" width="48" height="48" fill="#eeeeee" stroke="#555" stroke-width="1.5"/>
+<text x="534.0" y="340" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">C32</text>
+<rect x="558" y="318" width="48" height="48" fill="#eeeeee" stroke="#555" stroke-width="1.5"/>
+<text x="582.0" y="340" text-anchor="middle" font-size="13" fill="#222" font-weight="normal">C33</text>
+<line x1="436" y1="246.0" x2="459" y2="246.0" stroke="#222" stroke-width="3" stroke-dasharray="" marker-end="url(#ah)"/>
+<line x1="486.0" y1="196" x2="486.0" y2="219" stroke="#222" stroke-width="3" stroke-dasharray="" marker-end="url(#ah)"/>
+<line x1="514" y1="260" x2="601" y2="260" stroke="#7f6000" stroke-width="3" stroke-dasharray="6,4" marker-end="url(#ahd)"/>
+<text x="290" y="388" text-anchor="start" font-size="12" fill="#222" font-weight="normal">C11 = A11·B11 + A12·B21 + A13·B31</text>
+<text x="290" y="408" text-anchor="start" font-size="12" fill="#444" font-weight="normal">The same row of A is used again for C12 and C13</text>
+<text x="290" y="428" text-anchor="start" font-size="12" fill="#444" font-weight="normal">(dashed arrow): each block of A is used once per</text>
+<text x="290" y="448" text-anchor="start" font-size="12" fill="#444" font-weight="normal">column of C, so n times for an n × n product.</text>
+<text x="20" y="484" text-anchor="start" font-size="12" fill="#555" font-weight="normal">Same color: blocks multiplied together.  Black outline: the blocks that produce the yellow block.</text>
+</svg>
