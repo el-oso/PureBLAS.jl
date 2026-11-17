@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 500" font-family="sans-serif">
+<title>Cache levels as rows of 64-byte lines, with capacities</title>
+<defs><marker id="dn" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#555"/></marker></defs>
+<rect width="700" height="500" rx="8" fill="#fafafa" stroke="#cfcfcf"/>
+<text x="20" y="28" text-anchor="start" font-size="14" fill="#222" font-weight="bold">Each level holds copies of 64-byte lines. Sizes are from the machine used for these docs.</text>
+<text x="20" y="46" text-anchor="start" font-size="12" fill="#555" font-weight="normal">Rows are not to scale: the multiplier between rows says how many times more lines the next level holds.</text>
+<text x="20" y="98" text-anchor="start" font-size="15" fill="#222" font-weight="bold">Registers</text>
+<rect x="140" y="70" width="14" height="36" fill="#ea9999" stroke="#555" stroke-width="1"/>
+<rect x="154" y="70" width="14" height="36" fill="#ea9999" stroke="#555" stroke-width="1"/>
+<rect x="168" y="70" width="14" height="36" fill="#ea9999" stroke="#555" stroke-width="1"/>
+<rect x="182" y="70" width="14" height="36" fill="#ea9999" stroke="#555" stroke-width="1"/>
+<rect x="196" y="70" width="14" height="36" fill="#ea9999" stroke="#555" stroke-width="1"/>
+<rect x="210" y="70" width="14" height="36" fill="#ea9999" stroke="#555" stroke-width="1"/>
+<rect x="224" y="70" width="14" height="36" fill="#ea9999" stroke="#555" stroke-width="1"/>
+<rect x="238" y="70" width="14" height="36" fill="#ea9999" stroke="#555" stroke-width="1"/>
+<text x="260" y="94" text-anchor="start" font-size="16" fill="#222" font-weight="normal">…</text>
+<text x="20" y="122" text-anchor="start" font-size="12" fill="#555" font-weight="normal">32 vector registers × 64 B = 2 KiB</text>
+<text x="250" y="122" text-anchor="start" font-size="12" fill="#555" font-weight="normal">256 numbers   (a 16 × 16 matrix)</text>
+<path d="M 180 128 v 14" stroke="#555" stroke-width="1.2" marker-end="url(#dn)"/>
+<text x="188" y="140" text-anchor="start" font-size="11" fill="#555" font-weight="bold">× 24</text>
+<text x="20" y="176" text-anchor="start" font-size="15" fill="#222" font-weight="bold">L1 cache</text>
+<rect x="140" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="154" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="168" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="182" y="148" width="14" height="36" fill="#ffe599" stroke="#7f6000" stroke-width="1"/>
+<rect x="196" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="210" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="224" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="238" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="252" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="266" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="280" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="294" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="308" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<rect x="322" y="148" width="14" height="36" fill="#93c47d" stroke="#555" stroke-width="1"/>
+<text x="344" y="172" text-anchor="start" font-size="16" fill="#222" font-weight="normal">…</text>
+<text x="20" y="200" text-anchor="start" font-size="12" fill="#555" font-weight="normal">48 KiB = 768 lines</text>
+<text x="250" y="200" text-anchor="start" font-size="12" fill="#555" font-weight="normal">6,144 numbers   (a 78 × 78 matrix)</text>
+<path d="M 180 206 v 14" stroke="#555" stroke-width="1.2" marker-end="url(#dn)"/>
+<text x="188" y="218" text-anchor="start" font-size="11" fill="#555" font-weight="bold">× 21</text>
+<text x="20" y="254" text-anchor="start" font-size="15" fill="#222" font-weight="bold">L2 cache</text>
+<rect x="140" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="154" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="168" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="182" y="226" width="14" height="36" fill="#ffe599" stroke="#7f6000" stroke-width="1"/>
+<rect x="196" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="210" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="224" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="238" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="252" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="266" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="280" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="294" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="308" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="322" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="336" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="350" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="364" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="378" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="392" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<rect x="406" y="226" width="14" height="36" fill="#f6b26b" stroke="#555" stroke-width="1"/>
+<text x="428" y="250" text-anchor="start" font-size="16" fill="#222" font-weight="normal">…</text>
+<text x="20" y="278" text-anchor="start" font-size="12" fill="#555" font-weight="normal">1 MiB = 16,384 lines</text>
+<text x="250" y="278" text-anchor="start" font-size="12" fill="#555" font-weight="normal">131,072 numbers   (a 362 × 362 matrix)</text>
+<path d="M 180 284 v 14" stroke="#555" stroke-width="1.2" marker-end="url(#dn)"/>
+<text x="188" y="296" text-anchor="start" font-size="11" fill="#555" font-weight="bold">× 16</text>
+<text x="20" y="332" text-anchor="start" font-size="15" fill="#222" font-weight="bold">L3 cache</text>
+<rect x="140" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="154" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="168" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="182" y="304" width="14" height="36" fill="#ffe599" stroke="#7f6000" stroke-width="1"/>
+<rect x="196" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="210" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="224" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="238" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="252" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="266" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="280" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="294" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="308" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="322" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="336" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="350" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="364" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="378" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="392" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="406" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="420" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="434" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="448" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="462" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="476" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<rect x="490" y="304" width="14" height="36" fill="#8ab4f8" stroke="#555" stroke-width="1"/>
+<text x="512" y="328" text-anchor="start" font-size="16" fill="#222" font-weight="normal">…</text>
+<text x="20" y="356" text-anchor="start" font-size="12" fill="#555" font-weight="normal">16 MiB = 262,144 lines</text>
+<text x="250" y="356" text-anchor="start" font-size="12" fill="#555" font-weight="normal">2,097,152 numbers   (a 1448 × 1448 matrix)</text>
+<path d="M 180 362 v 14" stroke="#555" stroke-width="1.2" marker-end="url(#dn)"/>
+<text x="188" y="374" text-anchor="start" font-size="11" fill="#555" font-weight="bold">× thousands</text>
+<text x="20" y="410" text-anchor="start" font-size="15" fill="#222" font-weight="bold">Main memory</text>
+<rect x="140" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="154" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="168" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="182" y="382" width="14" height="36" fill="#ffe599" stroke="#7f6000" stroke-width="1"/>
+<rect x="196" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="210" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="224" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="238" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="252" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="266" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="280" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="294" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="308" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="322" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="336" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="350" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="364" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="378" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="392" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="406" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="420" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="434" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="448" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="462" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="476" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="490" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="504" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="518" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="532" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="546" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="560" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<rect x="574" y="382" width="14" height="36" fill="#d9d9d9" stroke="#555" stroke-width="1"/>
+<text x="596" y="406" text-anchor="start" font-size="16" fill="#222" font-weight="normal">…</text>
+<text x="20" y="434" text-anchor="start" font-size="12" fill="#555" font-weight="normal">gigabytes</text>
+<text x="250" y="434" text-anchor="start" font-size="12" fill="#555" font-weight="normal">billions of numbers</text>
+<path d="M 655 88 V 420" stroke="#555" stroke-width="1.2" marker-end="url(#dn)"/>
+<text x="655" y="80" text-anchor="middle" font-size="11" fill="#555">smaller, faster</text>
+<text x="655" y="440" text-anchor="middle" font-size="11" fill="#555">bigger, slower</text>
+<text x="20" y="480" text-anchor="start" font-size="12" fill="#7f6000" font-weight="normal">The yellow cell is one 64-byte line (8 Float64). A copy sits at every level that has used it recently.</text>
+</svg>
