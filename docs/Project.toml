@@ -9,3 +9,8 @@ PureBLAS = "cc9e14db-574f-4602-bf53-1167cc4b26d2"
 # `Pkg.develop(PackageSpec(path=pwd()))` first. Drop this section once the package is registered.
 [sources]
 PureBLAS = {path = ".."}
+
+# The docs build checks nothing, so StrictMode's precompile-time checks are off here. They run in
+# every test job and at every normal precompile.
+[preferences.StrictMode]
+checks_enabled = false
