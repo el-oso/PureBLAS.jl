@@ -1257,13 +1257,14 @@ end
         @generated ctlg_chase(p::Ptr{Float64}, q::Ptr{Int}, n::Int, ::Val{U}) where {U} = $(QuoteNode(chase_body))
         @strict_function guarantees = (:vectorized,) signatures = [(Ptr{Float64}, Ptr{Int}, Int, Val{1})] ctlg_chase
     end
-    # A second, scoped policy in one module (src/verify.jl holds two) checks its own matches.
-    @test_throws SV @eval module CtlPolicySecond
+    # The same form on a plain concrete method (src/verify.jl, on `_trsm_tile_R_f64!`), in a module that
+    # also holds a policy.
+    @test_throws SV @eval module CtlFnPlainSpill
         using StrictMode
         ctlp_clean(x::Int) = x + 1
         ctlq_spill!(p::Ptr{Float64}, n::Int) = $(toy_spill_body(3 * NVREG))
         @strict_policy :typestable only = r"^ctlp_"
-        @strict_policy :no_spill only = [:ctlq_spill!]
+        @strict_function guarantees = (:no_spill,) signatures = [(Ptr{Float64}, Int)] ctlq_spill!
     end
     @test_logs (:warn, r"trim_compatible") match_mode = :any @eval module CtlPolicyTrim
         using StrictMode

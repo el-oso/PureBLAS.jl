@@ -877,12 +877,12 @@ end
 # name it selects — a policy cannot reach a parametric method, whose signature names no concrete types.
 # It selects the C-ABI entry points (`*_64_`, the roots `juliac --trim` builds from): concrete inferred
 # return type (gates), and no trim-hostile construct StrictMode's static scan can see (reports).
-# test/trim_tests.jl runs juliac's verifier over the same roots. A module holds one policy, set by the
-# first `@strict_policy`; a later SCOPED one checks its own guarantees on its matches.
+# test/trim_tests.jl runs juliac's verifier over the same roots.
 @strict_policy (:typestable, :trim_compatible) only = r"_64_$"
-# The trsm side-R tile is concrete, so a scoped policy reaches it: the same register-pressure check as
-# the microkernels above (`:no_spill` gates).
-@strict_policy :no_spill only = [:_trsm_tile_R_f64!]
+# The trsm side-R tile: the same register-pressure check as the microkernels above (`:no_spill` gates).
+@strict_function guarantees = (:no_spill,) signatures = [
+    (Bool, Bool, Bool, Ptr{Float64}, Int, Ptr{Float64}, Int, Int, Int),
+] _trsm_tile_R_f64!
 # Guarantees not checked at load, and why:
 #   `:noalloc` on the C-ABI entries: the value-free scan reports about a third of them as allocating
 #                       (151 of 492 on Zen4), each a warning at every precompile. The backend calls

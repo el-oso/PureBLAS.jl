@@ -333,6 +333,11 @@ end
         ];
         guarantees = (:no_spill,)
     )
+    # The signatures src/verify.jl declares with `@strict_function guarantees = …` (the microkernels'
+    # `:vectorized`/`:no_spill`, the trsm side-R tile's `:no_spill`), re-proved here with each one's
+    # own guarantees.
+    fs = test_registered(; modules = [P])
+    @test count(f -> f.status === :pass, fs) >= 9
     # Every kernel in the table. A wide (ymm/zmm) spill anywhere, or inside a loop, is the real defect.
     # `spill_report` also counts xmm lines: on a kernel that takes scalar alpha/beta arguments those
     # carry the spilled scalars, which is not register pressure on the vector tile.
@@ -369,6 +374,20 @@ end
     @test !StrictMode.kernel_report(toy_chase, (Pd, Ptr{Int}, Int)).vectorized
     @test !StrictMode.kernel_report(toy_recurrence!, (Pd, Int, Float64)).vectorized
     @test_throws StrictViolation test_signatures([(toy_chase, (Pd, Ptr{Int}, Int))]; guarantees = (:vectorized,))
+    # The strict-order sum is a `:vectorized` control on x86 only. StrictMode gap: on aarch64 its scalar
+    # FP adds sit behind 128-bit vector loads, and `:vectorized` passes them.
+    sum_throws = try
+        test_signatures([(toy_strict_sum, (Pd, Int))]; guarantees = (:vectorized,))
+        false
+    catch e
+        e isa StrictViolation || rethrow()
+        true
+    end
+    if Sys.ARCH === :aarch64
+        @test_broken sum_throws
+    else
+        @test sum_throws
+    end
     @test_throws StrictViolation test_signatures([(toy_recurrence!, (Pd, Int, Float64))]; guarantees = (:vectorized,))
     # The forwarder is judged unvectorized; a check that follows the forwarder to its body would pass.
     fwd_ok = try
