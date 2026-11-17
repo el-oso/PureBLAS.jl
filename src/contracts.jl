@@ -8,7 +8,7 @@
 # methods carry explicit concrete return-type annotations so inference matches the contract.
 
 using TypeContracts
-using StrictMode  # the performance layer over the method surface; its macros are used in verify.jl
+using StrictMode  # @strict_contract / @verify_strict — the performance layer over the method surface
 
 """
     AbstractBLAS1
@@ -27,6 +27,22 @@ function dotu end       # unconjugated inner product (x·y)
 function nrm2 end       # Euclidean norm
 function asum end       # Σ|xᵢ| (complex: Σ|Re|+|Im|)
 function iamax end      # argmax|xᵢ|
+
+# Level-1 is a *strict* contract: implementations must satisfy not just the method surface
+# (TypeContracts) but StrictMode's performance guarantees — type-stable and allocation-free. The
+# bandwidth-bound L1 kernels are where a stray allocation or type instability is most costly, so
+# they carry the hardest guarantee. Verified by `@verify_strict SIMDBackend` (backend.jl).
+@strict_contract AbstractBLAS1 begin
+    axpy!(::Self, ::AbstractVector, ::Number, ::AbstractVector)::AbstractVector => "y := y + a·x"
+    scal!(::Self, ::Number, ::AbstractVector)::AbstractVector => "x := a·x"
+    blascopy!(::Self, ::AbstractVector, ::AbstractVector)::AbstractVector => "y := x"
+    swap!(::Self, ::AbstractVector, ::AbstractVector)::Nothing => "exchange the contents of x and y"
+    dot(::Self, ::AbstractVector, ::AbstractVector)::Number => "conjugated inner product conj(x)·y"
+    dotu(::Self, ::AbstractVector, ::AbstractVector)::Number => "unconjugated inner product x·y"
+    nrm2(::Self, ::AbstractVector)::Real => "Euclidean norm ‖x‖₂ via scaled accumulation (overflow/underflow safe)"
+    asum(::Self, ::AbstractVector)::Real => "Σ|xᵢ| (complex: Σ|Re| + |Im|)"
+    iamax(::Self, ::AbstractVector)::Integer => "index of the first element of largest magnitude"
+end
 
 """
     AbstractBLAS2 <: AbstractBLAS1
@@ -57,6 +73,31 @@ function spr2! end  # A := α·x·yᵀ + α·y·xᵀ + A, A symmetric packed (ra
 function hpr! end   # A := α·x·xᴴ + A, A Hermitian packed (rank-1, α real)
 function hpr2! end  # A := α·x·yᴴ + ᾱ·y·xᴴ + A, A Hermitian packed (rank-2)
 
+# Level-2 is also a *strict* contract: every matrix-vector kernel is type-stable and allocation-free
+# — dense (gemv/ger/symv/hemv/trmv/trsv), packed (spmv/hpmv/tpmv/tpsv/spr/spr2/hpr/hpr2), and banded
+# (gbmv/sbmv/hbmv/tbmv/tbsv), all verified by `@verify_strict SIMDBackend` (verify.jl).
+@strict_contract AbstractBLAS2 begin
+    gemv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "y := β·y + α·op(A)·x"
+    ger!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "A := α·x·yᵀ + A (geru / gerc)"
+    symv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A symmetric"
+    hemv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A Hermitian"
+    trmv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "x := op(A)·x, A triangular"
+    trsv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "x := op(A)⁻¹·x, A triangular (solve)"
+    spmv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A symmetric in packed storage"
+    hpmv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A Hermitian in packed storage"
+    tpmv!(::Self, ::AbstractVector, ::AbstractVector)::AbstractVector => "x := op(A)·x, A triangular packed"
+    tpsv!(::Self, ::AbstractVector, ::AbstractVector)::AbstractVector => "x := op(A)⁻¹·x, A triangular packed (solve)"
+    gbmv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector, ::Integer, ::Integer, ::Integer)::AbstractVector => "y := α·op(A)·x + β·y, A general banded"
+    sbmv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A symmetric banded"
+    hbmv!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "y := α·A·x + β·y, A Hermitian banded"
+    tbmv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "x := op(A)·x, A triangular banded"
+    tbsv!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractVector => "x := op(A)⁻¹·x, A triangular banded (solve)"
+    spr!(::Self, ::Number, ::AbstractVector, ::AbstractVector)::AbstractVector => "A := α·x·xᵀ + A, symmetric packed rank-1"
+    spr2!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector => "A := α·x·yᵀ + α·y·xᵀ + A, symmetric packed rank-2"
+    hpr!(::Self, ::Number, ::AbstractVector, ::AbstractVector)::AbstractVector => "A := α·x·xᴴ + A, Hermitian packed rank-1 (α real)"
+    hpr2!(::Self, ::Number, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractVector => "A := α·x·yᴴ + ᾱ·y·xᴴ + A, Hermitian packed rank-2"
+end
+
 """
     AbstractBLAS3 <: AbstractBLAS2
 
@@ -79,6 +120,30 @@ function her2k! end  # C := β·C + α·op(A)·op(B)ᴴ + ᾱ·op(B)·op(A)ᴴ, 
 function trmm! end   # B := α·op(A)·B / α·B·op(A),      A triangular
 function trsm! end   # B := α·op(A)⁻¹·B / α·B·op(A)⁻¹,  A triangular (solve)
 
+# Level-3 is a strict contract: every matrix-matrix op is type-stable and allocation-free, verified by
+# `@verify_strict SIMDBackend` (verify.jl). It ALSO carries a TRIM-COMPATIBILITY guarantee — the C-ABI
+# entry points that export these ops (cabi.jl: s/d/c/z `gemm_64_` …) must compile under juliac --trim for
+# the Mode-1 LBT `.so`, a hard requirement. The trim-critical path is the complex unpacked gemm kernel
+# (`_gemm_cmplx_unpacked!`): test/strictmode_tests.jl proves it with `@test_trim_compatible` (juliac's
+# verify_typeinf_trim, TrimCheck loaded), and verify.jl's `@strict_policy` scans every C-ABI entry point
+# for `:trim_compatible` at precompile (StrictMode's static scan, which reports). trim_tests.jl keeps the
+# exhaustive ccallable-rooted belt.
+# The rank-k/hemm family's divide-and-conquer drivers were
+# refactored to carry integer offsets into the original arrays (not fresh sub-block SubArrays, which
+# are non-isbits and heap-box when passed to the non-inlined recursive call — the sub-block views are
+# also built per concrete type, never as a Union, so they stay stack-allocated). All nine now gate 0-alloc.
+@strict_contract AbstractBLAS3 begin
+    gemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·op(A)·op(B)"
+    symm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·A·B or α·B·A, A symmetric"
+    hemm!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·A·B or α·B·A, A Hermitian"
+    syrk!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·op(A)·op(A)ᵀ, C symmetric"
+    herk!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·op(A)·op(A)ᴴ, C Hermitian (α, β real)"
+    syr2k!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·(op(A)·op(B)ᵀ + op(B)·op(A)ᵀ), C symmetric"
+    her2k!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "C := β·C + α·op(A)·op(B)ᴴ + ᾱ·op(B)·op(A)ᴴ, C Hermitian"
+    trmm!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "B := α·op(A)·B or α·B·op(A), A triangular"
+    trsm!(::Self, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "B := α·op(A)⁻¹·B or α·B·op(A)⁻¹, A triangular (solve)"
+end
+
 """
     AbstractLAPACK <: AbstractBLAS3
 
@@ -97,6 +162,15 @@ function potrf! end  # Cholesky:  A = L·Lᴴ (or Uᴴ·U); overwrites the store
 function getrf! end  # LU w/ partial pivoting: P·A = L·U → (A, ipiv, info)
 function geqrf! end  # QR (Householder): A = Q·R → (A, tau)
 function gesvd! end  # SVD: A = U·Σ·Vᵀ → (U, S, Vᵀ)
+
+# LAPACK is a strict contract — ALL FOUR factorizations are type-stable and allocation-free, verified by
+# `@verify_strict SIMDBackend` (verify.jl). potrf! factors through its own pointer-based
+# `_syrk_lower_f64!`/trsm kernels (lapack.jl); getrf!/geqrf!/gesvd! reach 0-alloc through their IN-PLACE
+# forms — getrf!(A,ipiv)/geqrf!(A,τ)/gesvd!(A,U,S,Vᵀ) take caller-provided output buffers, and gesvd's
+# bidiagonalization scratch comes from a cached Float64 SVDWorkspace (svd.jl). The convenience forms that
+# allocate pivots/τ/U/S/Vᵀ are unchanged; the allocation is the inherent output, and the C-ABI + strict
+# paths use the in-place forms.
+# (The contract itself is declared once, below, after the solve/inverse/condition names are introduced.)
 
 # ── The solve / inverse / condition-estimate surface, built on the four factorizations above.
 #
@@ -246,3 +320,89 @@ function gglse! end   # equality-constrained least squares
 function stebz! end   # symmetric-tridiagonal eigenvalues by bisection (in-place w/iblock/isplit)
 function stein! end   # symmetric-tridiagonal eigenvectors by inverse iteration (in-place Z)
 
+@strict_contract AbstractLAPACK begin
+    potrf!(::Self, ::AbstractMatrix)::AbstractMatrix => "Cholesky factor A = L·Lᴴ (or Uᴴ·U); overwrites the stored triangle"
+    getrf!(::Self, ::AbstractMatrix)::Tuple => "LU with partial pivoting, P·A = L·U → (A, ipiv, info)"
+    geqrf!(::Self, ::AbstractMatrix)::Tuple => "Householder QR, A = Q·R → (A, τ)"
+    gesvd!(::Self, ::AbstractMatrix)::Tuple => "SVD, A = U·Σ·Vᵀ → (U, S, Vᵀ)"
+    potrs!(::Self, ::AbstractMatrix, ::AbstractVecOrMat)::AbstractVecOrMat => "solve A·X = B from a Cholesky factor"
+    potri!(::Self, ::AbstractMatrix)::AbstractMatrix => "explicit inverse from a Cholesky factor (trtri then lauum)"
+    pptrf!(::Self, ::AbstractVector)::AbstractVector => "Cholesky factor in packed triangular storage"
+    pptrs!(::Self, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from a packed Cholesky factor"
+    pbtrf!(::Self, ::AbstractMatrix)::AbstractMatrix => "Cholesky factor of a symmetric/Hermitian band matrix"
+    pbtrs!(::Self, ::AbstractMatrix, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from a band Cholesky factor"
+    pstrf!(::Self, ::AbstractMatrix, ::AbstractVector, ::Real)::Tuple => "pivoted rank-revealing Cholesky → (A, piv, rank, info)"
+    pocon!(::Self, ::Real, ::AbstractMatrix)::Real => "reciprocal condition number of a posdef matrix, from its factor"
+    getrs!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve A·X = B from LU factors and pivots"
+    getri!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "explicit inverse from LU factors and pivots"
+    trtrs!(::Self, ::AbstractMatrix, ::AbstractVecOrMat)::AbstractVecOrMat => "triangular solve op(A)·X = B"
+    trtri!(::Self, ::AbstractMatrix)::AbstractMatrix => "explicit inverse of a triangular matrix, in place"
+    gecon!(::Self, ::Real, ::AbstractMatrix, ::AbstractVector)::Real => "reciprocal condition number of a general matrix, from its LU"
+    trcon!(::Self, ::AbstractMatrix)::Real => "reciprocal condition number of a triangular matrix"
+    trrfs!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractVecOrMat, ::AbstractVecOrMat, ::AbstractVector, ::AbstractVector)::Tuple => "forward/backward error bounds for a triangular solve → (ferr, berr)"
+    gbtrf!(::Self, ::Integer, ::Integer, ::Integer, ::AbstractMatrix, ::AbstractVector)::Tuple => "banded LU with partial pivoting; ipiv is caller-provided → (AB, ipiv, info)"
+    gbtrs!(::Self, ::AbstractChar, ::Integer, ::Integer, ::Integer, ::AbstractMatrix, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from banded LU factors"
+    gtsv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "tridiagonal solve — factor and solve in one pass"
+    gttrf!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector)::Tuple => "tridiagonal LU with partial pivoting"
+    gttrs!(::Self, ::AbstractChar, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from tridiagonal LU factors"
+    pttrf!(::Self, ::AbstractVector, ::AbstractVector)::Tuple => "LDLᴴ factor of an SPD tridiagonal matrix"
+    pttrs!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve from an SPD tridiagonal LDLᴴ factor"
+    ptsv!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVecOrMat)::Tuple => "SPD tridiagonal solve — factor and solve in one pass"
+    gesvx!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::Char, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "expert driver: equilibrate, factor, solve, refine, bound the error"
+    gelqf!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "LQ factorization A = L·Q, reflectors in A and tau"
+    geqlf!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "QL factorization A = Q·L"
+    gerqf!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "RQ factorization A = R·Q"
+    geqp3!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "column-pivoted QR, A·P = Q·R → (A, jpvt, tau)"
+    tzrzf!(::Self, ::AbstractMatrix, ::AbstractVector)::Tuple => "trapezoidal RZ reduction → (A, tau)"
+    orgqr!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "form Q in place from geqrf reflectors"
+    orglq!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "form Q in place from gelqf reflectors"
+    orgql!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "form Q in place from geqlf reflectors"
+    orgrq!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "form Q in place from gerqf reflectors"
+    ormqr!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply geqrf Q to C (side, trans)"
+    ormlq!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply gelqf Q to C (side, trans)"
+    ormql!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply geqlf Q to C (side, trans)"
+    ormrq!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply gerqf Q to C (side, trans)"
+    ormrz!(::Self, ::Char, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply tzrzf Z to C (side, trans)"
+    orgtr!(::Self, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "form Q from sytrd reflectors into a caller-supplied Q"
+    ungtr!(::Self, ::Char, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "form Q from hetrd reflectors into a caller-supplied Q"
+    gebal!(::Self, ::AbstractMatrix, ::AbstractVector)::Tuple => "balance a general matrix into the caller's `scale` → (ilo, ihi)"
+    gebak!(::Self, ::AbstractChar, ::AbstractChar, ::Integer, ::Integer, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "undo gebal's permutation and scaling on the eigen/Schur vectors"
+    gehrd!(::Self, ::AbstractMatrix, ::Integer, ::Integer, ::AbstractVector)::AbstractMatrix => "reduce A[ilo:ihi, ilo:ihi] to upper Hessenberg, reflectors in A and tau"
+    orghr!(::Self, ::AbstractMatrix, ::Integer, ::Integer, ::AbstractVector)::AbstractMatrix => "form Q in place from gehrd reflectors (A is overwritten with Q)"
+    ormhr!(::Self, ::Char, ::Char, ::Integer, ::Integer, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "apply gehrd's Q to C (side, trans); A and tau are read-only"
+    hseqr!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::Integer, ::Integer, ::AbstractVector, ::AbstractMatrix)::Integer => "Schur decomposition of an upper-Hessenberg matrix → info"
+    trevc!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::AbstractMatrix => "right eigenvectors of a Schur form ('A') or their back-transform ('B')"
+    trexc!(::Self, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::Integer, ::Integer)::Tuple => "move the diagonal block at ifst to ilst, accumulating into Q"
+    trsen!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::Tuple => "reorder the selected cluster to the leading block, eigenvalues into w → (T, Q, w, s, sep)"
+    sygvd!(::Self, ::Integer, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "generalized symmetric-definite eigenproblem, eigenvalues into w, eigenvectors into A"
+    hegvd!(::Self, ::Integer, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "generalized Hermitian-definite eigenproblem, eigenvalues into w, eigenvectors into A"
+    trsyl!(::Self, ::AbstractChar, ::AbstractChar, ::Integer, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "Sylvester equation op(A)·X ± X·op(B) = scale·C → (X, scale)"
+    geev!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector)::Tuple => "general eigensolver into caller buffers (real arity: wr, wi, VL, VR, scale)"
+    gees!(::Self, ::AbstractChar, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix, ::AbstractVector)::Tuple => "Schur decomposition into caller buffers → (T, Z, w)"
+    sytrf!(::Self, ::AbstractMatrix, ::AbstractVector)::Integer => "Bunch-Kaufman factor of a symmetric matrix → info"
+    hetrf!(::Self, ::AbstractMatrix, ::AbstractVector)::Integer => "Bunch-Kaufman factor of a Hermitian matrix → info"
+    sytrs!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve A·X = B from symmetric Bunch-Kaufman factors"
+    hetrs!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVecOrMat)::AbstractVecOrMat => "solve A·X = B from Hermitian Bunch-Kaufman factors"
+    sytri!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "explicit inverse from symmetric Bunch-Kaufman factors"
+    hetri!(::Self, ::AbstractMatrix, ::AbstractVector)::AbstractMatrix => "explicit inverse from Hermitian Bunch-Kaufman factors"
+    sysv!(::Self, ::Char, ::AbstractMatrix, ::AbstractVecOrMat, ::AbstractVector)::Tuple => "symmetric-indefinite solve: sytrf! then sytrs!, pivots into the caller's ipiv"
+    hesv!(::Self, ::Char, ::AbstractMatrix, ::AbstractVecOrMat, ::AbstractVector)::Tuple => "Hermitian solve: hetrf! then hetrs!, pivots into the caller's ipiv"
+    syconv!(::Self, ::AbstractChar, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "convert Bunch-Kaufman factors between LAPACK's two storage conventions"
+    gghrd!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "reduce the pencil (A,B) to generalized Hessenberg-triangular form"
+    hgeqz!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix)::Integer => "QZ iteration to generalized Schur form → info"
+    tgevc!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix)::Integer => "right eigenvectors of a generalized Schur form"
+    tgsen!(::Self, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "reorder a generalized Schur form onto the selected cluster"
+    ggev!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "generalized eigensolver into caller buffers (real arity: alphar, alphai, beta, vl, vr)"
+    gges!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "generalized Schur decomposition into caller buffers"
+    gebrd!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractMatrix => "blocked bidiagonal reduction A = Q·B·Pᴴ, reflectors in A"
+    bdsdc!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractMatrix, ::AbstractMatrix)::AbstractVector => "bidiagonal SVD by divide-and-conquer, singular values in d, vectors into Lvec/Rvec"
+    gebd2!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector)::AbstractMatrix => "unblocked bidiagonal reduction A = Q·B·Pᴴ, reflectors in A"
+    bdsqr!(::Self, ::AbstractVector, ::AbstractVector, ::Union{Nothing, AbstractMatrix}, ::Union{Nothing, AbstractMatrix})::AbstractVector => "bidiagonal SVD by implicit-shift QR, singular values in d"
+    ggsvd!(::Self, ::AbstractChar, ::AbstractChar, ::AbstractChar, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::Tuple => "generalized SVD of (A,B) into caller buffers → (k, l)"
+    gels!(::Self, ::Char, ::AbstractMatrix, ::AbstractMatrix)::Tuple => "least-squares / minimum-norm solve of op(A)·X = B over QR/LQ"
+    gelsy!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::AbstractVector, ::Real)::Tuple => "rank-revealing least squares (pivoted QR + RZ) → (B, rank)"
+    gelsd!(::Self, ::AbstractMatrix, ::AbstractMatrix, ::Real, ::AbstractVector)::Tuple => "minimum-norm least squares by SVD, singular values into the caller's s → (B, rank, s)"
+    gglse!(::Self, ::AbstractMatrix, ::AbstractVector, ::AbstractMatrix, ::AbstractVector, ::AbstractVector)::Tuple => "equality-constrained least squares → (x, residual)"
+    stebz!(::Self, ::AbstractChar, ::AbstractChar, ::Real, ::Real, ::Integer, ::Integer, ::Real, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector)::Tuple => "symmetric-tridiagonal eigenvalues by bisection → (m, nsplit, info)"
+    stein!(::Self, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractVector, ::AbstractMatrix)::AbstractMatrix => "symmetric-tridiagonal eigenvectors by inverse iteration, into the caller's Z"
+end
