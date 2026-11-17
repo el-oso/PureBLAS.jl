@@ -12,8 +12,12 @@ permissions:
   statuses: write
   pull-requests: write
 # deps/build.jl times the host's idle-state onset whenever Pkg builds PureBLAS; not wanted on a runner.
+# PureBLAS's precompile peaks near the runner's 16 GB even with StrictMode checks off when the image is
+# emitted on 2 or more threads; one image thread and one precompile task keep it under (see CI.yml).
 env:
   PUREBLAS_SKIP_BUILD_TUNE: '1'
+  JULIA_IMAGE_THREADS: '1'
+  JULIA_NUM_PRECOMPILE_TASKS: '1'
 jobs:
   docs:
     runs-on: ubuntu-latest
