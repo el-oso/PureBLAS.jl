@@ -6,38 +6,38 @@
 <line x1="337" y1="42" x2="359" y2="42" stroke="#1f77b4" stroke-width="3"/>
 <text x="364" y="46" font-size="12">Zen4 · AVX-512</text>
 <line x1="488" y1="42" x2="510" y2="42" stroke="#2ca02c" stroke-width="3"/>
-<text x="515" y="46" font-size="12">Zen5 · AVX-512 — 277 ref arms throttled</text>
+<text x="515" y="46" font-size="12">Zen5 · AVX-512 — 266 ref arms throttled</text>
 <rect x="46" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
-<line x1="46" y1="161.8426797186961" x2="256" y2="161.8426797186961" stroke="#d33" stroke-dasharray="4 3"/>
-<text x="42" y="164.8426797186961" text-anchor="end" font-size="9" fill="#999">1.0×</text>
-<text x="42" y="63.000592262909976" text-anchor="end" font-size="9" fill="#999">141.69×</text>
-<polygon points="46.0,160.8 79.4,161.2 116.0,150.7 149.4,163.2 186.0,159.4 219.4,167.1 256.0,61.6 256.0,75.6 219.4,196.5 186.0,160.1 149.4,163.8 116.0,152.1 79.4,161.5 46.0,160.8" fill="#d62728" opacity="0.11"/>
-<polyline points="46.0,160.8 79.4,161.2 116.0,151.4 149.4,163.3 186.0,159.9 219.4,185.3 256.0,67.2" fill="none" stroke="#d62728" stroke-width="1.6"/>
-<circle cx="46.0" cy="160.8" r="2" fill="#d62728"/>
-<circle cx="79.4" cy="161.2" r="2" fill="#d62728"/>
-<circle cx="116.0" cy="151.4" r="2" fill="#d62728"/>
-<circle cx="149.4" cy="163.3" r="2" fill="#d62728"/>
-<circle cx="186.0" cy="159.9" r="2" fill="#d62728"/>
-<circle cx="219.4" cy="185.3" r="2" fill="#d62728"/>
-<circle cx="256.0" cy="67.2" r="2" fill="#d62728"/>
-<polygon points="46.0,160.0 79.4,161.4 116.0,155.0 149.4,165.9 186.0,161.4 219.4,163.5 256.0,151.9 256.0,160.8 219.4,165.0 186.0,162.0 149.4,166.5 116.0,155.7 79.4,161.5 46.0,160.1" fill="#1f77b4" opacity="0.11"/>
-<polyline points="46.0,160.1 79.4,161.4 116.0,155.3 149.4,166.3 186.0,161.6 219.4,164.5 256.0,160.3" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
-<circle cx="46.0" cy="160.1" r="2" fill="#1f77b4"/>
-<circle cx="79.4" cy="161.4" r="2" fill="#1f77b4"/>
-<circle cx="116.0" cy="155.3" r="2" fill="#1f77b4"/>
-<circle cx="149.4" cy="166.3" r="2" fill="#1f77b4"/>
-<circle cx="186.0" cy="161.6" r="2" fill="#1f77b4"/>
-<circle cx="219.4" cy="164.5" r="2" fill="#1f77b4"/>
-<circle cx="256.0" cy="160.3" r="2" fill="#1f77b4"/>
-<polygon points="46.0,160.9 79.4,160.3 116.0,160.1 149.4,167.2 186.0,158.2 219.4,162.4 256.0,147.6 256.0,161.8 219.4,164.4 186.0,159.2 149.4,167.7 116.0,160.3 79.4,160.6 46.0,161.0" fill="#2ca02c" opacity="0.11"/>
-<polyline points="46.0,161.0 79.4,160.5 116.0,160.2 149.4,167.6 186.0,158.7 219.4,163.7 256.0,161.3" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
-<circle cx="46.0" cy="161.0" r="2" fill="#2ca02c"/>
-<circle cx="79.4" cy="160.5" r="2" fill="#2ca02c"/>
-<circle cx="116.0" cy="160.2" r="2" fill="#2ca02c"/>
-<circle cx="149.4" cy="167.6" r="2" fill="#2ca02c"/>
-<circle cx="186.0" cy="158.7" r="2" fill="#2ca02c"/>
-<circle cx="219.4" cy="163.7" r="2" fill="#2ca02c"/>
-<circle cx="256.0" cy="161.3" r="2" fill="#2ca02c"/>
+<line x1="46" y1="182.66136309395864" x2="256" y2="182.66136309395864" stroke="#d33" stroke-dasharray="4 3"/>
+<text x="42" y="201.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
+<text x="42" y="185.66136309395864" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<polygon points="46.0,181.4 79.4,181.9 116.0,171.6 149.4,186.4 186.0,180.4 219.4,178.9 256.0,61.7 256.0,68.8 219.4,186.7 186.0,182.1 149.4,187.1 116.0,172.9 79.4,182.3 46.0,181.5" fill="#d62728" opacity="0.11"/>
+<polyline points="46.0,181.5 79.4,181.9 116.0,172.4 149.4,186.7 186.0,180.9 219.4,185.7 256.0,64.5" fill="none" stroke="#d62728" stroke-width="1.6"/>
+<circle cx="46.0" cy="181.5" r="2" fill="#d62728"/>
+<circle cx="79.4" cy="181.9" r="2" fill="#d62728"/>
+<circle cx="116.0" cy="172.4" r="2" fill="#d62728"/>
+<circle cx="149.4" cy="186.7" r="2" fill="#d62728"/>
+<circle cx="186.0" cy="180.9" r="2" fill="#d62728"/>
+<circle cx="219.4" cy="185.7" r="2" fill="#d62728"/>
+<circle cx="256.0" cy="64.5" r="2" fill="#d62728"/>
+<polygon points="46.0,180.5 79.4,182.1 116.0,175.0 149.4,186.3 186.0,181.4 219.4,183.0 256.0,173.0 256.0,182.3 219.4,183.8 186.0,181.8 149.4,187.1 116.0,175.5 79.4,182.2 46.0,180.7" fill="#1f77b4" opacity="0.11"/>
+<polyline points="46.0,180.6 79.4,182.2 116.0,175.4 149.4,187.0 186.0,181.6 219.4,183.4 256.0,181.5" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
+<circle cx="46.0" cy="180.6" r="2" fill="#1f77b4"/>
+<circle cx="79.4" cy="182.2" r="2" fill="#1f77b4"/>
+<circle cx="116.0" cy="175.4" r="2" fill="#1f77b4"/>
+<circle cx="149.4" cy="187.0" r="2" fill="#1f77b4"/>
+<circle cx="186.0" cy="181.6" r="2" fill="#1f77b4"/>
+<circle cx="219.4" cy="183.4" r="2" fill="#1f77b4"/>
+<circle cx="256.0" cy="181.5" r="2" fill="#1f77b4"/>
+<polygon points="46.0,181.5 79.4,180.9 116.0,180.7 149.4,185.0 186.0,176.6 219.4,182.4 256.0,168.4 256.0,183.3 219.4,184.6 186.0,177.8 149.4,185.8 116.0,180.9 79.4,181.2 46.0,181.7" fill="#2ca02c" opacity="0.11"/>
+<polyline points="46.0,181.6 79.4,181.0 116.0,180.7 149.4,185.4 186.0,177.3 219.4,183.6 256.0,182.6" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
+<circle cx="46.0" cy="181.6" r="2" fill="#2ca02c"/>
+<circle cx="79.4" cy="181.0" r="2" fill="#2ca02c"/>
+<circle cx="116.0" cy="180.7" r="2" fill="#2ca02c"/>
+<circle cx="149.4" cy="185.4" r="2" fill="#2ca02c"/>
+<circle cx="186.0" cy="177.3" r="2" fill="#2ca02c"/>
+<circle cx="219.4" cy="183.6" r="2" fill="#2ca02c"/>
+<circle cx="256.0" cy="182.6" r="2" fill="#2ca02c"/>
 <text x="151.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">axpy</text>
 <line x1="46.0" y1="60" x2="46.0" y2="198" stroke="#f4f4f4"/>
 <text x="46.0" y="209" text-anchor="middle" font-size="8" fill="#999">1000</text>
@@ -54,37 +54,36 @@
 <line x1="256.0" y1="60" x2="256.0" y2="198" stroke="#f4f4f4"/>
 <text x="256.0" y="209" text-anchor="middle" font-size="8" fill="#999">976k</text>
 <rect x="276" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
-<line x1="276" y1="88.10634685903064" x2="486" y2="88.10634685903064" stroke="#d33" stroke-dasharray="4 3"/>
-<text x="272" y="200.69522460918566" text-anchor="end" font-size="9" fill="#999">0.16×</text>
-<text x="272" y="91.10634685903064" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<line x1="276" y1="112.30438807139613" x2="486" y2="112.30438807139613" stroke="#d33" stroke-dasharray="4 3"/>
+<text x="272" y="115.30438807139613" text-anchor="end" font-size="9" fill="#999">1.0×</text>
 <text x="272" y="63.0" text-anchor="end" font-size="9" fill="#999">1.6×</text>
-<polygon points="276.0,83.3 309.4,87.5 346.0,88.0 379.4,104.2 416.0,101.1 449.4,104.6 486.0,129.4 486.0,165.1 449.4,193.7 416.0,104.6 379.4,106.7 346.0,88.0 309.4,87.7 276.0,83.7" fill="#d62728" opacity="0.11"/>
-<polyline points="276.0,83.5 309.4,87.6 346.0,88.0 379.4,105.3 416.0,102.5 449.4,135.5 486.0,143.7" fill="none" stroke="#d62728" stroke-width="1.6"/>
-<circle cx="276.0" cy="83.5" r="2" fill="#d62728"/>
-<circle cx="309.4" cy="87.6" r="2" fill="#d62728"/>
-<circle cx="346.0" cy="88.0" r="2" fill="#d62728"/>
-<circle cx="379.4" cy="105.3" r="2" fill="#d62728"/>
-<circle cx="416.0" cy="102.5" r="2" fill="#d62728"/>
-<circle cx="449.4" cy="135.5" r="2" fill="#d62728"/>
-<circle cx="486.0" cy="143.7" r="2" fill="#d62728"/>
-<polygon points="276.0,86.0 309.4,88.2 346.0,88.1 379.4,130.7 416.0,110.3 449.4,100.4 486.0,84.5 486.0,89.1 449.4,104.6 416.0,111.6 379.4,132.0 346.0,88.2 309.4,88.7 276.0,86.6" fill="#1f77b4" opacity="0.11"/>
-<polyline points="276.0,86.5 309.4,88.7 346.0,88.1 379.4,131.4 416.0,110.9 449.4,103.0 486.0,85.8" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
-<circle cx="276.0" cy="86.5" r="2" fill="#1f77b4"/>
-<circle cx="309.4" cy="88.7" r="2" fill="#1f77b4"/>
-<circle cx="346.0" cy="88.1" r="2" fill="#1f77b4"/>
-<circle cx="379.4" cy="131.4" r="2" fill="#1f77b4"/>
-<circle cx="416.0" cy="110.9" r="2" fill="#1f77b4"/>
-<circle cx="449.4" cy="103.0" r="2" fill="#1f77b4"/>
-<circle cx="486.0" cy="85.8" r="2" fill="#1f77b4"/>
-<polygon points="276.0,86.3 309.4,86.0 346.0,90.4 379.4,124.7 416.0,101.5 449.4,102.1 486.0,83.9 486.0,90.0 449.4,110.1 416.0,105.0 379.4,127.0 346.0,93.5 309.4,87.4 276.0,86.5" fill="#2ca02c" opacity="0.11"/>
-<polyline points="276.0,86.4 309.4,87.3 346.0,92.0 379.4,125.7 416.0,102.8 449.4,106.2 486.0,88.3" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
-<circle cx="276.0" cy="86.4" r="2" fill="#2ca02c"/>
-<circle cx="309.4" cy="87.3" r="2" fill="#2ca02c"/>
-<circle cx="346.0" cy="92.0" r="2" fill="#2ca02c"/>
-<circle cx="379.4" cy="125.7" r="2" fill="#2ca02c"/>
-<circle cx="416.0" cy="102.8" r="2" fill="#2ca02c"/>
-<circle cx="449.4" cy="106.2" r="2" fill="#2ca02c"/>
-<circle cx="486.0" cy="88.3" r="2" fill="#2ca02c"/>
+<polygon points="276.0,101.7 309.4,110.7 346.0,111.9 379.4,142.2 416.0,138.8 449.4,100.0 486.0,118.5 486.0,162.0 449.4,141.0 416.0,140.9 379.4,147.5 346.0,112.1 309.4,111.5 276.0,102.7" fill="#d62728" opacity="0.11"/>
+<polyline points="276.0,102.5 309.4,111.2 346.0,112.0 379.4,144.8 416.0,140.3 449.4,137.0 486.0,140.9" fill="none" stroke="#d62728" stroke-width="1.6"/>
+<circle cx="276.0" cy="102.5" r="2" fill="#d62728"/>
+<circle cx="309.4" cy="111.2" r="2" fill="#d62728"/>
+<circle cx="346.0" cy="112.0" r="2" fill="#d62728"/>
+<circle cx="379.4" cy="144.8" r="2" fill="#d62728"/>
+<circle cx="416.0" cy="140.3" r="2" fill="#d62728"/>
+<circle cx="449.4" cy="137.0" r="2" fill="#d62728"/>
+<circle cx="486.0" cy="140.9" r="2" fill="#d62728"/>
+<polygon points="276.0,108.0 309.4,111.8 346.0,112.1 379.4,187.5 416.0,148.4 449.4,130.7 486.0,111.0 486.0,116.4 449.4,133.9 416.0,150.0 379.4,189.9 346.0,112.3 309.4,112.5 276.0,109.1" fill="#1f77b4" opacity="0.11"/>
+<polyline points="276.0,108.9 309.4,112.4 346.0,112.2 379.4,189.0 416.0,149.3 449.4,132.4 486.0,113.8" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
+<circle cx="276.0" cy="108.9" r="2" fill="#1f77b4"/>
+<circle cx="309.4" cy="112.4" r="2" fill="#1f77b4"/>
+<circle cx="346.0" cy="112.2" r="2" fill="#1f77b4"/>
+<circle cx="379.4" cy="189.0" r="2" fill="#1f77b4"/>
+<circle cx="416.0" cy="149.3" r="2" fill="#1f77b4"/>
+<circle cx="449.4" cy="132.4" r="2" fill="#1f77b4"/>
+<circle cx="486.0" cy="113.8" r="2" fill="#1f77b4"/>
+<polygon points="276.0,108.6 309.4,109.5 346.0,115.9 379.4,151.4 416.0,129.4 449.4,134.2 486.0,112.5 486.0,126.9 449.4,144.0 416.0,134.8 379.4,156.1 346.0,121.7 309.4,111.0 276.0,109.0" fill="#2ca02c" opacity="0.11"/>
+<polyline points="276.0,108.8 309.4,110.6 346.0,118.8 379.4,154.2 416.0,132.6 449.4,139.1 486.0,114.5" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
+<circle cx="276.0" cy="108.8" r="2" fill="#2ca02c"/>
+<circle cx="309.4" cy="110.6" r="2" fill="#2ca02c"/>
+<circle cx="346.0" cy="118.8" r="2" fill="#2ca02c"/>
+<circle cx="379.4" cy="154.2" r="2" fill="#2ca02c"/>
+<circle cx="416.0" cy="132.6" r="2" fill="#2ca02c"/>
+<circle cx="449.4" cy="139.1" r="2" fill="#2ca02c"/>
+<circle cx="486.0" cy="114.5" r="2" fill="#2ca02c"/>
 <text x="381.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">dot</text>
 <line x1="276.0" y1="60" x2="276.0" y2="198" stroke="#f4f4f4"/>
 <text x="276.0" y="209" text-anchor="middle" font-size="8" fill="#999">1000</text>
@@ -101,37 +100,36 @@
 <line x1="486.0" y1="60" x2="486.0" y2="198" stroke="#f4f4f4"/>
 <text x="486.0" y="209" text-anchor="middle" font-size="8" fill="#999">976k</text>
 <rect x="506" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
-<line x1="506" y1="174.68097707664663" x2="716" y2="174.68097707664663" stroke="#d33" stroke-dasharray="4 3"/>
+<line x1="506" y1="174.75518708386824" x2="716" y2="174.75518708386824" stroke="#d33" stroke-dasharray="4 3"/>
 <text x="502" y="201.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
-<text x="502" y="177.68097707664663" text-anchor="end" font-size="9" fill="#999">1.0×</text>
-<text x="502" y="63.00014264850148" text-anchor="end" font-size="9" fill="#999">30.23×</text>
-<polygon points="506.0,134.1 539.4,140.3 576.0,145.4 609.4,151.3 646.0,153.5 679.4,62.6 716.0,98.2 716.0,119.6 679.4,83.9 646.0,154.5 609.4,152.1 576.0,147.3 539.4,140.5 506.0,134.6" fill="#d62728" opacity="0.11"/>
-<polyline points="506.0,134.4 539.4,140.4 576.0,145.5 609.4,151.8 646.0,154.0 679.4,69.2 716.0,104.5" fill="none" stroke="#d62728" stroke-width="1.6"/>
-<circle cx="506.0" cy="134.4" r="2" fill="#d62728"/>
-<circle cx="539.4" cy="140.4" r="2" fill="#d62728"/>
-<circle cx="576.0" cy="145.5" r="2" fill="#d62728"/>
-<circle cx="609.4" cy="151.8" r="2" fill="#d62728"/>
-<circle cx="646.0" cy="154.0" r="2" fill="#d62728"/>
-<circle cx="679.4" cy="69.2" r="2" fill="#d62728"/>
-<circle cx="716.0" cy="104.5" r="2" fill="#d62728"/>
-<polygon points="506.0,118.9 539.4,123.4 576.0,145.7 609.4,163.8 646.0,160.3 679.4,154.2 716.0,152.7 716.0,154.7 679.4,158.6 646.0,161.2 609.4,165.1 576.0,150.2 539.4,124.1 506.0,120.3" fill="#1f77b4" opacity="0.11"/>
-<polyline points="506.0,119.7 539.4,123.6 576.0,147.7 609.4,164.6 646.0,160.8 679.4,156.1 716.0,153.5" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
-<circle cx="506.0" cy="119.7" r="2" fill="#1f77b4"/>
-<circle cx="539.4" cy="123.6" r="2" fill="#1f77b4"/>
-<circle cx="576.0" cy="147.7" r="2" fill="#1f77b4"/>
-<circle cx="609.4" cy="164.6" r="2" fill="#1f77b4"/>
-<circle cx="646.0" cy="160.8" r="2" fill="#1f77b4"/>
-<circle cx="679.4" cy="156.1" r="2" fill="#1f77b4"/>
-<circle cx="716.0" cy="153.5" r="2" fill="#1f77b4"/>
-<polygon points="506.0,117.9 539.4,122.2 576.0,93.2 609.4,166.8 646.0,159.4 679.4,147.0 716.0,153.8 716.0,156.1 679.4,149.0 646.0,161.2 609.4,168.6 576.0,93.7 539.4,123.0 506.0,118.6" fill="#2ca02c" opacity="0.11"/>
-<polyline points="506.0,118.2 539.4,122.7 576.0,93.3 609.4,167.6 646.0,159.8 679.4,148.0 716.0,155.4" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
+<text x="502" y="177.75518708386824" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<polygon points="506.0,134.5 539.4,140.4 576.0,145.5 609.4,156.1 646.0,155.9 679.4,62.6 716.0,76.0 716.0,89.8 679.4,73.3 646.0,156.4 609.4,156.6 576.0,147.3 539.4,140.7 506.0,134.9" fill="#d62728" opacity="0.11"/>
+<polyline points="506.0,134.8 539.4,140.5 576.0,145.6 609.4,156.2 646.0,156.1 679.4,66.9 716.0,80.1" fill="none" stroke="#d62728" stroke-width="1.6"/>
+<circle cx="506.0" cy="134.8" r="2" fill="#d62728"/>
+<circle cx="539.4" cy="140.5" r="2" fill="#d62728"/>
+<circle cx="576.0" cy="145.6" r="2" fill="#d62728"/>
+<circle cx="609.4" cy="156.2" r="2" fill="#d62728"/>
+<circle cx="646.0" cy="156.1" r="2" fill="#d62728"/>
+<circle cx="679.4" cy="66.9" r="2" fill="#d62728"/>
+<circle cx="716.0" cy="80.1" r="2" fill="#d62728"/>
+<polygon points="506.0,119.8 539.4,124.6 576.0,145.7 609.4,161.6 646.0,158.7 679.4,151.1 716.0,154.5 716.0,156.9 679.4,153.4 646.0,159.4 609.4,162.5 576.0,150.3 539.4,125.2 506.0,120.8" fill="#1f77b4" opacity="0.11"/>
+<polyline points="506.0,120.3 539.4,124.9 576.0,147.8 609.4,162.4 646.0,159.2 679.4,153.2 716.0,155.5" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
+<circle cx="506.0" cy="120.3" r="2" fill="#1f77b4"/>
+<circle cx="539.4" cy="124.9" r="2" fill="#1f77b4"/>
+<circle cx="576.0" cy="147.8" r="2" fill="#1f77b4"/>
+<circle cx="609.4" cy="162.4" r="2" fill="#1f77b4"/>
+<circle cx="646.0" cy="159.2" r="2" fill="#1f77b4"/>
+<circle cx="679.4" cy="153.2" r="2" fill="#1f77b4"/>
+<circle cx="716.0" cy="155.5" r="2" fill="#1f77b4"/>
+<polygon points="506.0,118.1 539.4,122.3 576.0,93.0 609.4,165.7 646.0,155.0 679.4,143.2 716.0,155.2 716.0,157.7 679.4,149.7 646.0,157.1 609.4,166.3 576.0,93.7 539.4,123.1 506.0,118.6" fill="#2ca02c" opacity="0.11"/>
+<polyline points="506.0,118.2 539.4,122.8 576.0,93.2 609.4,166.0 646.0,156.1 679.4,144.5 716.0,156.2" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
 <circle cx="506.0" cy="118.2" r="2" fill="#2ca02c"/>
-<circle cx="539.4" cy="122.7" r="2" fill="#2ca02c"/>
-<circle cx="576.0" cy="93.3" r="2" fill="#2ca02c"/>
-<circle cx="609.4" cy="167.6" r="2" fill="#2ca02c"/>
-<circle cx="646.0" cy="159.8" r="2" fill="#2ca02c"/>
-<circle cx="679.4" cy="148.0" r="2" fill="#2ca02c"/>
-<circle cx="716.0" cy="155.4" r="2" fill="#2ca02c"/>
+<circle cx="539.4" cy="122.8" r="2" fill="#2ca02c"/>
+<circle cx="576.0" cy="93.2" r="2" fill="#2ca02c"/>
+<circle cx="609.4" cy="166.0" r="2" fill="#2ca02c"/>
+<circle cx="646.0" cy="156.1" r="2" fill="#2ca02c"/>
+<circle cx="679.4" cy="144.5" r="2" fill="#2ca02c"/>
+<circle cx="716.0" cy="156.2" r="2" fill="#2ca02c"/>
 <text x="611.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">nrm2</text>
 <line x1="506.0" y1="60" x2="506.0" y2="198" stroke="#f4f4f4"/>
 <text x="506.0" y="209" text-anchor="middle" font-size="8" fill="#999">1000</text>
@@ -148,36 +146,37 @@
 <line x1="716.0" y1="60" x2="716.0" y2="198" stroke="#f4f4f4"/>
 <text x="716.0" y="209" text-anchor="middle" font-size="8" fill="#999">976k</text>
 <rect x="736" y="60" width="210" height="138" fill="none" stroke="#e2e2e2"/>
-<line x1="736" y1="160.41103594691447" x2="946" y2="160.41103594691447" stroke="#d33" stroke-dasharray="4 3"/>
+<line x1="736" y1="160.84143675236055" x2="946" y2="160.84143675236055" stroke="#d33" stroke-dasharray="4 3"/>
 <text x="732" y="201.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
-<text x="732" y="163.41103594691447" text-anchor="end" font-size="9" fill="#999">1.0×</text>
-<polygon points="736.0,110.4 769.4,108.0 806.0,135.9 839.4,99.9 876.0,73.1 909.4,64.2 946.0,119.4 946.0,154.2 909.4,83.6 876.0,73.8 839.4,101.5 806.0,136.3 769.4,108.6 736.0,111.3" fill="#d62728" opacity="0.11"/>
-<polyline points="736.0,111.0 769.4,108.2 806.0,136.1 839.4,101.0 876.0,73.5 909.4,71.9 946.0,127.9" fill="none" stroke="#d62728" stroke-width="1.6"/>
-<circle cx="736.0" cy="111.0" r="2" fill="#d62728"/>
-<circle cx="769.4" cy="108.2" r="2" fill="#d62728"/>
-<circle cx="806.0" cy="136.1" r="2" fill="#d62728"/>
-<circle cx="839.4" cy="101.0" r="2" fill="#d62728"/>
-<circle cx="876.0" cy="73.5" r="2" fill="#d62728"/>
-<circle cx="909.4" cy="71.9" r="2" fill="#d62728"/>
-<circle cx="946.0" cy="127.9" r="2" fill="#d62728"/>
-<polygon points="736.0,134.8 769.4,146.5 806.0,160.1 839.4,144.8 876.0,104.5 909.4,139.9 946.0,158.4 946.0,162.1 909.4,145.5 876.0,108.7 839.4,147.3 806.0,160.3 769.4,146.9 736.0,135.3" fill="#1f77b4" opacity="0.11"/>
-<polyline points="736.0,135.0 769.4,146.6 806.0,160.2 839.4,146.6 876.0,105.2 909.4,144.4 946.0,159.5" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
-<circle cx="736.0" cy="135.0" r="2" fill="#1f77b4"/>
-<circle cx="769.4" cy="146.6" r="2" fill="#1f77b4"/>
-<circle cx="806.0" cy="160.2" r="2" fill="#1f77b4"/>
-<circle cx="839.4" cy="146.6" r="2" fill="#1f77b4"/>
-<circle cx="876.0" cy="105.2" r="2" fill="#1f77b4"/>
-<circle cx="909.4" cy="144.4" r="2" fill="#1f77b4"/>
-<circle cx="946.0" cy="159.5" r="2" fill="#1f77b4"/>
-<polygon points="736.0,143.7 769.4,155.9 806.0,160.9 839.4,146.8 876.0,113.0 909.4,134.1 946.0,126.2 946.0,169.9 909.4,141.8 876.0,124.3 839.4,149.9 806.0,161.4 769.4,156.3 736.0,144.6" fill="#2ca02c" opacity="0.11"/>
-<polyline points="736.0,144.1 769.4,156.0 806.0,161.1 839.4,148.1 876.0,120.2 909.4,137.3 946.0,168.9" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
-<circle cx="736.0" cy="144.1" r="2" fill="#2ca02c"/>
-<circle cx="769.4" cy="156.0" r="2" fill="#2ca02c"/>
-<circle cx="806.0" cy="161.1" r="2" fill="#2ca02c"/>
-<circle cx="839.4" cy="148.1" r="2" fill="#2ca02c"/>
-<circle cx="876.0" cy="120.2" r="2" fill="#2ca02c"/>
-<circle cx="909.4" cy="137.3" r="2" fill="#2ca02c"/>
-<circle cx="946.0" cy="168.9" r="2" fill="#2ca02c"/>
+<text x="732" y="163.84143675236055" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<text x="732" y="63.00439918164908" text-anchor="end" font-size="9" fill="#999">6.56×</text>
+<polygon points="736.0,111.2 769.4,109.0 806.0,136.6 839.4,107.8 876.0,78.6 909.4,64.1 946.0,84.3 946.0,102.2 909.4,79.9 876.0,79.1 839.4,109.9 806.0,136.9 769.4,109.6 736.0,112.0" fill="#d62728" opacity="0.11"/>
+<polyline points="736.0,111.6 769.4,109.2 806.0,136.9 839.4,108.8 876.0,78.9 909.4,72.8 946.0,89.8" fill="none" stroke="#d62728" stroke-width="1.6"/>
+<circle cx="736.0" cy="111.6" r="2" fill="#d62728"/>
+<circle cx="769.4" cy="109.2" r="2" fill="#d62728"/>
+<circle cx="806.0" cy="136.9" r="2" fill="#d62728"/>
+<circle cx="839.4" cy="108.8" r="2" fill="#d62728"/>
+<circle cx="876.0" cy="78.9" r="2" fill="#d62728"/>
+<circle cx="909.4" cy="72.8" r="2" fill="#d62728"/>
+<circle cx="946.0" cy="89.8" r="2" fill="#d62728"/>
+<polygon points="736.0,135.6 769.4,146.2 806.0,160.5 839.4,142.6 876.0,102.6 909.4,135.9 946.0,161.3 946.0,164.9 909.4,137.2 876.0,106.6 839.4,143.6 806.0,160.6 769.4,148.4 736.0,136.2" fill="#1f77b4" opacity="0.11"/>
+<polyline points="736.0,135.7 769.4,146.3 806.0,160.5 839.4,142.9 876.0,103.4 909.4,136.4 946.0,162.8" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
+<circle cx="736.0" cy="135.7" r="2" fill="#1f77b4"/>
+<circle cx="769.4" cy="146.3" r="2" fill="#1f77b4"/>
+<circle cx="806.0" cy="160.5" r="2" fill="#1f77b4"/>
+<circle cx="839.4" cy="142.9" r="2" fill="#1f77b4"/>
+<circle cx="876.0" cy="103.4" r="2" fill="#1f77b4"/>
+<circle cx="909.4" cy="136.4" r="2" fill="#1f77b4"/>
+<circle cx="946.0" cy="162.8" r="2" fill="#1f77b4"/>
+<polygon points="736.0,144.2 769.4,156.3 806.0,160.1 839.4,145.0 876.0,108.1 909.4,131.3 946.0,127.4 946.0,173.1 909.4,139.4 876.0,117.6 839.4,146.0 806.0,161.0 769.4,156.7 736.0,145.1" fill="#2ca02c" opacity="0.11"/>
+<polyline points="736.0,144.5 769.4,156.5 806.0,160.5 839.4,145.6 876.0,115.4 909.4,134.2 946.0,167.5" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
+<circle cx="736.0" cy="144.5" r="2" fill="#2ca02c"/>
+<circle cx="769.4" cy="156.5" r="2" fill="#2ca02c"/>
+<circle cx="806.0" cy="160.5" r="2" fill="#2ca02c"/>
+<circle cx="839.4" cy="145.6" r="2" fill="#2ca02c"/>
+<circle cx="876.0" cy="115.4" r="2" fill="#2ca02c"/>
+<circle cx="909.4" cy="134.2" r="2" fill="#2ca02c"/>
+<circle cx="946.0" cy="167.5" r="2" fill="#2ca02c"/>
 <text x="841.0" y="55" text-anchor="middle" font-size="12" font-weight="bold">asum</text>
 <line x1="736.0" y1="60" x2="736.0" y2="198" stroke="#f4f4f4"/>
 <text x="736.0" y="209" text-anchor="middle" font-size="8" fill="#999">1000</text>
@@ -194,36 +193,36 @@
 <line x1="946.0" y1="60" x2="946.0" y2="198" stroke="#f4f4f4"/>
 <text x="946.0" y="209" text-anchor="middle" font-size="8" fill="#999">976k</text>
 <rect x="46" y="232" width="210" height="138" fill="none" stroke="#e2e2e2"/>
-<line x1="46" y1="303.67888508366167" x2="256" y2="303.67888508366167" stroke="#d33" stroke-dasharray="4 3"/>
-<text x="42" y="372.52832343767614" text-anchor="end" font-size="9" fill="#999">0.28×</text>
-<text x="42" y="306.67888508366167" text-anchor="end" font-size="9" fill="#999">1.0×</text>
-<polygon points="46.0,300.9 79.4,302.2 116.0,303.3 149.4,259.4 186.0,236.0 219.4,286.3 256.0,338.6 256.0,366.2 219.4,296.0 186.0,236.7 149.4,260.5 116.0,303.4 79.4,302.5 46.0,301.0" fill="#d62728" opacity="0.11"/>
-<polyline points="46.0,301.0 79.4,302.4 116.0,303.3 149.4,260.0 186.0,236.3 219.4,288.8 256.0,350.8" fill="none" stroke="#d62728" stroke-width="1.6"/>
-<circle cx="46.0" cy="301.0" r="2" fill="#d62728"/>
-<circle cx="79.4" cy="302.4" r="2" fill="#d62728"/>
-<circle cx="116.0" cy="303.3" r="2" fill="#d62728"/>
-<circle cx="149.4" cy="260.0" r="2" fill="#d62728"/>
-<circle cx="186.0" cy="236.3" r="2" fill="#d62728"/>
-<circle cx="219.4" cy="288.8" r="2" fill="#d62728"/>
-<circle cx="256.0" cy="350.8" r="2" fill="#d62728"/>
-<polygon points="46.0,301.7 79.4,302.9 116.0,303.4 149.4,283.4 186.0,269.2 219.4,304.1 256.0,293.5 256.0,301.8 219.4,310.1 186.0,271.2 149.4,285.8 116.0,304.1 79.4,303.3 46.0,302.1" fill="#1f77b4" opacity="0.11"/>
-<polyline points="46.0,301.9 79.4,303.1 116.0,303.6 149.4,284.1 186.0,269.5 219.4,308.2 256.0,299.9" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
-<circle cx="46.0" cy="301.9" r="2" fill="#1f77b4"/>
-<circle cx="79.4" cy="303.1" r="2" fill="#1f77b4"/>
-<circle cx="116.0" cy="303.6" r="2" fill="#1f77b4"/>
-<circle cx="149.4" cy="284.1" r="2" fill="#1f77b4"/>
-<circle cx="186.0" cy="269.5" r="2" fill="#1f77b4"/>
-<circle cx="219.4" cy="308.2" r="2" fill="#1f77b4"/>
-<circle cx="256.0" cy="299.9" r="2" fill="#1f77b4"/>
-<polygon points="46.0,298.4 79.4,303.4 116.0,300.4 149.4,280.7 186.0,298.8 219.4,301.4 256.0,295.4 256.0,304.5 219.4,311.3 186.0,300.5 149.4,282.9 116.0,302.4 79.4,306.2 46.0,299.4" fill="#2ca02c" opacity="0.11"/>
-<polyline points="46.0,298.7 79.4,303.6 116.0,301.3 149.4,281.8 186.0,299.7 219.4,308.0 256.0,302.6" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
-<circle cx="46.0" cy="298.7" r="2" fill="#2ca02c"/>
-<circle cx="79.4" cy="303.6" r="2" fill="#2ca02c"/>
-<circle cx="116.0" cy="301.3" r="2" fill="#2ca02c"/>
-<circle cx="149.4" cy="281.8" r="2" fill="#2ca02c"/>
-<circle cx="186.0" cy="299.7" r="2" fill="#2ca02c"/>
-<circle cx="219.4" cy="308.0" r="2" fill="#2ca02c"/>
-<circle cx="256.0" cy="302.6" r="2" fill="#2ca02c"/>
+<line x1="46" y1="317.49289842780104" x2="256" y2="317.49289842780104" stroke="#d33" stroke-dasharray="4 3"/>
+<text x="42" y="372.58171861362007" text-anchor="end" font-size="9" fill="#999">0.44×</text>
+<text x="42" y="320.49289842780104" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<polygon points="46.0,314.1 79.4,315.7 116.0,317.1 149.4,272.8 186.0,236.9 219.4,294.9 256.0,327.1 256.0,365.4 219.4,300.5 186.0,237.6 149.4,274.0 116.0,317.2 79.4,316.1 46.0,314.3" fill="#d62728" opacity="0.11"/>
+<polyline points="46.0,314.2 79.4,315.9 116.0,317.1 149.4,273.4 186.0,237.3 219.4,297.1 256.0,342.0" fill="none" stroke="#d62728" stroke-width="1.6"/>
+<circle cx="46.0" cy="314.2" r="2" fill="#d62728"/>
+<circle cx="79.4" cy="315.9" r="2" fill="#d62728"/>
+<circle cx="116.0" cy="317.1" r="2" fill="#d62728"/>
+<circle cx="149.4" cy="273.4" r="2" fill="#d62728"/>
+<circle cx="186.0" cy="237.3" r="2" fill="#d62728"/>
+<circle cx="219.4" cy="297.1" r="2" fill="#d62728"/>
+<circle cx="256.0" cy="342.0" r="2" fill="#d62728"/>
+<polygon points="46.0,315.0 79.4,316.4 116.0,317.2 149.4,290.5 186.0,270.7 219.4,312.6 256.0,306.4 256.0,317.2 219.4,314.2 186.0,272.6 149.4,291.9 116.0,318.0 79.4,316.9 46.0,315.6" fill="#1f77b4" opacity="0.11"/>
+<polyline points="46.0,315.4 79.4,316.7 116.0,317.3 149.4,291.0 186.0,271.2 219.4,313.4 256.0,314.4" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
+<circle cx="46.0" cy="315.4" r="2" fill="#1f77b4"/>
+<circle cx="79.4" cy="316.7" r="2" fill="#1f77b4"/>
+<circle cx="116.0" cy="317.3" r="2" fill="#1f77b4"/>
+<circle cx="149.4" cy="291.0" r="2" fill="#1f77b4"/>
+<circle cx="186.0" cy="271.2" r="2" fill="#1f77b4"/>
+<circle cx="219.4" cy="313.4" r="2" fill="#1f77b4"/>
+<circle cx="256.0" cy="314.4" r="2" fill="#1f77b4"/>
+<polygon points="46.0,311.1 79.4,314.6 116.0,313.3 149.4,279.7 186.0,300.6 219.4,305.4 256.0,314.8 256.0,321.6 219.4,316.8 186.0,303.6 149.4,283.0 116.0,314.8 79.4,315.4 46.0,312.2" fill="#2ca02c" opacity="0.11"/>
+<polyline points="46.0,311.5 79.4,314.9 116.0,313.8 149.4,281.4 186.0,302.6 219.4,313.0 256.0,316.8" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
+<circle cx="46.0" cy="311.5" r="2" fill="#2ca02c"/>
+<circle cx="79.4" cy="314.9" r="2" fill="#2ca02c"/>
+<circle cx="116.0" cy="313.8" r="2" fill="#2ca02c"/>
+<circle cx="149.4" cy="281.4" r="2" fill="#2ca02c"/>
+<circle cx="186.0" cy="302.6" r="2" fill="#2ca02c"/>
+<circle cx="219.4" cy="313.0" r="2" fill="#2ca02c"/>
+<circle cx="256.0" cy="316.8" r="2" fill="#2ca02c"/>
 <text x="151.0" y="227" text-anchor="middle" font-size="12" font-weight="bold">scal</text>
 <line x1="46.0" y1="232" x2="46.0" y2="370" stroke="#f4f4f4"/>
 <text x="46.0" y="381" text-anchor="middle" font-size="8" fill="#999">1000</text>
@@ -240,37 +239,36 @@
 <line x1="256.0" y1="232" x2="256.0" y2="370" stroke="#f4f4f4"/>
 <text x="256.0" y="381" text-anchor="middle" font-size="8" fill="#999">976k</text>
 <rect x="276" y="232" width="210" height="138" fill="none" stroke="#e2e2e2"/>
-<line x1="276" y1="330.62159260507883" x2="486" y2="330.62159260507883" stroke="#d33" stroke-dasharray="4 3"/>
+<line x1="276" y1="332.67824301039457" x2="486" y2="332.67824301039457" stroke="#d33" stroke-dasharray="4 3"/>
 <text x="272" y="373.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
-<text x="272" y="333.62159260507883" text-anchor="end" font-size="9" fill="#999">1.0×</text>
-<text x="272" y="235.0437062600923" text-anchor="end" font-size="9" fill="#999">5.67×</text>
-<polygon points="276.0,316.7 309.4,318.2 346.0,330.3 379.4,294.4 416.0,256.9 449.4,251.7 486.0,306.5 486.0,344.3 449.4,270.6 416.0,259.0 379.4,296.7 346.0,334.0 309.4,322.4 276.0,318.5" fill="#d62728" opacity="0.11"/>
-<polyline points="276.0,317.5 309.4,319.8 346.0,331.9 379.4,296.0 416.0,258.0 449.4,257.4 486.0,321.0" fill="none" stroke="#d62728" stroke-width="1.6"/>
-<circle cx="276.0" cy="317.5" r="2" fill="#d62728"/>
-<circle cx="309.4" cy="319.8" r="2" fill="#d62728"/>
-<circle cx="346.0" cy="331.9" r="2" fill="#d62728"/>
-<circle cx="379.4" cy="296.0" r="2" fill="#d62728"/>
-<circle cx="416.0" cy="258.0" r="2" fill="#d62728"/>
-<circle cx="449.4" cy="257.4" r="2" fill="#d62728"/>
-<circle cx="486.0" cy="321.0" r="2" fill="#d62728"/>
-<polygon points="276.0,324.0 309.4,318.1 346.0,331.5 379.4,316.2 416.0,275.0 449.4,255.0 486.0,247.9 486.0,253.8 449.4,260.9 416.0,277.0 379.4,318.1 346.0,332.1 309.4,320.9 276.0,328.4" fill="#1f77b4" opacity="0.11"/>
-<polyline points="276.0,325.5 309.4,319.1 346.0,331.7 379.4,317.3 416.0,275.6 449.4,256.3 486.0,249.8" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
-<circle cx="276.0" cy="325.5" r="2" fill="#1f77b4"/>
-<circle cx="309.4" cy="319.1" r="2" fill="#1f77b4"/>
-<circle cx="346.0" cy="331.7" r="2" fill="#1f77b4"/>
-<circle cx="379.4" cy="317.3" r="2" fill="#1f77b4"/>
-<circle cx="416.0" cy="275.6" r="2" fill="#1f77b4"/>
-<circle cx="449.4" cy="256.3" r="2" fill="#1f77b4"/>
-<circle cx="486.0" cy="249.8" r="2" fill="#1f77b4"/>
-<polygon points="276.0,322.3 309.4,320.2 346.0,317.9 379.4,304.0 416.0,268.6 449.4,236.4 486.0,236.9 486.0,239.8 449.4,239.0 416.0,270.0 379.4,308.2 346.0,319.0 309.4,322.1 276.0,328.8" fill="#2ca02c" opacity="0.11"/>
-<polyline points="276.0,325.8 309.4,321.2 346.0,318.6 379.4,305.3 416.0,269.1 449.4,237.1 486.0,238.0" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
-<circle cx="276.0" cy="325.8" r="2" fill="#2ca02c"/>
-<circle cx="309.4" cy="321.2" r="2" fill="#2ca02c"/>
-<circle cx="346.0" cy="318.6" r="2" fill="#2ca02c"/>
-<circle cx="379.4" cy="305.3" r="2" fill="#2ca02c"/>
-<circle cx="416.0" cy="269.1" r="2" fill="#2ca02c"/>
-<circle cx="449.4" cy="237.1" r="2" fill="#2ca02c"/>
-<circle cx="486.0" cy="238.0" r="2" fill="#2ca02c"/>
+<text x="272" y="335.67824301039457" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<polygon points="276.0,319.4 309.4,321.0 346.0,332.1 379.4,298.3 416.0,262.2 449.4,253.5 486.0,272.9 486.0,308.7 449.4,268.7 416.0,264.2 379.4,300.3 346.0,335.7 309.4,325.2 276.0,321.1" fill="#d62728" opacity="0.11"/>
+<polyline points="276.0,320.2 309.4,322.5 346.0,333.8 379.4,299.9 416.0,262.7 449.4,258.7 486.0,283.2" fill="none" stroke="#d62728" stroke-width="1.6"/>
+<circle cx="276.0" cy="320.2" r="2" fill="#d62728"/>
+<circle cx="309.4" cy="322.5" r="2" fill="#d62728"/>
+<circle cx="346.0" cy="333.8" r="2" fill="#d62728"/>
+<circle cx="379.4" cy="299.9" r="2" fill="#d62728"/>
+<circle cx="416.0" cy="262.7" r="2" fill="#d62728"/>
+<circle cx="449.4" cy="258.7" r="2" fill="#d62728"/>
+<circle cx="486.0" cy="283.2" r="2" fill="#d62728"/>
+<polygon points="276.0,326.0 309.4,320.9 346.0,333.5 379.4,315.9 416.0,273.3 449.4,252.0 486.0,256.8 486.0,260.6 449.4,256.8 416.0,275.2 379.4,317.3 346.0,334.2 309.4,323.6 276.0,330.2" fill="#1f77b4" opacity="0.11"/>
+<polyline points="276.0,327.6 309.4,321.7 346.0,333.7 379.4,316.8 416.0,274.1 449.4,253.2 486.0,258.4" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
+<circle cx="276.0" cy="327.6" r="2" fill="#1f77b4"/>
+<circle cx="309.4" cy="321.7" r="2" fill="#1f77b4"/>
+<circle cx="346.0" cy="333.7" r="2" fill="#1f77b4"/>
+<circle cx="379.4" cy="316.8" r="2" fill="#1f77b4"/>
+<circle cx="416.0" cy="274.1" r="2" fill="#1f77b4"/>
+<circle cx="449.4" cy="253.2" r="2" fill="#1f77b4"/>
+<circle cx="486.0" cy="258.4" r="2" fill="#1f77b4"/>
+<polygon points="276.0,326.2 309.4,323.2 346.0,320.3 379.4,303.9 416.0,266.2 449.4,236.1 486.0,244.1 486.0,250.6 449.4,246.0 416.0,268.8 379.4,304.3 346.0,321.5 309.4,324.9 276.0,332.2" fill="#2ca02c" opacity="0.11"/>
+<polyline points="276.0,329.5 309.4,324.1 346.0,320.8 379.4,304.1 416.0,267.5 449.4,237.3 486.0,247.4" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
+<circle cx="276.0" cy="329.5" r="2" fill="#2ca02c"/>
+<circle cx="309.4" cy="324.1" r="2" fill="#2ca02c"/>
+<circle cx="346.0" cy="320.8" r="2" fill="#2ca02c"/>
+<circle cx="379.4" cy="304.1" r="2" fill="#2ca02c"/>
+<circle cx="416.0" cy="267.5" r="2" fill="#2ca02c"/>
+<circle cx="449.4" cy="237.3" r="2" fill="#2ca02c"/>
+<circle cx="486.0" cy="247.4" r="2" fill="#2ca02c"/>
 <text x="381.0" y="227" text-anchor="middle" font-size="12" font-weight="bold">iamax</text>
 <line x1="276.0" y1="232" x2="276.0" y2="370" stroke="#f4f4f4"/>
 <text x="276.0" y="381" text-anchor="middle" font-size="8" fill="#999">1000</text>
@@ -287,31 +285,32 @@
 <line x1="486.0" y1="232" x2="486.0" y2="370" stroke="#f4f4f4"/>
 <text x="486.0" y="381" text-anchor="middle" font-size="8" fill="#999">976k</text>
 <rect x="506" y="232" width="210" height="138" fill="none" stroke="#e2e2e2"/>
-<line x1="506" y1="321.18698583592425" x2="716" y2="321.18698583592425" stroke="#d33" stroke-dasharray="4 3"/>
+<line x1="506" y1="322.72510502793085" x2="716" y2="322.72510502793085" stroke="#d33" stroke-dasharray="4 3"/>
 <text x="502" y="373.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
-<text x="502" y="324.18698583592425" text-anchor="end" font-size="9" fill="#999">1.0×</text>
-<polygon points="679.4,237.4 716.0,274.8 716.0,324.4 679.4,348.1" fill="#d62728" opacity="0.11"/>
-<polyline points="679.4,277.8 716.0,290.8" fill="none" stroke="#d62728" stroke-width="1.6"/>
-<circle cx="679.4" cy="277.8" r="2" fill="#d62728"/>
-<circle cx="716.0" cy="290.8" r="2" fill="#d62728"/>
-<polygon points="506.0,318.0 539.4,321.4 576.0,295.5 609.4,275.1 646.0,315.1 679.4,320.5 716.0,312.0 716.0,316.7 679.4,324.3 646.0,316.1 609.4,278.0 576.0,297.4 539.4,322.0 506.0,318.6" fill="#1f77b4" opacity="0.11"/>
-<polyline points="506.0,318.2 539.4,321.8 576.0,296.6 609.4,276.4 646.0,315.6 679.4,323.4 716.0,313.5" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
-<circle cx="506.0" cy="318.2" r="2" fill="#1f77b4"/>
-<circle cx="539.4" cy="321.8" r="2" fill="#1f77b4"/>
-<circle cx="576.0" cy="296.6" r="2" fill="#1f77b4"/>
-<circle cx="609.4" cy="276.4" r="2" fill="#1f77b4"/>
-<circle cx="646.0" cy="315.6" r="2" fill="#1f77b4"/>
-<circle cx="679.4" cy="323.4" r="2" fill="#1f77b4"/>
-<circle cx="716.0" cy="313.5" r="2" fill="#1f77b4"/>
-<polygon points="506.0,312.7 539.4,312.1 576.0,320.7 609.4,288.2 646.0,311.1 679.4,317.0 716.0,313.0 716.0,325.6 679.4,323.5 646.0,313.6 609.4,289.1 576.0,322.1 539.4,314.2 506.0,314.6" fill="#2ca02c" opacity="0.11"/>
-<polyline points="506.0,314.3 539.4,313.2 576.0,321.8 609.4,288.8 646.0,311.9 679.4,320.1 716.0,323.2" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
-<circle cx="506.0" cy="314.3" r="2" fill="#2ca02c"/>
-<circle cx="539.4" cy="313.2" r="2" fill="#2ca02c"/>
-<circle cx="576.0" cy="321.8" r="2" fill="#2ca02c"/>
-<circle cx="609.4" cy="288.8" r="2" fill="#2ca02c"/>
-<circle cx="646.0" cy="311.9" r="2" fill="#2ca02c"/>
-<circle cx="679.4" cy="320.1" r="2" fill="#2ca02c"/>
-<circle cx="716.0" cy="323.2" r="2" fill="#2ca02c"/>
+<text x="502" y="325.72510502793085" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<text x="502" y="235.03359727861653" text-anchor="end" font-size="9" fill="#999">3.78×</text>
+<polygon points="679.4,237.2 716.0,248.5 716.0,297.9 679.4,255.0" fill="#d62728" opacity="0.11"/>
+<polyline points="679.4,244.7 716.0,262.8" fill="none" stroke="#d62728" stroke-width="1.6"/>
+<circle cx="679.4" cy="244.7" r="2" fill="#d62728"/>
+<circle cx="716.0" cy="262.8" r="2" fill="#d62728"/>
+<polygon points="506.0,319.4 539.4,323.1 576.0,296.8 609.4,275.9 646.0,314.1 679.4,317.8 716.0,319.4 716.0,322.8 679.4,319.5 646.0,314.7 609.4,279.1 576.0,298.8 539.4,323.6 506.0,320.1" fill="#1f77b4" opacity="0.11"/>
+<polyline points="506.0,319.8 539.4,323.4 576.0,298.4 609.4,276.7 646.0,314.5 679.4,318.6 716.0,321.1" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
+<circle cx="506.0" cy="319.8" r="2" fill="#1f77b4"/>
+<circle cx="539.4" cy="323.4" r="2" fill="#1f77b4"/>
+<circle cx="576.0" cy="298.4" r="2" fill="#1f77b4"/>
+<circle cx="609.4" cy="276.7" r="2" fill="#1f77b4"/>
+<circle cx="646.0" cy="314.5" r="2" fill="#1f77b4"/>
+<circle cx="679.4" cy="318.6" r="2" fill="#1f77b4"/>
+<circle cx="716.0" cy="321.1" r="2" fill="#1f77b4"/>
+<polygon points="506.0,314.5 539.4,312.6 576.0,321.5 609.4,277.2 646.0,306.8 679.4,312.0 716.0,323.1 716.0,327.8 679.4,326.7 646.0,310.0 609.4,279.9 576.0,323.1 539.4,314.4 506.0,316.1" fill="#2ca02c" opacity="0.11"/>
+<polyline points="506.0,315.6 539.4,313.8 576.0,322.7 609.4,278.6 646.0,308.2 679.4,322.5 716.0,325.8" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
+<circle cx="506.0" cy="315.6" r="2" fill="#2ca02c"/>
+<circle cx="539.4" cy="313.8" r="2" fill="#2ca02c"/>
+<circle cx="576.0" cy="322.7" r="2" fill="#2ca02c"/>
+<circle cx="609.4" cy="278.6" r="2" fill="#2ca02c"/>
+<circle cx="646.0" cy="308.2" r="2" fill="#2ca02c"/>
+<circle cx="679.4" cy="322.5" r="2" fill="#2ca02c"/>
+<circle cx="716.0" cy="325.8" r="2" fill="#2ca02c"/>
 <text x="611.0" y="227" text-anchor="middle" font-size="12" font-weight="bold">blascopy</text>
 <line x1="506.0" y1="232" x2="506.0" y2="370" stroke="#f4f4f4"/>
 <text x="506.0" y="381" text-anchor="middle" font-size="8" fill="#999">1000</text>
@@ -328,27 +327,27 @@
 <line x1="716.0" y1="232" x2="716.0" y2="370" stroke="#f4f4f4"/>
 <text x="716.0" y="381" text-anchor="middle" font-size="8" fill="#999">976k</text>
 <rect x="736" y="232" width="210" height="138" fill="none" stroke="#e2e2e2"/>
-<line x1="736" y1="336.37081907039124" x2="946" y2="336.37081907039124" stroke="#d33" stroke-dasharray="4 3"/>
+<line x1="736" y1="337.3205083625484" x2="946" y2="337.3205083625484" stroke="#d33" stroke-dasharray="4 3"/>
 <text x="732" y="373.0" text-anchor="end" font-size="9" fill="#999">0.5×</text>
-<text x="732" y="339.37081907039124" text-anchor="end" font-size="9" fill="#999">1.0×</text>
-<polygon points="736.0,302.8 769.4,303.4 806.0,301.1 839.4,261.3 876.0,237.0 909.4,235.7 946.0,237.7 946.0,243.5 909.4,243.9 876.0,241.4 839.4,265.5 806.0,309.5 769.4,305.6 736.0,303.7" fill="#1f77b4" opacity="0.11"/>
-<polyline points="736.0,302.9 769.4,303.7 806.0,305.3 839.4,262.2 876.0,237.8 909.4,239.1 946.0,239.3" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
-<circle cx="736.0" cy="302.9" r="2" fill="#1f77b4"/>
-<circle cx="769.4" cy="303.7" r="2" fill="#1f77b4"/>
-<circle cx="806.0" cy="305.3" r="2" fill="#1f77b4"/>
-<circle cx="839.4" cy="262.2" r="2" fill="#1f77b4"/>
-<circle cx="876.0" cy="237.8" r="2" fill="#1f77b4"/>
-<circle cx="909.4" cy="239.1" r="2" fill="#1f77b4"/>
-<circle cx="946.0" cy="239.3" r="2" fill="#1f77b4"/>
-<polygon points="736.0,302.3 769.4,303.9 806.0,318.7 839.4,281.7 876.0,250.2 909.4,239.7 946.0,243.0 946.0,247.9 909.4,246.0 876.0,252.5 839.4,282.6 806.0,319.7 769.4,306.7 736.0,303.2" fill="#2ca02c" opacity="0.11"/>
-<polyline points="736.0,302.6 769.4,305.3 806.0,319.3 839.4,282.2 876.0,250.7 909.4,243.6 946.0,245.2" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
-<circle cx="736.0" cy="302.6" r="2" fill="#2ca02c"/>
-<circle cx="769.4" cy="305.3" r="2" fill="#2ca02c"/>
-<circle cx="806.0" cy="319.3" r="2" fill="#2ca02c"/>
-<circle cx="839.4" cy="282.2" r="2" fill="#2ca02c"/>
-<circle cx="876.0" cy="250.7" r="2" fill="#2ca02c"/>
-<circle cx="909.4" cy="243.6" r="2" fill="#2ca02c"/>
-<circle cx="946.0" cy="245.2" r="2" fill="#2ca02c"/>
+<text x="732" y="340.3205083625484" text-anchor="end" font-size="9" fill="#999">1.0×</text>
+<polygon points="736.0,304.7 769.4,305.3 806.0,296.1 839.4,263.2 876.0,239.3 909.4,235.6 946.0,245.1 946.0,247.6 909.4,242.7 876.0,243.0 839.4,264.7 806.0,297.8 769.4,307.4 736.0,307.8" fill="#1f77b4" opacity="0.11"/>
+<polyline points="736.0,304.7 769.4,305.5 806.0,297.0 839.4,264.0 876.0,239.8 909.4,239.3 946.0,246.2" fill="none" stroke="#1f77b4" stroke-width="1.6"/>
+<circle cx="736.0" cy="304.7" r="2" fill="#1f77b4"/>
+<circle cx="769.4" cy="305.5" r="2" fill="#1f77b4"/>
+<circle cx="806.0" cy="297.0" r="2" fill="#1f77b4"/>
+<circle cx="839.4" cy="264.0" r="2" fill="#1f77b4"/>
+<circle cx="876.0" cy="239.8" r="2" fill="#1f77b4"/>
+<circle cx="909.4" cy="239.3" r="2" fill="#1f77b4"/>
+<circle cx="946.0" cy="246.2" r="2" fill="#1f77b4"/>
+<polygon points="736.0,303.9 769.4,306.1 806.0,304.1 839.4,279.6 876.0,249.5 909.4,242.7 946.0,247.4 946.0,253.3 909.4,247.9 876.0,252.9 839.4,282.7 806.0,308.6 769.4,308.4 736.0,304.5" fill="#2ca02c" opacity="0.11"/>
+<polyline points="736.0,304.2 769.4,307.2 806.0,306.7 839.4,281.5 876.0,251.0 909.4,244.4 946.0,252.0" fill="none" stroke="#2ca02c" stroke-width="1.6"/>
+<circle cx="736.0" cy="304.2" r="2" fill="#2ca02c"/>
+<circle cx="769.4" cy="307.2" r="2" fill="#2ca02c"/>
+<circle cx="806.0" cy="306.7" r="2" fill="#2ca02c"/>
+<circle cx="839.4" cy="281.5" r="2" fill="#2ca02c"/>
+<circle cx="876.0" cy="251.0" r="2" fill="#2ca02c"/>
+<circle cx="909.4" cy="244.4" r="2" fill="#2ca02c"/>
+<circle cx="946.0" cy="252.0" r="2" fill="#2ca02c"/>
 <text x="841.0" y="227" text-anchor="middle" font-size="12" font-weight="bold">swap</text>
 <line x1="736.0" y1="232" x2="736.0" y2="370" stroke="#f4f4f4"/>
 <text x="736.0" y="381" text-anchor="middle" font-size="8" fill="#999">1000</text>
