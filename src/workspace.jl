@@ -172,7 +172,7 @@ const _M3_OTHER = Base.OncePerTask{IdDict{DataType, Any}}(IdDict{DataType, Any})
 # These functions are NOT allocation barriers: a pool that reaches a new high-water mark allocates again
 # in the same process, thread and task, so there is no memoization scope whose initialization has
 # finished, and `StrictMode.register_alloc_barrier!` is for exactly that. They are excused from the
-# static `:noalloc` guarantee (`@strict_exempt` below), and the property they do have — finitely many
+# static `:noalloc` guarantee (`@strict_exempt`, verify.jl), and the property they do have — finitely many
 # growths, then none — is asserted by measurement: test/strictmode_tests.jl warms each entry point and
 # checks that a second identical call allocates 0 bytes.
 #
@@ -203,10 +203,6 @@ end
     return m
 end
 # The growth functions of the workspaces and the arena (`_arena_grow!`/`_arena_coalesce!`: arena.jl).
-@strict_exempt _ws_grow! guarantees = (:noalloc,) reason = "grows a pool to a new high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
-@strict_exempt _ws_slot! guarantees = (:noalloc,) reason = "grows a pool slot to a new high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
-@strict_exempt _arena_grow! guarantees = (:noalloc,) reason = "adds a slab at a new arena high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
-@strict_exempt _arena_coalesce! guarantees = (:noalloc,) reason = "folds the slab chain after a call that grew; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # Per-task owner lookup. `Base.OncePerTask`'s call is `@inline get!(init, task_local_storage(), once)`,
 # so an inlined `owner()` puts the task-local `IdDict` grow and lookup, plus the initializer's
@@ -215,7 +211,7 @@ end
 # (`_BARRIER_FUNCTIONS`, verify.jl), and every later touch is the lookup alone. The barrier registration
 # is legitimate because this function only returns the task's owner: it allocates when the task first
 # touches `x` and reads thereafter. Growing the owner's contents is the caller's job, through a
-# growth function (`_ws_grow!` and the `@strict_exempt` growers beside each owner).
+# growth function (`_ws_grow!` and the `@strict_exempt` growers listed in verify.jl).
 @noinline _opt(x::Base.OncePerTask) = x()
 
 # transB-Strassen Bᵀ buffer, k×n over a GROW-ONLY flat slot viewed at ld == k. `transpose!` needs an

@@ -144,7 +144,6 @@ _GVDWork{T, R}() where {T, R} =
     ws.n = m
     return ws
 end
-@strict_exempt _gvd_grow! guarantees = (:noalloc,) reason = "grows the generalized-eigenproblem workspace to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # One workspace per thread (written during the call) — see `_l3ws`.
 const _GVDWS_F64 = Base.OncePerTask{_GVDWork{Float64, Float64}}(_GVDWork{Float64, Float64})

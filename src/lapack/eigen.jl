@@ -158,7 +158,6 @@ _TRDWork{T, R}() where {T, R} = _TRDWork{T, R}(0, 0, Matrix{T}(undef, 0, 0), T[]
     ws.n = m; ws.nb = b
     return ws
 end
-@strict_exempt _trd_grow! guarantees = (:noalloc,) reason = "grows the tridiagonalization panel scratch to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # One workspace per thread (written during the call) — see `_l3ws`.
 const _TRDWS_F64 = Base.OncePerTask{_TRDWork{Float64, Float64}}(_TRDWork{Float64, Float64})

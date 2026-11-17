@@ -259,7 +259,6 @@ _EDCWork{T}() where {T} = _EDCWork{T}(
     ws.n = m
     return ws
 end
-@strict_exempt _edc_grow! guarantees = (:noalloc,) reason = "grows the divide-and-conquer workspace to a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 
 # One workspace per thread (written during the call) — see `_l3ws`.
 const _EDCWS_F64 = Base.OncePerTask{_EDCWork{Float64}}(_EDCWork{Float64})
