@@ -856,13 +856,13 @@ if StrictMode.checks_enabled()
     end
 end
 
-# Register pressure and vectorization of the gemm microkernels and the trsm side-R tile. A tile sized past the register file
-# spills vectors to the stack on every k step, which neither the type-stability nor the allocation
-# checks see; these scan the compiled native code. Each call also executes, so every operand is a live
-# buffer. The argtypes are the FULL method signature, trailing `Val{B0}` included: the 9-argument
-# `_microkernel_masked!` form is a default-argument forwarder whose native code is a call and a return,
-# which a scan passes without reaching the kernel. The α-scaled `_microkernel!` shares the tile with a
-# different epilogue and has its own `B0 = false` and `B0 = true` instances.
+# Register pressure and vectorization of the gemm microkernels and the trsm side-R tile. A tile sized
+# past the register file spills vectors to the stack on every k step, which neither the type-stability
+# nor the allocation checks see; these scan the compiled native code. Each call also executes, so
+# every operand is a live buffer. The argtypes are the FULL method signature, trailing `Val{B0}`
+# included: the 9-argument `_microkernel_masked!` form is a default-argument forwarder whose native
+# code is a call and a return, which a scan passes without reaching the kernel. The α-scaled `_microkernel!` shares the tile with a different epilogue and
+# has its own `B0 = false` and `B0 = true` instances.
 let m = 64, kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
         Ap = ones(mr * kc), Bp = ones(nr * kc), Ck = ones(mr, nr),
         Lt = ones(m, m), Bt = ones(m, m)
