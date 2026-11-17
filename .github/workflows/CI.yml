@@ -9,8 +9,14 @@ concurrency:
   cancel-in-progress: true
 # deps/build.jl times the host's idle-state onset whenever Pkg builds PureBLAS. A shared runner's
 # reading describes nothing a user runs on, and the tests must not depend on it.
+#
+# PureBLAS's precompile with the StrictMode checks on peaks near 20 GB when the image's native code is
+# emitted on 2 or more threads, and near 10 GB on one (Zen4, --check-bounds=yes), against the hosted
+# runner's 16 GB. One image thread and one precompile task keep every job under that.
 env:
   PUREBLAS_SKIP_BUILD_TUNE: '1'
+  JULIA_IMAGE_THREADS: '1'
+  JULIA_NUM_PRECOMPILE_TASKS: '1'
 jobs:
   # Parallel jobs run DISJOINT slices of the suite (PUREBLAS_TEST_GROUP/SHARD, read by test/runtests.jl):
   # `test` shards the correctness suite across 2 runners (with coverage → Coveralls parallel build);
@@ -38,13 +44,6 @@ jobs:
       - uses: julia-actions/cache@v2
         with:
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
-      # PureBLAS's precompile with the StrictMode checks on peaks near 20 GB, above the runner's 16 GB
-      # of RAM; without more swap the runner is stopped mid-precompile.
-      - name: Add swap for the precompile peak
-        run: |
-          sudo fallocate -l 12G /mnt/pb-swap && sudo chmod 600 /mnt/pb-swap
-          sudo mkswap /mnt/pb-swap && sudo swapon /mnt/pb-swap
-          free -g
       - uses: julia-actions/julia-buildpkg@v1
       # `-t 4`: any item that reaches a threaded kernel needs workers to reach it at all, and below two
       # threads the pool never forms. The bit-identity and threaded-correctness items are NOT here —
@@ -126,12 +125,6 @@ jobs:
       - uses: julia-actions/cache@v2
         with:
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
-      # Same precompile peak as the `test` job; see the swap step there.
-      - name: Add swap for the precompile peak
-        run: |
-          sudo fallocate -l 12G /mnt/pb-swap && sudo chmod 600 /mnt/pb-swap
-          sudo mkswap /mnt/pb-swap && sudo swapon /mnt/pb-swap
-          free -g
       - uses: julia-actions/julia-buildpkg@v1
       # Inference/trim-safety dogfood — no line coverage (these exercise the SAME kernels the `test` job
       # already covers functionally; they assert type-stability/no-alloc/trim-safety, not new surface).
@@ -258,12 +251,6 @@ jobs:
       - uses: julia-actions/cache@v2
         with:
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
-      # Same precompile peak as the `test` job (twice: base and PR); see the swap step there.
-      - name: Add swap for the precompile peak
-        run: |
-          sudo fallocate -l 12G /mnt/pb-swap && sudo chmod 600 /mnt/pb-swap
-          sudo mkswap /mnt/pb-swap && sudo swapon /mnt/pb-swap
-          free -g
       # Blocks the merge on a >25% slowdown vs the base branch (coarse: shared runners are noisy — see
       # benchmark/judge_ci.jl). Precise 0.96× OpenBLAS gating runs on a pinned self-hosted fleet runner.
       - name: Judge performance vs base branch
