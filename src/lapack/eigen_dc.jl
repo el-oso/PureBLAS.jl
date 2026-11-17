@@ -8,22 +8,8 @@
 # Formulas (deflation tolerance, zhat Löwner product, merge z/rho setup) verified against current
 # Reference-LAPACK dlaed1.f/dlaed2.f/dlaed3.f/dlaed4.f/dlamch.f.
 
-# --- generic Givens / column rotation (BLAS DROT convention: x←c·x+s·y, y←−s·x+c·y). Kept LOCAL to
-# this D&C (deflation rotations), distinct from svd.jl's _givens/_rot_cols! (different sign convention).
-@inline function _mkgivens_g(p::T, q::T) where {T <: Real}
-    if q == zero(T)
-        return (p < zero(T) ? -one(T) : one(T)), zero(T)
-    elseif p == zero(T)
-        return zero(T), (q < zero(T) ? one(T) : -one(T))
-    elseif abs(p) > abs(q)
-        t = q / p; u = sqrt(muladd(t, t, one(T))); p < zero(T) && (u = -u)
-        c = one(T) / u; return c, -t * c
-    else
-        t = p / q; u = sqrt(muladd(t, t, one(T))); q < zero(T) && (u = -u)
-        s = -one(T) / u; return -t * s, s
-    end
-end
-
+# --- generic column rotation (BLAS DROT convention: x←c·x+s·y, y←−s·x+c·y). Kept LOCAL to
+# this D&C (deflation rotations), distinct from svd.jl's _rot_cols! (different sign convention).
 @inline function _drot_cols!(M::AbstractMatrix{T}, j1::Int, j2::Int, c::T, s::T) where {T <: Real}
     @inbounds @simd for i in 1:size(M, 1)
         a = M[i, j1]; b = M[i, j2]

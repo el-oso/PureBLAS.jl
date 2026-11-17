@@ -3266,8 +3266,8 @@ end
 # ⚠ UNREACHABLE THROUGH THE ROUTE ON EVERY FLEET BOX, so tuning it changes nothing by itself. The
 # unpacked kernel is selected first, by `max(m, n, k) <= _CGEMM_UNPACK_MAX`, and only then does this
 # cut pick the tile width — so the NR=6 arm needs `_CGEMM_UNPACK_MAX >= _CUKER_NR6_MIN`. Measured:
-# AVX2 40 < 48, AVX-512 and NEON `typemax`. The arm is still reached by `_EXPINT[3]`, which names a
-# width directly, and by direct callers such as `src/verify.jl`. Raising it requires raising
+# AVX2 40 < 48, AVX-512 and NEON `typemax`. The arm is still reached by `_EXPINT[3]`, which forces
+# the width 6, and by direct callers such as `src/verify.jl`. Raising it requires raising
 # `_CGEMM_UNPACK_MAX` past it in the same change, or the knob is inert.
 const _CUKER_NR6_MIN = @load_preference("cuker_nr6_min", _W64 == 4 ? 48 : typemax(Int))::Int
 # TB/OV/A1/AR are Val TYPE-PARAMS (not value args) so the trimmer union-splits _uker_sweep! into concrete
@@ -3345,18 +3345,14 @@ function _gemm_cmplx_unpacked!(
     parA = parent(A); parB = parent(B); parC = parent(C)   # preserve parents, not view wrappers (no box)
     GC.@preserve parA parB parC begin
         Ap = Ptr{T}(pointer(A)); Bp = Ptr{T}(pointer(B)); Cp = Ptr{T}(pointer(C))
-        # `_EXPINT[3]` — NR A/B arm. On AVX-512 `_CNR`=4 and `_CUKER_NR6_MIN`=typemax, so the wider
-        # NR=6 tile is DISABLED there and every complex unpacked call runs a 16×4 tile: only
-        # 2·(mr/W)·NR = 16 accumulators of the 32 available, and n/NR column-blocks each re-reading A.
-        # At the failing `zgemm@32` cell that is 8 passes over A. Branch into LITERAL Vals (trim-safe;
-        # `Val(_EXPINT[3])` would be a runtime Val — see the pattern note at gemm.jl:707).
+        # `_EXPINT[3]` — NR A/B arm: 0 = the route below, 6 = force the NR=6 tile (the only forced
+        # width). On AVX-512 `_CNR`=4 and `_CUKER_NR6_MIN`=typemax, so the route never picks NR=6 there.
+        # Branch into LITERAL Vals (trim-safe; `Val(_EXPINT[3])` would be a runtime Val — see the
+        # pattern note at gemm.jl:707).
         nrsel = @inbounds _EXPINT[3]
+        nrsel == 0 || nrsel == 6 || throw(ArgumentError("_EXPINT[3] must be 0 or 6, got $nrsel"))
         if nrsel == 6
             _res_tb!(Val(6), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
-        elseif nrsel == 8
-            _res_tb!(Val(8), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
-        elseif nrsel == 12
-            _res_tb!(Val(12), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
         # FROM `nrt`: this selects the microkernel's COLUMN TILE WIDTH, so a column band that picked a
         # different one would group its accumulators differently from the undivided problem. Live only
         # where `_CNR != _CNR_SMALL` (AVX2); on AVX-512 `_CUKER_NR6_MIN` is `typemax` and both arms are
