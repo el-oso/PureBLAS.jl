@@ -25,29 +25,6 @@
 # getrf!/geqrf!/gesvd! are listed at their IN-PLACE forms (caller-provided ipiv/τ, U/S/Vᵀ): the
 # convenience forms allocate those outputs, which is inherent, not a bug.
 
-# Builders for the operands below. Deterministic and Random-free (same reason the rest of this file
-# uses `ones`), well-separated and diagonally dominant.
-_strict_nonsym(::Type{T}, n) where {T} = T[i == j ? T(i) : T(1) / T(2 * (i + j)) for i in 1:n, j in 1:n]
-_strict_ddom(::Type{T}, n, dg) where {T} = T[i == j ? T(dg) : T(1) / T(4 * (i + j)) for i in 1:n, j in 1:n]
-_strict_utri(::Type{T}, n) where {T} =
-    T[i <= j ? (i == j ? T(j + 1) : T(3) / T(10 * (i + j))) : zero(T) for i in 1:n, j in 1:n]
-_strict_eye(::Type{T}, n) where {T} = T[i == j ? one(T) : zero(T) for i in 1:n, j in 1:n]
-# A REAL Schur form carrying one 2×2 conjugate-pair block. Without it every diagonal block is 1×1 and
-# `trexc!`/`trsyl!`/`trevc!` never reach their `dlaexc`/`dlasy2`/`dlaln2` 2×2 arms — half of each real
-# kernel, and the half that borrows the `t16` / `D` arena scratch.
-function _strict_quasitri(n)
-    Tq = _strict_utri(Float64, n)
-    Tq[1, 1] = 1.0; Tq[2, 2] = 1.0; Tq[1, 2] = 1.0; Tq[2, 1] = -1.0
-    return Tq
-end
-# gehrd! leaves its reflectors below the subdiagonal; hseqr! wants a clean Hessenberg.
-function _strict_clean_hess!(H)
-    @inbounds for j in axes(H, 2), i in (j + 2):size(H, 1)
-        H[i, j] = zero(eltype(H))
-    end
-    return H
-end
-
 # ── Growth functions excused from the static `:noalloc` guarantee. Each allocates at a new high-water
 # mark, so none can be a barrier; the property they do have (finitely many growths, then none) is asserted
 # by measurement: test/strictmode_tests.jl warms each entry point and checks that a second identical call
@@ -117,21 +94,19 @@ let bk = DEFAULT_BACKEND, n = 1000, m = 64,
         C3v = view(P3, 1:m, 1:m), A3v = view(Q3, 1:m, 1:m), B3v = view(R3, 1:m, 1:m),
         Btv = view(Pt, 1:m, 1:m), Atv = view(Qt, 1:m, 1:m),
         Cz3 = ones(ComplexF64, m, m), Az3 = ones(ComplexF64, m, m), Bz3 = ones(ComplexF64, m, m),
-        # SPD/non-singular source (diagonally dominant: diag m+1, off-diag 1) + a working copy the
-        # factorizations overwrite; pre-allocated pivot/τ so the in-place LU/QR kernels are 0-alloc.
-        Apd = [i == j ? float(m) + 1.0 : 1.0 for i in 1:m, j in 1:m], Aw = zeros(m, m),
+        # A working matrix the factorizations overwrite; pre-allocated pivot/τ for the in-place
+        # LU/QR kernels.
+        Aw = zeros(m, m),
         ipiv = Vector{Int}(undef, m), tau = Vector{Float64}(undef, m),
         # QR-family sources: a pristine A, and pre-factored copies for the Q-generators and
         # Q-appliers (which need real reflectors, not raw data).
         Aqr = ones(m, m), Aqw = zeros(m, m), tauq = Vector{Float64}(undef, m),
-        jpq = zeros(Int, m), Cqr = ones(m, m), Cqw = zeros(m, m),
+        jpq = zeros(Int, m), Cqw = zeros(m, m),
         # COMPLEX counterparts. The contract previously verified `symm!`/`syrk!`/`syr2k!`/`trmm!`/
         # `trsm!` and every factorization on REAL operands only, so any defect confined to a complex
         # kernel was invisible to it — which is exactly how ~1 KB/call of `unsafe_wrap` allocation in
-        # the complex-only 3M path passed for a month. Hermitian PD (diag m+1, off-diag 1+0im) so
-        # zpotrf succeeds; `Atz` is the triangular operand for ztrmm/ztrsm (unit diagonal ⇒
-        # non-singular), `Btz` the one they overwrite, mirroring the real `At`/`Bt` pair.
-        Apdz = [i == j ? ComplexF64(m + 1) : ComplexF64(1) for i in 1:m, j in 1:m],
+        # the complex-only 3M path passed for a month. `Atz` is the triangular operand for
+        # ztrmm/ztrsm, `Btz` the one they overwrite, mirroring the real `At`/`Bt` pair.
         Awz3 = zeros(ComplexF64, m, m), tauz = Vector{ComplexF64}(undef, m),
         Atz = ones(ComplexF64, m, m), Btz = ones(ComplexF64, m, m),
         # L2 packed storage (AP length m(m+1)/2) and band storage (kb sub/super-diagonals).
@@ -141,32 +116,26 @@ let bk = DEFAULT_BACKEND, n = 1000, m = 64,
         Usv = zeros(m, m), Ssv = zeros(m), Vtsv = zeros(m, m),
         # ── AbstractLAPACKSolve operands. SMALL on purpose (ms=32, nrhs=2, band widths 1-2): this
         # block runs at every user's precompile, so each of the 24 members gets the smallest shape
-        # that still reaches its real kernel rather than a degenerate one. Everything is
-        # diagonally dominant — dense diag ms+1 vs ms-1 off-diagonal ones, tridiagonal 4.0 vs
-        # 0.3/0.2, both band stores 10.0 on the diagonal row vs 1.0 elsewhere — so no call can
-        # raise PosDefException/SingularException. That matters more here than in a test: a throw
-        # inside @verify_strict fails the PRECOMPILE, i.e. the package stops loading at all.
+        # that still reaches its real kernel rather than a degenerate one. The checks never run
+        # these routines, so the operands carry types and dimensions, not values.
         ms = 32, nrhs = 2,
-        Aspd = [i == j ? float(ms) + 1.0 : 1.0 for i in 1:ms, j in 1:ms],
         Asw = zeros(ms, ms), Achol = zeros(ms, ms), Alu = zeros(ms, ms), AFx = zeros(ms, ms),
         ipivs = Vector{Int}(undef, ms), ipivx = Vector{Int}(undef, ms), pivs = Vector{Int}(undef, ms),
         Bs0 = ones(ms, nrhs), Bsw = zeros(ms, nrhs), Xs = zeros(ms, nrhs),
         ferrs = zeros(nrhs), berrs = zeros(nrhs), Rq = ones(ms), Cq = ones(ms),
-        # Packed lower storage: column j is rows j:ms, so the comprehension's j-outer/i-inner order
-        # IS the packing. APc stands for the factor pptrs! consumes.
-        APs0 = [i == j ? float(ms) + 1.0 : 1.0 for j in 1:ms for i in j:ms],
-        APc = zeros(length(APs0)),
+        # Packed lower storage: column j is rows j:ms, so the length is ms(ms+1)/2. APc stands for
+        # the factor pptrs! consumes.
+        APc = zeros(ms * (ms + 1) ÷ 2),
         # pptrf!'s own operand is order 32, deliberately ABOVE `_PPTRF_BLK_MIN` (16) so the strict
         # window covers `_pptrf_lower_blocked!` — see the note at its call below.
-        nps = 32, APu0 = [i == j ? float(nps) + 1.0 : 1.0 for j in 1:nps for i in j:nps],
-        APuw = zeros(length(APu0)),
+        nps = 32,
+        APuw = zeros(nps * (nps + 1) ÷ 2),
         # Band SPD (kdS sub-diagonals; row 1 of the lower band store is the diagonal).
-        kdS = 2, ABp0 = [r == 1 ? 10.0 : 1.0 for r in 1:(kdS + 1), j in 1:ms],
+        kdS = 2,
         ABpw = zeros(kdS + 1, ms), ABpc = zeros(kdS + 1, ms),
         # General band LU: ldab = 2kl+ku+1 with the diagonal on row kl+ku+1 and rows 1:kl reserved
         # for the factorization's fill, exactly dgbtrf's convention.
         klS = 1, kuS = 1,
-        ABg0 = [r == klS + kuS + 1 ? 10.0 : 1.0 for r in 1:(2 * klS + kuS + 1), j in 1:ms],
         ABgw = zeros(2 * klS + kuS + 1, ms), ABgc = zeros(2 * klS + kuS + 1, ms),
         ipivg = Vector{Int}(undef, ms), ipivgw = Vector{Int}(undef, ms),
         # A SECOND, WIDE band for gbtrf! only. kl=ku=1 above reaches `_gbtf2!` and nothing else:
@@ -177,16 +146,13 @@ let bk = DEFAULT_BACKEND, n = 1000, m = 64,
         # who pins `gbtrf_cross` above 64 falls back to the unblocked kernel here — still 0-alloc,
         # just less coverage.) gbtrs! is unaffected by blocking and stays on the narrow band above.
         klB = 64, kuB = 8, msB = 128,
-        ABb0 = [r == klB + kuB + 1 ? 10.0 : 1.0 for r in 1:(2 * klB + kuB + 1), j in 1:msB],
         ABbw = zeros(2 * klB + kuB + 1, msB), ipivb = Vector{Int}(undef, msB),
-        # Tridiagonal source + a working triple the factor-in-place routines overwrite, and a
-        # separately factored triple gttrs! solves against.
-        dl0 = fill(0.2, ms - 1), d0 = fill(4.0, ms), du0 = fill(0.3, ms - 1),
+        # Tridiagonal working triple the factor-in-place routines overwrite, and a separately
+        # factored triple gttrs! solves against.
         dlw = zeros(ms - 1), dw = zeros(ms), duw = zeros(ms - 1), du2w = zeros(ms - 2),
         dlf = zeros(ms - 1), df = zeros(ms), duf = zeros(ms - 1), du2f = zeros(ms - 2),
         ipivt = Vector{Int}(undef, ms), ipivtw = Vector{Int}(undef, ms),
         # SPD tridiagonal (pttrf/pttrs/ptsv): D real, E the sub-diagonal.
-        Dp0 = fill(4.0, ms), Ep0 = fill(0.3, ms - 1),
         Dpw = zeros(ms), Epw = zeros(ms - 1), Dpf = zeros(ms), Epf = zeros(ms - 1)
     # No PureBLAS routine is called below this line: the checks read argument types only, so a
     # factored source has the type of the matrix it would be factored from, and calling a routine
@@ -207,51 +173,40 @@ let bk = DEFAULT_BACKEND, n = 1000, m = 64,
     # half and generalized SVD, `ls*`/`lsz*` least squares, `st*` the tridiagonal eigen pair.
     # Each `ev/ez` set carries four ms×ms scratch matrices because several members need two or three
     # distinct mutable targets live at once (trexc!'s T and Q, gghrd!'s A/B/Q/Z).
-    evA = _strict_nonsym(Float64, ms); evB = _strict_ddom(Float64, ms, ms + 1)
+    evA = ones(ms, ms)
     evW1 = zeros(ms, ms); evW2 = zeros(ms, ms); evW3 = zeros(ms, ms); evW4 = zeros(ms, ms)
     evsc = ones(ms); evtau = Vector{Float64}(undef, ms)
     evilo, evihi = 1, ms              # the (ilo, ihi) range gebal! returns: two Ints
-    evV = ones(ms, ms); evV0 = ones(ms, ms); evC = ones(ms, ms)
+    evV = ones(ms, ms)
     evAf = copy(evA)
-    evH = _strict_clean_hess!(copy(evAf))
     evw = Vector{ComplexF64}(undef, ms); evwr = zeros(ms); evwi = zeros(ms)
-    evT = _strict_quasitri(ms); evQI = _strict_eye(Float64, ms)
+    evT = ones(ms, ms)
     # trsen!: `select` marks the leading cluster; `w` receives the eigenvalues (must not alias T).
     tsnsel = zeros(Int, ms); tsnsel[1:(ms ÷ 2)] .= 1
     tsnw = Vector{ComplexF64}(undef, ms)
     # sygvd!/hegvd!: A symmetric/Hermitian, B symmetric/Hermitian POSITIVE DEFINITE (potrf! must
     # succeed). Diagonally dominant; the complex diagonals are real, as a Hermitian's must be.
-    gvA = Float64[i == j ? Float64(ms + 4) : 1.0 / (i + j) for i in 1:ms, j in 1:ms]
-    gvB = Float64[i == j ? Float64(ms + 8) : 0.5 / (i + j) for i in 1:ms, j in 1:ms]
     gvAw = zeros(ms, ms); gvBw = zeros(ms, ms); gvw = zeros(ms)
-    gvzA = ComplexF64[i == j ? ComplexF64(ms + 4) : ComplexF64(1, 0.2) / (i + j) for i in 1:ms, j in 1:ms]
-    gvzB = ComplexF64[i == j ? ComplexF64(ms + 8) : ComplexF64(0.5, 0.1) / (i + j) for i in 1:ms, j in 1:ms]
     gvzAw = zeros(ComplexF64, ms, ms); gvzBw = zeros(ComplexF64, ms, ms)
-    evVL = zeros(ms, 0); evU = _strict_utri(Float64, ms)
-    ezA = _strict_nonsym(ComplexF64, ms); ezB = _strict_ddom(ComplexF64, ms, ms + 1)
+    evVL = zeros(ms, 0); evU = ones(ms, ms)
+    ezA = ones(ComplexF64, ms, ms)
     ezW1 = zeros(ComplexF64, ms, ms); ezW2 = zeros(ComplexF64, ms, ms)
     ezW3 = zeros(ComplexF64, ms, ms); ezW4 = zeros(ComplexF64, ms, ms)
     ezsc = ones(ms); eztau = Vector{ComplexF64}(undef, ms)
     ezilo, ezihi = 1, ms
-    ezV = ones(ComplexF64, ms, ms); ezV0 = ones(ComplexF64, ms, ms); ezC = ones(ComplexF64, ms, ms)
+    ezV = ones(ComplexF64, ms, ms)
     ezAf = copy(ezA)
-    ezH = _strict_clean_hess!(copy(ezAf))
     ezw = Vector{ComplexF64}(undef, ms)
-    ezQI = _strict_eye(ComplexF64, ms); ezVL = zeros(ComplexF64, ms, 0)
-    ezU = _strict_utri(ComplexF64, ms)
-    # QZ: the Hessenberg-triangular pair hgeqz! takes and the generalized Schur pair tgevc!/tgsen!
-    # take.
-    qzA = copy(evA); qzB = copy(evB)
+    ezVL = zeros(ComplexF64, ms, 0)
+    ezU = ones(ComplexF64, ms, ms)
+    # QZ: eigenvalue / selection operands for hgeqz!, tgevc!, tgsen!.
     qzal = Vector{ComplexF64}(undef, ms); qzbe = zeros(ms)
-    qzS = copy(qzA); qzP = copy(qzB); qzZ = zeros(ms, ms)
     qzsel = zeros(Int, ms); qzsel[1] = 1; qzsel[2] = 1; qzsel[5] = 1
-    qzzA = copy(ezA); qzzB = copy(ezB)
     qzzal = Vector{ComplexF64}(undef, ms); qzzbe = Vector{ComplexF64}(undef, ms)
-    qzzS = copy(qzzA); qzzP = copy(qzzB); qzzZ = zeros(ComplexF64, ms, ms)
     # Bunch-Kaufman: one source per (sy/he) × (L/U), each with its own pivots, because `_sytri_lower!`
     # / `_sytri_upper!` and the symmetric / Hermitian arms are four separate kernels.
-    bkfA = _strict_ddom(Float64, ms, ms + 1)
-    bkzA = [i == j ? ComplexF64(ms + 1) : ComplexF64(1, 0.25) / (i + j) for i in 1:ms, j in 1:ms]
+    bkfA = ones(ms, ms)
+    bkzA = ones(ComplexF64, ms, ms)
     bkfip = Vector{Int}(undef, ms); bkfiph = Vector{Int}(undef, ms)
     bkzip = Vector{Int}(undef, ms); bkziph = Vector{Int}(undef, ms)
     bkfwk = Vector{Float64}(undef, ms); bkzwk = Vector{ComplexF64}(undef, ms)
@@ -267,27 +222,20 @@ let bk = DEFAULT_BACKEND, n = 1000, m = 64,
     # SVD front half + generalized SVD. `p < n` for ggsvd! so the RQ branches (`_ggs_gerq2!` /
     # `_ggs_apply_rq_right!`, the two O(n²) sites the conversion actually targeted) are on the path.
     svm, svn, svp = 24, 16, 8
-    svA = Float64[i == j ? 8.0 : 1.0 / (i + j) for i in 1:svm, j in 1:svn]
     svAw = zeros(svm, svn); svd = zeros(svn); sve = zeros(svn)
     svtq = Vector{Float64}(undef, svn); svtp = Vector{Float64}(undef, svn)
-    svzA = ComplexF64[i == j ? ComplexF64(8) : ComplexF64(1, 0.3) / (i + j) for i in 1:svm, j in 1:svn]
     svzAw = zeros(ComplexF64, svm, svn)
     svztq = Vector{ComplexF64}(undef, svn); svztp = Vector{ComplexF64}(undef, svn)
-    ggA = Float64[i == j ? 4.0 : 1.0 / (i + j) for i in 1:svm, j in 1:svn]
-    ggB = Float64[i == j ? 3.0 : 1.0 / (2 * (i + j)) for i in 1:svp, j in 1:svn]
     ggAw = zeros(svm, svn); ggBw = zeros(svp, svn)
     ggU = zeros(svm, svm); ggV = zeros(svp, svp); ggQ = zeros(svn, svn)
     ggal = zeros(svn); ggbe = zeros(svn); ggR = zeros(svn, svn)
-    ggzA = ComplexF64[i == j ? ComplexF64(4) : ComplexF64(1, 0.2) / (i + j) for i in 1:svm, j in 1:svn]
-    ggzB = ComplexF64[i == j ? ComplexF64(3) : ComplexF64(0.5, 0.1) / (i + j) for i in 1:svp, j in 1:svn]
     ggzAw = zeros(ComplexF64, svm, svn); ggzBw = zeros(ComplexF64, svp, svn)
     ggzU = zeros(ComplexF64, svm, svm); ggzV = zeros(ComplexF64, svp, svp)
     ggzQ = zeros(ComplexF64, svn, svn); ggzR = zeros(ComplexF64, svn, svn)
     # Bidiagonal SVD driver: d/e are the bidiagonal itself, so no factored source is needed.
-    bqd0 = [2.0 + i / svn for i in 1:svn]; bqe0 = fill(0.3, svn)
     bqd = zeros(svn); bqe = zeros(svn)
-    bqU = _strict_eye(Float64, svn); bqV = _strict_eye(Float64, svn)
-    bqVt = _strict_eye(ComplexF64, svn); bqUz = _strict_eye(ComplexF64, svn)
+    bqU = ones(svn, svn); bqV = ones(svn, svn)
+    bqVt = ones(ComplexF64, svn, svn); bqUz = ones(ComplexF64, svn, svn)
     bqC = zeros(ComplexF64, svn, 0)
     # bdsdc! writes both singular-vector sets into caller buffers (n×n each).
     bdLv = zeros(svn, svn); bdRv = zeros(svn, svn)
@@ -318,13 +266,11 @@ let bk = DEFAULT_BACKEND, n = 1000, m = 64,
     vwk = view(ones(ms + 8), 1:ms)
     vAf = copy(evA); vtauP = Vector{Float64}(undef, ms + 8)
     vtauf = view(vtauP, 1:ms)
-    vH = _strict_clean_hess!(copy(vAf))
     vbkf = copy(bkfLs); copyto!(vip, bkfLsp)
     vBP = ones(ms + 8, nrhs + 4); vBv = view(vBP, 1:ms, 1:nrhs)
-    vB0 = ones(ms, nrhs)
     vlsP = ones(svm + 8, svn + 8); vlsA = view(vlsP, 1:svm, 1:svn)
     vlsBP = ones(svm + 8, nrhs + 4); vlsB = view(vlsBP, 1:svm, 1:nrhs)
-    vlsB0 = ones(svm, nrhs); vlsjp = view(vipP, 1:svn)
+    vlsjp = view(vipP, 1:svn)
     vstP = ones(ms + 8, stm + 4); vstZ = view(vstP, 1:ms, 1:stm)
     # The guarantees are named so every listed signature is also registered, and
     # test_registered (StrictModeTest) re-proves them in the test environment.
@@ -486,7 +432,6 @@ let bk = DEFAULT_BACKEND, n = 1000, m = 64,
         gesvx!(bk, 'N', 'N', Asw, AFx, ipivx, 'N', Rq, Cq, Bsw, Xs, ferrs, berrs)
         # ── QR / LQ / QL / RZ. 14 distinct implementations; the nine `un*!` names are `const`
         # aliases of these same function objects, so verifying `or*!` verifies them too.
-        # orgtr!/ungtr! are absent — they allocate their output Q (see contracts.jl).
         gelqf!(Aqw, tauq)
         geqlf!(Aqw, tauq)
         gerqf!(Aqw, tauq)
