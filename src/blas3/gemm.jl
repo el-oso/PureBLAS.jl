@@ -3350,7 +3350,7 @@ function _gemm_cmplx_unpacked!(
         # Branch into LITERAL Vals (trim-safe; `Val(_EXPINT[3])` would be a runtime Val — see the
         # pattern note at gemm.jl:707).
         nrsel = @inbounds _EXPINT[3]
-        nrsel == 0 || nrsel == 6 || throw(ArgumentError("_EXPINT[3] must be 0 or 6, got $nrsel"))
+        nrsel == 0 || nrsel == 6 || throw(ArgumentError("_EXPINT[3] must be 0 or 6"))
         if nrsel == 6
             _res_tb!(Val(6), Cp, ldc, Ap, lda, Bp, ldb, m, n, k, alr, ali, W, mr, tB, Val(SA), Val(SB), b0, a1, ar)
         # FROM `nrt`: this selects the microkernel's COLUMN TILE WIDTH, so a column band that picked a
