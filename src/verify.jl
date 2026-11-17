@@ -1,19 +1,19 @@
-# Precompile-time contract verification for the SIMDBackend. Included LAST (after every backend op is
-# defined) because @verify_strict actually CALLS the ops — the L3 warm-up and @strict calls need
-# gemm!/symm!/trmm!/trsm! from gemm.jl/level3.jl, which are included after backend.jl.
+# Precompile-time guarantees for the SIMDBackend. Included LAST, after every backend op and C-ABI entry
+# is defined, because the declarations below name them.
 #
-# @verify_strict is the single backend verifier: it runs TypeContracts.@verify SIMDBackend — method
-# existence + declared return types over the whole chain (AbstractBLAS1 → BLAS2 → BLAS3 → LAPACK →
-# LAPACKSolve) —
-# AND @strict on each representative call (type-stable + allocation-free), since AbstractBLAS1/2/3 are
-# @strict_contracts. The @strict calls self-gate on the `checks_enabled` preference.
+# `@verify_strict SIMDBackend` runs `TypeContracts.@verify SIMDBackend` — method existence + declared
+# return types over the whole chain (AbstractBLAS1 → BLAS2 → BLAS3 → LAPACK → LAPACKSolve) — and checks
+# each representative call listed in it at the argument types it names:
+#   :typestable — the inferred return type must be concrete. This GATES: a failure stops PureBLAS from
+#                 precompiling.
+#   :noalloc    — StrictMode's value-free IR scan. This REPORTS: a finding is a `StrictViolation`
+#                 warning, recorded in `_LOADTIME_WARNINGS` below and compared against
+#                 test/loadtime_warnings_baseline.txt by test/loadtime_warnings_tests.jl.
+# The listed calls are NOT performed: every check reads argument types only, so the operands in the
+# `let` exist to name those types and their values are never used. The proofs of both guarantees —
+# JET for stability, AllocCheck for allocation, TrimCheck for trim — run from test/ (StrictModeTest is a
+# test-only dependency, so it cannot load at this package's own precompile).
 #
-# WHICH HALF ACTUALLY RUNS, MEASURED — read this before adding a member. `StrictMode.proofs_loaded()`
-# is FALSE in the main env (StrictModeTest, and with it AllocCheck/JET/TrimCheck, is test-only), so the
-# @strict half of this block does no proving at PureBLAS's own precompile. What DOES run every time is
-# `TypeContracts.@verify SIMDBackend` — the method surface + declared return types of all 78 members —
-# because that is inside @verify_strict but the `if` guards the whole let. The @strict half proves when
-# the block is entered with StrictModeTest loaded, i.e. the test suite's strictmode dogfood.
 # Do NOT use StrictMode's IR heuristic (`_alloc_signals`) as the eligibility test for a new
 # member: the control run in bench/probes/strict_heuristic_control.jl flags EVERY already-contracted
 # LAPACK member — gemm!, potrf!, getrf!, geqrf!, potrs!, getri!, pstrf!, the whole QR family — at a
@@ -21,16 +21,11 @@
 # concrete inferred return type; that is what every member below was admitted on
 # (bench/probes/strict_contract_eligibility.jl, strict_contract_dryrun.jl).
 #
-# TRIM-COMPATIBILITY is a strict-contract guarantee too (contracts.jl): the complex-gemm
-# kernel is asserted `@assert_trim_compatible` HERE (fast/dev → heuristic scan, cheap early net) and in the
-# full-mode dogfood (test → juliac's authoritative verify_typeinf_trim). The heuristic misses reachability-
-# limit union-splits the authoritative pass catches — StrictMode 0.3.9 now logs a one-time caveat on that
-# heuristic-path trim PASS (issue #13); trim_tests.jl keeps the authoritative ccallable-rooted belt.
-# trim_tests.jl keeps the exhaustive ccallable-rooted TrimCheck.@validate belt (strict verify isn't perfect).
 # Values live in a `let` — only their types matter, so `ones` (no Random dep).
-# potrf! overwrites its argument and throws PosDefException if re-factored — but @strict calls its
-# target repeatedly. This probe re-seeds the SPD source (in-place copyto!, no allocation) before each
-# factorization, so it's a single 0-alloc, type-stable call @strict can invoke as many times as it likes.
+# The probes below are statically resolved functions over the operands a call needs, returning
+# `nothing` so a multi-output tuple is not charged to the call site. Each re-seeds the arguments the
+# routine overwrites before calling it (in-place copyto!, no allocation), so the same probe is also a
+# valid, repeatable call when a test executes it.
 _strict_potrf_probe(bk, Aw, Apd) = (copyto!(Aw, Apd); potrf!(bk, Aw; uplo = 'L'))
 # getrf!/geqrf! are 0-alloc through their IN-PLACE (pre-allocated ipiv/τ) forms — the convenience forms
 # allocate the pivot/τ output, which is inherent, not a bug. These probes re-seed the source and call the
@@ -45,12 +40,12 @@ _strict_gesvd_probe(Gw, G0, U, S, Vt) = (copyto!(Gw, G0); gesvd!(Gw, U, S, Vt); 
 # ── AbstractLAPACKSolve probes (contracts.jl). Same re-seeding discipline as the four factorization
 # probes above, and for the same reason — but it applies to the WHOLE contract here rather than to a
 # couple of members: every one of these 24 either overwrites its factor/band/tridiagonal input or its
-# right-hand side, and @strict invokes its target repeatedly. A direct call would re-factor an
+# right-hand side, and a probe must stay valid when invoked repeatedly. A direct call would re-factor an
 # already-factored matrix on the second invocation (PosDefException from pptrf!/pbtrf!, a zero pivot
 # from gttrf!) or, worse, keep solving against a solution it just produced and pass on garbage. The
 # three condition estimators (pocon!/gecon!/trcon!) read their factor without touching it, so those
 # alone are called directly in the block below. Every probe returns nothing so the multi-output tuples
-# — (piv, rank, info), (dl, d, du, du2, ipiv), gesvx's 6-tuple — never escape the strict window and
+# — (piv, rank, info), (dl, d, du, du2, ipiv), gesvx's 6-tuple — never escape the checked call and
 # get charged as an allocation that belongs to the call site rather than to the routine.
 _strict_potrs_probe(bk, Bw, B0, Ac) = (copyto!(Bw, B0); potrs!(bk, Ac, Bw; uplo = 'L'); nothing)
 _strict_potri_probe(bk, Aw, Ac) = (copyto!(Aw, Ac); potri!(bk, Aw; uplo = 'L'); nothing)
@@ -87,8 +82,8 @@ _strict_gesvx_probe(bk, A, A0, AF, ipiv, R, C, Bw, B0, X, fe, be) =
     gesvx!(bk, 'N', 'N', A, AF, ipiv, 'N', R, C, Bw, X, fe, be); nothing
 )
 
-# ── QR/LQ/QL/RZ probes. Every one of these overwrites its input, and `@strict` calls its target
-# repeatedly, so each re-seeds from a pristine source with `copyto!` (allocation-free) and returns
+# ── QR/LQ/QL/RZ probes. Every one of these overwrites its input, and a probe must stay valid when
+# invoked repeatedly, so each re-seeds from a pristine source with `copyto!` (allocation-free) and returns
 # `nothing` so the multi-output tuples never escape to the call site.
 _strict_qrfac_probe(f, Aw, A0, tau) = (copyto!(Aw, A0); f(Aw, tau); nothing)
 _strict_qp3_probe(Aw, A0, jp, tau) = (copyto!(Aw, A0); fill!(jp, 0); geqp3!(Aw, jp, tau); nothing)
@@ -99,14 +94,14 @@ _strict_ormq_probe(f, Cw, C0, Af, tau) = (copyto!(Cw, C0); f('L', 'N', Af, tau, 
 
 # orgtr!/ungtr! read A/tau and OVERWRITE the caller-supplied Q, so only Q needs re-seeding — and it does
 # need it: the in-place form zeroes Q itself (its off-diagonal zeros are READ by the block-reflector
-# gemms), so a repeated @strict call must not inherit the previous call's Q. Return nothing so Q does
+# gemms), so a repeated call must not inherit the previous call's Q. Return nothing so Q does
 # not escape and get charged to the call site.
 _strict_orgtr_probe(bk, A, tau, Q) = (orgtr!(bk, 'L', A, tau, Q); nothing)
 _strict_ungtr_probe(bk, A, tau, Q) = (ungtr!(bk, 'L', A, tau, Q); nothing)
 
 # ── Probes for the 34 members added when the nonsymmetric-eigen / Bunch-Kaufman / QZ / SVD-front /
 # least-squares families moved to owned workspace. Same discipline as everything above: re-seed every
-# overwritten input with `copyto!` (allocation-free) because `@strict` calls its target repeatedly, and
+# overwritten input with `copyto!` (allocation-free) so a repeated invocation sees the same problem, and
 # return `nothing` so the multi-output tuples are never charged to the call site. Each is routed through
 # the BACKEND method, since that is the method the contract actually binds. The `job`/`uplo`/`side`/
 # `trans` characters are passed as ARGUMENTS rather than baked in, so one probe covers every arm and the
@@ -220,8 +215,8 @@ _strict_stein_probe(bk, d, e, w, iblock, isplit, Z) =
     (stein!(bk, d, e, w, iblock, isplit, Z); nothing)
 
 # Source builders for the operands those probes take. Deterministic and Random-free (same reason the
-# rest of this file uses `ones`), well-separated and diagonally dominant so no call in the strict
-# window can raise — a throw here fails the PRECOMPILE, i.e. the package stops loading at all.
+# rest of this file uses `ones`), well-separated and diagonally dominant, so a probe executed on them
+# cannot raise.
 _strict_nonsym(::Type{T}, n) where {T} = T[i == j ? T(i) : T(1) / T(2 * (i + j)) for i in 1:n, j in 1:n]
 _strict_ddom(::Type{T}, n, dg) where {T} = T[i == j ? T(dg) : T(1) / T(4 * (i + j)) for i in 1:n, j in 1:n]
 _strict_utri(::Type{T}, n) where {T} =
@@ -243,36 +238,38 @@ function _strict_clean_hess!(H)
     return H
 end
 
-# StrictMode 0.4 deleted both names this line used to call. `analysis_mode()` is gone outright — 0.4 has
-# one engine per package and `checks_enabled()` is the whole on/off switch — and `backend_available()`
-# became `proofs_loaded()`, which asks whether StrictModeTest is loaded rather than whether a particular
-# analysis backend resolved. Together they made this a HARD break: the package stopped precompiling at
-# all rather than merely stopping gating, which is the failure mode StrictMode's own migration.jl says it
-# measured on three of eight consumers.
-#
-# `proofs_loaded()` ALONE, and the disjunction is deliberately NOT carried over — this is where the
-# translation is easy to get wrong, and the first attempt did. 0.3.10's `analysis` preference defaulted to
-# `"full"`, NOT `:fast`, so `analysis_mode() === :fast` was FALSE wherever nothing set it, and
-# `backend_available()` was false in the main env (AllocCheck/JET being test-only). The old guard was
-# therefore FALSE at PureBLAS's own precompile and this whole block was SKIPPED there; it ran only where
-# the analysis backend was loaded, i.e. the test suite. Writing the 0.4 form as
-# `checks_enabled() || proofs_loaded()` inverts that: `checks_enabled()` defaults to TRUE, so the block
-# started executing every probe below at every precompile and printing a wall of `@noalloc` warnings from
-# the value-free IR scan — the very heuristic the paragraph above says flags EVERY contracted LAPACK
-# member at a measured 0 B. Minutes of precompile spent producing verdicts this file already documents as
-# worthless. `proofs_loaded()` is the exact translation of "a real backend is present".
 # Functions whose allocations the static no-allocation proof treats as expected: each only performs the
 # first touch of a task-local owner (the allocation is the one-time initialization of that task's slot,
 # and every later call is a lookup). Each must be `@noinline` and be the `:invoke` callee itself to be
 # recognized. Functions that grow a pool to a new high-water mark are not here — they allocate again at
 # each new mark, so they are `@strict_exempt :noalloc` (workspace.jl) and asserted by measurement.
 const _BARRIER_FUNCTIONS = (_m3ws, _gpackws, _strws, _opt)
+# The registry is process-global and not part of the saved image, so this registration covers only the
+# checks in this file, which run while PureBLAS precompiles. test/strictmode_tests.jl registers (and
+# removes) its own barriers around each proof it runs in the test process.
+foreach(StrictMode.register_alloc_barrier!, _BARRIER_FUNCTIONS)
 
-if StrictMode.proofs_loaded()
-    # The registry is process-global and not part of the saved image, so this registration covers only the
-    # `@verify_strict` below, which runs while PureBLAS precompiles. test/strictmode_tests.jl registers
-    # (and removes) its own barriers around each proof it runs in the test process.
-    foreach(StrictMode.register_alloc_barrier!, _BARRIER_FUNCTIONS)
+# A heuristic check below reports by logging a `StrictViolation` warning instead of throwing. From here
+# to the end of this file the global logger is wrapped so each such message is also pushed onto
+# `_LOADTIME_WARNINGS`, which is saved in the package image; test/loadtime_warnings_tests.jl compares it
+# against a baseline. Messages still reach the original logger unchanged.
+const _LOADTIME_WARNINGS = String[]
+struct _WarnRecorder{L <: Base.CoreLogging.AbstractLogger} <: Base.CoreLogging.AbstractLogger
+    inner::L
+end
+Base.CoreLogging.min_enabled_level(r::_WarnRecorder) = Base.CoreLogging.min_enabled_level(r.inner)
+Base.CoreLogging.shouldlog(r::_WarnRecorder, args...) = Base.CoreLogging.shouldlog(r.inner, args...)
+Base.CoreLogging.catch_exceptions(r::_WarnRecorder) = Base.CoreLogging.catch_exceptions(r.inner)
+function Base.CoreLogging.handle_message(r::_WarnRecorder, level, message, args...; kwargs...)
+    if level == Base.CoreLogging.Warn && message isa AbstractString && startswith(message, "StrictViolation")
+        push!(_LOADTIME_WARNINGS, message)
+    end
+    return Base.CoreLogging.handle_message(r.inner, level, message, args...; kwargs...)
+end
+Base.CoreLogging.global_logger(_WarnRecorder(Base.CoreLogging.global_logger()))
+
+# With checks disabled every per-call check below compiles to nothing, so the operands are not built.
+if StrictMode.checks_enabled()
     let bk = DEFAULT_BACKEND, n = 1000, m = 64,
             xd = ones(n), yd = ones(n), xz = ones(ComplexF64, n), yz = ones(ComplexF64, n),
             Ad = ones(m, m), Az = ones(ComplexF64, m, m), um = ones(m), vm = ones(m),
@@ -324,7 +321,7 @@ if StrictMode.proofs_loaded()
             Bs0 = ones(ms, nrhs), Bsw = zeros(ms, nrhs), Xs = zeros(ms, nrhs),
             ferrs = zeros(nrhs), berrs = zeros(nrhs), Rq = ones(ms), Cq = ones(ms),
             # Packed lower storage: column j is rows j:ms, so the comprehension's j-outer/i-inner order
-            # IS the packing. APc is the factor pptrs! consumes (filled in the warm-up below).
+            # IS the packing. APc stands for the factor pptrs! consumes.
             APs0 = [i == j ? float(ms) + 1.0 : 1.0 for j in 1:ms for i in j:ms],
             APc = zeros(length(APs0)),
             # pptrf!'s own operand is order 32, deliberately ABOVE `_PPTRF_BLK_MIN` (16) so the strict
@@ -359,74 +356,17 @@ if StrictMode.proofs_loaded()
             # SPD tridiagonal (pttrf/pttrs/ptsv): D real, E the sub-diagonal.
             Dp0 = fill(4.0, ms), Ep0 = fill(0.3, ms - 1),
             Dpw = zeros(ms), Epw = zeros(ms - 1), Dpf = zeros(ms), Epf = zeros(ms - 1)
-        # Warm the per-type Level-3 / Cholesky workspace scratch (allocated once on first touch) so the
-        # fast-mode runtime @noalloc below sees steady state. All L3 ops are 0-alloc after the offset
-        # recursion refactor (rank-k/hemm sub-blocks no longer heap-box), so the whole matrix-matrix set
-        # is verified below.
-        # complex gemm warms the 3M split/product pools too — they grow on first touch, so without this
-        # the new in-window `gemm!(bk, Cz3, Az3, Bz3)` assertion below would trip on pool growth rather
-        # than on a real per-call allocation.
-        gemm!(bk, C3, A3, B3); gemm!(bk, Cz3, Az3, Bz3); symm!(bk, C3, A3, B3)
-        trmm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
-        trsm!(bk, Bt, At; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
-        # complex L3 + complex Cholesky warmup (own per-type workspaces and 3M pools)
-        symm!(bk, Cz3, Az3, Bz3); syrk!(bk, Cz3, Az3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0 + 0im)
-        syr2k!(bk, Cz3, Az3, Bz3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0 + 0im)
-        trmm!(bk, Btz, Atz; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0 + 0im)
-        trsm!(bk, Btz, Atz; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0 + 0im)
-        copyto!(Awz3, Apdz); potrf!(Awz3; uplo = 'L')
-        copyto!(Awz3, Apdz); getrf!(Awz3, ipiv); copyto!(Awz3, Apdz); geqrf!(Awz3, tauz)
-        syrk!(bk, C3, A3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
-        herk!(bk, Cz3, Az3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
-        syr2k!(bk, C3, A3, B3; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
-        her2k!(bk, Cz3, Az3, Bz3; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0)
-        hemm!(bk, Cz3, Az3, Bz3; side = 'L', uplo = 'L', alpha = 1.0 + 0im, beta = 1.0 + 0im)
-        copyto!(Aw, Apd); potrf!(bk, Aw; uplo = 'L')
-        copyto!(Aw, Apd); getrf!(Aw, ipiv); copyto!(Aw, Apd); geqrf!(Aw, tau)
-        copyto!(Aw, Apd); gesvd!(Aw, Usv, Ssv, Vtsv)   # warm the cached SVDWorkspace
-        # LAPACKSolve warm-up, in two parts. First build the factored sources the solves, inverses and
-        # condition estimators consume — those routines take a factor, not a matrix, and handing them a
-        # raw SPD/general matrix would "succeed" on nonsense. Then take one pass through every probe, so
-        # the owned scratch each routine grows on first touch (getri's n×nb block column, pstrf's 2n work
-        # vector, the LACN2 estimator buffers behind gecon/trcon/pocon, the L3 workspaces the trsm-based
-        # solves reach) is already at steady state when the strict window opens — otherwise first-touch
-        # growth is charged to the routine and reads as a per-call allocation that isn't one.
-        copyto!(Achol, Aspd); potrf!(Achol; uplo = 'L')
-        copyto!(Alu, Aspd); getrf!(Alu, ipivs)
-        copyto!(APc, APs0); pptrf!(APc; uplo = 'L')
-        copyto!(ABpc, ABp0); pbtrf!(ABpc; uplo = 'L', kd = kdS)
-        copyto!(ABgc, ABg0); gbtrf!(klS, kuS, ms, ABgc, ipivg)
-        copyto!(dlf, dl0); copyto!(df, d0); copyto!(duf, du0); gttrf!(dlf, df, duf, du2f, ipivt)
-        copyto!(Dpf, Dp0); copyto!(Epf, Ep0); pttrf!(Dpf, Epf)
-        copyto!(Xs, Bs0); trtrs!(Achol, Xs; uplo = 'L')   # a genuine solution for trrfs!'s error bounds
-        _strict_potrs_probe(bk, Bsw, Bs0, Achol); _strict_potri_probe(bk, Asw, Achol)
-        _strict_pptrf_probe(bk, APuw, APu0); _strict_pptrs_probe(bk, Bsw, Bs0, APc)
-        _strict_pbtrf_probe(bk, ABpw, ABp0, kdS); _strict_pbtrs_probe(bk, Bsw, Bs0, ABpc)
-        _strict_pstrf_probe(bk, Asw, Aspd, pivs); pocon!(bk, float(2 * ms), Achol; uplo = 'L')
-        _strict_getrs_probe(bk, Bsw, Bs0, Alu, ipivs); _strict_getri_probe(bk, Asw, Alu, ipivs)
-        _strict_trtrs_probe(bk, Bsw, Bs0, Achol); _strict_trtri_probe(bk, Asw, Achol)
-        gecon!(bk, float(2 * ms), Alu, ipivs; norm = '1'); trcon!(bk, Achol; uplo = 'L', diag = 'N', norm = '1')
-        _strict_trrfs_probe(bk, Achol, Bs0, Xs, ferrs, berrs)
-        _strict_gbtrf_probe(bk, ABgw, ABg0, klS, kuS, ms, ipivgw)
-        _strict_gbtrs_probe(bk, Bsw, Bs0, klS, kuS, ms, ABgc, ipivg)
-        _strict_gtsv_probe(bk, dlw, dw, duw, dl0, d0, du0, Bsw, Bs0)
-        _strict_gttrf_probe(bk, dlw, dw, duw, du2w, ipivtw, dl0, d0, du0)
-        _strict_gttrs_probe(bk, Bsw, Bs0, dlf, df, duf, du2f, ipivt)
-        _strict_pttrf_probe(bk, Dpw, Epw, Dp0, Ep0); _strict_pttrs_probe(bk, Bsw, Bs0, Dpf, Epf)
-        _strict_ptsv_probe(bk, Dpw, Epw, Dp0, Ep0, Bsw, Bs0)
-        _strict_gesvx_probe(bk, Asw, Aspd, AFx, ipivx, Rq, Cq, Bsw, Bs0, Xs, ferrs, berrs)
-        # QR-family factored sources. The Q-generators and Q-appliers need REAL reflectors, so each
-        # gets its own factorization of the same pristine A; reusing one factor across families would
-        # not exercise the distinct reflector layouts (QR stores below the diagonal, LQ to the right,
-        # QL/RQ at the opposite corners, RZ in the trapezoidal tail).
-        Afqr = copy(Aqr); geqrf!(Afqr, tauq)
-        Aflq = copy(Aqr); taul = Vector{Float64}(undef, m); gelqf!(Aflq, taul)
-        Afql = copy(Aqr); tauql = Vector{Float64}(undef, m); geqlf!(Afql, tauql)
-        Afrq = copy(Aqr); taurq = Vector{Float64}(undef, m); gerqf!(Afrq, taurq)
-        Afrz = copy(Aqr); taurz = Vector{Float64}(undef, m); tzrzf!(Afrz, taurz)
+        # No PureBLAS routine is called below this line: the checks read argument types only, so a
+        # factored source has the type of the matrix it would be factored from, and calling a routine
+        # here would only compile its call tree into this package's precompile.
+        # QR-family sources, one per reflector layout (QR, LQ, QL, RQ, RZ).
+        Afqr = copy(Aqr)
+        Aflq = copy(Aqr); taul = Vector{Float64}(undef, m)
+        Afql = copy(Aqr); tauql = Vector{Float64}(undef, m)
+        Afrq = copy(Aqr); taurq = Vector{Float64}(undef, m)
+        Afrz = copy(Aqr); taurz = Vector{Float64}(undef, m)
         Aqtr = ones(m, m); tautr = Vector{Float64}(undef, m); Qtr = zeros(m, m)
         Aztr = ones(ComplexF64, m, m); tauztr = Vector{ComplexF64}(undef, m); Qztr = zeros(ComplexF64, m, m)
-        copyto!(Xs, Bs0); trtrs!(Achol, Xs; uplo = 'L')   # gesvx overwrote Xs — restore the solution
         # ── Operands for the 34 members added with the nonsymmetric-eigen / Bunch-Kaufman / QZ /
         # SVD-front / least-squares owned-workspace conversion. Everything is order `ms` (=32) or
         # smaller: this block runs at every user's precompile, so each member gets the smallest shape
@@ -438,9 +378,9 @@ if StrictMode.proofs_loaded()
         evA = _strict_nonsym(Float64, ms); evB = _strict_ddom(Float64, ms, ms + 1)
         evW1 = zeros(ms, ms); evW2 = zeros(ms, ms); evW3 = zeros(ms, ms); evW4 = zeros(ms, ms)
         evsc = ones(ms); evtau = Vector{Float64}(undef, ms)
-        copyto!(evW1, evA); evilo, evihi = gebal!(evW1, evsc; job = 'B')
+        evilo, evihi = 1, ms              # the (ilo, ihi) range gebal! returns: two Ints
         evV = ones(ms, ms); evV0 = ones(ms, ms); evC = ones(ms, ms)
-        evAf = copy(evA); gehrd!(evAf, evilo, evihi, evtau)
+        evAf = copy(evA)
         evH = _strict_clean_hess!(copy(evAf))
         evw = Vector{ComplexF64}(undef, ms); evwr = zeros(ms); evwi = zeros(ms)
         evT = _strict_quasitri(ms); evQI = _strict_eye(Float64, ms)
@@ -460,25 +400,22 @@ if StrictMode.proofs_loaded()
         ezW1 = zeros(ComplexF64, ms, ms); ezW2 = zeros(ComplexF64, ms, ms)
         ezW3 = zeros(ComplexF64, ms, ms); ezW4 = zeros(ComplexF64, ms, ms)
         ezsc = ones(ms); eztau = Vector{ComplexF64}(undef, ms)
-        copyto!(ezW1, ezA); ezilo, ezihi = gebal!(ezW1, ezsc; job = 'B')
+        ezilo, ezihi = 1, ms
         ezV = ones(ComplexF64, ms, ms); ezV0 = ones(ComplexF64, ms, ms); ezC = ones(ComplexF64, ms, ms)
-        ezAf = copy(ezA); gehrd!(ezAf, ezilo, ezihi, eztau)
+        ezAf = copy(ezA)
         ezH = _strict_clean_hess!(copy(ezAf))
         ezw = Vector{ComplexF64}(undef, ms)
         ezQI = _strict_eye(ComplexF64, ms); ezVL = zeros(ComplexF64, ms, 0)
         ezU = _strict_utri(ComplexF64, ms)
-        # QZ: a Hessenberg-triangular pair for hgeqz!, and a generalized Schur pair for tgevc!/tgsen!.
-        # Both must be genuine — handing the QZ iteration a raw pencil would "succeed" on nonsense.
-        qzA = copy(evA); qzB = copy(evB); gghrd!('I', 'I', qzA, qzB, zeros(ms, ms), zeros(ms, ms))
+        # QZ: the Hessenberg-triangular pair hgeqz! takes and the generalized Schur pair tgevc!/tgsen!
+        # take.
+        qzA = copy(evA); qzB = copy(evB)
         qzal = Vector{ComplexF64}(undef, ms); qzbe = zeros(ms)
         qzS = copy(qzA); qzP = copy(qzB); qzZ = zeros(ms, ms)
-        hgeqz!('S', 'V', 'V', qzS, qzP, qzal, qzbe, zeros(ms, ms), qzZ)
         qzsel = zeros(Int, ms); qzsel[1] = 1; qzsel[2] = 1; qzsel[5] = 1
         qzzA = copy(ezA); qzzB = copy(ezB)
-        gghrd!('I', 'I', qzzA, qzzB, zeros(ComplexF64, ms, ms), zeros(ComplexF64, ms, ms))
         qzzal = Vector{ComplexF64}(undef, ms); qzzbe = Vector{ComplexF64}(undef, ms)
         qzzS = copy(qzzA); qzzP = copy(qzzB); qzzZ = zeros(ComplexF64, ms, ms)
-        hgeqz!('S', 'V', 'V', qzzS, qzzP, qzzal, qzzbe, zeros(ComplexF64, ms, ms), qzzZ)
         # Bunch-Kaufman: one source per (sy/he) × (L/U), each with its own pivots, because `_sytri_lower!`
         # / `_sytri_upper!` and the symmetric / Hermitian arms are four separate kernels.
         bkfA = _strict_ddom(Float64, ms, ms + 1)
@@ -488,13 +425,13 @@ if StrictMode.proofs_loaded()
         bkfwk = Vector{Float64}(undef, ms); bkzwk = Vector{ComplexF64}(undef, ms)
         bkfb0 = ones(ms); bkfbw = zeros(ms); bkzb0 = ones(ComplexF64, ms); bkzbw = zeros(ComplexF64, ms)
         bkzB0 = ones(ComplexF64, ms, nrhs); bkzBw = zeros(ComplexF64, ms, nrhs)
-        bkfLs = copy(bkfA); bkfLsp = Vector{Int}(undef, ms); sytrf!(bkfLs, bkfLsp; uplo = 'L')
-        bkfUs = copy(bkfA); bkfUsp = Vector{Int}(undef, ms); sytrf!(bkfUs, bkfUsp; uplo = 'U')
-        bkfLh = copy(bkfA); bkfLhp = Vector{Int}(undef, ms); hetrf!(bkfLh, bkfLhp; uplo = 'L')
-        bkzLs = copy(bkzA); bkzLsp = Vector{Int}(undef, ms); sytrf!(bkzLs, bkzLsp; uplo = 'L')
-        bkzUs = copy(bkzA); bkzUsp = Vector{Int}(undef, ms); sytrf!(bkzUs, bkzUsp; uplo = 'U')
-        bkzLh = copy(bkzA); bkzLhp = Vector{Int}(undef, ms); hetrf!(bkzLh, bkzLhp; uplo = 'L')
-        bkzUh = copy(bkzA); bkzUhp = Vector{Int}(undef, ms); hetrf!(bkzUh, bkzUhp; uplo = 'U')
+        bkfLs = copy(bkfA); bkfLsp = Vector{Int}(undef, ms)
+        bkfUs = copy(bkfA); bkfUsp = Vector{Int}(undef, ms)
+        bkfLh = copy(bkfA); bkfLhp = Vector{Int}(undef, ms)
+        bkzLs = copy(bkzA); bkzLsp = Vector{Int}(undef, ms)
+        bkzUs = copy(bkzA); bkzUsp = Vector{Int}(undef, ms)
+        bkzLh = copy(bkzA); bkzLhp = Vector{Int}(undef, ms)
+        bkzUh = copy(bkzA); bkzUhp = Vector{Int}(undef, ms)
         # SVD front half + generalized SVD. `p < n` for ggsvd! so the RQ branches (`_ggs_gerq2!` /
         # `_ggs_apply_rq_right!`, the two O(n²) sites the conversion actually targeted) are on the path.
         svm, svn, svp = 24, 16, 8
@@ -528,11 +465,11 @@ if StrictMode.proofs_loaded()
         lsc0 = ones(svm); lscw = zeros(svm); lsd0 = ones(svp); lsdw = zeros(svp); lsx = zeros(svn)
         lszc0 = ones(ComplexF64, svm); lszcw = zeros(ComplexF64, svm)
         lszd0 = ones(ComplexF64, svp); lszdw = zeros(ComplexF64, svp); lszx = zeros(ComplexF64, svn)
-        # Symmetric-tridiagonal eigen. stein! wants stebz!'s own w/iblock/isplit, trimmed to the m
-        # eigenvalues and nsplit blocks it actually found.
+        # Symmetric-tridiagonal eigen. stein! takes stebz!'s w/iblock/isplit trimmed to the m eigenvalues
+        # and nsplit blocks found, so those three arrive as views.
         std = [2.0 + i / ms for i in 1:ms]; ste = fill(0.4, ms - 1)
         stw = zeros(ms); stib = zeros(Int, ms); stisp = zeros(Int, ms)
-        stm, stns, _ = stebz!('A', 'B', 0.0, 0.0, 1, 1, -1.0, std, ste, stw, stib, stisp)
+        stm, stns = ms, 1
         stwv = view(stw, 1:stm); stibv = view(stib, 1:stm); stispv = view(stisp, 1:stns)
         stZ = zeros(ms, stm)
         # SubArray operands over LARGER parents (lda != nrows), for the same reason the L3 block has
@@ -548,7 +485,7 @@ if StrictMode.proofs_loaded()
         vipP = Vector{Int}(undef, ms + 8); vip = view(vipP, 1:ms)
         vwk = view(ones(ms + 8), 1:ms)
         vAf = copy(evA); vtauP = Vector{Float64}(undef, ms + 8)
-        gehrd!(vAf, 1, ms, vtauP); vtauf = view(vtauP, 1:ms)
+        vtauf = view(vtauP, 1:ms)
         vH = _strict_clean_hess!(copy(vAf))
         vbkf = copy(bkfLs); copyto!(vip, bkfLsp)
         vBP = ones(ms + 8, nrhs + 4); vBv = view(vBP, 1:ms, 1:nrhs)
@@ -557,72 +494,6 @@ if StrictMode.proofs_loaded()
         vlsBP = ones(svm + 8, nrhs + 4); vlsB = view(vlsBP, 1:svm, 1:nrhs)
         vlsB0 = ones(svm, nrhs); vlsjp = view(vipP, 1:svn)
         vstP = ones(ms + 8, stm + 4); vstZ = view(vstP, 1:ms, 1:stm)
-        # One pass through every new probe, so the workspace each routine grows on first touch is at
-        # steady state before the strict window opens — otherwise first-touch growth is charged to the
-        # routine and reads as a per-call allocation that isn't one.
-        _strict_gebal_probe(bk, evW1, evA, evsc); _strict_gebak_probe(bk, evV, evV0, evsc, evilo, evihi)
-        _strict_gehrd_probe(bk, evW1, evA, evilo, evihi, evtau)
-        _strict_orghr_probe(bk, evW1, evAf, evilo, evihi, evtau)
-        _strict_ormhr_probe(bk, evW2, evC, 'L', 'N', evilo, evihi, evAf, evtau)
-        _strict_hseqr_probe(bk, evW1, evH, 'S', 'I', evilo, evihi, evw, evW3)
-        _strict_trevc_probe(bk, evW1, evT, evVL, evW2, evQI)
-        _strict_trexc_probe(bk, evW1, evT, evW2, evQI, 5, 1)
-        _strict_trsyl_probe(bk, evW2, evC, 'N', 'N', evU, evU)
-        _strict_geevr_probe(bk, evW1, evA, evwr, evwi, evVL, evW2, evsc)
-        _strict_gees_probe(bk, evW1, evA, evw, evW2, evsc)
-        _strict_gebal_probe(bk, ezW1, ezA, ezsc); _strict_gebak_probe(bk, ezV, ezV0, ezsc, ezilo, ezihi)
-        _strict_gehrd_probe(bk, ezW1, ezA, ezilo, ezihi, eztau)
-        _strict_orghr_probe(bk, ezW1, ezAf, ezilo, ezihi, eztau)
-        _strict_ormhr_probe(bk, ezW2, ezC, 'L', 'N', ezilo, ezihi, ezAf, eztau)
-        _strict_hseqr_probe(bk, ezW1, ezH, 'S', 'I', ezilo, ezihi, ezw, ezW3)
-        _strict_trevc_probe(bk, ezW1, ezU, ezVL, ezW2, ezQI)
-        _strict_trexc_probe(bk, ezW1, ezU, ezW2, ezQI, 5, 1)
-        _strict_trsyl_probe(bk, ezW2, ezC, 'N', 'N', ezU, ezU)
-        _strict_geevc_probe(bk, ezW1, ezA, ezw, ezVL, ezW2, ezsc)
-        _strict_gees_probe(bk, ezW1, ezA, ezw, ezW2, ezsc)
-        _strict_sytrf_probe(bk, evW1, bkfA, bkfip, 'L'); _strict_hetrf_probe(bk, evW1, bkfA, bkfiph, 'L')
-        _strict_sytrs_probe(bk, Bsw, Bs0, bkfLs, bkfLsp, 'L')
-        _strict_sytrs_probe(bk, bkfbw, bkfb0, bkfLs, bkfLsp, 'L')
-        _strict_hetrs_probe(bk, Bsw, Bs0, bkfLh, bkfLhp, 'L')
-        _strict_sytri_probe(bk, evW1, bkfLs, bkfLsp, 'L'); _strict_hetri_probe(bk, evW1, bkfLh, bkfLhp, 'L')
-        _strict_sysv_probe(bk, evW1, bkfA, Bsw, Bs0, bkfip, 'L')
-        _strict_hesv_probe(bk, evW1, bkfA, Bsw, Bs0, bkfiph, 'L')
-        _strict_syconv_probe(bk, evW1, bkfLs, bkfLsp, bkfwk, 'L')
-        _strict_sytrf_probe(bk, ezW1, bkzA, bkzip, 'L'); _strict_hetrf_probe(bk, ezW1, bkzA, bkziph, 'L')
-        _strict_sytrs_probe(bk, bkzBw, bkzB0, bkzLs, bkzLsp, 'L')
-        _strict_hetrs_probe(bk, bkzBw, bkzB0, bkzLh, bkzLhp, 'L')
-        _strict_sytri_probe(bk, ezW1, bkzLs, bkzLsp, 'L'); _strict_hetri_probe(bk, ezW1, bkzLh, bkzLhp, 'L')
-        _strict_sysv_probe(bk, ezW1, bkzA, bkzBw, bkzB0, bkzip, 'L')
-        _strict_hesv_probe(bk, ezW1, bkzA, bkzBw, bkzB0, bkziph, 'L')
-        _strict_syconv_probe(bk, ezW1, bkzLs, bkzLsp, bkzwk, 'L')
-        _strict_gghrd_probe(bk, evW1, evA, evW2, evB, evW3, evW4)
-        _strict_hgeqz_probe(bk, evW1, qzA, evW2, qzB, qzal, qzbe, evW3, evW4)
-        _strict_tgevc_probe(bk, evW1, qzS, evW2, qzP, evVL, evW3, qzZ)
-        _strict_tgsen_probe(bk, qzsel, evW1, qzS, evW2, qzP, evW3, qzZ, evW4, qzZ, qzal, qzbe)
-        _strict_ggevr_probe(bk, evW1, evA, evW2, evB, evwr, evwi, qzbe, evVL, evW3)
-        _strict_gges_probe(bk, evW1, evA, evW2, evB, qzal, qzbe, evW3, evW4)
-        _strict_gghrd_probe(bk, ezW1, ezA, ezW2, ezB, ezW3, ezW4)
-        _strict_hgeqz_probe(bk, ezW1, qzzA, ezW2, qzzB, qzzal, qzzbe, ezW3, ezW4)
-        _strict_tgevc_probe(bk, ezW1, qzzS, ezW2, qzzP, ezVL, ezW3, qzzZ)
-        _strict_tgsen_probe(bk, qzsel, ezW1, qzzS, ezW2, qzzP, ezW3, qzzZ, ezW4, qzzZ, qzzal, qzzbe)
-        _strict_ggevc_probe(bk, ezW1, ezA, ezW2, ezB, qzzal, qzzbe, ezVL, ezW3)
-        _strict_gges_probe(bk, ezW1, ezA, ezW2, ezB, ezw, qzzbe, ezW3, ezW4)
-        _strict_gebd2_probe(bk, svAw, svA, svd, sve, svtq, svtp)
-        _strict_gebd2_probe(bk, svzAw, svzA, svd, sve, svztq, svztp)
-        _strict_bdsqr_probe(bk, bqd, bqd0, bqe, bqe0, bqU, bqV)
-        _strict_bdsqr_probe(bk, bqd, bqd0, bqe, bqe0, nothing, nothing)
-        _strict_bdsqrc_probe(bk, bqd, bqd0, bqe, bqe0, bqVt, bqUz, bqC)
-        _strict_ggsvd_probe(bk, ggAw, ggA, ggBw, ggB, ggU, ggV, ggQ, ggal, ggbe, ggR)
-        _strict_ggsvd_probe(bk, ggzAw, ggzA, ggzBw, ggzB, ggzU, ggzV, ggzQ, ggal, ggbe, ggzR)
-        _strict_gels_probe(bk, svAw, svA, lsBw, lsB0)
-        _strict_gels_probe(bk, svzAw, svzA, lszBw, lszB0)
-        _strict_gelsy_probe(bk, svAw, svA, lsBw, lsB0, lsjp, 1.0e-12)
-        _strict_gelsy_probe(bk, svzAw, svzA, lszBw, lszB0, lsjp, 1.0e-12)
-        _strict_gglse_probe(bk, ggAw, ggA, lscw, lsc0, ggBw, ggB, lsdw, lsd0, lsx)
-        _strict_gglse_probe(bk, ggzAw, ggzA, lszcw, lszc0, ggzBw, ggzB, lszdw, lszd0, lszx)
-        _strict_stebz_probe(bk, std, ste, stw, stib, stisp)
-        _strict_stein_probe(bk, std, ste, stwv, stibv, stispv, stZ)
-        _strict_gbtrf_probe(bk, ABbw, ABb0, klB, kuB, msB, ipivb)
         @verify_strict SIMDBackend begin
             # ── Level 1 (bandwidth-bound; SIMD real path + generic complex path)
             axpy!(bk, yd, 2.0, xd)
@@ -671,7 +542,7 @@ if StrictMode.proofs_loaded()
             hbmv!(bk, wz, ABz, uz; uplo = 'U', alpha = 2.0 + 0im, beta = 1.0 + 0im)
             tbmv!(bk, ABs, um; uplo = 'U', trans = 'N', diag = 'N')
             tbsv!(bk, ABs, um; uplo = 'U', trans = 'N', diag = 'N')
-            # ── Level 3 (all matrix-matrix ops; scratch pre-warmed above; real + complex)
+            # ── Level 3 (all matrix-matrix ops; real + complex)
             gemm!(bk, C3, A3, B3)
             # COMPLEX gemm, and deliberately at m=64 — INSIDE the Karatsuba-3M window
             # (`_CGEMM_3M_MIN`=48 ≤ max(m,n,k) ≤ 2048, min ≥ `_CGEMM_3M_KMIN`=16). Until now every
@@ -712,7 +583,7 @@ if StrictMode.proofs_loaded()
             gemm!(bk, C3v, A3v, B3v)
             syrk!(bk, C3v, A3v; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
             # ── LAPACK: potrf!/getrf!/geqrf! are 0-alloc (potrf via its own pointer kernels; LU/QR via
-            # their in-place pre-allocated-output forms). Via re-seeding probes so repeated @strict calls
+            # their in-place pre-allocated-output forms). Via re-seeding probes so repeated calls
             # always factor a fresh source (potrf would otherwise throw PosDefException on its L-output).
             # All four LAPACK factorizations are strict now: gesvd! reaches 0-alloc via the in-place
             # gesvd!(A,U,S,Vᵀ) form + a cached SVDWorkspace for the bidiagonalization scratch.
@@ -722,7 +593,7 @@ if StrictMode.proofs_loaded()
             _strict_gesvd_probe(Aw, Apd, Usv, Ssv, Vtsv)
             # COMPLEX factorizations — a wholly separate kernel set (`_cpotrf_lower!`, `_cgetf2_simd!`,
             # the complex QR panel), previously outside the contract entirely. Same re-seeding probes so
-            # repeated @strict invocations stay 0-alloc and type-stable rather than re-factoring in place.
+            # repeated invocations stay 0-alloc and type-stable rather than re-factoring in place.
             # gesvd is deliberately NOT included for complex: its in-place form caches a Float64
             # SVDWorkspace and the complex path has not been shown 0-alloc — asserting it here without
             # that evidence would be guessing, so it stays an open item rather than a silent pass.
@@ -980,45 +851,19 @@ if StrictMode.proofs_loaded()
             _strict_gelsy_probe(bk, vlsA, svA, vlsB, vlsB0, vlsjp, 1.0e-12)
             _strict_stein_probe(bk, std, ste, stwv, stibv, stispv, vstZ)
         end
-        # Trim-compatibility guarantee (contracts.jl): the complex unpacked gemm kernel is the trim-critical
-        # path (its runtime bool→Val flags were the union-split that regressed zgemm_64_/cgemm_64_). Fast/dev
-        # here → heuristic; the full-mode dogfood roots the same call under juliac's authoritative verifier.
-        @assert_trim_compatible _gemm_cmplx_unpacked!(
-            Val(1), Val(1), false, m, m, m,
-            one(ComplexF64), Az3, Bz3, zero(ComplexF64), Cz3, -1
-        )
     end
 end
 
-# A heuristic check below reports by logging a `StrictViolation` warning instead of throwing. From here
-# to the end of this file the global logger is wrapped so each such message is also pushed onto
-# `_LOADTIME_WARNINGS`, which is saved in the package image; test/loadtime_warnings_tests.jl compares it
-# against a baseline. Messages still reach the original logger unchanged.
-const _LOADTIME_WARNINGS = String[]
-struct _WarnRecorder{L <: Base.CoreLogging.AbstractLogger} <: Base.CoreLogging.AbstractLogger
-    inner::L
-end
-Base.CoreLogging.min_enabled_level(r::_WarnRecorder) = Base.CoreLogging.min_enabled_level(r.inner)
-Base.CoreLogging.shouldlog(r::_WarnRecorder, args...) = Base.CoreLogging.shouldlog(r.inner, args...)
-Base.CoreLogging.catch_exceptions(r::_WarnRecorder) = Base.CoreLogging.catch_exceptions(r.inner)
-function Base.CoreLogging.handle_message(r::_WarnRecorder, level, message, args...; kwargs...)
-    if level == Base.CoreLogging.Warn && message isa AbstractString && startswith(message, "StrictViolation")
-        push!(_LOADTIME_WARNINGS, message)
-    end
-    return Base.CoreLogging.handle_message(r.inner, level, message, args...; kwargs...)
-end
-Base.CoreLogging.global_logger(_WarnRecorder(Base.CoreLogging.global_logger()))
-# Register pressure and vectorization of the gemm microkernels and the trsm side-R tile. A tile sized
-# past the register file spills vectors to the stack on every k step, which neither the type-stability
-# nor the allocation checks see; these scan the compiled native code. Each call also executes, so
-# every operand is a live buffer. The argtypes are the FULL method signature, trailing `Val{B0}`
-# included: the 9-argument `_microkernel_masked!` form is a default-argument forwarder whose native
-# code is a call and a return, which a scan passes without reaching the kernel. The α-scaled `_microkernel!` shares the tile with a different epilogue and
-# has its own `B0 = false` and `B0 = true` instances.
-let m = 64, kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
-        Ap = ones(mr * kc), Bp = ones(nr * kc), Ck = ones(mr, nr),
-        Lt = ones(m, m), Bt = ones(m, m)
-    GC.@preserve Ap Bp Ck Lt Bt begin
+# Register pressure and vectorization of the gemm microkernels. A tile sized past the register file
+# spills vectors to the stack on every k step, which neither the type-stability nor the allocation
+# checks see; these scan the compiled native code. Each call also executes, so every operand is a live
+# buffer. The argtypes are the FULL method signature, trailing `Val{B0}` included: the 9-argument
+# `_microkernel_masked!` form is a default-argument forwarder whose native code is a call and a return,
+# which a scan passes without reaching the kernel. The α-scaled `_microkernel!` shares the tile with a
+# different epilogue and has its own `B0 = false` and `B0 = true` instances.
+let kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
+        Ap = ones(mr * kc), Bp = ones(nr * kc), Ck = ones(mr, nr)
+    GC.@preserve Ap Bp Ck begin
         ap = pointer(Ap); bp = pointer(Bp); cp = pointer(Ck)
         @assert_no_spill _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
         @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, Val(_MR), Val(_NR), Val(false))
@@ -1028,14 +873,23 @@ let m = 64, kc = 64, W = _vwidth(Float64), mr = _MR * W, nr = _NR,
         @assert_vectorized _microkernel!(cp, mr, ap, bp, kc, 1.0, Val(_MR), Val(_NR), Val(true))
         @assert_no_spill _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(false))
         @assert_vectorized _microkernel_masked!(cp, mr, ap, bp, kc, 11, 5, Val(_MR), Val(_NR), Val(false))
-        @assert_no_spill _trsm_tile_R_f64!(false, false, false, pointer(Lt), m, pointer(Bt), m, m, m)
     end
 end
-# At load, outside any gate, only `@assert_no_spill` and `@assert_vectorized` above run. Guarantees not
-# asserted at load, and what each waits for:
-#   `@verify_strict` block (type stability, no allocation, `@assert_trim_compatible`): it runs only under
-#                       `StrictMode.proofs_loaded()` (see the `if` above), and running it at every
-#                       precompile waits for a measurement of the precompile time and memory it adds.
+
+# Module-level policies. Each checks, here at load, every method above whose own signature is concrete
+# and whose name it selects; a policy cannot reach a parametric method (its signature names no concrete
+# types). `:no_spill` gates; `:trim_compatible` is StrictMode's static scan and reports.
+#   The trsm side-R tile (`_trsm_tile_R_f64!`, concrete) must not spill: same register-pressure check as
+# the microkernels above.
+@strict_policy :no_spill only = [:_trsm_tile_R_f64!]
+#   The C-ABI entry points (`*_64_`, the roots `juliac --trim` builds from): concrete inferred return
+# type, and no trim-hostile construct the static scan can see. test/trim_tests.jl runs juliac's
+# verifier over the same roots.
+@strict_policy (:typestable, :trim_compatible) only = r"_64_$"
+# Guarantees not checked at load, and why:
+#   `:noalloc` on the C-ABI entries: the value-free scan reports about a third of them as allocating
+#                       (151 of 492 on Zen4), each a warning at every precompile. The backend calls
+#                       under the C ABI carry `:noalloc` in the `@verify_strict` block above.
 #   `:inlined`, `:noboxing`, `:no_scalar_loops`, `:no_threadid_state`: each waits for a measurement of
 #                       the precompile time and memory it adds.
 #   `:owned`            inner functions take their per-task buffer as an argument.

@@ -124,8 +124,8 @@ end
             # IdDict{DataType,Matrix} value) shows up as internal runtime dispatch / boxing here. This is the
             # check that was missing when the per-leaf boxing shipped — it passes only with concrete returns.
             Atri = tri(32)
-            @assert_typestable P._trsm_base_invL!(false, false, false, Atri, randn(32, 256))
-            @assert_typestable P._trsm_base_invR!(false, false, false, Atri, randn(256, 32))
+            @test_typestable P._trsm_base_invL!(false, false, false, Atri, randn(32, 256))
+            @test_typestable P._trsm_base_invR!(false, false, false, Atri, randn(256, 32))
             # Driver steady-state is allocation-free. Cached scratch allocates once on first touch, so what
             # is asserted is the empirical WARMED path — and from StrictMode 0.4 that has to be spelled with
             # `@test_noalloc` is ONLY AllocCheck's static all-paths proof since StrictModeTest 0.4, which
@@ -137,8 +137,7 @@ end
             # StrictMode macros reject kwargs, so we assert on the POSITIONAL
             # internal drivers — which is exactly where the scratch/views live: the invL/invR bases hold
             # the trtri+gemm scratch (the boxing site), the packed syrk/syr2k/symm hold the pack buffers.
-            # WARM the trsm_tmp scratch first: @assert_typestable above is JET-static (never executes), and
-            # trsm_tmp is trsm-specific (unlike the syrk pack buffers, pre-grown by the earlier GEMM items in
+            # WARM the trsm_tmp scratch on the measured operands first: trsm_tmp is trsm-specific (unlike the syrk pack buffers, pre-grown by the earlier GEMM items in
             # this worker). Without this the noalloc target IS the first-touch grow → scheduling-flaky fail.
             BL = randn(32, 256); BR = randn(256, 32)
             P._trsm_base_invL!(false, false, false, Atri, BL)
@@ -178,7 +177,7 @@ end
             )
             BF = randn(128, 256)
             P._trsm_fused_L!(false, Aup, BF)                                  # warm the ftrsm buffer
-            @assert_typestable P._trsm_fused_L!(false, Aup, randn(128, 256))
+            @test_typestable P._trsm_fused_L!(false, Aup, randn(128, 256))
             a_fusedL(A, B) = @allocated PureBLAS._trsm_fused_L!(false, A, B)
             @test minimum(a_fusedL(Aup, BF) for _ in 1:8) == 0
             # Whole-k packed sweep (shared-panel restructure; default-off toggle) — same typestable + alloc-free
@@ -194,7 +193,7 @@ end
                 )
                 BFF = randn(512, 256)
                 P._trsm_fused_full_L!(false, Auf, BFF)                           # warm the ftrsm buffer
-                @assert_typestable P._trsm_fused_full_L!(false, Auf, randn(512, 256))
+                @test_typestable P._trsm_fused_full_L!(false, Auf, randn(512, 256))
                 a_fusedFull(A, B) = @allocated PureBLAS._trsm_fused_full_L!(false, A, B)
                 @test minimum(a_fusedFull(Auf, BFF) for _ in 1:8) == 0
             end
@@ -255,19 +254,26 @@ end
             # PUBLIC ENTRY POINTS — assertable directly now that StrictMode ≥0.3.4 supports kwarg calls
             # (issue el-oso/StrictMode.jl#4). This closes the mandate: StrictMode on every entry point, not
             # just the positional internal drivers. :full-mode JET sees the whole kwarg→dispatch→kernel tree.
-            @assert_typestable P.trsm!(copy(Bs), tri(512); side = 'L', uplo = 'L', diag = 'N', alpha = 1.0)
-            @assert_typestable P.syrk!(zeros(512, 512), As; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
-            @assert_typestable P.syr2k!(zeros(512, 512), As, Bs; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
-            @assert_typestable P.symm!(zeros(512, 512), As, Bs; side = 'L', uplo = 'L', alpha = 0.8, beta = 0.3)
-            # OWNED-SCRATCH (GKH) guard — @assert_owned (StrictMode ≥0.3.5) fails on a runtime AbstractDict
-            # lookup reached on the hot path. This is the check that WAS MISSING when the complex `_symm_scr`
+            @test_typestable P.trsm!(copy(Bs), tri(512); side = 'L', uplo = 'L', diag = 'N', alpha = 1.0)
+            @test_typestable P.syrk!(zeros(512, 512), As; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
+            @test_typestable P.syr2k!(zeros(512, 512), As, Bs; uplo = 'L', trans = 'N', alpha = 0.8, beta = 0.3)
+            @test_typestable P.symm!(zeros(512, 512), As, Bs; side = 'L', uplo = 'L', alpha = 0.8, beta = 0.3)
+            # OWNED-SCRATCH (GKH) guard — the `:owned` guarantee fails on a runtime AbstractDict lookup
+            # reached on the hot path. This is the check that WAS MISSING when the complex `_symm_scr`
             # scratch accessor shipped with const-dispatched owned Refs only for Float64/Float32: ComplexF64/F32
             # fell through to the generic `get(::IdDict, T, …)` (~130 ns/call, ~26% of a tiny-n op). That's
             # type-stable + alloc-free (warm hit) + trim-safe, so it passed all three OTHER asserts — only a
             # benchmark caught it. Now every eltype has an owned Ref, and this guard goes red if that regresses.
+            # A keyword call dispatches through `Core.kwcall`, so that is the signature proved.
+            kwsig(f, args...; kw...) = (Core.kwcall, (typeof(values(kw)), typeof(f), map(typeof, args)...))
             Az = randn(ComplexF64, 64, 64); Hz = Az + Az'; Bz = randn(ComplexF64, 64, 64)
-            @assert_owned P.hemm!(zeros(ComplexF64, 64, 64), Hz, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im)
-            @assert_owned P.symm!(zeros(ComplexF64, 64, 64), Az, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im)
+            test_signatures(
+                [
+                    kwsig(P.hemm!, zeros(ComplexF64, 64, 64), Hz, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im),
+                    kwsig(P.symm!, zeros(ComplexF64, 64, 64), Az, Bz; side = 'L', uplo = 'U', alpha = 1.0 + 0im, beta = 0.0im),
+                ];
+                guarantees = (:owned,)
+            )
             # UNPACKED-TRI complex rank-k (small-n trans='N', `_ctri_unpacked!` → `_uker_cmplx!` TRI-store): the
             # path that fixed the zsyrk/zherk n≈24–48 valley. Direct-read A, no pack, masks the diagonal tile —
             # must stay typestable + alloc-free (the tri sweep resolves sb/a1/ar/nr to concrete Vals). trim-side
@@ -275,16 +281,16 @@ end
             Awz = randn(ComplexF64, 48, 40); Bwz = randn(ComplexF64, 48, 40)
             Cwz = zeros(ComplexF64, 48, 48)
             MZ48 = Matrix{ComplexF64}
-            @assert_typestable P._ctri_unpacked!(true, true, 1.0, Awz, zeros(ComplexF64, 48, 48), 40)
-            @assert_typestable P.herk!(zeros(ComplexF64, 48, 48), Awz; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)
+            @test_typestable P._ctri_unpacked!(true, true, 1.0, Awz, zeros(ComplexF64, 48, 48), 40)
+            @test_typestable P.herk!(zeros(ComplexF64, 48, 48), Awz; uplo = 'U', trans = 'N', alpha = 1.0, beta = 0.0)
             # rank-2k (two products through the shared _ctri_core!)
-            @assert_typestable P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40)
+            @test_typestable P._ctri2_unpacked!(true, true, 1.0, Awz, Bwz, zeros(ComplexF64, 48, 48), 40)
             # ztrsmR-C direct base (`_trsm_cmplx_dRC!`, the zpotrf-lower recursion path) — typestable + alloc-free.
             Atr = randn(ComplexF64, 48, 48) ./ 96; for d in 1:48
                 Atr[d, d] = 1 + abs(Atr[d, d])
             end
             Btr = randn(ComplexF64, 64, 48)
-            @assert_typestable P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48))
+            @test_typestable P._trsm_cmplx_dRC!(true, false, 48, Atr, randn(ComplexF64, 64, 48))
             # The complex rank-k and ztrsmR drivers reach no pool at all, so they prove with or without
             # the registration. `alpha`'s type selects the kernel arm, so both arms are asserted rather
             # than assumed to share one.
@@ -328,19 +334,22 @@ end
         GC.@preserve Ap Bp C begin
             ap = pointer(Ap); bp = pointer(Bp); cptr = pointer(C); ldc = mr
             # register-blocked microkernel: the hot path — must be tight
-            @assert_typestable P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
+            @test_typestable P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
             @test_noalloc P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
             @test_trim_compatible P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
-            # StrictMode 0.3.9 @assert_no_spill: the µarch-derived _MR×_NR tile must fit the register file
+            # `:no_spill`: the µarch-derived _MR×_NR tile must fit the register file
             # with no vector spill/reload. Verified clean on both AVX-512 (Zen4/Zen5, 32 zmm) and AVX2 (Zen3,
             # 16 ymm) — the packed hot path. (NB the SMALL-matrix `_microkernel_unpacked!` spills 3 vectors on
             # AVX2 with the same tile — a real register-pressure finding, tracked separately; not asserted here.)
-            @assert_no_spill P._microkernel!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(P._NR), Val(false))
+            test_signatures(
+                [(P._microkernel!, (Ptr{Float64}, Int, Ptr{Float64}, Ptr{Float64}, Int, Val{P._MR}, Val{P._NR}, Val{false}))];
+                guarantees = (:no_spill,)
+            )
             @test_noalloc P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
-            @assert_typestable P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
+            @test_typestable P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             @test_trim_compatible P._microkernel_masked!(cptr, ldc, ap, bp, kc, 11, 5, Val(P._MR), Val(P._NR))
             # clip kernel: W-aligned partial row-tile (reads _MR-strided panel, computes 1 live vector)
-            @assert_typestable P._microkernel_clip!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
+            @test_typestable P._microkernel_clip!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
             @test_noalloc P._microkernel_clip!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
             @test_trim_compatible P._microkernel_clip!(cptr, ldc, ap, bp, kc, Val(P._MR), Val(1), Val(P._NR))
         end
@@ -348,7 +357,7 @@ end
         kk = 32; Au = randn(mr * kk); Bu = randn(kk * nr); Cu = zeros(mr, nr)
         GC.@preserve Au Bu Cu begin
             aup = pointer(Au); bup = pointer(Bu); cup = pointer(Cu)
-            @assert_typestable P._microkernel_unpacked!(
+            @test_typestable P._microkernel_unpacked!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk, 1.0, 0.0,
                 Val(P._MR), Val(P._NR), Val(false), Val(true)
             )
@@ -363,7 +372,7 @@ end
             # masked-row kernel (partial rows): mre=12 → second row-vector partially masked. VW is the
             # explicit vector-width Val (full register width here; the ≤W row tail passes the narrower
             # `_at_tail_vw` — that instance is trim-covered from the ccallable roots via `_mrows_tail!`).
-            @assert_typestable P._microkernel_unpacked_mrows!(
+            @test_typestable P._microkernel_unpacked_mrows!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 0.0, 12, Val(P._MR), Val(P._NR), Val(false), Val(true), Val(W)
             )
@@ -380,7 +389,7 @@ end
             # on a double-pumped part. Asserting the dispatcher (not just the kernel) is the point — a
             # width choice that failed to const-fold would show up here as an instability, not as a
             # slightly slower benchmark.
-            @assert_typestable P._mrows_tail!(
+            @test_typestable P._mrows_tail!(
                 cup, mr, aup, mr, 0, bup, kk, 0, kk,
                 1.0, 0.0, 2, Val(P._NR), Val(false), Val(true)
             )
@@ -414,7 +423,7 @@ end
                 asp = pointer(As); csp = pointer(Cs); bsp = pointer(Bu)
                 for mask in (false, true)
                     mv = mask ? smr - 2 : smr        # ragged vs the full tile
-                    @assert_typestable P._microkernel_unpacked_split!(
+                    @test_typestable P._microkernel_unpacked_split!(
                         csp, smr, asp, smr, 0, bsp, kk, 0, kk, 1.0, 0.0, mv,
                         Val(P._SMR), Val(P._SNR), Val(P._GEMM_SPLIT_S), Val(false), Val(true), Val(mask)
                     )
@@ -447,7 +456,7 @@ end
         end
         # packing + generic path allocate nothing
         A = randn(8, 5); Bm = randn(5, 6); Cg = zeros(8, 6)
-        @assert_typestable P._gemm_generic!(false, false, false, false, 8, 6, 5, 1.0, A, Bm, 0.0, Cg)
+        @test_typestable P._gemm_generic!(false, false, false, false, 8, 6, 5, 1.0, A, Bm, 0.0, Cg)
         @test_noalloc P._gemm_generic!(false, false, false, false, 8, 6, 5, 1.0, A, Bm, 0.0, Cg)
         @test true
     end
@@ -463,28 +472,28 @@ end
         # closure + deinterleaved SIMD FMA must stay typestable + alloc-free on the Mode-2 native hot path.
         for TC in (ComplexF64, ComplexF32)
             A = randn(TC, 48, 48); A = A * A' + 48I + zeros(TC, 48, 48)
-            @assert_typestable P._cpotf2_lower!(copy(A), 48)
+            @test_typestable P._cpotf2_lower!(copy(A), 48)
             @test_noalloc P._cpotf2_lower!(copy(A), 48)
-            @assert_typestable P.potrf!(copy(A); uplo = 'L')          # n≤base → single base
+            @test_typestable P.potrf!(copy(A); uplo = 'L')          # n≤base → single base
             A2 = randn(TC, 128, 128); A2 = A2 * A2' + 128I + zeros(TC, 128, 128)
-            @assert_typestable P.potrf!(copy(A2); uplo = 'L')         # n>base → recursive nb=n/4 blocked
-            @assert_typestable P._cpotrf_lower!(copy(A2), 128)
+            @test_typestable P.potrf!(copy(A2); uplo = 'L')         # n>base → recursive nb=n/4 blocked
+            @test_typestable P._cpotrf_lower!(copy(A2), 128)
             # UPPER was covered by NEITHER of the above: it is Lever C (conj-transpose → `_potrf_pad`
             # scratch → `_cpotrf_lower!` → conj-transpose back), a different call graph that reaches
             # `_tri_upper_to_lowerT!`/`_tri_lowerT_to_upper!` and `_potf2_needs_buf` — none of which any
             # 'L' assertion roots. Both sizes: n≤base is the single-base window where `_potf2_needs_buf`
             # decides, n>base takes the recursion.
-            @assert_typestable P.potrf!(copy(A); uplo = 'U')
-            @assert_typestable P.potrf!(copy(A2); uplo = 'U')
+            @test_typestable P.potrf!(copy(A); uplo = 'U')
+            @test_typestable P.potrf!(copy(A2); uplo = 'U')
             # complex getf2 panel (`_cgetf2_simd!`, zgetrf base) + QR panel (`qr_unblocked!`, zgeqrf) —
             # both vectorize via the L1 complex kernels; typestable + alloc-free on the native hot path.
             G = randn(TC, 48, 48) + 48I; ip = zeros(Int, 48); pG = pointer(G); ldG = stride(G, 2)
             GC.@preserve G begin
-                @assert_typestable P._cgetf2_simd!(pG, ldG, 48, 48, 0, ip, 0)
+                @test_typestable P._cgetf2_simd!(pG, ldG, 48, 48, 0, ip, 0)
                 @test_noalloc P._cgetf2_simd!(pG, ldG, 48, 48, 0, ip, 0)
             end
             Q = randn(TC, 48, 48); tau = similar(Q, 48)
-            @assert_typestable P.qr_unblocked!(copy(Q), tau)
+            @test_typestable P.qr_unblocked!(copy(Q), tau)
             # RUNTIME form, not the static proof, and the reason is the one this file's header gives:
             # the panel's Householder norm goes through complex `nrm2`, which takes the BLOCKED
             # reduction — so an all-paths proof counts the L1 reduction pool's `wait` site even though
