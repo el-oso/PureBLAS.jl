@@ -226,7 +226,20 @@ function toy_recurrence!(p::Ptr{Float64}, n::Int, a::Float64)
     return nothing
 end
 
-# A strict-order reduction: no reassociation is allowed, so LLVM emits no vector code at all.
+# A pointer chase: each load's address is the previous load's value, so no vector form exists on any
+# ISA. The `:vectorized` control.
+function toy_chase(p::Ptr{Float64}, q::Ptr{Int}, n::Int)
+    s = 0.0
+    j = 1
+    for _ in 1:n
+        s += unsafe_load(p, j)
+        j = unsafe_load(q, j)
+    end
+    return s
+end
+
+# A strict-order reduction: no reassociation is allowed, so its adds stay scalar. The scalar-loop
+# control. Not a `:vectorized` control: on aarch64 its loads compile to 128-bit vector loads.
 function toy_strict_sum(p::Ptr{Float64}, n::Int)
     s = 0.0
     for i in 1:n
@@ -349,13 +362,13 @@ end
     using StrictMode, StrictModeTest, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
-        KNOWN_WIDE_SPILL, toy_fwd!
+        KNOWN_WIDE_SPILL, toy_fwd!, toy_chase
     Pd = Ptr{Float64}
-    # Controls: a strict-order reduction and a recurrence emit no vector code, and the `:vectorized`
-    # gate fails on each.
-    @test !StrictMode.kernel_report(toy_strict_sum, (Pd, Int)).vectorized
+    # Controls: a pointer chase and a recurrence emit no vector code, and the `:vectorized` gate fails
+    # on each.
+    @test !StrictMode.kernel_report(toy_chase, (Pd, Ptr{Int}, Int)).vectorized
     @test !StrictMode.kernel_report(toy_recurrence!, (Pd, Int, Float64)).vectorized
-    @test_throws StrictViolation test_signatures([(toy_strict_sum, (Pd, Int))]; guarantees = (:vectorized,))
+    @test_throws StrictViolation test_signatures([(toy_chase, (Pd, Ptr{Int}, Int))]; guarantees = (:vectorized,))
     @test_throws StrictViolation test_signatures([(toy_recurrence!, (Pd, Int, Float64))]; guarantees = (:vectorized,))
     # The forwarder is judged unvectorized; a check that follows the forwarder to its body would pass.
     fwd_ok = try
