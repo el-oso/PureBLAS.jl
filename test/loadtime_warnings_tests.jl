@@ -1,6 +1,5 @@
-# The ungated StrictMode checks at the end of src/verify.jl (`@assert_no_spill`, `@assert_vectorized`)
-# run at every precompile. A proof-backed failure there stops the build; a heuristic one only logs a
-# `StrictViolation` warning. src/verify.jl records each such
+# The StrictMode checks in src/verify.jl (`@verify_strict`, `@strict_policy`) run at every precompile.
+# A gating failure there stops the build; a heuristic one only logs a warning. src/verify.jl records each such
 # warning in `PureBLAS._LOADTIME_WARNINGS`, saved with the package image, so this item reads the warnings
 # of the build under test without compiling anything, and fails on any one not listed in
 # test/loadtime_warnings_baseline.txt.

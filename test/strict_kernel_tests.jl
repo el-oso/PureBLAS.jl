@@ -196,8 +196,9 @@ const FMA_FREE = Set(
 
 # --- positive controls ----------------------------------------------------------------------------
 # N vector accumulators that all stay live across the loop: more than the register file holds, so the
-# allocator must spill them inside the loop.
-@generated function toy_spill!(p::Ptr{Float64}, n::Int, ::Val{N}) where {N}
+# allocator must spill them inside the loop. The body is also spliced into a concrete method by the
+# `@strict_policy :no_spill` control in test/strictmode_tests.jl.
+function toy_spill_body(N)
     V = P.Vec{W, Float64}
     accs = [Symbol(:a, i) for i in 1:N]
     init = [:($(a) = zero($V)) for a in accs]
@@ -214,6 +215,8 @@ const FMA_FREE = Set(
         return nothing
     end
 end
+# Defined after its generator: a `@generated` body runs in the world where the method was defined.
+@generated toy_spill!(p::Ptr{Float64}, n::Int, ::Val{N}) where {N} = toy_spill_body(N)
 
 # A loop-carried recurrence: no vector form exists, so this is a scalar FP loop and nothing vectorizes.
 function toy_recurrence!(p::Ptr{Float64}, n::Int, a::Float64)
@@ -223,7 +226,20 @@ function toy_recurrence!(p::Ptr{Float64}, n::Int, a::Float64)
     return nothing
 end
 
-# A strict-order reduction: no reassociation is allowed, so LLVM emits no vector code at all.
+# A pointer chase: each load's address is the previous load's value, so no vector form exists on any
+# ISA. The `:vectorized` control.
+function toy_chase(p::Ptr{Float64}, q::Ptr{Int}, n::Int)
+    s = 0.0
+    j = 1
+    for _ in 1:n
+        s += unsafe_load(p, j)
+        j = unsafe_load(q, j)
+    end
+    return s
+end
+
+# A strict-order reduction: no reassociation is allowed, so its adds stay scalar. The scalar-loop
+# control. Not a `:vectorized` control: on aarch64 its loads compile to 128-bit vector loads.
 function toy_strict_sum(p::Ptr{Float64}, n::Int)
     s = 0.0
     for i in 1:n
@@ -294,37 +310,34 @@ end
     end
 end
 
-@testitem "kernel: @assert_no_spill / spill_report" tags = [:checks] setup = [KernelChecks] begin
-    using StrictMode, Test
+@testitem "kernel: :no_spill / spill_report" tags = [:checks] setup = [KernelChecks] begin
+    using StrictMode, StrictModeTest, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
         KNOWN_WIDE_SPILL
     N = 3 * NVREG
-    # Control: a toy with 3x the register file of live accumulators spills inside its loop.
-    toy = StrictMode.spill_report(toy_spill!, (Ptr{Float64}, Int, Val{N}))
+    Pd = Ptr{Float64}
+    # Control: a toy with 3x the register file of live accumulators spills inside its loop, and the
+    # `:no_spill` gate fails on it.
+    toy = StrictMode.spill_report(toy_spill!, (Pd, Int, Val{N}))
     @test toy.vec_spills > 0
-    buf = zeros(Float64, (64 + 2N + 2) * W + N * W)
-    if StrictMode.checks_enabled()
-        GC.@preserve buf begin
-            @test_throws StrictViolation @assert_no_spill toy_spill!(pointer(buf), 8, Val(N))
-        end
-    else
-        @test_skip "StrictMode checks are disabled in this build, so @assert_no_spill is a bare call" == ""
-    end
-    # Real kernels, driven through the macro on real buffers.
-    mr = P._MR * W; nr = P._NR; kc = 64
-    Ap = randn(mr * kc); Bp = randn(nr * kc); C = zeros(mr, nr)
-    if StrictMode.checks_enabled()
-        GC.@preserve Ap Bp C begin
-            c = pointer(C); a = pointer(Ap); b = pointer(Bp)
-            @assert_no_spill P._microkernel!(c, mr, a, b, kc, Val(P._MR), Val(P._NR), Val(false))
-            @assert_no_spill P._microkernel!(c, mr, a, b, kc, Val(P._MR), Val(P._NR), Val(true))
-            @assert_no_spill P._microkernel_masked!(c, mr, a, b, kc, 11, 3, Val(P._MR), Val(P._NR), Val(false))
-            @assert_no_spill P._microkernel_clip!(c, mr, a, b, kc, Val(P._MR), Val(1), Val(P._NR), Val(false))
-        end
-    else
-        @test_skip "StrictMode checks are disabled in this build" == ""
-    end
+    @test_throws StrictViolation test_signatures([(toy_spill!, (Pd, Int, Val{N}))]; guarantees = (:no_spill,))
+    # Real kernels, at the signatures the packed gemm path compiles.
+    MR = Val{P._MR}; NR = Val{P._NR}
+    test_signatures(
+        [
+            (P._microkernel!, (Pd, Int, Pd, Pd, Int, MR, NR, Val{false})),
+            (P._microkernel!, (Pd, Int, Pd, Pd, Int, MR, NR, Val{true})),
+            (P._microkernel_masked!, (Pd, Int, Pd, Pd, Int, Int, Int, MR, NR, Val{false})),
+            (P._microkernel_clip!, (Pd, Int, Pd, Pd, Int, MR, Val{1}, NR, Val{false})),
+        ];
+        guarantees = (:no_spill,)
+    )
+    # The signatures src/verify.jl declares with `@strict_function guarantees = …` (the microkernels'
+    # `:vectorized`/`:no_spill`, the trsm side-R tile's `:no_spill`), re-proved here with each one's
+    # own guarantees.
+    fs = test_registered(; modules = [P])
+    @test count(f -> f.status === :pass, fs) >= 9
     # Every kernel in the table. A wide (ymm/zmm) spill anywhere, or inside a loop, is the real defect.
     # `spill_report` also counts xmm lines: on a kernel that takes scalar alpha/beta arguments those
     # carry the spilled scalars, which is not register pressure on the vector tile.
@@ -350,39 +363,49 @@ end
     end
 end
 
-@testitem "kernel: @assert_vectorized / kernel_report" tags = [:checks] setup = [KernelChecks] begin
-    using StrictMode, Test
+@testitem "kernel: :vectorized / kernel_report" tags = [:checks] setup = [KernelChecks] begin
+    using StrictMode, StrictModeTest, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
-        KNOWN_WIDE_SPILL, toy_fwd!
+        KNOWN_WIDE_SPILL, toy_fwd!, toy_chase
     Pd = Ptr{Float64}
-    # Controls: a strict-order reduction and a recurrence emit no vector code.
-    @test !StrictMode.kernel_report(toy_strict_sum, (Pd, Int)).vectorized
+    # Controls: a pointer chase and a recurrence emit no vector code, and the `:vectorized` gate fails
+    # on each.
+    @test !StrictMode.kernel_report(toy_chase, (Pd, Ptr{Int}, Int)).vectorized
     @test !StrictMode.kernel_report(toy_recurrence!, (Pd, Int, Float64)).vectorized
-    buf = randn(256)
-    if StrictMode.checks_enabled()
-        GC.@preserve buf begin
-            @test_throws StrictViolation @assert_vectorized toy_strict_sum(pointer(buf), 200)
-            @test_throws StrictViolation @assert_vectorized toy_recurrence!(pointer(buf), 200, 0.5)
-            Ap = randn(P._MR * W * 8); Bp = randn(P._NR * 8); C = zeros(P._MR * W, P._NR)
-            GC.@preserve Ap Bp C begin
-                # The forwarder is judged unvectorized; a check that follows the forwarder to its body would pass.
-                fwd_ok = try
-                    @assert_vectorized toy_fwd!(pointer(buf), 200)
-                    true
-                catch e
-                    e isa StrictViolation || rethrow()
-                    false
-                end
-                @test_broken fwd_ok
-                @assert_vectorized P._microkernel!(pointer(C), P._MR * W, pointer(Ap), pointer(Bp), 8, Val(P._MR), Val(P._NR), Val(false))
-                # `types=` names Type{Float64}; the call's own argument type would be DataType, a different method instance.
-                @assert_vectorized types = (Int, Ptr{Float64}, Ptr{Float64}, Type{Float64}) P._dot_simd(200, pointer(buf), pointer(buf), Float64)
-            end
-        end
-    else
-        @test_skip "StrictMode checks are disabled in this build, so @assert_vectorized is a bare call" == ""
+    @test_throws StrictViolation test_signatures([(toy_chase, (Pd, Ptr{Int}, Int))]; guarantees = (:vectorized,))
+    # The strict-order sum is a `:vectorized` control on x86 only. StrictMode gap: on aarch64 its scalar
+    # FP adds sit behind 128-bit vector loads, and `:vectorized` passes them.
+    sum_throws = try
+        test_signatures([(toy_strict_sum, (Pd, Int))]; guarantees = (:vectorized,))
+        false
+    catch e
+        e isa StrictViolation || rethrow()
+        true
     end
+    if Sys.ARCH === :aarch64
+        @test_broken sum_throws
+    else
+        @test sum_throws
+    end
+    @test_throws StrictViolation test_signatures([(toy_recurrence!, (Pd, Int, Float64))]; guarantees = (:vectorized,))
+    # The forwarder is judged unvectorized; a check that follows the forwarder to its body would pass.
+    fwd_ok = try
+        test_signatures([(toy_fwd!, (Pd, Int))]; guarantees = (:vectorized,))
+        true
+    catch e
+        e isa StrictViolation || rethrow()
+        false
+    end
+    @test_broken fwd_ok
+    # `Type{Float64}`, not `DataType`: the latter names a different method instance of `_dot_simd`.
+    test_signatures(
+        [
+            (P._microkernel!, (Pd, Int, Pd, Pd, Int, Val{P._MR}, Val{P._NR}, Val{false})),
+            (P._dot_simd, (Int, Pd, Pd, Type{Float64})),
+        ];
+        guarantees = (:vectorized,)
+    )
     for (name, f, T) in KERNELS
         r = info(name)
         @test r.vectorized
@@ -395,25 +418,18 @@ end
     @test ax.intensity < mk.intensity
 end
 
-@testitem "kernel: @assert_no_scalar_loops / scalar_fp_loops" tags = [:checks] setup = [KernelChecks] begin
-    using StrictMode, Test
+@testitem "kernel: :no_scalar_loops / scalar_fp_loops" tags = [:checks] setup = [KernelChecks] begin
+    using StrictMode, StrictModeTest, Test
     using .KernelChecks: P, W, NVREG, KERNELS, info, FMA_FREE, toy_spill!, toy_recurrence!, toy_strict_sum,
         toy_dot_tail, toy_chain!, forwarder_info, StrictViolation, box, analyze, KNOWN_WIDE_LOOP_SPILL,
         KNOWN_WIDE_SPILL
     Pd = Ptr{Float64}
-    # Controls: scalar loops are flagged.
+    # Controls: scalar loops are flagged, and `test_signatures` fails on them under `:no_scalar_loops`
+    # (the same `scalar_fp_loops` scan; this driver gates on it).
     @test StrictMode.scalar_fp_loops(toy_strict_sum, (Pd, Int))
     @test StrictMode.scalar_fp_loops(toy_recurrence!, (Pd, Int, Float64))
-    buf = randn(256)
-    if StrictMode.checks_enabled()
-        GC.@preserve buf begin
-            # @assert_no_scalar_loops reports a heuristic verdict as a warning and never throws.
-            @test_logs (:warn, r"StrictViolation") match_mode = :any @assert_no_scalar_loops toy_recurrence!(pointer(buf), 200, 0.5)
-            @test_logs (:warn, r"StrictViolation") match_mode = :any @assert_no_scalar_loops toy_strict_sum(pointer(buf), 200)
-        end
-    else
-        @test_skip "StrictMode checks are disabled in this build" == ""
-    end
+    @test_throws StrictViolation test_signatures([(toy_recurrence!, (Pd, Int, Float64))]; guarantees = (:no_scalar_loops,))
+    @test_throws StrictViolation test_signatures([(toy_strict_sum, (Pd, Int))]; guarantees = (:no_scalar_loops,))
     # A vectorized SIMD dot product whose only scalar loop is the remainder (fewer than W iterations) is
     # flagged too: `scalar_fp_loops` cannot tell a bounded remainder from a hot loop once the function
     # holds a hand-vectorized loop.
@@ -463,12 +479,9 @@ end
         r = StrictMode.mca_report(P._microkernel!, T8)
         @test !r.whole_function                       # the hot loop was found
         @test r.ipc > 0 && r.block_rthroughput > 0
-        # Control: an unmeetable bound on the same kernel fails, and a serial FMA chain is latency-bound.
-        mr = P._MR * W; nr = P._NR; kc = 64
-        Ap = randn(mr * kc); Bp = randn(nr * kc); C = zeros(mr, nr)
-        GC.@preserve Ap Bp C begin
-            @test_throws StrictViolation StrictMode.@assert_mca max_rthroughput = 0.01 P._microkernel!(pointer(C), mr, pointer(Ap), pointer(Bp), kc, Val(P._MR), Val(P._NR), Val(false))
-        end
+        # Control: the kernel's block throughput is above an unmeetable bound, and a serial FMA chain
+        # is latency-bound.
+        @test r.block_rthroughput > 0.01
         chain = StrictMode.mca_report(toy_chain!, (Pd, Int))
         @test chain.ipc < r.ipc
     end

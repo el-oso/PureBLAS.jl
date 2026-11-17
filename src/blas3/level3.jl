@@ -5545,7 +5545,7 @@ const _L1_WAY_D = _way_doubles(_L1_BYTES, _L1D_ASSOC)
 # Whatever makes 512/1024 fast, it is not this predicate. Do not re-derive the quarter-period widening.
 # Next suspect for trsmR n=128 is the fused leaf's hardcoded MR=3 × NC=_CHOL_TILE=4 = 12-accumulator top
 # tier (lapack.jl:792-816): on AVX2's 16 ymm that is 12 accs + 3 T-vectors + 1 broadcast = exactly 16,
-# with 10 loop-invariant broadcasts that must spill (UNVERIFIED — check with @assert_no_spill first).
+# with 10 loop-invariant broadcasts that must spill (UNVERIFIED — check with `spill_report` first).
 
 # ── Alias-strategy self-tuning constant (PDM ladder, MEASURE tier — req#8b) ────────────────────────────
 # On an L1-way-stride ldb the side-R leaf's solved-column re-reads collide in one set. Two cures exist:
