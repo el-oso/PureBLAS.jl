@@ -258,6 +258,12 @@ jobs:
       - uses: julia-actions/cache@v2
         with:
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
+      # Same precompile peak as the `test` job (twice: base and PR); see the swap step there.
+      - name: Add swap for the precompile peak
+        run: |
+          sudo fallocate -l 12G /mnt/pb-swap && sudo chmod 600 /mnt/pb-swap
+          sudo mkswap /mnt/pb-swap && sudo swapon /mnt/pb-swap
+          free -g
       # Blocks the merge on a >25% slowdown vs the base branch (coarse: shared runners are noisy — see
       # benchmark/judge_ci.jl). Precise 0.96× OpenBLAS gating runs on a pinned self-hosted fleet runner.
       - name: Judge performance vs base branch
