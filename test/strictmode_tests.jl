@@ -1187,8 +1187,8 @@ end
 # FAILING CONTROLS. A declaration that cannot fail checks nothing, so every mechanism a guarantee is
 # declared through — in src/verify.jl and in this suite — is fed a known-bad target here, and the item
 # asserts it fails. Each target is a toy whose defect is built in: a `Union` return, a `copy`, a
-# dynamic `invokelatest`, a loop of accumulators past the register file, a strict-order reduction, an
-# `IdDict` lookup.
+# dynamic `invokelatest`, a loop of accumulators past the register file, a pointer chase (each load's address is the
+# previous load's value, so no vector form exists on any ISA), an `IdDict` lookup.
 @testitem "StrictMode controls: every declaration fails on a known-bad target" tags = [:checks] setup = [KernelChecks] begin
     using StrictModeTest, StrictMode, StrictMode.TypeContracts, TrimCheck, Test
     using .KernelChecks: toy_spill_body, NVREG
@@ -1203,13 +1203,16 @@ end
     ctl_unstable(x::Vector{Float64}) = x[1] > 0 ? 1 : "negative"
     ctl_alloc(x::Vector{Float64}) = copy(x)
     ctl_dyn(x::Int) = Base.invokelatest(identity, x)
-    function ctl_sum(p::Ptr{Float64}, n::Int)
+    chase_body = quote
         s = 0.0
-        for i in 1:n
-            s += unsafe_load(p, i)
+        j = 1
+        for _ in 1:n
+            s += unsafe_load(p, j)
+            j = unsafe_load(q, j)
         end
         return s
     end
+    @eval ctl_chase(p::Ptr{Float64}, q::Ptr{Int}, n::Int) = $chase_body
     const CTL_SCRATCH = IdDict{DataType, Vector{Float64}}(Float64 => zeros(2))
     ctl_lookup(::Type{T}) where {T} = CTL_SCRATCH[T]
     t = CtlImpl(); x = [1.0, 2.0]
@@ -1239,13 +1242,7 @@ end
     end
     @test_throws SV @eval module CtlPolicyVectorized
         using StrictMode
-        function ctlp_sum(p::Ptr{Float64}, n::Int)
-            s = 0.0
-            for i in 1:n
-                s += unsafe_load(p, i)
-            end
-            return s
-        end
+        ctlp_chase(p::Ptr{Float64}, q::Ptr{Int}, n::Int) = $chase_body
         @strict_policy :vectorized only = r"^ctlp_"
     end
     # `@strict_function guarantees = … signatures = … name` (src/verify.jl, on the `@generated` gemm
@@ -1257,16 +1254,8 @@ end
     end
     @test_throws SV @eval module CtlFnVectorized
         using StrictMode
-        @generated function ctlg_sum(p::Ptr{Float64}, n::Int, ::Val{U}) where {U}
-            return quote
-                s = 0.0
-                for i in 1:n
-                    s += unsafe_load(p, i)
-                end
-                return s
-            end
-        end
-        @strict_function guarantees = (:vectorized,) signatures = [(Ptr{Float64}, Int, Val{1})] ctlg_sum
+        @generated ctlg_chase(p::Ptr{Float64}, q::Ptr{Int}, n::Int, ::Val{U}) where {U} = $(QuoteNode(chase_body))
+        @strict_function guarantees = (:vectorized,) signatures = [(Ptr{Float64}, Ptr{Int}, Int, Val{1})] ctlg_chase
     end
     # A second, scoped policy in one module (src/verify.jl holds two) checks its own matches.
     @test_throws SV @eval module CtlPolicySecond
@@ -1288,7 +1277,7 @@ end
     @test_throws SV @test_trim_compatible ctl_dyn(1)
     @test_throws SV test_signatures([(ctl_unstable, (Vector{Float64},))]; guarantees = (:typestable,))
     @test_throws SV test_signatures([(ctl_alloc, (Vector{Float64},))]; guarantees = (:noalloc,))
-    @test_throws SV test_signatures([(ctl_sum, (Ptr{Float64}, Int))]; guarantees = (:vectorized,))
+    @test_throws SV test_signatures([(ctl_chase, (Ptr{Float64}, Ptr{Int}, Int))]; guarantees = (:vectorized,))
     @test_throws SV test_signatures([(ctl_lookup, (Type{Float64},))]; guarantees = (:owned,))
     # `:no_spill` and `:no_scalar_loops` under `test_signatures`: test/strict_kernel_tests.jl.
 end
