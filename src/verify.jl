@@ -398,6 +398,5 @@ end
 #   `:trusted`          StrictMode does not track raw `Ptr` reads.
 
 # The checks are over: put back the logger `_WarnRecorder` wrapped.
-let lg = Base.CoreLogging.global_logger()
-    lg isa _WarnRecorder && Base.CoreLogging.global_logger(lg.inner)
-end
+Base.CoreLogging.global_logger() isa _WarnRecorder &&
+    Base.CoreLogging.global_logger(Base.CoreLogging.global_logger().inner)
