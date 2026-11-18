@@ -334,7 +334,7 @@ end
         guarantees = (:no_spill,)
     )
     # Every signature src/verify.jl registers — the kernels declared with `@strict_function` and every
-    # call in the `@verify_strict` block — re-proved with its own guarantees. The ones that do not pass
+    # signature in the `@verify_strict` block — re-proved with its own guarantees. The ones that do not pass
     # yet are listed in registered_proof_baseline.txt. A failure missing from the list fails here, and
     # so does a listed one that now passes, so the list only shrinks as the allocations are fixed.
     # The per-task first-touch accessors are allocation barriers for the proofs, as in
