@@ -292,8 +292,8 @@ function _getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int)
     # that one trsm with n-1 `gemv!` entries at ~60 ns each. It cannot win.
     #
     # The rejected version also allocated: a bare `Vector{T}(undef, n)` is 128-480 B, which would have
-    # reddened the all-paths AllocCheck proof on `_strict_getri_probe` (src/verify.jl:604, run at
-    # n=32 where `_lu_nb(32)=48`, i.e. exactly in the rejected path's range). The arena `borrow!` it
+    # reddened the `:noalloc` check on `getri!` in src/verify.jl's `@verify_strict` block (operands at
+    # n=32, where `_lu_nb(32)=48`, i.e. exactly in the rejected path's range). The arena `borrow!` it
     # was avoiding costs the same 40 ns, so the allocation bought nothing either.
     #
     # THE REAL TARGET at n=8 is the 181 ns one-block body — zeroing an 8x8 W, copying 28 elements and

@@ -63,7 +63,7 @@ const N = 32          # small enough that any per-call allocation is unmissable,
 # is O(n) output, semantically required, and it is NOT the redundant per-call scratch that the copies
 # were: measured at n=32 and n=256, GC fires in 0.0% of samples for both and the bands stay modest
 # (geev 11.9%/5.6%, gelsd 6.3%/1.3%). The workspace-passing entries ARE 0-alloc and that is what the
-# strict contracts cover (`_strict_geevr_probe`/`_strict_geevc_probe` in src/verify.jl, which pass
+# strict contracts cover (the `geev!` calls in src/verify.jl's `@verify_strict` block, which pass
 # every output in; verify.jl:923 records gelsd's Float64 arm as 0 B).
 # Switching the PB arm to the workspace form while the reference arm keeps allocating its outputs
 # would break arm symmetry, so the rows stay on the convenience entry deliberately.

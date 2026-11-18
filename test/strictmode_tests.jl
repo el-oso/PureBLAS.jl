@@ -516,15 +516,15 @@ end
 # Eigen family — the contract members, proved.
 #
 # `gebal!`, `gehrd!`, `orghr!`, `ormhr!`, `hseqr!` and `geev!` are all @strict_contract members
-# (src/contracts.jl:368-380) and src/verify.jl's `@verify_strict` block lists purpose-built probes for
-# every one of them (`_strict_gehrd_probe` &c, ~20 call sites). That block runs at PureBLAS's own
+# (src/contracts.jl:368-380) and src/verify.jl's `@verify_strict` block lists a signature for every one
+# of them (~20 lines). That block runs at PureBLAS's own
 # precompile, where the proving tier cannot load, so it checks with the value-free engine: inference
 # for stability (gates), the IR scan for allocation (reports). test/ PROVES.
 #
 # `test_signatures` (StrictModeTest 0.4) is the right tool rather than a per-call macro, for two reasons
 # beyond not having to build valid eigen inputs. It takes SIGNATURES, so `Char` is a TYPE here: one entry
-# analyses `geev!` for every jobvl/jobvr combination at once, where the src probes pinned 'N','V' and
-# never covered the 'N','N' arm that bench/plots.jl:1003 actually benchmarks. And it costs nothing to
+# analyses `geev!` for every jobvl/jobvr combination at once, including the 'N','N' arm that
+# bench/plots.jl:1003 actually benchmarks. And it costs nothing to
 # list a large shape, so these are the n the gate cares about rather than an n=24 toy.
 #
 # GUARANTEE CHOICE, deliberate: `:typestable` only. NOT `:noalloc` — `gehrd!`'s blocked rewrite (the

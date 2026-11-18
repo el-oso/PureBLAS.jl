@@ -243,7 +243,7 @@ end
 # THE FOLD IS ITS OWN `@noinline` FUNCTION SO THE ALLOCATION IS ATTRIBUTABLE. This is the only
 # allocation an arena scope makes besides `_arena_grow!`. Both run only after a call that reached a new
 # high-water mark, so a report names them rather than the driver that borrowed from the arena; they
-# are `@strict_exempt :noalloc` (workspace.jl) and asserted by measurement, not registered as barriers.
+# are `@strict_exempt :noalloc` (verify.jl) and asserted by measurement, not registered as barriers.
 #
 # The branch is cold by construction — reached only after a call that grew — so this costs a scope
 # exit nothing. Measured, potrf/potri/sysv at n=16..128, eight processes per arm: no cell moved by

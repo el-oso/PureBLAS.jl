@@ -334,7 +334,6 @@ const _QR_WS_C = Base.OncePerTask{Base.RefValue{NTuple{5, Matrix{ComplexF64}}}}(
     r[] = (V, Tm, G, Wb, Yb)
     return V, Tm, G, Wb, Yb
 end
-@strict_exempt _qr_ws_c_grow! guarantees = (:noalloc,) reason = "replaces the owned complex QR workspace at a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 @inline function _qr_ws_c(::Type{T}, m::Int, n::Int, nb::Int) where {T}
     r = _opt(_QR_WS_C)
     V, Tm, G, Wb, Yb = r[]
@@ -430,7 +429,6 @@ const _QR_WS = Base.OncePerTask{Base.RefValue{NTuple{4, Matrix{Float64}}}}(
     r[] = (V, Tm, G, Wb)
     return V, Tm, G, Wb
 end
-@strict_exempt _qr_ws_grow! guarantees = (:noalloc,) reason = "replaces the owned QR workspace at a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 @inline function _qr_ws(m::Int, n::Int, nb::Int)
     r = _opt(_QR_WS)
     V, Tm, G, Wb = r[]

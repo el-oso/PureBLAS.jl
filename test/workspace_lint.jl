@@ -37,7 +37,7 @@ const _CALLBACK_EDGES = Dict("_lacn2!" => ["applyop!"],                  # gecon
                              "_lacn2_estimate" => ["apply!", "applyf"])  # trsen.jl:402 ← trsen!/trrfs!
 
 # `src/verify.jl` is EXCLUDED, and that is a correctness fix, not a convenience. It is a probe harness:
-# `@verify_strict SIMDBackend begin … end` calls a few hundred routines SEQUENTIALLY at one nesting level.
+# `@verify_strict SIMDBackend begin … end` names a few hundred routines SEQUENTIALLY at one nesting level.
 # A name-level call graph cannot tell that block apart from a function body, so every routine in it reads
 # as calling every routine after it — which manufactured 48 false findings the moment SVDWorkspace and
 # _GVDWork came under the lint (`gesvd!` "calling" `tbsv!` "calling" `stein!`). It defines no accessor and
