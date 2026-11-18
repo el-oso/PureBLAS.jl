@@ -1,5 +1,5 @@
-# Precompile-time guarantees for the SIMDBackend. Included LAST, after every backend op and C-ABI entry
-# is defined, because the declarations below name them.
+# Precompile-time guarantees for the SIMDBackend. Included after every backend op and C-ABI entry is
+# defined, because the declarations below name them, and after the precompile workload.
 #
 # `@verify_strict SIMDBackend` runs `TypeContracts.@verify SIMDBackend` — method existence + declared
 # return types over the whole chain (AbstractBLAS1 → BLAS2 → BLAS3 → LAPACK → LAPACKSolve) — and checks
