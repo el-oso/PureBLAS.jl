@@ -89,7 +89,6 @@ include("cabi/cabi_lapack3.jl")  # Mode 1: LAPACK batch 3 (syconv/trrfs; tgsen/g
 include("cabi/cabi_forward.jl")  # in-process LBT forward registry (@cfunction pointers to the above)
 include("lbt.jl")           # activate/deactivate via BLAS.lbt_set_forward
 include("tune.jl")          # per-machine tuning status + tune!() (spawns bench/calibrate.jl; NO benchmark here)
-include("verify.jl")        # precompile-time @verify_strict SIMDBackend (needs every op and C-ABI entry defined first)
 
 # ── Precompile workload ────────────────────────────────────────────────────────────────────────────
 # Run the hot native kernels once at precompile time so their native code is cached in the .ji — first-call
@@ -139,6 +138,10 @@ using PrecompileTools: @setup_workload, @compile_workload
         _heev!('V', 'L', copy(Ah))
     end
 end
+
+# Precompile-time @verify_strict SIMDBackend: needs every op and C-ABI entry defined first, and runs
+# after the workload so its checks reuse the code the workload inferred.
+include("verify.jl")
 
 # The threaded setup path runs only in a process with more than one thread, which a precompile process
 # never is, so the workload above cannot reach it. These directives compile it without running it: the
