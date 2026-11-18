@@ -1348,47 +1348,6 @@ end
 # Build Q (m×n) and P (n×n) from the stored reflectors, then let bdsqr accumulate Ub,Vb into them.
 # Returns (U, S, Vt): U is m×n (thin), S length-n descending, Vt is n×n. ponytail: m<n via transpose.
 
-# Form the thin Q (m×n) = H(1)···H(n) from the left reflectors below A's diagonal. Each reflector is
-# applied to the trailing columns with H·C = C − τ·v·(vᵀ·C): one gemv! (vᵀC) + one ger! (rank-1).
-function _form_Q!(A::AbstractMatrix{Float64}, tauq::AbstractVector{Float64}, m::Int, n::Int)
-    Q = zeros(Float64, m, n)
-    @inbounds for i in 1:n
-        Q[i, i] = 1.0
-    end
-    w = Vector{Float64}(undef, n)
-    @inbounds for i in n:-1:1
-        τ = tauq[i]
-        τ == 0.0 && continue
-        A[i, i] = 1.0                          # make the implicit reflector 1 explicit (A unused after)
-        v = view(A, i:m, i); C = view(Q, i:m, 1:n); wv = view(w, 1:n)
-        gemv!(wv, C, v; trans = 'T', alpha = 1.0, beta = 0.0)
-        ger!(-τ, v, wv, C)
-    end
-    return Q
-end
-
-# Form P (n×n) = G(1)···G(n-1) from the right reflectors above A's superdiagonal.
-function _form_P!(A::AbstractMatrix{Float64}, taup::AbstractVector{Float64}, n::Int)
-    P = zeros(Float64, n, n)
-    @inbounds for i in 1:n
-        P[i, i] = 1.0
-    end
-    w = Vector{Float64}(undef, n); vb = Vector{Float64}(undef, n)
-    @inbounds for i in (n - 1):-1:1
-        τ = taup[i]
-        τ == 0.0 && continue
-        len = n - i                                  # reflector lives in row i, cols i+1:n (v[1]=1)
-        vb[1] = 1.0
-        for t in 2:len
-            vb[t] = A[i, i + t]                         # contiguous copy of the strided row reflector
-        end
-        v = view(vb, 1:len); C = view(P, (i + 1):n, 1:n); wv = view(w, 1:n)
-        gemv!(wv, C, v; trans = 'T', alpha = 1.0, beta = 0.0)
-        ger!(-τ, v, wv, C)
-    end
-    return P
-end
-
 # Apply Q = H(1)···H(k) (standard reflectors, columns of Vfull, implicit unit diagonal already made
 # explicit; roff = row offset of reflector i's support below its index) to C from the left, in place:
 # C := Q·C. Blocked compact-WY (dlarft + dlarfb) driven by PureBLAS gemm! — the BLAS-3 back-transform
@@ -1435,8 +1394,8 @@ function _apply_reflectors_left!(
 end
 
 # COMPLEX blocked back-transform (zunmbr role): C := Q·C, Q = H_k·⋯·H_1 (trans='N'), applied in nb-wide
-# compact-WY blocks — the complex mirror of `_apply_reflectors_left!`, replacing the unblocked per-reflector
-# `_zapply_Q_left!`/`_zapply_P_left!` (BLAS-2 → BLAS-3 on ~half the with-vectors flops). `Vfull` is the
+# compact-WY blocks — the complex mirror of `_apply_reflectors_left!` (BLAS-3 on ~half the with-vectors
+# flops). `Vfull` is the
 # explicit unit-lower-trapezoid reflector panel (built by the caller with roff row-offset; the P-side stores
 # CONJUGATED essentials). Block reflector Q_b = I − V·T·Vᴴ: G = VᴴV (herk), zlarft T (upper), apply via
 # W = VᴴC (gemm 'C'), W := T·W (trmm), C −= V·W. Blocks run reverse (rightmost first ⇒ Q·C). Uses the
@@ -1739,52 +1698,6 @@ function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{<:Real}) where {T <
     end
     return S
 end
-# ── Complex singular-VECTOR back-transform (unblocked, mirrors _unmtr! in eigen.jl) ─────────────────────
-# Q = H_1·H_2·⋯·H_n from the LEFT (tauq) reflectors: apply C := Q·C. H_i = I − τq_i·v_i·v_iᴴ acts on rows
-# i:m, v_i[1]≡1 (at row i), v_i[2:] = A[i+1:m, i] (stored un-conjugated — the LEFT reflectors get no zlacgv
-# dance). ALL n reflectors applied (i=n has a length-1 v with a nonzero phase τ — no real-code τ=0 shortcut,
-# per the eigen lesson). trans='N' (form Q, not Qᴴ) ⇒ τ un-conjugated.
-function _zapply_Q_left!(
-        A::AbstractMatrix{T}, tauq::AbstractVector{T}, C::AbstractMatrix{T},
-        m::Int, n::Int
-    ) where {T <: Complex}
-    v = Vector{T}(undef, m)
-    @inbounds for i in n:-1:1
-        len = m - i + 1
-        v[1] = one(T)
-        for r in 2:len
-            v[r] = A[i + r - 1, i]
-        end
-        _house_left!(view(C, i:m, :), view(v, 1:len), tauq[i])
-    end
-    return C
-end
-
-# P = R_1·R_2·⋯·R_{n-1} from the LEFT (taup) reflectors: apply C := P·C. From A = Q·B·Pᴴ, P = R_1…R_{n-1}
-# with R_i = I − τp_i·w_i·w_iᴴ acting on the col-index space i+1:n (rows i+1:n of C), w_i[1]≡1 (col i+1),
-# w_i[2:] = conj(A[i, i+2:n]). The CONJUGATION on w (vs the real _form_P!, which uses A[i,i+t] directly) is
-# the P-side subtlety: zgebd2 reduces the CONJUGATED row (zlacgv), so the reflector applied from the right
-# during factorization is w_i = conj(stored essential); forming P from the left re-uses that same w_i. τ is
-# un-conjugated (form P, not Pᴴ). Derivation cross-checked against the known-correct Q side + verified
-# numerically (reconstruction ‖A−UΣVᴴ‖ at machine eps across scaled/rank-deficient cases). i=n−1 has a
-# length-1 w (phase-only) — applied, no τ=0 shortcut.
-function _zapply_P_left!(
-        A::AbstractMatrix{T}, taup::AbstractVector{T}, C::AbstractMatrix{T},
-        n::Int
-    ) where {T <: Complex}
-    n <= 1 && return C
-    v = Vector{T}(undef, n)
-    @inbounds for i in (n - 1):-1:1
-        len = n - i
-        v[1] = one(T)
-        for t in 2:len
-            v[t] = conj(A[i, i + t])
-        end
-        _house_left!(view(C, (i + 1):n, :), view(v, 1:len), taup[i])
-    end
-    return C
-end
-
 # ── Complex in-place SVD core (m ≥ n), mirrors _gesvd_core! (the _heev! pattern for SVD) ────────────────
 # gebrd! (complex; real d,e + complex tauq/taup) → REAL bidiagonal SVD (bdsqr!/bdsdc! into real Lvec/Rvec)
 # → realify into complex U/V staging → apply complex Q (tauq) / P (taup) back-transforms → Vᴴ = conjugate
