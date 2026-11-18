@@ -1734,9 +1734,8 @@ function run_benchmarks()
         # exactly the round-level bimodality (round medians 103/247/119/241/113/248/251/253 us).
         # Dropping the copy takes GC to 0.0% of samples and the n=8 median down 20% — the cell stops
         # timing the allocator and starts timing the kernel.
-        # The kernels themselves were never the problem: `trtri!` measures 0 B at n=8 and n=256, and
-        # `src/verify.jl`'s entry-point contracts (`_strict_trtri_probe` et al.) already refresh their
-        # operand the allocation-free way, with `copyto!` into a preallocated buffer.
+        # The kernels themselves were never the problem: `trtri!` measures 0 B at n=8 and n=256. The
+        # allocation-free way to refresh an operand is `copyto!` into a preallocated buffer.
         # Every other row here (sytrs, gbtrf, geqp3, …) already passed `c` straight through; these
         # eight were the outliers. KEEP IT THAT WAY — `bench/check_sweep_noalloc.jl` asserts it.
         # FACTOR WITH PureBLAS, NOT WITH LAPACK — see the note on `_lufac2` below. A setup that calls a

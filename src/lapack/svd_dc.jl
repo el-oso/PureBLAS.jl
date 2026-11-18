@@ -37,7 +37,6 @@ const _DC_WS_N = Base.OncePerTask{Base.RefValue{Int}}(() -> Ref(1))
     ws[] = _dcwork(n); nn[] = n
     return nothing
 end
-@strict_exempt _dcwork_grow! guarantees = (:noalloc,) reason = "replaces the divide-and-conquer workspace at a new size high-water mark; a warmed second call allocates 0 bytes (test/strictmode_tests.jl)"
 @inline function _get_dcwork(n::Int)
     ws = _opt(_DC_WS); nn = _opt(_DC_WS_N)
     nn[] < n && _dcwork_grow!(ws, nn, n)
