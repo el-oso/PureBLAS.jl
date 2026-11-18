@@ -1195,6 +1195,7 @@ end
         (P.hemm!, (M, M, M)), (P.syrk!, (M, M)), (P.herk!, (M, M)), (P.syr2k!, (M, M, M)),
         (P.her2k!, (M, M, M)), (P.trmm!, (M, M)), (P.trsm!, (M, M)),
         (P.potrf!, (M,)), (P.potrs!, (M, M)), (P.potri!, (M,)), (P.pptrf!, (V,)), (P.pptrs!, (V, M)),
+        (P.pbtrf!, (M,)), (P.pbtrs!, (M, M)),
         (P.pstrf!, (M, I, Float64)), (P.pocon!, (Float64, M)), (P.getrs!, (M, I, M)),
         (P.trtrs!, (M, M)), (P.trtri!, (M,)), (P.gecon!, (Float64, M, I)), (P.trcon!, (M,)),
         (P.pttrs!, (V, V, M)), (P.ptsv!, (V, V, M)), (P.gebal!, (M, V)),
@@ -1206,7 +1207,7 @@ end
         @test kws(f, args) == Base.kwarg_decl(which(f, args))
     end
     # Control: a `kw...` forwarder does not restate its target's keywords.
-    @test kws(P.pbtrs!, (M, M)) != Base.kwarg_decl(which(P.pbtrs!, (M, M)))
+    @test kws(P.gemm!, (M, M, M)) != Base.kwarg_decl(which(P.gemm!, (M, M, M)))
 end
 
 # FAILING CONTROLS. A declaration that cannot fail checks nothing, so every mechanism a guarantee is
