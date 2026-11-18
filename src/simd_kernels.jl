@@ -1328,6 +1328,27 @@ end
     return s
 end
 
+# `_dot_simd` for a substitution recurrence (trsv-T), where `y[n]` — and a few elements before it — were
+# stored as scalars by the caller's previous steps. A vector load that covers a pending scalar store is not
+# forwarded from it and waits for the store to commit, which then sits on the recurrence's critical path
+# once per solved element. So the last `r` elements, `1 <= r <= W`, are read with scalar loads after the
+# horizontal sum, and the newest element is never inside a vector load. (Keeping `r = n mod W`, so that
+# every W-th element still lands in a full vector, measured 2-9% slower on Zen4 at n=32..256.)
+# Measured Zen4, `trsv` U,T in `_trsv_simd!`, ns per solve, `_dot_simd` -> this form:
+#     n=32 516 -> 227, n=64 1062 -> 489, n=128 2203 -> 1198, n=256 4714 -> 3747, n=512 17258 -> 17072
+# The L,T form's newest element is the FIRST one of its dot, so it needs the mirror image of this order.
+@inline function _dot_subst(n::Int, x, y, ::Type{T}) where {T <: BlasReal}
+    px = _ptr(x); py = _ptr(y)
+    nv = ((n - 1) ÷ _vwidth(T)) * _vwidth(T)      # a multiple of W, so `_dot_simd` has no remainder
+    GC.@preserve x y begin
+        s = _dot_simd(nv, px, py, T)
+        for i in (nv + 1):n
+            s += unsafe_load(px, i) * unsafe_load(py, i)
+        end
+    end
+    return s
+end
+
 # EIGHT accumulators, not four — **Derive**: cover the FP-add LATENCY across the add pipes. Each vector
 # costs one load, one `abs` (a `vandpd`) and one `vaddpd` into an accumulator, so the loop's floor is set
 # by how many INDEPENDENT add chains are in flight: chains >= add_latency x add_pipes. On Zen4 that is
