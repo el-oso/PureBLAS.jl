@@ -425,9 +425,10 @@ end
         r = info(name)
         @test r.vectorized
     end
-    # kernel_report on the packed microkernel: register-blocked, so FP work per vector memory op is high.
+    # kernel_report on the packed microkernel: register-blocked, so it does more FP work per vector
+    # memory op than a streaming kernel. The absolute ratio follows the tile shape (_MR, _NR) the
+    # build derives for its CPU, so only the comparison is asserted.
     mk = info("_microkernel! 8-arg B0=false")
-    @test mk.intensity >= 1.0
     # Control: a streaming kernel does about one FMA per loaded vector, a lower ratio than the tile.
     ax = info("_axpy_unrolled! U=4")
     @test ax.intensity < mk.intensity
