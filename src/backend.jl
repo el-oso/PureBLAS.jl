@@ -289,18 +289,18 @@ end
 # not yet routed through DEFAULT_BACKEND — add that forwarding when a real default-swap need appears.)
 @inline gemm!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = gemm!(C, A, B; kw...)
 @inline symm!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = symm!(C, A, B; kw...)
-@inline hemm!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = hemm!(C, A, B; kw...)
-@inline syrk!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix; kw...)::AbstractMatrix = syrk!(C, A; kw...)
-@inline herk!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix; kw...)::AbstractMatrix = herk!(C, A; kw...)
-@inline syr2k!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = syr2k!(C, A, B; kw...)
-@inline her2k!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; kw...)::AbstractMatrix = her2k!(C, A, B; kw...)
-@inline trmm!(::SIMDBackend, B::AbstractMatrix, A::AbstractMatrix; kw...)::AbstractMatrix = trmm!(B, A; kw...)
-@inline trsm!(::SIMDBackend, B::AbstractMatrix, A::AbstractMatrix; kw...)::AbstractMatrix = trsm!(B, A; kw...)
+@inline hemm!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; side::Char = 'L', uplo::Char = 'U', alpha::Number = true, beta::Number = false)::AbstractMatrix = hemm!(C, A, B; side, uplo, alpha, beta)
+@inline syrk!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N', alpha::Number = true, beta::Number = false)::AbstractMatrix = syrk!(C, A; uplo, trans, alpha, beta)
+@inline herk!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N', alpha::Real = true, beta::Real = false)::AbstractMatrix = herk!(C, A; uplo, trans, alpha, beta)
+@inline syr2k!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N', alpha::Number = true, beta::Number = false)::AbstractMatrix = syr2k!(C, A, B; uplo, trans, alpha, beta)
+@inline her2k!(::SIMDBackend, C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N', alpha::Number = true, beta::Real = false)::AbstractMatrix = her2k!(C, A, B; uplo, trans, alpha, beta)
+@inline trmm!(::SIMDBackend, B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Char = 'U', transA::Char = 'N', diag::Char = 'N', alpha::Number = true)::AbstractMatrix = trmm!(B, A; side, uplo, transA, diag, alpha)
+@inline trsm!(::SIMDBackend, B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Char = 'U', transA::Char = 'N', diag::Char = 'N', alpha::Number = true)::AbstractMatrix = trsm!(B, A; side, uplo, transA, diag, alpha)
 
 # ── LAPACK backend surface (AbstractLAPACK contract). Same thin-wrapper form as L3: the bare
 # `fac!(A; …)` entry points (lapack.jl/lu.jl/qr.jl/svd.jl) are the implementations; these dispatch a
 # second backend's factorizations and let the contract enforce completeness. Zero-cost (inlined).
-@inline potrf!(::SIMDBackend, A::AbstractMatrix; kw...)::AbstractMatrix = potrf!(A; kw...)
+@inline potrf!(::SIMDBackend, A::AbstractMatrix; uplo::Char = 'L')::AbstractMatrix = potrf!(A; uplo)
 @inline getrf!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = getrf!(A; kw...)
 @inline geqrf!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = geqrf!(A; kw...)
 @inline gesvd!(::SIMDBackend, A::AbstractMatrix; kw...)::Tuple = gesvd!(A; kw...)
@@ -310,20 +310,20 @@ end
 # interface docstring in contracts.jl for why that is load-bearing rather than decorative. Where a
 # routine has both an in-place and an allocating convenience form (gbtrf!, gesvx!), the wrapper binds
 # the IN-PLACE one: the contract must not be satisfiable by a method that allocates.
-@inline potrs!(::SIMDBackend, A::AbstractMatrix, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = potrs!(A, B; kw...)
-@inline potri!(::SIMDBackend, A::AbstractMatrix; kw...)::AbstractMatrix = potri!(A; kw...)
-@inline pptrf!(::SIMDBackend, AP::AbstractVector; kw...)::AbstractVector = pptrf!(AP; kw...)
-@inline pptrs!(::SIMDBackend, AP::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = pptrs!(AP, B; kw...)
+@inline potrs!(::SIMDBackend, A::AbstractMatrix, B::AbstractVecOrMat; uplo::AbstractChar = 'L')::AbstractVecOrMat = potrs!(A, B; uplo)
+@inline potri!(::SIMDBackend, A::AbstractMatrix; uplo::AbstractChar = 'L')::AbstractMatrix = potri!(A; uplo)
+@inline pptrf!(::SIMDBackend, AP::AbstractVector; uplo::AbstractChar = 'L')::AbstractVector = pptrf!(AP; uplo)
+@inline pptrs!(::SIMDBackend, AP::AbstractVector, B::AbstractVecOrMat; uplo::AbstractChar = 'L')::AbstractVecOrMat = pptrs!(AP, B; uplo)
 @inline pbtrf!(::SIMDBackend, AB::AbstractMatrix; kw...)::AbstractMatrix = pbtrf!(AB; kw...)
 @inline pbtrs!(::SIMDBackend, AB::AbstractMatrix, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = pbtrs!(AB, B; kw...)
-@inline pstrf!(::SIMDBackend, A::AbstractMatrix, piv::AbstractVector, tol::Real; kw...)::Tuple = pstrf!(A, piv, tol; kw...)
-@inline pocon!(::SIMDBackend, normA::Real, A::AbstractMatrix; kw...)::Real = pocon!(normA, A; kw...)
-@inline getrs!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = getrs!(A, ipiv, B; kw...)
+@inline pstrf!(::SIMDBackend, A::AbstractMatrix, piv::AbstractVector, tol::Real; uplo::Char = 'L')::Tuple = pstrf!(A, piv, tol; uplo)
+@inline pocon!(::SIMDBackend, normA::Real, A::AbstractMatrix; uplo::Char = 'L', norm::Char = '1')::Real = pocon!(normA, A; uplo, norm)
+@inline getrs!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat; trans::AbstractChar = 'N')::AbstractVecOrMat = getrs!(A, ipiv, B; trans)
 @inline getri!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector)::AbstractMatrix = getri!(A, ipiv)
-@inline trtrs!(::SIMDBackend, A::AbstractMatrix, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = trtrs!(A, B; kw...)
-@inline trtri!(::SIMDBackend, A::AbstractMatrix; kw...)::AbstractMatrix = trtri!(A; kw...)
-@inline gecon!(::SIMDBackend, normA::Real, A::AbstractMatrix, ipiv::AbstractVector; kw...)::Real = gecon!(normA, A, ipiv; kw...)
-@inline trcon!(::SIMDBackend, A::AbstractMatrix; kw...)::Real = trcon!(A; kw...)
+@inline trtrs!(::SIMDBackend, A::AbstractMatrix, B::AbstractVecOrMat; uplo::AbstractChar = 'U', trans::AbstractChar = 'N', diag::AbstractChar = 'N')::AbstractVecOrMat = trtrs!(A, B; uplo, trans, diag)
+@inline trtri!(::SIMDBackend, A::AbstractMatrix; uplo::AbstractChar = 'L', diag::AbstractChar = 'N')::AbstractMatrix = trtri!(A; uplo, diag)
+@inline gecon!(::SIMDBackend, normA::Real, A::AbstractMatrix, ipiv::AbstractVector; norm::Char = '1')::Real = gecon!(normA, A, ipiv; norm)
+@inline trcon!(::SIMDBackend, A::AbstractMatrix; uplo::Char = 'U', diag::Char = 'N', norm::Char = '1')::Real = trcon!(A; uplo, diag, norm)
 @inline trrfs!(::SIMDBackend, uplo::AbstractChar, trans::AbstractChar, diag::AbstractChar, A::AbstractMatrix, B::AbstractVecOrMat, X::AbstractVecOrMat, Ferr::AbstractVector, Berr::AbstractVector)::Tuple = trrfs!(uplo, trans, diag, A, B, X, Ferr, Berr)
 @inline gbtrf!(::SIMDBackend, kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix, ipiv::AbstractVector)::Tuple = gbtrf!(kl, ku, m, AB, ipiv)
 @inline gbtrs!(::SIMDBackend, trans::AbstractChar, kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat)::AbstractVecOrMat = gbtrs!(trans, kl, ku, m, AB, ipiv, B)
@@ -331,8 +331,8 @@ end
 @inline gttrf!(::SIMDBackend, dl::AbstractVector, d::AbstractVector, du::AbstractVector, du2::AbstractVector, ipiv::AbstractVector)::Tuple = gttrf!(dl, d, du, du2, ipiv)
 @inline gttrs!(::SIMDBackend, trans::AbstractChar, dl::AbstractVector, d::AbstractVector, du::AbstractVector, du2::AbstractVector, ipiv::AbstractVector, B::AbstractVecOrMat)::AbstractVecOrMat = gttrs!(trans, dl, d, du, du2, ipiv, B)
 @inline pttrf!(::SIMDBackend, D::AbstractVector, E::AbstractVector)::Tuple = pttrf!(D, E)
-@inline pttrs!(::SIMDBackend, D::AbstractVector, E::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = pttrs!(D, E, B; kw...)
-@inline ptsv!(::SIMDBackend, D::AbstractVector, E::AbstractVector, B::AbstractVecOrMat; kw...)::Tuple = ptsv!(D, E, B; kw...)
+@inline pttrs!(::SIMDBackend, D::AbstractVector, E::AbstractVector, B::AbstractVecOrMat; uplo::AbstractChar = 'L')::AbstractVecOrMat = pttrs!(D, E, B; uplo)
+@inline ptsv!(::SIMDBackend, D::AbstractVector, E::AbstractVector, B::AbstractVecOrMat; uplo::AbstractChar = 'L')::Tuple = ptsv!(D, E, B; uplo)
 @inline gesvx!(::SIMDBackend, fact::Char, trans::Char, A::AbstractMatrix, AF::AbstractMatrix, ipiv::AbstractVector, equed::Char, R::AbstractVector, C::AbstractVector, B::AbstractMatrix, X::AbstractMatrix, ferr::AbstractVector, berr::AbstractVector)::Tuple = gesvx!(fact, trans, A, AF, ipiv, equed, R, C, B, X, ferr, berr)
 
 # ── QR / LQ / QL / RZ backend surface (the rest of the AbstractLAPACK contract). Same thin-wrapper
@@ -365,7 +365,7 @@ end
 # neither adds an implementation to wrap. `geev!` gets TWO methods because its real and complex
 # in-place forms have different arities (wr+wi vs a single complex w) — the contract can only declare
 # one of them, so the complex arm is held to the guarantee by verify.jl instead.
-@inline gebal!(::SIMDBackend, A::AbstractMatrix, scale::AbstractVector; kw...)::Tuple = gebal!(A, scale; kw...)
+@inline gebal!(::SIMDBackend, A::AbstractMatrix, scale::AbstractVector; job::Char = 'B')::Tuple = gebal!(A, scale; job)
 @inline gebak!(::SIMDBackend, job::AbstractChar, side::AbstractChar, ilo::Integer, ihi::Integer, scale::AbstractVector, V::AbstractMatrix)::AbstractMatrix = gebak!(job, side, ilo, ihi, scale, V)
 @inline gehrd!(::SIMDBackend, A::AbstractMatrix, ilo::Integer, ihi::Integer, tau::AbstractVector)::AbstractMatrix = gehrd!(A, ilo, ihi, tau)
 @inline orghr!(::SIMDBackend, A::AbstractMatrix, ilo::Integer, ihi::Integer, tau::AbstractVector)::AbstractMatrix = orghr!(A, ilo, ihi, tau)
@@ -383,12 +383,12 @@ end
 
 # ── Bunch-Kaufman backend surface. `sysv!`/`hesv!`/`syconv!` bind the 4-argument forms; the 3-argument
 # siblings allocate `ipiv`/`work`.
-@inline sytrf!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; kw...)::Integer = sytrf!(A, ipiv; kw...)
-@inline hetrf!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; kw...)::Integer = hetrf!(A, ipiv; kw...)
-@inline sytrs!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = sytrs!(A, ipiv, B; kw...)
-@inline hetrs!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat; kw...)::AbstractVecOrMat = hetrs!(A, ipiv, B; kw...)
-@inline sytri!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; kw...)::AbstractMatrix = sytri!(A, ipiv; kw...)
-@inline hetri!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; kw...)::AbstractMatrix = hetri!(A, ipiv; kw...)
+@inline sytrf!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; uplo::Char = 'L')::Integer = sytrf!(A, ipiv; uplo)
+@inline hetrf!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; uplo::Char = 'L')::Integer = hetrf!(A, ipiv; uplo)
+@inline sytrs!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat; uplo::Char = 'L')::AbstractVecOrMat = sytrs!(A, ipiv, B; uplo)
+@inline hetrs!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector, B::AbstractVecOrMat; uplo::Char = 'L')::AbstractVecOrMat = hetrs!(A, ipiv, B; uplo)
+@inline sytri!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; uplo::Char = 'L')::AbstractMatrix = sytri!(A, ipiv; uplo)
+@inline hetri!(::SIMDBackend, A::AbstractMatrix, ipiv::AbstractVector; uplo::Char = 'L')::AbstractMatrix = hetri!(A, ipiv; uplo)
 @inline sysv!(::SIMDBackend, uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat, ipiv::AbstractVector)::Tuple = sysv!(uplo, A, B, ipiv)
 @inline hesv!(::SIMDBackend, uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat, ipiv::AbstractVector)::Tuple = hesv!(uplo, A, B, ipiv)
 @inline syconv!(::SIMDBackend, uplo::AbstractChar, A::AbstractMatrix, ipiv::AbstractVector, work::AbstractVector)::Tuple = syconv!(uplo, A, ipiv, work)
