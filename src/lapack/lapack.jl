@@ -774,20 +774,18 @@ const _CHOLW = _vwidth(Float64)                 # (used by lu.jl/svd_dc.jl)
 @inline _chol_sth(::Type{T}) where {T} = 16      # base-case element crossover (µarch-invariant; fleet-tuned later)
 @inline _chol_sb(::Type{T}) where {T} = 32       # small-n rl block size (= 2·_chol_sth)
 # The column width of the register tile in the fused Cholesky base kernels: the trsm panel solves
-# (`_trsm_right_lower_f64!`, `_trsm_rl_split_f64!`) and the syrk trailing updates (`_syrk_lower_f64!` and
-# its split twin) are each HAND-UNROLLED for exactly this many columns (d0..d3, l10..l32, accumulators
-# for columns c0..c0+3), with rank-update accumulators held in registers. This const is the loop step
+# (`_trsm_right_lower_f64!`, `_trsm_rl_split_f64!`) are each HAND-UNROLLED for exactly this many
+# columns (d0..d3, l10..l32, accumulators for columns c0..c0+3), with rank-update accumulators held
+# in registers. This const is the loop step
 # and the full-tile guard of those kernels, so it describes their shape and cannot be changed on its
 # own: a different value does not run slower, it runs WRONG. Measured 2026-08-22 at n=256 on an
 # oracle-confirmed positive-definite input (same on Zen3 and Zen4), varying the step of one kernel:
 #     trsm step 1, 2, 8, 16, 32          -> PosDefException
 #     trsm step 3                        -> SILENTLY WRONG, rel err 1.0e-01, no exception
-#     syrk step 2, 3, 8, 16, 32, 64, 128 -> SILENTLY WRONG, rel err 9.0e-02 .. 2.4e-01, no exception
-#     syrk step 1                        -> PosDefException
-#     both 4                             -> rel err 1.5e-15
+#     trsm step 4                        -> rel err 1.5e-15
 # A step of 3 passes the guard and the body then reads column c0+3, one past intent; 8 passes the guard
 # and leaves four columns unfactored. A timing sweep that does not check the result reports those arms
-# as wins (1.12x-1.63x at syrk step 16..128) because they skip the work.
+# as wins because they skip the work.
 # So it has no preference and no force hook. Four columns of accumulators fit the register file on
 # every ISA, and the small Cholesky base does not gain from a wider tile (same finding as `_chol_sth`).
 # PDM: Literal — the column count the fused Cholesky base kernels are hand-unrolled for; a structural invariant of that code. | tune: n/a — only 4 is correct
@@ -881,7 +879,7 @@ end
 
 # panel solve: L10 (m×bs) from L10·L00ᵀ = A10, in place on A10. FUSED — each NB=4 column panel downdates
 # against all prior columns AND does the within-panel triangular solve in ONE register pass (no store/re-load
-# round-trip between them), MR=3/2/1 tiers like _syrk_lower + a scalar tail. Measured Zen3: 80–92% of FMA
+# round-trip between them), MR=3/2/1 tiers + a scalar tail. Measured Zen3: 80–92% of FMA
 # peak vs the old two-pass ~47–58% (1.6–1.8×) — brings trsm-R to syrk's efficiency, the residual potrf lever.
 # The tile stays register-resident across downdate→solve. bs is a multiple of 4 in rl32 (powers of two down
 # to 4); the nb<4 remainder is a scalar fallback. Solve: L10[:,c] = (A10[:,c] − Σ_{k<c} L10[:,k]·L00[c,k])/L00[c,c].
@@ -993,118 +991,6 @@ function _trsm_right_lower_f64!(p00::Ptr{T}, p10::Ptr{T}, bs::Int, m::Int, ld::I
             end
         end
         c0 += _CHOL_TILE
-    end
-    return nothing
-end
-
-# one trailing column j: A11[i,j] -= Σ_c L10[j,c]·L10[i,c]  (remainder / <NC-column path).
-@inline function _syrk_panel_f64!(p11::Ptr{T}, p10::Ptr{T}, j::Int, m::Int, bs::Int, ld::Int) where {T}
-    W = _vwidth(T); V = Vec{W, T}
-    i = ((j - 1) ÷ W) * W + 1
-    @inbounds while i + W - 1 <= m
-        b = _cvptr(p11, i, j, ld); a = vload(V, b)
-        for c in 1:bs
-            a = muladd(V(-unsafe_load(p10, _clidx(j, c, ld))), vload(V, _cvptr(p10, i, c, ld)), a)
-        end
-        vstore(a, b); i += W
-    end
-    @inbounds if i <= m                              # MASKED tail — the body above, one pass
-        msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)   # inactive lanes are never accessed (no OOB)
-        b = _cvptr(p11, i, j, ld); a = vload(V, b, msk)
-        for c in 1:bs
-            a = muladd(V(-unsafe_load(p10, _clidx(j, c, ld))), vload(V, _cvptr(p10, i, c, ld), msk), a)
-        end
-        vstore(a, b, msk)
-    end
-    return nothing
-end
-
-# trailing symmetric rank-bs update A11 (m×m) −= L10·L10ᵀ. Register-blocked MR rows × NC cols.
-function _syrk_lower_f64!(p11::Ptr{T}, p10::Ptr{T}, m::Int, bs::Int, ld::Int) where {T}
-    W = _vwidth(T); V = Vec{W, T}
-    j = 1
-    @inbounds while j + _CHOL_TILE - 1 <= m
-        i = ((j - 1) ÷ W) * W + 1                # W-aligned triangular start (skip upper blocks)
-        while i + 3W - 1 <= m                          # MR=3 × NC=4 = 12 accumulators
-            r1 = i + W; r2 = i + 2W
-            e00 = _cvptr(p11, i, j, ld);      A00 = vload(V, e00)
-            e10 = _cvptr(p11, r1, j, ld);     C00 = vload(V, e10)
-            e20 = _cvptr(p11, r2, j, ld);     D00 = vload(V, e20)
-            e01 = _cvptr(p11, i, j + 1, ld);  A01 = vload(V, e01)
-            e11 = _cvptr(p11, r1, j + 1, ld); C01 = vload(V, e11)
-            e21 = _cvptr(p11, r2, j + 1, ld); D01 = vload(V, e21)
-            e02 = _cvptr(p11, i, j + 2, ld);  A02 = vload(V, e02)
-            e12 = _cvptr(p11, r1, j + 2, ld); C02 = vload(V, e12)
-            e22 = _cvptr(p11, r2, j + 2, ld); D02 = vload(V, e22)
-            e03 = _cvptr(p11, i, j + 3, ld);  A03 = vload(V, e03)
-            e13 = _cvptr(p11, r1, j + 3, ld); C03 = vload(V, e13)
-            e23 = _cvptr(p11, r2, j + 3, ld); D03 = vload(V, e23)
-            for c in 1:bs
-                v0 = vload(V, _cvptr(p10, i, c, ld)); v1 = vload(V, _cvptr(p10, r1, c, ld)); v2 = vload(V, _cvptr(p10, r2, c, ld))
-                g0 = V(-unsafe_load(p10, _clidx(j, c, ld)));     A00 = muladd(g0, v0, A00); C00 = muladd(g0, v1, C00); D00 = muladd(g0, v2, D00)
-                g1 = V(-unsafe_load(p10, _clidx(j + 1, c, ld))); A01 = muladd(g1, v0, A01); C01 = muladd(g1, v1, C01); D01 = muladd(g1, v2, D01)
-                g2 = V(-unsafe_load(p10, _clidx(j + 2, c, ld))); A02 = muladd(g2, v0, A02); C02 = muladd(g2, v1, C02); D02 = muladd(g2, v2, D02)
-                g3 = V(-unsafe_load(p10, _clidx(j + 3, c, ld))); A03 = muladd(g3, v0, A03); C03 = muladd(g3, v1, C03); D03 = muladd(g3, v2, D03)
-            end
-            vstore(A00, e00); vstore(A01, e01); vstore(A02, e02); vstore(A03, e03)
-            vstore(C00, e10); vstore(C01, e11); vstore(C02, e12); vstore(C03, e13)
-            vstore(D00, e20); vstore(D01, e21); vstore(D02, e22); vstore(D03, e23)
-            i += 3W
-        end
-        while i + 2W - 1 <= m                          # MR=2 × NC=4 = 8 accumulators
-            r1 = i + W
-            d00 = _cvptr(p11, i, j, ld);     A00 = vload(V, d00)
-            d10 = _cvptr(p11, r1, j, ld);    B00 = vload(V, d10)
-            d01 = _cvptr(p11, i, j + 1, ld); A01 = vload(V, d01)
-            d11 = _cvptr(p11, r1, j + 1, ld); B01 = vload(V, d11)
-            d02 = _cvptr(p11, i, j + 2, ld); A02 = vload(V, d02)
-            d12 = _cvptr(p11, r1, j + 2, ld); B02 = vload(V, d12)
-            d03 = _cvptr(p11, i, j + 3, ld); A03 = vload(V, d03)
-            d13 = _cvptr(p11, r1, j + 3, ld); B03 = vload(V, d13)
-            for c in 1:bs
-                v0 = vload(V, _cvptr(p10, i, c, ld)); v1 = vload(V, _cvptr(p10, r1, c, ld))
-                g0 = V(-unsafe_load(p10, _clidx(j, c, ld)));     A00 = muladd(g0, v0, A00); B00 = muladd(g0, v1, B00)
-                g1 = V(-unsafe_load(p10, _clidx(j + 1, c, ld))); A01 = muladd(g1, v0, A01); B01 = muladd(g1, v1, B01)
-                g2 = V(-unsafe_load(p10, _clidx(j + 2, c, ld))); A02 = muladd(g2, v0, A02); B02 = muladd(g2, v1, B02)
-                g3 = V(-unsafe_load(p10, _clidx(j + 3, c, ld))); A03 = muladd(g3, v0, A03); B03 = muladd(g3, v1, B03)
-            end
-            vstore(A00, d00); vstore(A01, d01); vstore(A02, d02); vstore(A03, d03)
-            vstore(B00, d10); vstore(B01, d11); vstore(B02, d12); vstore(B03, d13)
-            i += 2W
-        end
-        while i + W - 1 <= m
-            b0 = _cvptr(p11, i, j, ld);     a0 = vload(V, b0)
-            b1 = _cvptr(p11, i, j + 1, ld); a1 = vload(V, b1)
-            b2 = _cvptr(p11, i, j + 2, ld); a2 = vload(V, b2)
-            b3 = _cvptr(p11, i, j + 3, ld); a3 = vload(V, b3)
-            for c in 1:bs
-                lic = vload(V, _cvptr(p10, i, c, ld))
-                a0 = muladd(V(-unsafe_load(p10, _clidx(j, c, ld))), lic, a0)
-                a1 = muladd(V(-unsafe_load(p10, _clidx(j + 1, c, ld))), lic, a1)
-                a2 = muladd(V(-unsafe_load(p10, _clidx(j + 2, c, ld))), lic, a2)
-                a3 = muladd(V(-unsafe_load(p10, _clidx(j + 3, c, ld))), lic, a3)
-            end
-            vstore(a0, b0); vstore(a1, b1); vstore(a2, b2); vstore(a3, b3); i += W
-        end
-        if i <= m                                        # MASKED tail — the MR=1 body, one pass
-            msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)   # inactive lanes are never accessed (no OOB)
-            b0 = _cvptr(p11, i, j, ld);     a0 = vload(V, b0, msk)
-            b1 = _cvptr(p11, i, j + 1, ld); a1 = vload(V, b1, msk)
-            b2 = _cvptr(p11, i, j + 2, ld); a2 = vload(V, b2, msk)
-            b3 = _cvptr(p11, i, j + 3, ld); a3 = vload(V, b3, msk)
-            for c in 1:bs
-                lic = vload(V, _cvptr(p10, i, c, ld), msk)
-                a0 = muladd(V(-unsafe_load(p10, _clidx(j, c, ld))), lic, a0)
-                a1 = muladd(V(-unsafe_load(p10, _clidx(j + 1, c, ld))), lic, a1)
-                a2 = muladd(V(-unsafe_load(p10, _clidx(j + 2, c, ld))), lic, a2)
-                a3 = muladd(V(-unsafe_load(p10, _clidx(j + 3, c, ld))), lic, a3)
-            end
-            vstore(a0, b0, msk); vstore(a1, b1, msk); vstore(a2, b2, msk); vstore(a3, b3, msk)
-        end
-        j += _CHOL_TILE
-    end
-    while j <= m
-        _syrk_panel_f64!(p11, p10, j, m, bs, ld); j += 1
     end
     return nothing
 end
@@ -1377,122 +1263,6 @@ end
     return nothing
 end
 
-# Split-ld faer syrk column j: A11[i,j] (at ld1) −= Σ_c T[j,c]·T[i,c] (T at ldt).
-@inline function _syrk_panel_split_f64!(p11::Ptr{T}, ld1::Int, pT::Ptr{T}, ldt::Int, j::Int, m::Int, bs::Int) where {T}
-    W = _vwidth(T); V = Vec{W, T}
-    i = ((j - 1) ÷ W) * W + 1
-    @inbounds while i + W - 1 <= m
-        b = _cvptr(p11, i, j, ld1); a = vload(V, b)
-        for c in 1:bs
-            a = muladd(V(-unsafe_load(pT, _clidx(j, c, ldt))), vload(V, _cvptr(pT, i, c, ldt)), a)
-        end
-        vstore(a, b); i += W
-    end
-    @inbounds if i <= m                              # MASKED tail — the body above, one pass
-        msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)   # inactive lanes are never accessed (no OOB)
-        b = _cvptr(p11, i, j, ld1); a = vload(V, b, msk)
-        for c in 1:bs
-            a = muladd(V(-unsafe_load(pT, _clidx(j, c, ldt))), vload(V, _cvptr(pT, i, c, ldt), msk), a)
-        end
-        vstore(a, b, msk)
-    end
-    return nothing
-end
-
-# Split-ld faer trailing update: A11 (m×m at ld1, po2 is fine — registers carry the RMW across the
-# k-loop) −= T·Tᵀ with the PANEL read from conflict-free T at ldt. Body = _syrk_lower_f64! with the
-# two operands' lds split.
-@inline function _syrk_lower_split_f64!(
-        p11::Ptr{T}, ld1::Int, pT::Ptr{T}, ldt::Int,
-        m::Int, bs::Int
-    ) where {T}
-    W = _vwidth(T); V = Vec{W, T}
-    j = 1
-    @inbounds while j + _CHOL_TILE - 1 <= m
-        i = ((j - 1) ÷ W) * W + 1
-        while i + 3W - 1 <= m                          # MR=3 × NC=4 = 12 accumulators
-            r1 = i + W; r2 = i + 2W
-            e00 = _cvptr(p11, i, j, ld1);      A00 = vload(V, e00)
-            e10 = _cvptr(p11, r1, j, ld1);     C00 = vload(V, e10)
-            e20 = _cvptr(p11, r2, j, ld1);     D00 = vload(V, e20)
-            e01 = _cvptr(p11, i, j + 1, ld1);  A01 = vload(V, e01)
-            e11 = _cvptr(p11, r1, j + 1, ld1); C01 = vload(V, e11)
-            e21 = _cvptr(p11, r2, j + 1, ld1); D01 = vload(V, e21)
-            e02 = _cvptr(p11, i, j + 2, ld1);  A02 = vload(V, e02)
-            e12 = _cvptr(p11, r1, j + 2, ld1); C02 = vload(V, e12)
-            e22 = _cvptr(p11, r2, j + 2, ld1); D02 = vload(V, e22)
-            e03 = _cvptr(p11, i, j + 3, ld1);  A03 = vload(V, e03)
-            e13 = _cvptr(p11, r1, j + 3, ld1); C03 = vload(V, e13)
-            e23 = _cvptr(p11, r2, j + 3, ld1); D03 = vload(V, e23)
-            for c in 1:bs
-                v0 = vload(V, _cvptr(pT, i, c, ldt)); v1 = vload(V, _cvptr(pT, r1, c, ldt)); v2 = vload(V, _cvptr(pT, r2, c, ldt))
-                g0 = V(-unsafe_load(pT, _clidx(j, c, ldt)));     A00 = muladd(g0, v0, A00); C00 = muladd(g0, v1, C00); D00 = muladd(g0, v2, D00)
-                g1 = V(-unsafe_load(pT, _clidx(j + 1, c, ldt))); A01 = muladd(g1, v0, A01); C01 = muladd(g1, v1, C01); D01 = muladd(g1, v2, D01)
-                g2 = V(-unsafe_load(pT, _clidx(j + 2, c, ldt))); A02 = muladd(g2, v0, A02); C02 = muladd(g2, v1, C02); D02 = muladd(g2, v2, D02)
-                g3 = V(-unsafe_load(pT, _clidx(j + 3, c, ldt))); A03 = muladd(g3, v0, A03); C03 = muladd(g3, v1, C03); D03 = muladd(g3, v2, D03)
-            end
-            vstore(A00, e00); vstore(A01, e01); vstore(A02, e02); vstore(A03, e03)
-            vstore(C00, e10); vstore(C01, e11); vstore(C02, e12); vstore(C03, e13)
-            vstore(D00, e20); vstore(D01, e21); vstore(D02, e22); vstore(D03, e23)
-            i += 3W
-        end
-        while i + 2W - 1 <= m                          # MR=2 × NC=4 = 8 accumulators
-            r1 = i + W
-            d00 = _cvptr(p11, i, j, ld1);      A00 = vload(V, d00)
-            d10 = _cvptr(p11, r1, j, ld1);     B00 = vload(V, d10)
-            d01 = _cvptr(p11, i, j + 1, ld1);  A01 = vload(V, d01)
-            d11 = _cvptr(p11, r1, j + 1, ld1); B01 = vload(V, d11)
-            d02 = _cvptr(p11, i, j + 2, ld1);  A02 = vload(V, d02)
-            d12 = _cvptr(p11, r1, j + 2, ld1); B02 = vload(V, d12)
-            d03 = _cvptr(p11, i, j + 3, ld1);  A03 = vload(V, d03)
-            d13 = _cvptr(p11, r1, j + 3, ld1); B03 = vload(V, d13)
-            for c in 1:bs
-                v0 = vload(V, _cvptr(pT, i, c, ldt)); v1 = vload(V, _cvptr(pT, r1, c, ldt))
-                g0 = V(-unsafe_load(pT, _clidx(j, c, ldt)));     A00 = muladd(g0, v0, A00); B00 = muladd(g0, v1, B00)
-                g1 = V(-unsafe_load(pT, _clidx(j + 1, c, ldt))); A01 = muladd(g1, v0, A01); B01 = muladd(g1, v1, B01)
-                g2 = V(-unsafe_load(pT, _clidx(j + 2, c, ldt))); A02 = muladd(g2, v0, A02); B02 = muladd(g2, v1, B02)
-                g3 = V(-unsafe_load(pT, _clidx(j + 3, c, ldt))); A03 = muladd(g3, v0, A03); B03 = muladd(g3, v1, B03)
-            end
-            vstore(A00, d00); vstore(A01, d01); vstore(A02, d02); vstore(A03, d03)
-            vstore(B00, d10); vstore(B01, d11); vstore(B02, d12); vstore(B03, d13)
-            i += 2W
-        end
-        while i + W - 1 <= m
-            b0 = _cvptr(p11, i, j, ld1);     a0 = vload(V, b0)
-            b1 = _cvptr(p11, i, j + 1, ld1); a1 = vload(V, b1)
-            b2 = _cvptr(p11, i, j + 2, ld1); a2 = vload(V, b2)
-            b3 = _cvptr(p11, i, j + 3, ld1); a3 = vload(V, b3)
-            for c in 1:bs
-                lic = vload(V, _cvptr(pT, i, c, ldt))
-                a0 = muladd(V(-unsafe_load(pT, _clidx(j, c, ldt))), lic, a0)
-                a1 = muladd(V(-unsafe_load(pT, _clidx(j + 1, c, ldt))), lic, a1)
-                a2 = muladd(V(-unsafe_load(pT, _clidx(j + 2, c, ldt))), lic, a2)
-                a3 = muladd(V(-unsafe_load(pT, _clidx(j + 3, c, ldt))), lic, a3)
-            end
-            vstore(a0, b0); vstore(a1, b1); vstore(a2, b2); vstore(a3, b3); i += W
-        end
-        if i <= m                                        # MASKED tail — the MR=1 body, one pass
-            msk = Vec(ntuple(l -> l, Val(W))) <= (m - i + 1)   # inactive lanes are never accessed (no OOB)
-            b0 = _cvptr(p11, i, j, ld1);     a0 = vload(V, b0, msk)
-            b1 = _cvptr(p11, i, j + 1, ld1); a1 = vload(V, b1, msk)
-            b2 = _cvptr(p11, i, j + 2, ld1); a2 = vload(V, b2, msk)
-            b3 = _cvptr(p11, i, j + 3, ld1); a3 = vload(V, b3, msk)
-            for c in 1:bs
-                lic = vload(V, _cvptr(pT, i, c, ldt), msk)
-                a0 = muladd(V(-unsafe_load(pT, _clidx(j, c, ldt))), lic, a0)
-                a1 = muladd(V(-unsafe_load(pT, _clidx(j + 1, c, ldt))), lic, a1)
-                a2 = muladd(V(-unsafe_load(pT, _clidx(j + 2, c, ldt))), lic, a2)
-                a3 = muladd(V(-unsafe_load(pT, _clidx(j + 3, c, ldt))), lic, a3)
-            end
-            vstore(a0, b0, msk); vstore(a1, b1, msk); vstore(a2, b2, msk); vstore(a3, b3, msk)
-        end
-        j += _CHOL_TILE
-    end
-    while j <= m
-        _syrk_panel_split_f64!(p11, ld1, pT, ldt, j, m, bs); j += 1
-    end
-    return nothing
-end
 
 # Conflict-free scratches, BORROWED from the arena (arena.jl) rather than owned as `chold`/`cholt`/
 # `cholpad` fields — `_chol_d`/`_chol_t`/`_chol_pad` are gone with their call sites below. Their leading

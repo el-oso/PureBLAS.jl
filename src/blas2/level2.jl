@@ -1279,35 +1279,6 @@ const _GEMVT_U_DEEP = 4       # 4 lines per stream per body ⇒ NC·U = 32 lines
 # in that repeated-sweep regime blocked won on Zen4 at EVERY size measured (in-context replay
 # 38 vs 30 GB/s at the n=2048 trailing shape; live geqp3 1.03-1.34x at n=256..2048) even though the
 # clean standalone probe ranks per-column ahead there (probe-regime-must-match-live).
-# Knob-free blocked gemv-T sweep at an explicit NC — what `_measure_gemvt_nc` duels. Kept separate from
-# `_gemv_t_simd!` so the harness exercises the SAME block kernel the shipped path uses, without the knob
-# lookup inside the timed region.
-function _gemv_t_sweep_nc!(m::Int, n::Int, α::T, A, x, β::T, y, nc::Int) where {T <: BlasReal}
-    GC.@preserve A x y begin
-        # `_ptr` not `pointer`: the C-ABI entry passes raw `Ptr` vectors (a pointer IS the densest
-        # unit-stride representation) and `pointer(::Ptr)` is undefined. `_ptr(::Ptr) = p` /
-        # `_ptr(a) = pointer(a)` const-folds either way, so the native path is unchanged.
-        Aptr = pointer(A); xptr = _ptr(x); yptr = _ptr(y); lda = stride(A, 2); sz = sizeof(T)
-        j = 0
-        while j + nc <= n
-            if nc >= 16
-                _gemv_t_block!(yptr + j * sz, _colbases(Aptr + j * lda * sz, lda, sz, Val(16)), xptr, m, α, β, Val(16), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
-            elseif nc >= 8
-                _gemv_t_block!(yptr + j * sz, _colbases(Aptr + j * lda * sz, lda, sz, Val(8)), xptr, m, α, β, Val(8), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
-            else
-                _gemv_t_block!(yptr + j * sz, _colbases(Aptr + j * lda * sz, lda, sz, Val(4)), xptr, m, α, β, Val(4), Val(true), Val(_GEMVT_U), Val(_GEMVT_PF))  # req8-ok: candidate arm
-            end
-            j += nc
-        end
-        @inbounds while j < n
-            s = _dot_simd(m, Aptr + j * lda * sz, xptr, T)
-            unsafe_store!(yptr, α * s, j + 1)
-            j += 1
-        end
-    end
-    return y
-end
-
 # The NC-column sweep of `_gemv_t_simd!`, lifted out so NC is a `Val` the caller picks at runtime.
 # Returns the first column index NOT covered (the caller's remainder loop starts there).
 @inline function _gemvt_cols!(

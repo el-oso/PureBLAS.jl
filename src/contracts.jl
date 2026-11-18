@@ -165,7 +165,7 @@ function gesvd! end  # SVD: A = U·Σ·Vᵀ → (U, S, Vᵀ)
 
 # LAPACK is a strict contract — ALL FOUR factorizations are type-stable and allocation-free, verified by
 # `@verify_strict SIMDBackend` (verify.jl). potrf! factors through its own pointer-based
-# `_syrk_lower_f64!`/trsm kernels (lapack.jl); getrf!/geqrf!/gesvd! reach 0-alloc through their IN-PLACE
+# trsm kernels (lapack.jl); getrf!/geqrf!/gesvd! reach 0-alloc through their IN-PLACE
 # forms — getrf!(A,ipiv)/geqrf!(A,τ)/gesvd!(A,U,S,Vᵀ) take caller-provided output buffers, and gesvd's
 # bidiagonalization scratch comes from a cached Float64 SVDWorkspace (svd.jl). The convenience forms that
 # allocate pivots/τ/U/S/Vᵀ are unchanged; the allocation is the inherent output, and the C-ABI + strict
