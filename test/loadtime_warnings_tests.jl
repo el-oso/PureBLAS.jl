@@ -10,12 +10,16 @@
     @test StrictMode.checks_enabled()
     file = joinpath(@__DIR__, "loadtime_warnings_baseline.txt")
     baseline = Set(l for l in eachline(file) if !isempty(strip(l)) && !startswith(l, '#'))
-    # One key per warning, `<guarantee>\t<target>`, from the first two lines StrictMode's `showerror` prints.
-    function key(msg)
+    # One key per finding, `<guarantee>\t<target>`. A `StrictViolation` names them in its first two
+    # lines; a `StrictMode: N finding(s)` report has one `[✗ <guarantee> <code>] <target> — …` line per
+    # finding. The source locations those messages carry are not part of the key.
+    function keys_of(msg)
         m = match(r"^StrictViolation \(@(\w+)\)[^\n]*\n\s*target:\s*([^\n]*)", msg)
-        return isnothing(m) ? msg : m[1] * "\t" * strip(m[2])
+        isnothing(m) || return [m[1] * "\t" * strip(m[2])]
+        ks = [f[1] * "\t" * f[2] for f in eachmatch(r"\[✗ (\w+) SM\d+\] ([^\n]*?) — ", msg)]
+        return isempty(ks) ? [msg] : ks
     end
-    new = filter(!in(baseline), map(key, PureBLAS._LOADTIME_WARNINGS))
+    new = filter(!in(baseline), unique(mapreduce(keys_of, vcat, PureBLAS._LOADTIME_WARNINGS; init = String[])))
     isempty(new) || println("load-time StrictMode warnings not in the baseline:\n  ", join(new, "\n  "))
     @test isempty(new)
 end
