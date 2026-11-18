@@ -86,9 +86,7 @@ const _MatView{T} = SubArray{T, 2, Matrix{T}, Tuple{UnitRange{Int}, UnitRange{In
 const _VecView{T} = SubArray{T, 1, Vector{T}, Tuple{UnitRange{Int}}, true}
 
 # Operands of the example-call lines, one per argument type; the checks read only their types.
-let bk = DEFAULT_BACKEND, Md = zeros(0, 0), Mz = zeros(ComplexF64, 0, 0), vd = zeros(0),
-        vz = zeros(ComplexF64, 0), ip = Int[], Mv = view(zeros(0, 0), 1:0, 1:0),
-        vv = view(zeros(0), 1:0), ipv = view(Int[], 1:0)
+let bk = DEFAULT_BACKEND, Md = zeros(0, 0)
     # The guarantees are named so every listed signature is also registered, and
     # test_registered (StrictModeTest) re-proves them in the test environment.
     @verify_strict SIMDBackend guarantees = (:typestable, :noalloc, :owned) begin
@@ -142,33 +140,33 @@ let bk = DEFAULT_BACKEND, Md = zeros(0, 0), Mz = zeros(ComplexF64, 0, 0), vd = z
         # COMPLEX gemm: 3M (`_gemm_3m!`) is complex-only, so a real-only `gemm!` line cannot reach it.
         gemm!(::SIMDBackend, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}, ::Matrix{ComplexF64})
         symm!(::SIMDBackend, ::Matrix{Float64}, ::Matrix{Float64}, ::Matrix{Float64})
-        hemm!(bk, Mz, Mz, Mz; side = 'L', uplo = 'L', alpha = 1.0 + 0im, beta = 1.0 + 0im)
-        syrk!(bk, Md, Md; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
-        herk!(bk, Mz, Mz; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
-        syr2k!(bk, Md, Md, Md; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
-        her2k!(bk, Mz, Mz, Mz; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0)
-        trmm!(bk, Md, Md; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
-        trsm!(bk, Md, Md; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0)
+        hemm!(::SIMDBackend, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}; side::Char, uplo::Char, alpha::ComplexF64, beta::ComplexF64)
+        syrk!(::SIMDBackend, ::Matrix{Float64}, ::Matrix{Float64}; uplo::Char, trans::Char, alpha::Float64, beta::Float64)
+        herk!(::SIMDBackend, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}; uplo::Char, trans::Char, alpha::Float64, beta::Float64)
+        syr2k!(::SIMDBackend, ::Matrix{Float64}, ::Matrix{Float64}, ::Matrix{Float64}; uplo::Char, trans::Char, alpha::Float64, beta::Float64)
+        her2k!(::SIMDBackend, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}; uplo::Char, trans::Char, alpha::ComplexF64, beta::Float64)
+        trmm!(::SIMDBackend, ::Matrix{Float64}, ::Matrix{Float64}; side::Char, uplo::Char, transA::Char, diag::Char, alpha::Float64)
+        trsm!(::SIMDBackend, ::Matrix{Float64}, ::Matrix{Float64}; side::Char, uplo::Char, transA::Char, diag::Char, alpha::Float64)
         # COMPLEX arms of the five L3 ops that were verified on the real path only. `hemm!`/`herk!`/
         # `her2k!` above do NOT substitute: the symmetric (non-Hermitian) complex kernels are
         # separate specializations — `zsymm`/`zsyrk`/`zsyr2k` conjugate nothing — and `ztrmm`/`ztrsm`
         # share no code with any of them.
         symm!(::SIMDBackend, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}, ::Matrix{ComplexF64})
-        syrk!(bk, Mz, Mz; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0 + 0im)
-        syr2k!(bk, Mz, Mz, Mz; uplo = 'L', trans = 'N', alpha = 1.0 + 0im, beta = 1.0 + 0im)
-        trmm!(bk, Mz, Mz; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0 + 0im)
-        trsm!(bk, Mz, Mz; side = 'L', uplo = 'L', transA = 'N', diag = 'N', alpha = 1.0 + 0im)
+        syrk!(::SIMDBackend, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}; uplo::Char, trans::Char, alpha::ComplexF64, beta::ComplexF64)
+        syr2k!(::SIMDBackend, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}; uplo::Char, trans::Char, alpha::ComplexF64, beta::ComplexF64)
+        trmm!(::SIMDBackend, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}; side::Char, uplo::Char, transA::Char, diag::Char, alpha::ComplexF64)
+        trsm!(::SIMDBackend, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}; side::Char, uplo::Char, transA::Char, diag::Char, alpha::ComplexF64)
         # ── SubArray arguments. A slot that holds both the caller's argument and a workspace view is
         # union-typed; that costs nothing when the argument is a `Matrix`, and boxes when it is a
         # `SubArray`. The owned-workspace panels hand views to exactly these ops.
-        trsm!(bk, Mv, Mv; side = 'R', uplo = 'L', transA = 'T', diag = 'N', alpha = 1.0)
-        trmm!(bk, Mv, Mv; side = 'R', uplo = 'L', transA = 'T', diag = 'N', alpha = 1.0)
+        trsm!(::SIMDBackend, ::_MatView{Float64}, ::_MatView{Float64}; side::Char, uplo::Char, transA::Char, diag::Char, alpha::Float64)
+        trmm!(::SIMDBackend, ::_MatView{Float64}, ::_MatView{Float64}; side::Char, uplo::Char, transA::Char, diag::Char, alpha::Float64)
         gemm!(::SIMDBackend, ::_MatView{Float64}, ::_MatView{Float64}, ::_MatView{Float64})
-        syrk!(bk, Mv, Mv; uplo = 'L', trans = 'N', alpha = 1.0, beta = 1.0)
+        syrk!(::SIMDBackend, ::_MatView{Float64}, ::_MatView{Float64}; uplo::Char, trans::Char, alpha::Float64, beta::Float64)
         # ── LAPACK: potrf!/getrf!/geqrf! are 0-alloc (potrf via its own pointer kernels; LU/QR via
         # their in-place pre-allocated-output forms). gesvd! reaches 0-alloc via the in-place
         # gesvd!(A,U,S,Vᵀ) form + a cached SVDWorkspace for the bidiagonalization scratch.
-        potrf!(bk, Md; uplo = 'L')
+        potrf!(::SIMDBackend, ::Matrix{Float64}; uplo::Char)
         getrf!(::Matrix{Float64}, ::Vector{Int})
         geqrf!(::Matrix{Float64}, ::Vector{Float64})
         gesvd!(::Matrix{Float64}, ::Matrix{Float64}, ::Vector{Float64}, ::Matrix{Float64})
@@ -177,7 +175,7 @@ let bk = DEFAULT_BACKEND, Md = zeros(0, 0), Mz = zeros(ComplexF64, 0, 0), vd = z
         # gesvd is deliberately NOT included for complex: its in-place form caches a Float64
         # SVDWorkspace and the complex path has not been shown 0-alloc — asserting it here without
         # that evidence would be guessing, so it stays an open item rather than a silent pass.
-        potrf!(bk, Mz; uplo = 'L')
+        potrf!(::SIMDBackend, ::Matrix{ComplexF64}; uplo::Char)
         getrf!(::Matrix{ComplexF64}, ::Vector{Int})
         geqrf!(::Matrix{ComplexF64}, ::Vector{ComplexF64})
         # ── AbstractLAPACKSolve (contracts.jl): the solve/inverse/condition surface built on those
@@ -188,23 +186,24 @@ let bk = DEFAULT_BACKEND, Md = zeros(0, 0), Mz = zeros(ComplexF64, 0, 0), vd = z
         # Cholesky family: solve, explicit inverse (potri! takes the FACTOR, not the SPD matrix,
         # and overwrites it with A⁻¹), packed and banded factor+solve, the rank-revealing pivoted
         # factor, and the condition estimate.
-        potrs!(bk, Md, Md; uplo = 'L')
-        potri!(bk, Md; uplo = 'L')
-        pptrf!(bk, vd; uplo = 'L')
-        pptrs!(bk, vd, Md; uplo = 'L')
+        potrs!(::SIMDBackend, ::Matrix{Float64}, ::Matrix{Float64}; uplo::Char)
+        potri!(::SIMDBackend, ::Matrix{Float64}; uplo::Char)
+        pptrf!(::SIMDBackend, ::Vector{Float64}; uplo::Char)
+        pptrs!(::SIMDBackend, ::Vector{Float64}, ::Matrix{Float64}; uplo::Char)
+        # The banded forwarders take `kw...`: `kd` defaults to `size(AB, 1) - 1`, a value of an argument.
         pbtrf!(bk, Md; uplo = 'L', kd = 1)
         pbtrs!(bk, Md, Md; uplo = 'L')
-        pstrf!(bk, Md, ip, -1.0; uplo = 'L')
-        pocon!(bk, 1.0, Md; uplo = 'L')
+        pstrf!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Int}, ::Float64; uplo::Char)
+        pocon!(::SIMDBackend, ::Float64, ::Matrix{Float64}; uplo::Char)
         # LU family: solve against the factors and the explicit inverse. getri! runs LAPACK's
         # block-column algorithm over an owned n×nb buffer, which is exactly what this line holds it to.
-        getrs!(bk, Md, ip, Md; trans = 'N')
+        getrs!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Int}, ::Matrix{Float64}; trans::Char)
         getri!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Int})
         # Triangular: solve, in-place inverse, condition estimate, and the trrfs! error bounds.
-        trtrs!(bk, Md, Md; uplo = 'L', trans = 'N', diag = 'N')
-        trtri!(bk, Md; uplo = 'L', diag = 'N')
-        gecon!(bk, 1.0, Md, ip; norm = '1')
-        trcon!(bk, Md; uplo = 'L', diag = 'N', norm = '1')
+        trtrs!(::SIMDBackend, ::Matrix{Float64}, ::Matrix{Float64}; uplo::Char, trans::Char, diag::Char)
+        trtri!(::SIMDBackend, ::Matrix{Float64}; uplo::Char, diag::Char)
+        gecon!(::SIMDBackend, ::Float64, ::Matrix{Float64}, ::Vector{Int}; norm::Char)
+        trcon!(::SIMDBackend, ::Matrix{Float64}; uplo::Char, diag::Char, norm::Char)
         trrfs!(::SIMDBackend, ::Char, ::Char, ::Char, ::Matrix{Float64}, ::Matrix{Float64}, ::Matrix{Float64}, ::Vector{Float64}, ::Vector{Float64})
         # Banded LU: the IN-PLACE gbtrf!(kl, ku, m, AB, ipiv) form, not the convenience form that
         # allocates ipiv — the contract binds the former precisely so it cannot be satisfied by a
@@ -218,8 +217,8 @@ let bk = DEFAULT_BACKEND, Md = zeros(0, 0), Mz = zeros(ComplexF64, 0, 0), vd = z
         gttrf!(::SIMDBackend, ::Vector{Float64}, ::Vector{Float64}, ::Vector{Float64}, ::Vector{Float64}, ::Vector{Int})
         gttrs!(::SIMDBackend, ::Char, ::Vector{Float64}, ::Vector{Float64}, ::Vector{Float64}, ::Vector{Float64}, ::Vector{Int}, ::Matrix{Float64})
         pttrf!(::SIMDBackend, ::Vector{Float64}, ::Vector{Float64})
-        pttrs!(bk, vd, vd, Md; uplo = 'L')
-        ptsv!(bk, vd, vd, Md; uplo = 'L')
+        pttrs!(::SIMDBackend, ::Vector{Float64}, ::Vector{Float64}, ::Matrix{Float64}; uplo::Char)
+        ptsv!(::SIMDBackend, ::Vector{Float64}, ::Vector{Float64}, ::Matrix{Float64}; uplo::Char)
         # Expert driver — the deepest composition in the contract (equilibrate → getrf → solve →
         # gecon ×2 → iterative refinement), so it is also the one most likely to leak an allocation
         # from a callee. Again the IN-PLACE form: X/ferr/berr come from the caller, which is what
@@ -247,7 +246,7 @@ let bk = DEFAULT_BACKEND, Md = zeros(0, 0), Mz = zeros(ComplexF64, 0, 0), vd = z
         # REAL and COMPLEX arms both, because they are separate kernel sets throughout (dlahqr vs
         # zlahqr, the real quasi-triangular 2×2 machinery vs plain triangular back-substitution), and
         # a real-only assertion is exactly how ~1 KB/call in the complex 3M gemm passed for a month.
-        gebal!(bk, Md, vd; job = 'B')
+        gebal!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Float64}; job::Char)
         gebak!(::SIMDBackend, ::Char, ::Char, ::Int, ::Int, ::Vector{Float64}, ::Matrix{Float64})
         gehrd!(::SIMDBackend, ::Matrix{Float64}, ::Int, ::Int, ::Vector{Float64})
         orghr!(::SIMDBackend, ::Matrix{Float64}, ::Int, ::Int, ::Vector{Float64})
@@ -261,7 +260,7 @@ let bk = DEFAULT_BACKEND, Md = zeros(0, 0), Mz = zeros(ComplexF64, 0, 0), vd = z
         trsyl!(::SIMDBackend, ::Char, ::Char, ::Int, ::Matrix{Float64}, ::Matrix{Float64}, ::Matrix{Float64})
         geev!(::SIMDBackend, ::Char, ::Char, ::Matrix{Float64}, ::Vector{Float64}, ::Vector{Float64}, ::Matrix{Float64}, ::Matrix{Float64}, ::Vector{Float64})
         gees!(::SIMDBackend, ::Char, ::Matrix{Float64}, ::Vector{ComplexF64}, ::Matrix{Float64}, ::Vector{Float64})
-        gebal!(bk, Mz, vd; job = 'B')
+        gebal!(::SIMDBackend, ::Matrix{ComplexF64}, ::Vector{Float64}; job::Char)
         gebak!(::SIMDBackend, ::Char, ::Char, ::Int, ::Int, ::Vector{Float64}, ::Matrix{ComplexF64})
         gehrd!(::SIMDBackend, ::Matrix{ComplexF64}, ::Int, ::Int, ::Vector{ComplexF64})
         orghr!(::SIMDBackend, ::Matrix{ComplexF64}, ::Int, ::Int, ::Vector{ComplexF64})
@@ -275,26 +274,26 @@ let bk = DEFAULT_BACKEND, Md = zeros(0, 0), Mz = zeros(ComplexF64, 0, 0), vd = z
         gees!(::SIMDBackend, ::Char, ::Matrix{ComplexF64}, ::Vector{ComplexF64}, ::Matrix{ComplexF64}, ::Vector{Float64})
         # ── Bunch-Kaufman. For REAL eltype `hetrf!`/`hetrs!`/`hetri!`/`hesv!` ARE `sytrf!`/…
         # (herm=false).
-        sytrf!(bk, Md, ip; uplo = 'L')
-        hetrf!(bk, Md, ip; uplo = 'L')
-        sytrs!(bk, Md, ip, Md; uplo = 'L')
+        sytrf!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Int}; uplo::Char)
+        hetrf!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Int}; uplo::Char)
+        sytrs!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Int}, ::Matrix{Float64}; uplo::Char)
         # VECTOR right-hand side: `sytrs!` must not `reshape(B, n, 1)` it — that is 48 B/call of
         # Array header, and a `Base.ReshapedArray` (the trim-hostile `_throw_dmrs` path) when the RHS
         # is itself a view.
-        sytrs!(bk, Md, ip, vd; uplo = 'L')
-        hetrs!(bk, Md, ip, Md; uplo = 'L')
-        sytri!(bk, Md, ip; uplo = 'L')
-        hetri!(bk, Md, ip; uplo = 'L')
+        sytrs!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Int}, ::Vector{Float64}; uplo::Char)
+        hetrs!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Int}, ::Matrix{Float64}; uplo::Char)
+        sytri!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Int}; uplo::Char)
+        hetri!(::SIMDBackend, ::Matrix{Float64}, ::Vector{Int}; uplo::Char)
         sysv!(::SIMDBackend, ::Char, ::Matrix{Float64}, ::Matrix{Float64}, ::Vector{Int})
         hesv!(::SIMDBackend, ::Char, ::Matrix{Float64}, ::Matrix{Float64}, ::Vector{Int})
         syconv!(::SIMDBackend, ::Char, ::Matrix{Float64}, ::Vector{Int}, ::Vector{Float64})
-        sytrf!(bk, Mz, ip; uplo = 'L')
-        hetrf!(bk, Mz, ip; uplo = 'L')
-        sytrs!(bk, Mz, ip, Mz; uplo = 'L')
-        sytrs!(bk, Mz, ip, vz; uplo = 'L')
-        hetrs!(bk, Mz, ip, Mz; uplo = 'L')
-        sytri!(bk, Mz, ip; uplo = 'L')
-        hetri!(bk, Mz, ip; uplo = 'L')
+        sytrf!(::SIMDBackend, ::Matrix{ComplexF64}, ::Vector{Int}; uplo::Char)
+        hetrf!(::SIMDBackend, ::Matrix{ComplexF64}, ::Vector{Int}; uplo::Char)
+        sytrs!(::SIMDBackend, ::Matrix{ComplexF64}, ::Vector{Int}, ::Matrix{ComplexF64}; uplo::Char)
+        sytrs!(::SIMDBackend, ::Matrix{ComplexF64}, ::Vector{Int}, ::Vector{ComplexF64}; uplo::Char)
+        hetrs!(::SIMDBackend, ::Matrix{ComplexF64}, ::Vector{Int}, ::Matrix{ComplexF64}; uplo::Char)
+        sytri!(::SIMDBackend, ::Matrix{ComplexF64}, ::Vector{Int}; uplo::Char)
+        hetri!(::SIMDBackend, ::Matrix{ComplexF64}, ::Vector{Int}; uplo::Char)
         sysv!(::SIMDBackend, ::Char, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}, ::Vector{Int})
         hesv!(::SIMDBackend, ::Char, ::Matrix{ComplexF64}, ::Matrix{ComplexF64}, ::Vector{Int})
         syconv!(::SIMDBackend, ::Char, ::Matrix{ComplexF64}, ::Vector{Int}, ::Vector{ComplexF64})
@@ -343,7 +342,7 @@ let bk = DEFAULT_BACKEND, Md = zeros(0, 0), Mz = zeros(ComplexF64, 0, 0), vd = z
         stebz!(::SIMDBackend, ::Char, ::Char, ::Float64, ::Float64, ::Int, ::Int, ::Float64, ::Vector{Float64}, ::Vector{Float64}, ::Vector{Float64}, ::Vector{Int}, ::Vector{Int})
         stein!(::SIMDBackend, ::Vector{Float64}, ::Vector{Float64}, ::_VecView{Float64}, ::_VecView{Int}, ::_VecView{Int}, ::Matrix{Float64})
         # ── SubArray arguments for the families above, same rationale as the L3 SubArray lines.
-        gebal!(bk, Mv, vv; job = 'B')
+        gebal!(::SIMDBackend, ::_MatView{Float64}, ::_VecView{Float64}; job::Char)
         gehrd!(::SIMDBackend, ::_MatView{Float64}, ::Int, ::Int, ::_VecView{Float64})
         orghr!(::SIMDBackend, ::_MatView{Float64}, ::Int, ::Int, ::_VecView{Float64})
         ormhr!(::SIMDBackend, ::Char, ::Char, ::Int, ::Int, ::Matrix{Float64}, ::_VecView{Float64}, ::_MatView{Float64})
@@ -354,9 +353,9 @@ let bk = DEFAULT_BACKEND, Md = zeros(0, 0), Mz = zeros(ComplexF64, 0, 0), vd = z
         geev!(::SIMDBackend, ::Char, ::Char, ::_MatView{Float64}, ::_VecView{Float64}, ::_VecView{Float64}, ::Matrix{Float64}, ::_MatView{Float64}, ::_VecView{Float64})
         gees!(::SIMDBackend, ::Char, ::_MatView{Float64}, ::_VecView{ComplexF64}, ::_MatView{Float64}, ::_VecView{Float64})
         gghrd!(::SIMDBackend, ::Char, ::Char, ::_MatView{Float64}, ::_MatView{Float64}, ::_MatView{Float64}, ::_MatView{Float64})
-        sytrf!(bk, Mv, ipv; uplo = 'L')
-        sytrs!(bk, Md, ipv, Mv; uplo = 'L')
-        sytri!(bk, Mv, ipv; uplo = 'L')
+        sytrf!(::SIMDBackend, ::_MatView{Float64}, ::_VecView{Int}; uplo::Char)
+        sytrs!(::SIMDBackend, ::Matrix{Float64}, ::_VecView{Int}, ::_MatView{Float64}; uplo::Char)
+        sytri!(::SIMDBackend, ::_MatView{Float64}, ::_VecView{Int}; uplo::Char)
         syconv!(::SIMDBackend, ::Char, ::_MatView{Float64}, ::_VecView{Int}, ::_VecView{Float64})
         gels!(::SIMDBackend, ::Char, ::_MatView{Float64}, ::_MatView{Float64})
         gelsy!(::SIMDBackend, ::_MatView{Float64}, ::_MatView{Float64}, ::_VecView{Int}, ::Float64)
