@@ -516,8 +516,8 @@ end
 # Eigen family — the contract members, proved.
 #
 # `gebal!`, `gehrd!`, `orghr!`, `ormhr!`, `hseqr!` and `geev!` are all @strict_contract members
-# (src/contracts.jl:368-380) and src/verify.jl's `@verify_strict` block lists a call to every one of
-# them at fixed argument types (~20 call sites). That block runs at PureBLAS's own
+# (src/contracts.jl:368-380) and src/verify.jl's `@verify_strict` block lists a signature for every one
+# of them (~20 lines). That block runs at PureBLAS's own
 # precompile, where the proving tier cannot load, so it checks with the value-free engine: inference
 # for stability (gates), the IR scan for allocation (reports). test/ PROVES.
 #
