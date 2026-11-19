@@ -3536,7 +3536,7 @@ end
             if up                                # U,T: forward, j ascending
                 @inbounds for j in 1:n
                     cp = Ap + (j - 1) * lda * sz
-                    t = unsafe_load(xp, j) - _dot_simd(j - 1, cp, xp, T)
+                    t = unsafe_load(xp, j) - _dot_subst(j - 1, cp, xp, T)
                     unit || (t = userc ? t * rcp[j] : t / unsafe_load(cp + (j - 1) * sz))
                     unsafe_store!(xp, t, j)
                 end
