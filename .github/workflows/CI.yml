@@ -143,6 +143,28 @@ jobs:
           PUREBLAS_TEST_GROUP: checks
           JULIA_NUM_THREADS: '4'
 
+  # Guard-page sweep for out-of-bounds reads and writes (StrictMode `memsafe_report`). It runs outside
+  # `Pkg.test()` because its probe subprocesses need the package's own project (test/memsafe_verify.jl
+  # header), and in a job of its own so its precompile under default flags does not share a runner's
+  # memory with the `checks` job's bounds-checked one.
+  memsafe:
+    name: Julia 1.13 - guard-page memory safety
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.13'
+      - name: Record CPU model for the cache key
+        run: |
+          echo "CPU_MODEL=$(lscpu | awk -F': *' '/^Model name/{print $2; exit}' | tr -c 'A-Za-z0-9\n' '-')" >> "$GITHUB_ENV"
+      - uses: julia-actions/cache@v2
+        with:
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};cpu_model=${{ env.CPU_MODEL }}
+      - uses: julia-actions/julia-buildpkg@v1
+      - name: memsafe_verify.jl
+        run: julia --project=. test/memsafe_verify.jl
+
   # AUTHORITATIVE trim gate: actually build libpureblas.so via juliac --trim=safe. The `checks` job's
   # StrictModeTest @test_trim_compatible + TrimCheck @validate are dev-time HEURISTICS that miss the
   # reachability-limit union-splits juliac catches (a green suite once shipped a non-building .so — the
