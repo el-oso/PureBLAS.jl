@@ -4,11 +4,10 @@
 #
 #     julia --project=. test/memsafe_verify.jl
 #
-# It is kept OUT of `Pkg.test()` on purpose: `memsafe_report`'s `isolate=true` spawns a fresh julia subprocess
+# It is kept OUT of `Pkg.test()` and runs as its own CI job: every probe runs in a julia subprocess
 # with `--project=$(Base.active_project())` that must `using Serialization` (StrictMode's arg-marshaling dep) —
 # resolvable here (a direct/transitive dep of THIS project) but NOT under Pkg.test's merged temp env, where
-# Serialization is only transitive. Running under `--project=.` sidesteps that (and keeps the ~subprocess cost
-# out of every dev/CI suite run).
+# Serialization is only transitive.
 #
 # WHY THIS OP: the blocked direct-B masked kernel (`_microkernel_db_masked!`, src/gemm.jl) reads B's columns
 # DIRECTLY (no packed padding), so a partial last col-tile (nre < NR) must clamp its read to the last valid
@@ -19,17 +18,7 @@
 # guard page (caught as a violation) — the guard genuinely bites, it is not a vacuous pass.
 using PureBLAS, StrictMode
 import PureBLAS as P
-
-# Named positional wrappers. The native API takes `trans`/`conj` as KEYWORDS, but memsafe_report
-# forwards only positional args to the probed call — so a kwarg variant has to be baked into a
-# function. Named (not closures) so the same wrapper also works under `isolate=true`, which needs a
-# function reachable by name in a fresh process.
-gbmvN!(y, AB, x, m, kl, ku) = P.gbmv!(y, AB, x, m, kl, ku; trans = 'N')
-gbmvT!(y, AB, x, m, kl, ku) = P.gbmv!(y, AB, x, m, kl, ku; trans = 'T')
-gemvN!(y, A, x) = P.gemv!(y, A, x; trans = 'N')
-gemvT!(y, A, x) = P.gemv!(y, A, x; trans = 'T')
-geru!(x, y, A) = P.ger!(one(eltype(A)), x, y, A; conj = false)
-gerc!(x, y, A) = P.ger!(one(eltype(A)), x, y, A; conj = true)
+include("memsafe_wrappers.jl")
 
 function main()
     if !(Sys.islinux() || Sys.isapple())
@@ -40,7 +29,7 @@ function main()
     # unpacked direct-read (partial rows/cols) + BLOCKED direct-B masked partial cols (n=453 → nre=5).
     for (m, k, n) in ((12, 8, 5), (13, 7, 11), (64, 64, 453))
         C = zeros(m, n); A = randn(m, k); B = randn(k, n)
-        r = memsafe_report(P.gemm!, C, A, B; isolate = true, using_module = :PureBLAS)
+        r = memsafe_report(P.gemm!, C, A, B; using_module = :PureBLAS)
         if r.violation === nothing
             println("  clean  gemm! m=$m k=$k n=$n")
         else
@@ -61,33 +50,20 @@ function main()
     # So this phase varies SHAPE, not size: m > n and m < n (they fail differently — m > n overruns
     # the destination, m < n produces the empty-column suffix), odd extents, and every trans/uplo.
     #
-    # isolate=false: in-process, catches STORES only, no subprocess. That is the right trade here —
-    # the write class is exactly what this phase hunts, and cheapness is what lets it cover many
-    # shapes. Read-side OOB keeps the isolate=true treatment in phase 1, where the direct-read
-    # kernels live.
+    # Each probe runs in a reused subprocess, so a read past the end (a guard-page fault) and a write
+    # past the end (a changed canary) are both reported as a VIOLATION line.
     #
-    # POSITIVE CONTROL, verified 2026-08-16 — this phase is NOT a vacuous pass. Restoring the buggy
-    # bound (`chi = (m-kl)-2W`) makes this sweep fault immediately, inside `_gbmv_t_conv_block!`:
-    #
-    #     signal 11 (2): Segmentation fault
-    #       muladd at SIMD/simdvec.jl:444 [inlined]
-    #       _gbmv_t_conv_block! at src/blas2/level2_banded.jl:101
-    #
-    # READ THE FAILURE MODE CAREFULLY. That is a hard SIGSEGV that kills the process — NOT the tidy
-    # "VIOLATION …" line this script prints, and NOT its final `error()`. Two reasons: `isolate=false`
-    # intercepts STORES only, and on this shape the x super-window READ runs off the guard page first
-    # (the fault is at the `muladd`'s load, not at the y store). So a regression here surfaces as a
-    # CRASH with a PureBLAS frame on top — that IS the harness working, not the harness broken. The
-    # stack names the offending kernel, which is the diagnostic that matters.
+    # POSITIVE CONTROL: restoring the buggy gbmv bound (`chi = (m-kl)-2W`) faults this sweep inside
+    # `_gbmv_t_conv_block!`, at the x super-window read.
     #
     # HONEST LIMIT, stated because a passing harness invites over-reading: this inherits the very
     # blindness it was written to fix — it can only catch a bug some shape HERE reaches. It is a
     # complement to the correctness suite's shape matrix, not a substitute for widening it.
-    println("\nphase 2: OOB-write sweep over shapes (isolate=false, stores only)")
+    println("\nphase 2: out-of-bounds sweep over shapes")
     shapes = 0
     chk(f, args...; nm) = begin
         shapes += 1
-        r = memsafe_report(f, args...; isolate = false)
+        r = memsafe_report(f, args...)
         isnothing(r.violation) || (fails += 1; println("  VIOLATION  ", nm, " : ", r.violation))
     end
 

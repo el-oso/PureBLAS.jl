@@ -167,8 +167,9 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         τ = unsafe_load(tau)
         l = sd == 'L' ? M : N
         vv = Vector{$T}(undef, max(l, 1))
+        v1 = iv < 0 ? 1 - (l - 1) * iv : 1               # Fortran stride: v(1) is last when incv < 0
         @inbounds for j in 1:l
-            vv[j] = unsafe_load(v, 1 + (j - 1) * iv)
+            vv[j] = unsafe_load(v, v1 + (j - 1) * iv)
         end
         if sd == 'L'
             _house_left!(Cm, vv, τ)
@@ -610,10 +611,11 @@ Base.@ccallable function sgebrd_64_(
     _svd_grow_bidiag!(ws, M, N)
     gebrd!(Af, df, ef, tqf, tpf, ws)
     _f64_to_f32!(Am, Af, M, N)
-    dm = PtrVector(d, k); em = PtrVector(e, k)
+    dm = PtrVector(d, k); em = PtrVector(e, max(k - 1, 0))   # LAPACK E has min(m,n)-1 elements
     tqm = PtrVector(tauq, k); tpm = PtrVector(taup, k)
     @inbounds for i in 1:k
-        dm[i] = Float32(df[i]); em[i] = Float32(ef[i]); tqm[i] = Float32(tqf[i]); tpm[i] = Float32(tpf[i])
+        dm[i] = Float32(df[i]); tqm[i] = Float32(tqf[i]); tpm[i] = Float32(tpf[i])
+        i < k && (em[i] = Float32(ef[i]))
     end
     unsafe_store!(info, Int64(0)); return
 end

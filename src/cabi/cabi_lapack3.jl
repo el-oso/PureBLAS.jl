@@ -71,6 +71,22 @@ end
 # real dtgsen/stgsen path is NOT forwarded (2×2 conjugate-pair swap unbuilt; would throw). pl/pr/dif are
 # ijob=0-unused (Ptr{Cvoid}). `_ztgsen!` mutates A/B/Q/Z in place → PtrMatrix writes reach the caller.
 # `ztgsen_64_(ijob,wantq,wantz,select,n,A,lda,B,ldb,alpha,beta,Q,ldq,Z,ldz,m,pl,pr,dif,work,lwork,iwork,liwork,info)`.
+#
+# tgsen! always updates Q and Z. When wantq/wantz is 0, LAPACK does not reference Q/Z (ldq/ldz may be
+# 1), so the update goes to an owned N×N scratch instead of the caller's buffer.
+function _tgsen_cabi!(
+        sel, S::PtrMatrix{T}, Tm::PtrMatrix{T}, Q::Ptr{T}, ldq::Ptr{Int64}, wantq::Ptr{Int64},
+        Z::Ptr{T}, ldz::Ptr{Int64}, wantz::Ptr{Int64}, N::Int
+    ) where {T}
+    wq = !iszero(unsafe_load(wantq)); wz = !iszero(unsafe_load(wantz))
+    qs = wq ? Matrix{T}(undef, 0, 0) : zeros(T, N, N)
+    zs = wz ? Matrix{T}(undef, 0, 0) : zeros(T, N, N)
+    GC.@preserve qs zs begin
+        Qm = wq ? PtrMatrix(Q, N, N, Int(unsafe_load(ldq))) : PtrMatrix(pointer(qs), N, N, max(N, 1))
+        Zm = wz ? PtrMatrix(Z, N, N, Int(unsafe_load(ldz))) : PtrMatrix(pointer(zs), N, N, max(N, 1))
+        return tgsen!(sel, S, Tm, Qm, Zm)
+    end
+end
 for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
     @eval Base.@ccallable function $(Symbol(p, "tgsen_64_"))(
             ijob::Ptr{Int64}, wantq::Ptr{Int64},
@@ -87,10 +103,8 @@ for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
         end
         S = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
         Tm = PtrMatrix(B, N, N, Int(unsafe_load(ldb)))
-        Qm = PtrMatrix(Q, N, N, Int(unsafe_load(ldq)))
-        Zm = PtrMatrix(Z, N, N, Int(unsafe_load(ldz)))
         sel = PtrVector(select, N)
-        _, _, al, be, _, _ = tgsen!(sel, S, Tm, Qm, Zm)
+        _, _, al, be, _, _ = _tgsen_cabi!(sel, S, Tm, Q, ldq, wantq, Z, ldz, wantz, N)
         av = PtrVector(alpha, N); bv = PtrVector(beta, N)
         cnt = 0
         @inbounds for i in 1:N
@@ -119,10 +133,8 @@ for (p, T) in (("s", Float32), ("d", Float64))
         end
         S = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
         Tm = PtrMatrix(B, N, N, Int(unsafe_load(ldb)))
-        Qm = PtrMatrix(Q, N, N, Int(unsafe_load(ldq)))
-        Zm = PtrMatrix(Z, N, N, Int(unsafe_load(ldz)))
         sel = PtrVector(select, N)
-        _, _, al, be, _, _ = tgsen!(sel, S, Tm, Qm, Zm)   # al::Complex, be::real
+        _, _, al, be, _, _ = _tgsen_cabi!(sel, S, Tm, Q, ldq, wantq, Z, ldz, wantz, N)   # al::Complex, be::real
         ar = PtrVector(alphar, N); ai = PtrVector(alphai, N); bv = PtrVector(beta, N)
         cnt = 0
         @inbounds for i in 1:N
@@ -262,12 +274,31 @@ function _gesvx_f32_mixed!(
     @inbounds for j in 1:RH, i in 1:N
         Bd[i, j] = Float64(Bm[i, j])
     end
+    # AF/ipiv/R/C are inputs for fact='F' and outputs otherwise, and A/B are rescaled when equilibrated:
+    # every one of them goes through the Float64 copies in both directions.
+    AFm = PtrMatrix(AF, N, N, Int(unsafe_load(ldaf)))
+    ipv = PtrVector(ipiv, N); Rv = PtrVector(R, N); Cv = PtrVector(C, N)
     AFd = Matrix{Float64}(undef, N, N); ipd = Vector{Int}(undef, N)
     Rd = Vector{Float64}(undef, N); Cd = Vector{Float64}(undef, N)
+    @inbounds for j in 1:N
+        for i in 1:N
+            AFd[i, j] = Float64(AFm[i, j])
+        end
+        ipd[j] = Int(ipv[j]); Rd[j] = Float64(Rv[j]); Cd[j] = Float64(Cv[j])
+    end
     Xo, eq, rc, fe, be, rpgf = gesvx!(
         _cabi_char(fact), _cabi_char(trans), Ad, AFd, ipd,
         _cabi_char(equed), Rd, Cd, Bd
     )
+    @inbounds for j in 1:N
+        for i in 1:N
+            AFm[i, j] = Float32(AFd[i, j]); Am[i, j] = Float32(Ad[i, j])
+        end
+        Rv[j] = Float32(Rd[j]); Cv[j] = Float32(Cd[j])
+    end
+    @inbounds for j in 1:RH, i in 1:N
+        Bm[i, j] = Float32(Bd[i, j])
+    end
     Xm = PtrMatrix(X, N, RH, Int(unsafe_load(ldx)))
     @inbounds for j in 1:RH, i in 1:N
         Xm[i, j] = Float32(Xo[i, j])

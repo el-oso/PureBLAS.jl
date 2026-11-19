@@ -1038,7 +1038,8 @@ end
     mn = min(M, N)
     Af = Matrix{Float64}(undef, M, N); _f32_to_f64!(Af, PtrMatrix(A, M, N, ld), M, N)
     Sf = Vector{Float64}(undef, mn)
-    needU = ju != 'N'; needV = jvt != 'N'
+    # 'O' puts the vectors in A, and LAPACK does not reference U/VT then (ldu/ldvt may be 1).
+    needU = ju == 'S' || ju == 'A'; needV = jvt == 'S' || jvt == 'A'
     ncu = ju == 'A' ? M : mn; ncv = jvt == 'A' ? N : mn
     Uf = Matrix{Float64}(undef, M, needU ? ncu : 1)
     Vf = Matrix{Float64}(undef, needV ? ncv : 1, N)
@@ -1053,6 +1054,8 @@ end
         end
         needU && _f64_to_f32!(PtrMatrix(U, M, ncu, ldu), Uf, M, ncu)
         needV && _f64_to_f32!(PtrMatrix(VT, ncv, N, ldvt), Vf, ncv, N)
+        ju == 'O' && _f64_to_f32!(PtrMatrix(A, M, mn, ld), Af, M, mn)
+        jvt == 'O' && _f64_to_f32!(PtrMatrix(A, mn, N, ld), Af, mn, N)
     end
     return
 end
@@ -2370,10 +2373,12 @@ for (nm, T) in (("sormrz", Float32), ("dormrz", Float64), ("cunmrz", ComplexF32)
             unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
         end
         K = Int(unsafe_load(k)); L = Int(unsafe_load(l))
-        M = Int(unsafe_load(m)); N = Int(unsafe_load(n))
-        Am = PtrMatrix(A, K, K + L, Int(unsafe_load(lda)))
+        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda))
+        sd = _cabi_char(side); nq = sd == 'L' ? M : N
+        # A is (lda, nq); reflector i's essential part is A(i, nq-L+1:nq), whatever K+L is.
+        V = PtrMatrix(A + (nq - L) * ld * sizeof($T), K, L, ld)
         Cm = PtrMatrix(C, M, N, Int(unsafe_load(ldc)))
-        ormrz!(_cabi_char(side), _cabi_char(trans), Am, PtrVector(tau, K), Cm)
+        _ormrz_v!(sd, _cabi_char(trans), V, PtrVector(tau, K), Cm)
         unsafe_store!(info, Int64(0)); return
     end
 end
