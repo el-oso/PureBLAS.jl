@@ -163,11 +163,20 @@ function ormrz!(
         side::Char, trans::Char, A::AbstractMatrix{T}, tau::AbstractVector{T},
         C::AbstractMatrix{T}
     ) where {T <: BlasFloat}
+    k = length(tau); L = size(A, 2) - k
+    return _ormrz_v!(side, trans, view(A, :, (k + 1):(k + L)), tau, C)
+end
+
+# The apply on the reflectors' essential parts alone: V is k×L, reflector i essential = V[i, :]. The
+# C-ABI entry passes LAPACK's A(1:k, nq-L+1:nq) here, which need not sit right after k columns of A.
+function _ormrz_v!(
+        side::Char, trans::Char, V::AbstractMatrix{T}, tau::AbstractVector{T}, C::AbstractMatrix{T}
+    ) where {T <: BlasFloat}
     (side == 'L' || side == 'R') || _throw_side_lr(:ormrz!, side)
     (trans == 'N' || trans == 'T' || trans == 'C') || _throw_trans_ntc(:ormrz!, trans)
     (T <: Complex && trans == 'T') &&
         throw(ArgumentError("ormrz!: trans='T' invalid for complex — use 'C'"))
-    k = length(tau); L = size(A, 2) - k
+    k = length(tau); L = size(V, 2)
     k == 0 && return C
     mC, nC = size(C); notran = trans == 'N'; left = side == 'L'
     # loop direction (dormr3): forward when (left & apply-Zᴴ) or (right & apply-Z)
@@ -181,12 +190,12 @@ function ormrz!(
             for jc in 1:nC
                 w = C[i, jc]
                 for l in 1:L
-                    w += conj(A[i, k + l]) * C[t0 + l, jc]
+                    w += conj(V[i, l]) * C[t0 + l, jc]
                 end
                 w *= τi
                 C[i, jc] -= w
                 for l in 1:L
-                    C[t0 + l, jc] -= A[i, k + l] * w
+                    C[t0 + l, jc] -= V[i, l] * w
                 end
             end
         end
@@ -198,12 +207,12 @@ function ormrz!(
             for r in 1:mC
                 w = C[r, i]
                 for l in 1:L
-                    w += C[r, t0 + l] * A[i, k + l]
+                    w += C[r, t0 + l] * V[i, l]
                 end
                 w *= τi
                 C[r, i] -= w
                 for l in 1:L
-                    C[r, t0 + l] -= w * conj(A[i, k + l])
+                    C[r, t0 + l] -= w * conj(V[i, l])
                 end
             end
         end
