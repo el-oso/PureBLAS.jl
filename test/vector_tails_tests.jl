@@ -1,5 +1,6 @@
 # The SIMD kernels finish a ragged length with binary-piece accesses (read-modify-write kernels, packs, trsm
-# tiles) or masked loads (reductions, iamax), never a scalar loop. These
+# tiles) or masked loads (reductions, iamax), never a scalar loop — except `_dot_subst`, whose last 1..W
+# elements are scalar loads so a trsv-T recurrence never reads a just-stored element through a vector. These
 # items run every kernel over the lengths and panel shapes that exercise the ragged edge and compare against
 # a scalar reference: bitwise for elementwise kernels, packs and the trsm tiles, to a BigFloat tolerance for
 # reductions, and by first-index semantics for iamax.
@@ -36,6 +37,11 @@ end
         @test abs(P._dot_simd(n, x, y, Float64) - sum(big.(x) .* big.(y))) <= 8 * eps() * scale
         @test abs(P._asum_simd(n, x, Float64) - sum(abs.(big.(x)))) <= 8 * eps() * sum(abs.(big.(x)))
         @test abs(P._sumsq_simd(n, x, Float64) - sum(big.(x) .^ 2)) <= 8 * eps() * sum(big.(x) .^ 2)
+    end
+    for n in vcat(0:(2W + 1), [100, 1003])               # the trsv-T dot: scalar last 1..W elements
+        x = randn(rng, n); y = randn(rng, n)
+        @test abs(P._dot_subst(n, x, y, Float64) - sum(big.(x) .* big.(y); init = big(0.0))) <=
+            8 * eps() * sum(abs.(big.(x) .* big.(y)); init = big(0.0))
     end
     for n in vcat((4W):(8W + 3), [255, 1003, 5003]), pat in 1:3
         x = pat == 1 ? randn(rng, n) : pat == 2 ? Float64.(rand(rng, -3:3, n)) : fill(1.0, n)
