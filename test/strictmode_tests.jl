@@ -1184,6 +1184,32 @@ end
     isempty(bad) || foreach(b -> @info(b), bad)
 end
 
+# The SIMDBackend forwarders that declare their keywords (src/backend.jl) restate the keywords of the
+# method they forward to, and src/verify.jl names those keywords in signature lines. A keyword added
+# to or renamed in the target and not in the forwarder fails here.
+@testitem "SIMDBackend forwarders declare their target's keywords" tags = [:checks] begin
+    const P = PureBLAS
+    M = Matrix{Float64}; V = Vector{Float64}; I = Vector{Int}
+    # (function, positional argument types after the backend)
+    cases = [
+        (P.hemm!, (M, M, M)), (P.syrk!, (M, M)), (P.herk!, (M, M)), (P.syr2k!, (M, M, M)),
+        (P.her2k!, (M, M, M)), (P.trmm!, (M, M)), (P.trsm!, (M, M)),
+        (P.potrf!, (M,)), (P.potrs!, (M, M)), (P.potri!, (M,)), (P.pptrf!, (V,)), (P.pptrs!, (V, M)),
+        (P.pbtrf!, (M,)), (P.pbtrs!, (M, M)),
+        (P.pstrf!, (M, I, Float64)), (P.pocon!, (Float64, M)), (P.getrs!, (M, I, M)),
+        (P.trtrs!, (M, M)), (P.trtri!, (M,)), (P.gecon!, (Float64, M, I)), (P.trcon!, (M,)),
+        (P.pttrs!, (V, V, M)), (P.ptsv!, (V, V, M)), (P.gebal!, (M, V)),
+        (P.sytrf!, (M, I)), (P.hetrf!, (M, I)), (P.sytrs!, (M, I, M)), (P.hetrs!, (M, I, M)),
+        (P.sytri!, (M, I)), (P.hetri!, (M, I)),
+    ]
+    kws(f, args) = Base.kwarg_decl(only(methods(f, (P.SIMDBackend, args...))))
+    for (f, args) in cases
+        @test kws(f, args) == Base.kwarg_decl(which(f, args))
+    end
+    # Control: a `kw...` forwarder does not restate its target's keywords.
+    @test kws(P.gemm!, (M, M, M)) != Base.kwarg_decl(which(P.gemm!, (M, M, M)))
+end
+
 # FAILING CONTROLS. A declaration that cannot fail checks nothing, so every mechanism a guarantee is
 # declared through — in src/verify.jl and in this suite — is fed a known-bad target here, and the item
 # asserts it fails. Each target is a toy whose defect is built in: a `Union` return, a `copy`, a
