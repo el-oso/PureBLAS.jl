@@ -181,19 +181,41 @@ instantiation, so no complex caller changed.
 `Expr(:meta, :inline)` stays inside returned generator bodies; `@inline` does not propagate into
 `@generated` CodeInfo.
 
-## The extension
+## The extension and the public protocol
 
 ```
 [weakdeps]  ForwardDiff = "..."
 [extensions] PureBLASForwardDiffExt = "ForwardDiff"
 ```
 
-Five one-line methods and **no kernels**: `_pairalg`, `_pairreal`, `_parts`, `_mkpair`, `_l1v`, plus
-the layout assert. ForwardDiff never enters `[deps]`, so the `--trim` build never loads it and
+The extension holds no kernels. It implements four methods, `pair_eltype`, `pair_nplanes`, `pair_parts` and
+`pair_make`, plus an `_l1v` override that makes `iamax` compare `|value|` for every `Dual`. PureBLAS derives
+all routing from those four, so ForwardDiff never enters `[deps]`, the `--trim` build never loads it, and
 `libpureblas.so` is unaffected.
 
 `Tag` is never inspected. The only Duals the fast path constructs carry `x`'s own tag, exactly as the
 scalar path does today via `convert`; a mixed-tag alpha fails in `convert` identically on both paths.
+
+### Public protocol
+
+A number type other than `ForwardDiff.Dual` can use the same fast paths by implementing the public
+protocol (docstrings: `PureBLAS.pair_eltype`, `pair_nplanes`, `pair_parts`, `pair_make`):
+
+```julia
+struct D2{V} <: Real; v::V; p::V; end                       # value, then partial: sizeof(D2) == 2sizeof(V)
+PureBLAS.pair_eltype(::Type{D2{V}}) where {V <: Union{Float32, Float64}} = V
+PureBLAS.pair_parts(d::D2) = (d.v, d.p)
+PureBLAS.pair_make(::Type{D2{V}}, parts::NTuple{2}) where {V} = D2{V}(parts...)
+```
+
+`pair_nplanes` defaults to 2. Define the methods on concrete types. The type must be an isbits struct of
+two fields, a `V` value and a partial made only of `V`, with plane `k` at offset `k*sizeof(V)`; it must
+multiply as `(a + bε)(c + dε) = ac + (ad + bc)ε` and support ordinary scalar arithmetic and `convert`,
+because the scalar loops remain the path for everything the fast paths do not take. The layout is checked
+on first use. Only two planes of `Float32` or `Float64` are supported: any other `pair_nplanes` or
+`pair_eltype` throws an `ArgumentError`, it never falls back to scalar loops silently. Which operations take the fast path is the table in "Per-op decisions" above.
+`gemv` with `trans = 'T'` or `'C'` applies α and β to each output element in scalar arithmetic after the
+pair-kernel dot product, which is O(n) scalar operations against the O(mn) kernel.
 
 ## Implementation sequence
 
