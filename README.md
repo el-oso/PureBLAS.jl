@@ -82,9 +82,15 @@ Forward mode works. The kernels are generic, so a `ForwardDiff.Dual` passes stra
 the test suite differentiates `gemm`, `gemv`, `ger`, `trmm`, `trsm`, `trmv`, `trsv`, `symv`, `nrm2`,
 `asum`, `dot` and `potrf` against known derivatives.
 
-It is slow, though. The SIMD kernels only fire for `Float32` and `Float64`, and a `Dual` is neither, so
-it falls back to plain scalar loops. You get the right answer at nothing like BLAS speed. Reverse mode
-does not work at all yet — there are no ChainRules or Enzyme rules.
+With ForwardDiff loaded, `Dual{Tag,V,1}` (one partial, `V` of `Float32` or `Float64`) runs on SIMD kernels:
+a dense vector of them is an interleaved (value, partial) buffer, like complex. That covers BLAS-1
+(`copy`, `swap`, `scal`, `axpy`, `dot`, `nrm2`, `asum`, `iamax`), `gemv`, `ger`, `trmv`, `trsv`, `gemm`,
+`trmm`, `trsm`, `syrk`, `herk`, and the symmetric eigensolver and Householder QR/SVD steps that call them. Vectors
+need unit stride; matrices may be strided views. Everything else takes the generic scalar loops: more than
+one partial, nested duals, other element types, non-unit-stride vectors and the remaining BLAS routines
+(`symv`, packed and banded storage, …). Those give the right answer at nothing like BLAS speed. Reverse
+mode does not work at all yet — there are no ChainRules or Enzyme rules. See
+[Dual Numbers](docs/src/dual.md).
 
 Where we want to end up is differentiation that runs at full BLAS speed, and the way to get there is
 reverse-mode rules rather than pushing `Dual` numbers through the kernels. An `rrule` can call the

@@ -1308,3 +1308,29 @@ end
     @test_throws SV test_signatures([(ctl_lookup, (Type{Float64},))]; guarantees = (:owned,))
     # `:no_spill` and `:no_scalar_loops` under `test_signatures`: test/strict_kernel_tests.jl.
 end
+
+# The public pair protocol (`pair_eltype`, `pair_nplanes`, `pair_parts`, `pair_make`) and the routing
+# predicates derived from it are consulted on every dual BLAS call, so they must const-fold: type-stable and
+# allocation-free at the signatures a `Dual{Tag,Float64,1}` reaches them with. A plain `Float64` is the
+# negative case and must route to no pair path.
+@testitem "StrictMode dogfood: pair protocol is type-stable and allocation-free" tags = [:checks] begin
+    using StrictModeTest, StrictMode, ForwardDiff
+    if !StrictMode.checks_enabled()
+        @info "StrictMode checks disabled — skipping pair-protocol dogfood"
+        @test_skip StrictMode.checks_enabled()
+    else
+        P = PureBLAS
+        D = ForwardDiff.Dual{Nothing, Float64, 1}
+        test_signatures(
+            [
+                (P.pair_eltype, (Type{D},)), (P.pair_eltype, (Type{Float64},)),
+                (P.pair_nplanes, (Type{D},)), (P.pair_parts, (D,)), (P.pair_make, (Type{D}, NTuple{2, Float64})),
+                (P._pairT, (Type{D},)), (P._pairT, (Type{Float64},)),
+                (P._pairalg, (Vector{D},)), (P._pairalg, (Vector{Float64},)),
+                (P._pairreal, (Vector{D},)), (P._l1v, (D,)),
+            ];
+            guarantees = (:typestable, :noalloc),
+        )
+        @test P._pairT(D) && !P._pairT(Float64)
+    end
+end

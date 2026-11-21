@@ -237,7 +237,7 @@ end
 # so comparing `_l1` on duals would break value ties on the DERIVATIVE, i.e. on the seed direction; and
 # `iamax` is getrf's pivot selector, so that would make the LU pivot sequence seed-dependent. Decision
 # recorded in docs/src/dual.md. The scalar loop here and the SIMD kernel must agree, hence one accessor.
-@inline _l1v(x) = _l1(x)
+@inline _l1v(x::T) where {T} = _pairT(T) ? abs(first(pair_parts(x))) : _l1(x)
 
 # One step of the LAPACK `lassq` scaled sum-of-squares (overflow/underflow safe) — the
 # correctness boundary for nrm2. Returns the updated (scale, ssq).

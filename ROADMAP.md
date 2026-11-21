@@ -2028,7 +2028,7 @@ Studied OpenBLAS `develop` for beat-OpenBLAS wins. Prioritized:
 ## M6 — AD rules
 
 `PureBLASChainRulesExt` (weakdep) + Enzyme rules so Mode 2 supports reverse-mode through the in-place
-ops. **Not started — there is no `ext/` directory yet.**
+ops. **Not started.** `ext/` holds only `PureBLASForwardDiffExt`; there is no ChainRules extension.
 
 **Forward mode is done and was the blocker.** Until 2026-08-30 only BLAS 1–3 and `potrf!` were generic;
 `getrf!`, `geqrf!` and `gesvd!` were signed to `Float64`, so a `ForwardDiff.Dual` hit a `MethodError`
@@ -2042,6 +2042,53 @@ SIMD kernels.
 fast Float64 primal and defines the adjoint separately, which beats pushing `Dual`s through a scalar
 fallback. Sensible first increment: `[weakdeps] ChainRulesCore` + rrules for gemm/trsm/trmm, gemv/ger,
 dot/nrm2 and potrf; LU/QR/SVD adjoints second, since that is where the subtlety lives.
+
+**Backlog (requested 2026-11-20 by PureAtomistic.jl, pure-Julia DFT; not scheduled).** Reverse mode
+for training interatomic potentials on DFT data. Needs, beyond the first increment: the symmetric
+eigen adjoint `Ā = Q(diag(λ̄) + F∘(QᵀQ̄))Qᵀ`, reusing the cluster logic `_syev_pair!` already has
+(`F = 1/(λⱼ − λᵢ)`, zero inside a cluster). It is correct for losses that do not depend on the basis
+chosen inside a cluster when the cluster is fully occupied or fully empty. A cluster split by the
+Fermi level needs smearing; document that limit, do not hide it. Also `sygvd!`, `potrf!`/`potrs!`.
+ChainRulesCore ≥ 1.26.3 depends only on LinearAlgebra, so a weakdep extension adds no binary.
+The open question is downstream: which binary-free reverse engine consumes the rules (Enzyme and
+Mooncake both pull binaries). Measure first: syev adjoint time against the primal, n = 64 to 512.
+Estimate (unmeasured): ~1 week BLAS-3 + potrf rules, ~1–2 weeks more for syev/sygvd with
+degenerate-eigenvalue tests.
+
+## Higher-order forward mode (backlog)
+
+Requested 2026-11-20 by PureAtomistic.jl (Hessians, phonons, second-order exchange-correlation
+kernels). Not scheduled. Today every dual fast path accepts only `Dual{T,V,1}` with `V<:BlasReal`
+(`ext/PureBLASForwardDiffExt.jl`; `docs/src/dual.md`). `Dual{T,V,N>1}`, nested duals and hyperduals
+take the generic scalar loop, which the published `dgemm1` geomean is ~8× slower than (`dsyev1` ~1.9×).
+
+1. **Nested duals (cheapest; do first).** Widen `_pairT` to accept `V` that is itself a pair type, and
+   route `_gemm_dual3!`'s plane products through the public `gemm!` instead of `_gemm_core_out!`
+   (which has no pair route). `_syev_pair!` already calls `_syev!` on its value plane, so it may
+   recurse with little change (unverified). Risks: `eps` and comparisons on a Dual in the cluster
+   test, and the dual `gemm!` frame is already at the compiler's optimization budget
+   (`src/blas3/gemm.jl`, comment near the dual entry). Check correctness against generic nested
+   ForwardDiff before timing. Estimate (unmeasured): 1–2 weeks for gemm + syev.
+2. **N > 1 partials.** L3 generalizes by stacking planes: still 3 real gemms, each N times larger in
+   one dimension. `_split2!`/`_combine_dual!` (stride 2) and the 9-slot `_gemm_3m_scratch` pool must
+   generalize; L1/L2 pair kernels use an even/odd lane shuffle and need new kernels. Results stay
+   bit-identical across thread counts but do not match the N = 1 bits. Do it only if a stacked-gemm
+   probe beats generic by a margin near N = 1's ~8×. Estimate (unmeasured): 3–5 weeks.
+3. **Coefficient-plane types (downstream proposal).** PureAtomistic.jl is building an isbits truncated
+   Taylor type (N inputs, order K, each coefficient stored once) in a small dependency-free package,
+   which PureBLAS could support as a weakdep. gemm/gemv/syrk then become real gemms on the planes,
+   `C_k = Σ_{i+j=k} A_i B_j`: 3 products for a Dual with N = 1, 6 at order 2, 10 at order 3. Symmetric
+   eigen derivatives would come from perturbation-theory rules built from gemm, not from pushing the
+   type through the iterations. This generalizes item 2. Layout (PureTaylor, PureAtomistic.jl main
+   bdc7c99; the coefficient order is its documented contract): `Taylor{N,K,M,T,L} <: Real`, isbits,
+   `c::NTuple{L,T}` of normalized coefficients `∂^α f / α!`, `c[1]` the value. `M` is an `Int`
+   bitmask of the variables present (bit i-1 = variable i, N ≤ 63), `L = binomial(count_ones(M) + K, K)`,
+   and only multi-indices inside `M` are stored. Order: graded by total degree, descending
+   lexicographic within a degree. Product: `C_γ = Σ_{α+β=γ, |γ|≤K} A_α B_β`. Operands may carry
+   different masks, so a plane gemm must align planes by multi-index across the union of masks. It also gives the dual paths a route that
+   does not need ForwardDiff, whose dependencies include a binary (OpenSpecFun_jll).
+4. **Measure first:** extend `bench/probes/dual_gemm_check.jl` and `dual_lp_ratios.jl` to N ∈ {2, 4, 8}
+   and `Dual{Dual{V,1},1}`, `arms=pb,generic`.
 
 ## M7 — GPU backend (CUDA-first; gate vs cuBLAS, CUTLASS as structural reference)
 
