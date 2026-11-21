@@ -706,3 +706,139 @@ end
     A0 = randn(12, 30); dA = randn(12, 30)
     @test ForwardDiff.derivative(t -> vec(triu(PureBLAS.syrk!(zeros(eltype(t), 12, 12), A0 .+ t .* dA))), 0.0) ≈ vec(triu(dA * A0' + A0 * dA'))
 end
+
+# The public pair protocol (docs/src/dual.md) on a dual type that is NOT ForwardDiff's. `GD{V,:fast}`
+# implements the protocol; `GD{V,:plain}` is the identical struct and arithmetic WITHOUT it, so it is the
+# scalar-loop control. Every `+`, `-` and `*` on either type bumps a counter: a SIMD pair kernel works on the
+# interleaved reals and never forms a `GD`, so a zero count proves the fast path ran, and the control's
+# nonzero count proves the counter can fail.
+@testmodule GenericDual begin
+    import PureBLAS
+    const COUNT = Ref(0)
+    struct GD{V <: AbstractFloat, K} <: Real
+        v::V
+        p::V
+    end
+    GD{V, K}(x::Real) where {V, K} = GD{V, K}(V(x), zero(V))
+    Base.:+(a::GD{V, K}, b::GD{V, K}) where {V, K} = (COUNT[] += 1; GD{V, K}(a.v + b.v, a.p + b.p))
+    Base.:-(a::GD{V, K}, b::GD{V, K}) where {V, K} = (COUNT[] += 1; GD{V, K}(a.v - b.v, a.p - b.p))
+    Base.:-(a::GD{V, K}) where {V, K} = GD{V, K}(-a.v, -a.p)
+    Base.:*(a::GD{V, K}, b::GD{V, K}) where {V, K} = (COUNT[] += 1; GD{V, K}(a.v * b.v, a.v * b.p + a.p * b.v))
+    Base.zero(::Type{GD{V, K}}) where {V, K} = GD{V, K}(zero(V), zero(V))
+    Base.one(::Type{GD{V, K}}) where {V, K} = GD{V, K}(one(V), zero(V))
+    Base.zero(::GD{V, K}) where {V, K} = zero(GD{V, K})
+    Base.one(::GD{V, K}) where {V, K} = one(GD{V, K})
+    Base.:(==)(a::GD{V, K}, b::GD{V, K}) where {V, K} = a.v == b.v && a.p == b.p
+    Base.promote_rule(::Type{GD{V, K}}, ::Type{<:Real}) where {V, K} = GD{V, K}
+    Base.convert(::Type{GD{V, K}}, x::Real) where {V, K} = GD{V, K}(V(x), zero(V))
+    Base.convert(::Type{GD{V, K}}, x::GD{V, K}) where {V, K} = x
+
+    PureBLAS.pair_eltype(::Type{GD{V, :fast}}) where {V <: Union{Float32, Float64}} = V
+    PureBLAS.pair_parts(d::GD{V, :fast}) where {V} = (d.v, d.p)
+    PureBLAS.pair_make(::Type{GD{V, :fast}}, parts::NTuple{2}) where {V} = GD{V, :fast}(V(parts[1]), V(parts[2]))
+
+    # a three-plane type (value + two partials): declared, so the fast paths must refuse it
+    struct GD3{V <: AbstractFloat} <: Real
+        v::V
+        p::V
+        q::V
+    end
+    PureBLAS.pair_eltype(::Type{GD3{V}}) where {V <: Union{Float32, Float64}} = V
+    PureBLAS.pair_nplanes(::Type{GD3{V}}) where {V} = 3
+
+    # right size and offsets, but the partial is an Int64: the layout check must refuse it
+    struct GDint <: Real
+        v::Float64
+        p::Int64
+    end
+    PureBLAS.pair_eltype(::Type{GDint}) = Float64
+    # a declared plane type the kernels do not support
+    struct GDh <: Real
+        v::Float16
+        p::Float16
+    end
+    PureBLAS.pair_eltype(::Type{GDh}) = Float16
+    # declared covariantly, so an abstract eltype such as `GDc{Float64}` also reaches the check
+    struct GDc{V, K} <: Real
+        v::V
+        p::V
+    end
+    PureBLAS.pair_eltype(::Type{<:GDc{V}}) where {V <: Union{Float32, Float64}} = V
+
+    mk(::Type{GD{V, K}}, v, p) where {V, K} = GD{V, K}.(V.(v), V.(p))
+    # run `f` and return (result, number of scalar GD operations it performed)
+    counted(f) = (COUNT[] = 0; r = f(); (r, COUNT[]))
+end
+
+@testitem "Pair protocol: a non-ForwardDiff dual type takes the fast path and matches the scalar loop" setup = [GenericDual] begin
+    using PureBLAS
+    using .GenericDual: GD, mk, counted
+    for V in (Float64, Float32)
+        F = GD{V, :fast}; S = GD{V, :plain}
+        # routing predicates: the fast type is a pair type, the control and plain numbers are not
+        @test PureBLAS.pair_eltype(F) === V
+        @test PureBLAS.pair_eltype(S) === nothing && PureBLAS.pair_eltype(V) === nothing
+        @test PureBLAS._pairT(F) && !PureBLAS._pairT(S) && !PureBLAS._pairT(V) && !PureBLAS._pairT(Complex{V})
+        @test PureBLAS._pairalg(zeros(F, 4)) && !PureBLAS._pairalg(zeros(S, 4)) && !PureBLAS._pairalg(view(zeros(F, 4), 1:2))
+        @test PureBLAS._pairreal(zeros(F, 4)) isa Ptr{V}
+
+        # a pair type whose layout does not hold fails fast instead of reading garbage
+        @test_throws "not an isbits struct" PureBLAS._pair_ok(Tuple{V, V, V}, V)
+        # more than two planes is refused loudly, never routed to scalar loops
+        @test PureBLAS.pair_nplanes(F) == 2 && PureBLAS.pair_nplanes(GenericDual.GD3{V}) == 3
+        @test_throws "support only 2 planes" PureBLAS._pairT(GenericDual.GD3{V})
+        @test_throws "support only 2 planes" PureBLAS.dot(Vector{GenericDual.GD3{V}}(undef, 8), Vector{GenericDual.GD3{V}}(undef, 8))
+        @test_throws "a partial built only from" PureBLAS._pairT(GenericDual.GDint)
+        @test_throws "only Float32 and Float64" PureBLAS._pairT(GenericDual.GDh)
+        # an abstract eltype has no interleaved buffer: scalar loop, no error; the concrete type is a pair type
+        @test !PureBLAS._pairT(GenericDual.GDc{V}) && PureBLAS._pairT(GenericDual.GDc{V, 1})
+        @test PureBLAS.pair_parts(GD{V, :fast}(V(1), V(2))) === (V(1), V(2))
+        @test PureBLAS.pair_make(F, (V(3), V(4))) === GD{V, :fast}(V(3), V(4))
+
+        tol = 64 * eps(V)
+        ≃(a, b) = isapprox(a.v, b.v; rtol = tol, atol = tol) && isapprox(a.p, b.p; rtol = tol, atol = tol)
+        n = 203
+        xv, xp, yv, yp = (randn(V, n) for _ in 1:4)
+        a = V(1.7)
+        # BLAS-1: each op on (fast, control) copies of the same data
+        for (name, op) in (
+                ("axpy!", (T, x, y) -> PureBLAS.axpy!(copy(y), a, x)),
+                ("scal!", (T, x, y) -> PureBLAS.scal!(a, copy(x))),
+                ("dot", (T, x, y) -> [PureBLAS.dot(x, y)]),
+            )
+            rf, cf = counted(() -> op(F, mk(F, xv, xp), mk(F, yv, yp)))
+            rs, cs = counted(() -> op(S, mk(S, xv, xp), mk(S, yv, yp)))
+            @test cf == 0           # witness: no scalar GD arithmetic, so the pair kernel ran
+            @test cs > 0            # control: the scalar loop does count
+            @test length(rf) == length(rs) && all(rf[i].v ≈ rs[i].v && ≃(GD{V, :plain}(rf[i].v, rf[i].p), rs[i]) for i in eachindex(rf))
+            @test eltype(rf) === F
+        end
+
+        # iamax compares |value| only, through the protocol's `pair_parts` (no Base.abs method exists on GD)
+        @test PureBLAS.iamax(mk(F, xv, xp)) == argmax(abs.(xv))
+
+        # BLAS-2 (gemv N and T) and BLAS-3 (gemm above the tiny-size floor)
+        m, k = 48, 40
+        Av, Ap = randn(V, m, k), randn(V, m, k)
+        x2v, x2p = randn(V, k), randn(V, k)
+        for tr in ('N', 'T')
+            xl = tr == 'N' ? k : m; ylen = tr == 'N' ? m : k
+            xv2, xp2 = randn(V, xl), randn(V, xl); yv2, yp2 = randn(V, ylen), randn(V, ylen)
+            run(T) = PureBLAS.gemv!(mk(T, yv2, yp2), mk(T, Av, Ap), mk(T, xv2, xp2); alpha = T(a), beta = one(T), trans = tr)
+            rf, cf = counted(() -> run(F)); rs, cs = counted(() -> run(S))
+            # 'N' runs entirely in the pair kernel. 'T' forms one dot per output element in the kernel and then
+            # applies α and β to it in scalar D arithmetic: three operations per output element, O(n) against
+            # the control's O(mn).
+            @test cs > 0
+            @test cf <= (tr == 'N' ? 0 : 3 * ylen)
+            @test 20 * cf < cs
+            @test all(≃(GD{V, :plain}(rf[i].v, rf[i].p), rs[i]) for i in eachindex(rf))
+        end
+        Bv, Bp = randn(V, k, 56), randn(V, k, 56)
+        rungemm(T) = PureBLAS.gemm!(zeros(T, m, 56), mk(T, Av, Ap), mk(T, Bv, Bp))
+        rf, cf = counted(() -> rungemm(F)); rs, cs = counted(() -> rungemm(S))
+        @test cs > 0
+        @test cf < cs ÷ 100         # planes ride the real gemm; only the O(mn) combine may touch scalars
+        @test all(isapprox(rf[i].v, rs[i].v; rtol = 100tol, atol = 100tol) && isapprox(rf[i].p, rs[i].p; rtol = 100tol, atol = 100tol) for i in eachindex(rf))
+    end
+end

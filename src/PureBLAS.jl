@@ -9,6 +9,9 @@ module PureBLAS
 # routine is called from the kernels.
 using LinearAlgebra: Adjoint, Transpose
 
+# The dual-number protocol (docs/src/dual.md); defined in simd_kernels.jl.
+public pair_eltype, pair_nplanes, pair_parts, pair_make
+
 include("core.jl")          # type aliases, _ld/_st! accessors, lassq, |·|
 include("ptrmat.jl")        # PtrMatrix/PtrVector: isbits Ptr-backed operands for the C-ABI boundary
 include("cpuinfo.jl")       # SIMD width detection (const-folded, trim-safe)
