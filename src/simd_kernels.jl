@@ -100,29 +100,93 @@ const _CplxArg{T} = Union{Ptr{Complex{T}}, PtrVector{Complex{T}}, DenseArray{Com
 # must never be reinterpreted as Complex and handed to a complex arithmetic kernel. Design and the trap:
 # docs/src/dual.md.
 #
-# The five accessors below are the ENTIRE surface the ForwardDiff extension (ext/PureBLASForwardDiffExt.jl)
-# implements — one method each, no kernels there. In the main env (no ForwardDiff) every `_pairalg` is
-# `false`, so the dual branches const-fold away and the --trim build never sees them.
-#   _pairalg(x)         true iff `x` is a dense unit-stride Dual{Tag,V<:BlasReal,1} vector (or Ptr)
+# The PUBLIC protocol is the methods `pair_eltype`, `pair_nplanes`, `pair_parts`, `pair_make` per number type
+# (docstrings below; docs/src/dual.md). Everything else here is derived from them, so no kernel names a Dual
+# type. The ForwardDiff extension (ext/PureBLASForwardDiffExt.jl) is the reference implementation. With no
+# pair type defined every `_pairT`/`_pairalg` is `false`, so the dual branches const-fold away and the --trim
+# build never sees them.
+#   _pairalg(x)         true iff `x` is a dense unit-stride pair-type vector (or Ptr)
 #   _pairreal(x)        Ptr{V} onto the interleaved [v p v p …] buffer (Complex too: `_reptr`)
 #   _parts(d)           (value, partial) of one pair element
 #   _mkpair(D, v, p)    build a `D` (the vector's own eltype, so its Tag) from value + partial
 #   _l1v(d)             |value| — iamax's magnitude, see core.jl
+"""
+    PureBLAS.pair_eltype(::Type{D})
+
+Declare that the number type `D` stores its value and derivative coefficients as `pair_nplanes(D)` planes of
+a real type, and return that real type `V <: Union{Float32, Float64}`. The default method returns `nothing`,
+meaning "not a pair type"; any other return value throws an `ArgumentError`. Define the method on concrete
+types. Dense unit-stride arrays of such a `D` (and, for BLAS-2/3, strided matrix views) then take PureBLAS's
+SIMD pair kernels in place of the scalar loops (see the Dual page of the manual for the operations covered).
+
+Layout contract, checked on first use (an `ArgumentError` is thrown if it fails): `D` is an `isbitstype`
+struct of two fields, a `V` value then a partial made only of `V` (a `V`, or a wrapper such as `NTuple{1,V}`),
+with plane `k` (0-based) at byte offset `k*sizeof(V)` and `sizeof(D) == pair_nplanes(D)*sizeof(V)`, so an
+array of `D` is the interleaved buffer `[v₁ p₁ v₂ p₂ …]`.
+Arithmetic contract: `D` supports ordinary scalar arithmetic and `convert` (the scalar loops remain the path
+for every input the fast paths do not take), and multiplication is the truncated product
+`(a + bε)(c + dε) = ac + (ad + bc)ε`, ε² = 0. A type with other multiplication rules must not implement this
+protocol.
+
+Also implement `pair_parts` and `pair_make`; `pair_nplanes` has a default.
+"""
+pair_eltype(::Type) = nothing
+"""
+    PureBLAS.pair_nplanes(::Type{D}) -> Int
+
+The number of real planes of the pair type `D` (see `pair_eltype`). Defaults to `2`, one value and one
+partial. The SIMD pair paths support only `2`; any other value makes them throw an `ArgumentError` instead of
+falling back to scalar loops.
+"""
+pair_nplanes(::Type) = 2
+"""
+    PureBLAS.pair_parts(d::D) -> NTuple{pair_nplanes(D), pair_eltype(D)}
+
+The planes of one element of a pair type `D`, value first.
+"""
+function pair_parts end
+"""
+    PureBLAS.pair_make(::Type{D}, parts::NTuple{pair_nplanes(D), pair_eltype(D)}) -> D
+
+Build a `D` from its planes, value first. Any further type parameter of `D` (such as a ForwardDiff tag) is
+taken from the `D` argument.
+"""
+function pair_make end
+@inline _pairalg(x::Union{Ptr, DenseArray}) = _pairT(_et(x))
 @inline _pairalg(@nospecialize(_)) = false
-function _pairreal end
-function _parts end
-function _mkpair end
+@inline _pairreal(x::Ptr) = Ptr{_pairvT(_et(x))}(x)
+@inline _pairreal(x::DenseArray) = Ptr{_pairvT(eltype(x))}(pointer(x))
 @inline _pairreal(x::_CplxArg) = _reptr(x)
 # TYPE-level twins for the L2/L3 routing (docs/src/dual_l2.md §3, dual_l3.md §2.1): a strided VIEW of a
 # `Matrix{Dual}` is not a `DenseArray`, so the value predicate above misses it while `_strided1` accepts the
-# complex equivalent. The extension adds the Dual methods; here `Complex` gets the same accessors so a driver
+# complex equivalent. Pair types get these from the public protocol; `Complex` gets the same accessors so a driver
 # generalised over the pair type reads `_parts(α)` / `_mkpair(P, v, p)` for BOTH algebras.
-#   _pairT(P)           true iff `P` is Dual{Tag,V<:BlasReal,1}
+#   _pairT(P)           true iff `P` implements the pair protocol with a BlasReal `pair_eltype`
 #   _pairvT(P)          the real type V under a pair type
-@inline _pairT(@nospecialize(_)) = false
+@inline _pairT(::Type{P}) where {P} = _pair_ok(P, pair_eltype(P))
+@inline _pair_ok(::Type, ::Nothing) = false
+@inline _pair_ok(::Type{P}, @nospecialize(V)) where {P} =
+    throw(ArgumentError("pair_eltype($P) = $V, but the SIMD pair paths support only Float32 and Float64 planes"))
+# THE LAYOUT FACT every pair kernel rests on, checked per type at the point of use (const-folded).
+@inline function _pair_ok(::Type{P}, ::Type{V}) where {P, V <: BlasReal}
+    # A non-concrete eltype (e.g. a `Vector{D{V,K} where K}`) stores boxed elements: no interleaved buffer exists.
+    isconcretetype(P) || return false
+    np = pair_nplanes(P)
+    np == 2 || throw(ArgumentError("pair_nplanes($P) = $np, but the SIMD pair paths support only 2 planes (a value and one partial)"))
+    (isbitstype(P) && fieldcount(P) == 2 && sizeof(P) == np * sizeof(V) && fieldoffset(P, 2) == sizeof(V) &&
+        fieldtype(P, 1) === V && _planes_of(fieldtype(P, 2), V)) ||
+        throw(ArgumentError("pair_eltype($P) = $V, but $P is not an isbits struct of two fields, a $V value and a partial built only from $V (such as `$V` or `NTuple{1,$V}`), at byte offsets 0 and sizeof($V)"))
+    return true
+end
+# `T` holds nothing but `V`s: `V` itself, or an isbits wrapper (ForwardDiff's `Partials{1,V}`) of such fields.
+Base.@assume_effects :foldable _planes_of(@nospecialize(T), @nospecialize(V)) =
+    T === V || (isbitstype(T) && fieldcount(T) >= 1 && all(i -> _planes_of(fieldtype(T, i), V), 1:fieldcount(T)))
 @inline _pairvT(::Type{Complex{T}}) where {T} = T
+@inline _pairvT(::Type{P}) where {P} = pair_eltype(P)
 @inline _parts(z::Complex) = (real(z), imag(z))
+@inline _parts(d) = pair_parts(d)
 @inline _mkpair(::Type{Complex{T}}, v, p) where {T} = Complex{T}(v, p)
+@inline _mkpair(::Type{P}, v, p) where {P} = pair_make(P, (v, p))
 @inline _pairv(x) = eltype(_pairreal(x))     # the real type V under a pair vector (static; the pointer is dead)
 # Both operands of a two-vector op must be the SAME pair type — same algebra, same real type, same tag.
 @inline _pair2(x, y) = _pairalg(x) && _pairalg(y) && _et(x) === _et(y)
@@ -145,8 +209,9 @@ _pair_sgn(ALG, N, V, ::Type{T}) where {T} =
 _pair_oddsel(ALG, V, N, q) = ALG === :cplx ?
     :(shufflevector($q, Val($(Expr(:tuple, (isodd(l) ? l - 1 : l + 1 for l in 0:(N - 1))...))))) :
     :(shufflevector(zero($V), $q, Val($(Expr(:tuple, (iseven(l) ? l : N + l - 1 for l in 0:(N - 1))...)))))
-# The tag of a pair TYPE, for drivers generic over `P` (the extension adds the Dual method).
+# The tag of a pair TYPE, for drivers generic over `P`: `:cplx` for `Complex`, `:dual` for every pair type.
 @inline _palg(::Type{Complex{T}}) where {T} = Val(:cplx)
+@inline _palg(::Type) = Val(:dual)
 
 @inline _ptr(p::Ptr) = p
 @inline _ptr(a) = pointer(a)
