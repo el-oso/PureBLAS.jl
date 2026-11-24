@@ -205,38 +205,44 @@ end
     Am = PtrMatrix(A, N, N, Int(unsafe_load(lda))); AFm = PtrMatrix(AF, N, N, Int(unsafe_load(ldaf)))
     Bm = PtrMatrix(B, N, RH, Int(unsafe_load(ldb))); Xm = PtrMatrix(X, N, RH, Int(unsafe_load(ldx)))
     ip = PtrVector(ipiv, N); Rv = PtrVector(R, N); Cv = PtrVector(C, N)
-    Xo, eq, rc, fe, be, rpgf = gesvx!(
+    Xo, eq, rc, fe, be, rpgf, inf = _gesvx_info!(
         _cabi_char(fact), _cabi_char(trans), Am, AFm, ip,
-        _cabi_char(equed), Rv, Cv, Bm
+        _cabi_char(equed), Rv, Cv, Bm, Matrix{T}(undef, N, RH), Vector{Tr}(undef, RH), Vector{Tr}(undef, RH)
     )
-    @inbounds for j in 1:RH, i in 1:N
-        Xm[i, j] = Xo[i, j]
-    end
-    @inbounds for j in 1:RH
-        PtrVector(ferr, RH)[j] = fe[j]; PtrVector(berr, RH)[j] = be[j]
+    if iszero(inf)
+        @inbounds for j in 1:RH, i in 1:N
+            Xm[i, j] = Xo[i, j]
+        end
+        @inbounds for j in 1:RH
+            PtrVector(ferr, RH)[j] = fe[j]; PtrVector(berr, RH)[j] = be[j]
+        end
     end
     unsafe_store!(equed, UInt8(eq)); unsafe_store!(rcond, Tr(rc))
-    return rpgf
+    return rpgf, _gesvx_cabi_info(inf, rc, N, Tr)
 end
+# dgesvx's info: i for an exact zero pivot U(i,i); otherwise n+1 when rcond < dlamch('Epsilon') (half
+# the spacing of 1, since LAPACK rounds), a warning that X was still computed; otherwise 0.
+_gesvx_cabi_info(inf, rc, N, ::Type{Tr}) where {Tr} =
+    Int64(inf > 0 ? inf : (rc < eps(Tr) / 2 ? N + 1 : 0))
 function _gesvx_real!(
         ::Type{T}, fact, trans, n, nrhs, A, lda, AF, ldaf, ipiv, equed, R, C, B, ldb,
         X, ldx, rcond, ferr, berr, work, info
     ) where {T}
-    rpgf = _gesvx_common!(
+    rpgf, inf = _gesvx_common!(
         T, T, fact, trans, n, nrhs, A, lda, AF, ldaf, ipiv, equed, R, C, B, ldb,
         X, ldx, rcond, ferr, berr
     )
-    unsafe_store!(work, T(rpgf)); unsafe_store!(info, Int64(0)); return
+    unsafe_store!(work, T(rpgf)); unsafe_store!(info, inf); return
 end
 function _gesvx_cplx!(
         ::Type{T}, ::Type{Tr}, fact, trans, n, nrhs, A, lda, AF, ldaf, ipiv, equed, R, C,
         B, ldb, X, ldx, rcond, ferr, berr, rwork, info
     ) where {T, Tr}
-    rpgf = _gesvx_common!(
+    rpgf, inf = _gesvx_common!(
         T, Tr, fact, trans, n, nrhs, A, lda, AF, ldaf, ipiv, equed, R, C, B, ldb,
         X, ldx, rcond, ferr, berr
     )
-    unsafe_store!(rwork, Tr(rpgf)); unsafe_store!(info, Int64(0)); return
+    unsafe_store!(rwork, Tr(rpgf)); unsafe_store!(info, inf); return
 end
 # ── bdsqr (COMPLEX): SVD of a REAL bidiagonal (d,e real) accumulating real Givens into COMPLEX Vt/U/C.
 # Native complex sweep (svd.jl `bdsqr!(uplo,d,e,Vt,U,C)`, robust Demmel–Kahan). `rwork` is the LAPACK
@@ -286,9 +292,10 @@ function _gesvx_f32_mixed!(
         end
         ipd[j] = Int(ipv[j]); Rd[j] = Float64(Rv[j]); Cd[j] = Float64(Cv[j])
     end
-    Xo, eq, rc, fe, be, rpgf = gesvx!(
+    Xo, eq, rc, fe, be, rpgf, inf = _gesvx_info!(
         _cabi_char(fact), _cabi_char(trans), Ad, AFd, ipd,
-        _cabi_char(equed), Rd, Cd, Bd
+        _cabi_char(equed), Rd, Cd, Bd, Matrix{Float64}(undef, N, RH), Vector{Float64}(undef, RH),
+        Vector{Float64}(undef, RH)
     )
     @inbounds for j in 1:N
         for i in 1:N
@@ -299,16 +306,19 @@ function _gesvx_f32_mixed!(
     @inbounds for j in 1:RH, i in 1:N
         Bm[i, j] = Float32(Bd[i, j])
     end
-    Xm = PtrMatrix(X, N, RH, Int(unsafe_load(ldx)))
-    @inbounds for j in 1:RH, i in 1:N
-        Xm[i, j] = Float32(Xo[i, j])
-    end
-    @inbounds for j in 1:RH
-        PtrVector(ferr, RH)[j] = Float32(fe[j]); PtrVector(berr, RH)[j] = Float32(be[j])
+    if iszero(inf)
+        Xm = PtrMatrix(X, N, RH, Int(unsafe_load(ldx)))
+        @inbounds for j in 1:RH, i in 1:N
+            Xm[i, j] = Float32(Xo[i, j])
+        end
+        @inbounds for j in 1:RH
+            PtrVector(ferr, RH)[j] = Float32(fe[j]); PtrVector(berr, RH)[j] = Float32(be[j])
+        end
     end
     ipv = PtrVector(ipiv, N); @inbounds for i in 1:N
         ipv[i] = Int64(ipd[i])
     end
     unsafe_store!(equed, UInt8(eq)); unsafe_store!(rcond, Float32(rc))
-    unsafe_store!(work, Float32(rpgf)); unsafe_store!(info, Int64(0)); return
+    # n+1 is judged against single-precision epsilon: that is the precision the caller asked for.
+    unsafe_store!(work, Float32(rpgf)); unsafe_store!(info, _gesvx_cabi_info(inf, rc, N, Float32)); return
 end

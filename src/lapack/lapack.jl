@@ -1,4 +1,23 @@
-using LinearAlgebra: PosDefException
+using LinearAlgebra: PosDefException, SingularException, LAPACKException
+
+# Throw SingularException(i) for the first i ≤ r with A[i,i] exactly zero — the info>0 contract of
+# dtrtrs/dtrtri/dgels. "Zero" is judged on the value (`_l1v`): a ForwardDiff Dual with value 0 and
+# nonzero partials is not `iszero`, yet dividing by it is the same division by zero. The scan has no early exit, so a nonsingular A (the common case) pays one
+# compare per diagonal element and no per-element branch; `checkbounds` once makes the `@inbounds`
+# provable for every i in 1:r.
+function _throw_if_zero_diag(A::AbstractMatrix, r::Int)
+    r <= 0 && return nothing
+    checkbounds(A, r, r)
+    bad = false
+    @inbounds for i in 1:r
+        bad |= iszero(_l1v(A[i, i]))
+    end
+    bad || return nothing
+    for i in 1:r
+        iszero(_l1v(A[i, i])) && throw(SingularException(i))
+    end
+    return nothing
+end
 
 # LAPACK-level routines built on the gated Level-3 BLAS. First: Cholesky (potrf).
 # Real symmetric positive-definite A = L·Lᵀ (uplo='L') or A = Uᵀ·U (uplo='U'), factored in place into

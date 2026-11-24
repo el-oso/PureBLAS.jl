@@ -102,6 +102,9 @@ function trtri!(A::AbstractMatrix{T}; uplo::AbstractChar = 'L', diag::AbstractCh
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("trtri!: uplo must be 'L' or 'U'"))
     (diag == 'N' || diag == 'U') || throw(ArgumentError("trtri!: diag must be 'N' or 'U'"))
     n == 0 && return A
+    # dtrtri: an exact zero on a non-unit diagonal is reported as SingularException(i), the first such
+    # i, before A is touched. getri! and potri! reach this first, so they inherit the same contract.
+    diag == 'N' && _throw_if_zero_diag(A, n)
     return _trtri_ip!(A, uplo == 'U', diag == 'U')
 end
 

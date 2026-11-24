@@ -234,12 +234,24 @@ function _sytri_upper!(
     return A
 end
 
+# dsytri/zhetri: a 1×1 pivot block (ipiv[k] > 0) whose D(k,k) is exactly zero makes A singular, and is
+# reported as SingularException(k) before A is touched. LAPACK scans upward from n for 'U' and downward
+# from 1 for 'L', so with several such blocks 'U' reports the last and 'L' the first.
+function _sytri_check_singular(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}, lower::Bool)
+    n = size(A, 1)
+    for k in (lower ? (1:1:n) : (n:-1:1))
+        ipiv[k] > 0 && iszero(_l1v(A[k, k])) && throw(SingularException(k))   # on the value, as _throw_if_zero_diag
+    end
+    return nothing
+end
+
 """
     sytri!(A, ipiv; uplo='L') -> A
 
 Overwrite A with the inverse of the symmetric (or complex-symmetric) matrix whose Bunch-Kaufman factors
 (`sytrf!` output) are stored in the `uplo` triangle of A with pivots `ipiv`. Only the `uplo` triangle of
 A⁻¹ is written (the inverse is symmetric). Generic over T<:Number. Mirrors LAPACK `dsytri`/`zsytri`.
+Throws `SingularException(k)`, with A untouched, if a 1×1 block D(k,k) is exactly zero.
 """
 function sytri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char = 'L')
     Base.require_one_based_indexing(A, ipiv)
@@ -247,6 +259,7 @@ function sytri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char =
     size(A, 2) == n || throw(DimensionMismatch("sytri!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("sytri!: length(ipiv) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("sytri!: uplo must be 'L' or 'U'"))
+    _sytri_check_singular(A, ipiv, uplo == 'L')
     # One arena borrow of length n, threaded down as an explicit argument (both engines take `work`),
     # so the only handle that leaves this scope is `A` — the matrix the caller owns.
     @scope arn begin
@@ -261,6 +274,7 @@ end
 Overwrite A with the inverse of the Hermitian matrix whose Bunch-Kaufman factors (`hetrf!` output) are in
 the `uplo` triangle with pivots `ipiv`. For real `eltype(A)` this is identical to `sytri!`. Only the
 `uplo` triangle of A⁻¹ is written. Mirrors LAPACK `zhetri` (real diagonal, conjugated off-diagonals).
+Throws `SingularException(k)`, with A untouched, if a 1×1 block D(k,k) is exactly zero.
 """
 function hetri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char = 'L')
     Base.require_one_based_indexing(A, ipiv)
@@ -268,6 +282,7 @@ function hetri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char =
     size(A, 2) == n || throw(DimensionMismatch("hetri!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("hetri!: length(ipiv) must equal size(A,1)"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("hetri!: uplo must be 'L' or 'U'"))
+    _sytri_check_singular(A, ipiv, uplo == 'L')
     herm = eltype(A) <: Complex
     @scope arn begin                       # same single borrow as sytri! — one field, one role, two entries
         work = borrow!(arn, eltype(A), n)
@@ -294,11 +309,13 @@ end
 Solve the symmetric-indefinite system A·X = B in place: Bunch-Kaufman–factor A (`sytrf!`, in the `uplo`
 triangle) then solve (`sytrs!`). On return A holds the factors, `ipiv` the pivots, and B the solution X.
 The 4-argument form writes the pivots into the caller's `ipiv` (length `size(A,1)`, checked by `sytrf!`)
-and allocates nothing.
+and allocates nothing. Throws `SingularException(k)` if D(k,k) is exactly zero; A then holds the factors
+and B is untouched.
 """
 function sysv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat, ipiv::AbstractVector{<:Integer})
     Base.require_one_based_indexing(A, B, ipiv)
-    sytrf!(A, ipiv; uplo = uplo)
+    info = sytrf!(A, ipiv; uplo = uplo)
+    info > 0 && throw(SingularException(info))      # dsysv: A holds the factors, B is untouched
     sytrs!(A, ipiv, B; uplo = uplo)
     return A, ipiv, B
 end
@@ -311,11 +328,13 @@ sysv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat) =
 
 Solve the Hermitian system A·X = B in place via the Hermitian Bunch-Kaufman factorization (`hetrf!` then
 `hetrs!`). For real `eltype(A)` this equals `sysv!`. The 4-argument form writes the pivots into the
-caller's `ipiv` and allocates nothing.
+caller's `ipiv` and allocates nothing. Throws `SingularException(k)` if D(k,k) is exactly zero; A then
+holds the factors and B is untouched.
 """
 function hesv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat, ipiv::AbstractVector{<:Integer})
     Base.require_one_based_indexing(A, B, ipiv)
-    hetrf!(A, ipiv; uplo = uplo)
+    info = hetrf!(A, ipiv; uplo = uplo)
+    info > 0 && throw(SingularException(info))      # zhesv: A holds the factors, B is untouched
     hetrs!(A, ipiv, B; uplo = uplo)
     return A, ipiv, B
 end
