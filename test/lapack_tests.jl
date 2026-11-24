@@ -1877,6 +1877,31 @@ end
     end
 end
 
+@testitem "geqrf! — extreme scales: no underflow or overflow in the reflector" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(20261124)
+    # Per column, each scale reaches a different guard. Squares that underflow (Float64 1e-170, 1e-300)
+    # or overflow (1e300) take the scaled norm. A subnormal column (1e-315) takes the rescale before
+    # 1/(α − β), which overflows otherwise. The two shapes reach the single-column path, the paired
+    # panel and the blocked driver. The bound is LAPACK's own error on the same matrix: a subnormal
+    # input carries only a few significant bits, so LAPACK's residual there is about 1e7·eps too.
+    err(Q, R, A) = (res = opnorm(Q * R - A, 1) / opnorm(A, 1), orth = opnorm(Q' * Q - I, 1))
+    scales = Dict(Float64 => (1.0e-170, 1.0e-300, 1.0e-315, 1.0e300), Float32 => (1.0f-25, 1.0f-41, 1.0f30))
+    @testset "$T $(m)x$(n) s=$s" for T in (Float64, Float32, ComplexF64, ComplexF32),
+            (m, n) in ((41, 31), (200, 150)), s in scales[real(T)]
+        A = randn(T, m, n) .* s; k = min(m, n)
+        F = copy(A); tau = zeros(T, k)
+        PureBLAS.geqrf!(F, tau); PureBLAS.geqrf_tau_lapack!(tau)
+        Q = PureBLAS.orgqr!(copy(F[:, 1:k]), tau, k)
+        @test all(isfinite, F) && all(isfinite, Q)                     # opnorm can skip a NaN entry
+        pb = err(Q, triu(F[1:k, :]), A)
+        L = qr(A); ref = err(Matrix(L.Q), L.R, A)
+        tol = 100 * eps(real(T))
+        @test pb.res <= max(tol, 4 * ref.res)
+        @test pb.orth <= max(tol, 4 * ref.orth)
+    end
+end
+
 @testitem "geqrf! — generic T<:Real: A = QR under the faer tau convention" begin
     using PureBLAS, LinearAlgebra, Random
     Random.seed!(31415)

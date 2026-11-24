@@ -13,6 +13,42 @@
     @inbounds begin
         α = x[1]
         n == 1 && return α, zero(T)
+        xnorm = _larfg_xnorm(x)
+        xnorm == zero(T) && return α, zero(T)
+        β = -copysign(hypot(α, xnorm), α)
+        # dlarfg's rescale: below safmin, 1/(α−β) overflows. Multiply x by 1/safmin (a power of two, so
+        # exact) until β is in range, and scale β back at the end; v and τ do not change under the scaling.
+        # x[1] is not written: callers read α back from it.
+        knt = 0
+        if abs(β) < _larfg_safmin(T)
+            rs = inv(_larfg_safmin(T))
+            while true
+                knt += 1
+                for i in 2:length(x)
+                    x[i] *= rs
+                end
+                α *= rs; β *= rs
+                (abs(β) < _larfg_safmin(T) && knt < 20) || break
+            end
+            xnorm = _larfg_xnorm(x); β = -copysign(hypot(α, xnorm), α)
+        end
+        τ = (β - α) / β
+        s = one(T) / (α - β)
+        for i in 2:n
+            x[i] *= s
+        end
+        for _ in 1:knt
+            β *= _larfg_safmin(T)
+        end
+    end
+    return β, τ
+end
+# dlamch('S')/dlamch('E'): the smallest value whose reciprocal does not overflow, with a margin of 1/eps.
+@inline _larfg_safmin(::Type{T}) where {T} = floatmin(T) / eps(T)
+# ‖x[2:end]‖₂ for `_larfg!`.
+@inline function _larfg_xnorm(x::AbstractVector{T}) where {T <: Real}
+    n = length(x)
+    @inbounds begin
         ss = zero(T)                                 # SIMD sum-of-squares (avoids O(n²) Base.hypot in gebrd);
         @simd for i in 2:n
             ss = muladd(x[i], x[i], ss)
@@ -27,22 +63,15 @@
             for i in 2:n
                 scale = max(scale, abs(x[i]))
             end
-            scale == zero(T) && return α, zero(T)
+            scale == zero(T) && return zero(T)
             ssum = zero(T)
             for i in 2:n
                 t = x[i] / scale; ssum = muladd(t, t, ssum)
             end
             xnorm = scale * sqrt(ssum)
         end
-        xnorm == zero(T) && return α, zero(T)
-        β = -copysign(hypot(α, xnorm), α)
-        τ = (β - α) / β
-        s = one(T) / (α - β)
-        for i in 2:n
-            x[i] *= s
-        end
     end
-    return β, τ
+    return xnorm
 end
 
 # Apply H = I − τ·v·vᵀ (v[1]≡1, v[2:]=v[2:]) to C (size len×nc) from the LEFT:  C := H·C.
@@ -164,10 +193,10 @@ end
 
 # ── Complex bidiagonalization (LAPACK zgebd2): real d,e — τ complex, β real. Left applies conj(τq); the
 # right reflector operates on the zlacgv-CONJUGATED row (the phase dance that keeps e real). WIP-debug.
-@inline function _larfg!(x::AbstractVector{T}) where {T <: Complex}
+# ‖x[2:end]‖₂ for the complex `_larfg!`.
+@inline function _larfg_xnorm(x::AbstractVector{T}) where {T <: Complex}
     R = real(T); n = length(x)
     @inbounds begin
-        α = x[1]
         ss = zero(R); for i in 2:n
             ss += abs2(x[i])
         end
@@ -189,14 +218,38 @@ end
                 xnorm = scale * sqrt(ssum)
             end
         end
+    end
+    return xnorm
+end
+@inline function _larfg!(x::AbstractVector{T}) where {T <: Complex}
+    R = real(T)
+    @inbounds begin
+        α = x[1]; xnorm = _larfg_xnorm(x)
         # n==1 (empty tail) with imag(α)≠0 still needs the phase rotation (τ≠0, β real) — do NOT early-return
         # on n==1; only the genuinely-trivial α (xnorm=0 AND real α) is τ=0.
         (xnorm == 0 && imag(α) == 0) && return real(α), zero(T)
         β = -copysign(hypot(abs(α), xnorm), real(α))
+        # zlarfg's rescale, as in the real `_larfg!`.
+        knt = 0
+        if abs(β) < _larfg_safmin(R)
+            rs = inv(_larfg_safmin(R))
+            while true
+                knt += 1
+                for i in 2:length(x)
+                    x[i] *= rs
+                end
+                α *= rs; β *= rs
+                (abs(β) < _larfg_safmin(R) && knt < 20) || break
+            end
+            xnorm = _larfg_xnorm(x); β = -copysign(hypot(abs(α), xnorm), real(α))
+        end
         τ = T((β - real(α)) / β, -imag(α) / β)
         s = one(T) / (α - β)
-        for i in 2:n
+        for i in 2:length(x)
             x[i] *= s
+        end
+        for _ in 1:knt
+            β *= _larfg_safmin(R)
         end
     end
     return β, τ
