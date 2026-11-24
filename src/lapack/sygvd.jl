@@ -175,6 +175,7 @@ function sygvd!(
         itype::Integer, jobz::Char, uplo::Char,
         A::AbstractMatrix{T}, B::AbstractMatrix{T}
     ) where {T <: Real}
+    Base.require_one_based_indexing(A, B)
     return _gvd_impl!(itype, jobz, uplo, A, B)
 end
 
@@ -182,6 +183,7 @@ function hegvd!(
         itype::Integer, jobz::Char, uplo::Char,
         A::AbstractMatrix{T}, B::AbstractMatrix{T}
     ) where {T <: Complex}
+    Base.require_one_based_indexing(A, B)
     return _gvd_impl!(itype, jobz, uplo, A, B)
 end
 
@@ -196,6 +198,7 @@ function sygvd!(
         itype::Integer, jobz::AbstractChar, uplo::AbstractChar,
         A::AbstractMatrix{T}, B::AbstractMatrix{T}, w::AbstractVector{T}
     ) where {T <: Real}
+    Base.require_one_based_indexing(A, B, w)
     n = _gvd_check(itype, jobz, uplo, A, B)
     length(w) >= n || throw(DimensionMismatch("sygvd!: length(w) < n"))
     Base.mightalias(w, A) && throw(ArgumentError("sygvd!: `w` must not alias `A`"))
@@ -218,6 +221,7 @@ function hegvd!(
         itype::Integer, jobz::AbstractChar, uplo::AbstractChar,
         A::AbstractMatrix{T}, B::AbstractMatrix{T}, w::AbstractVector{R}
     ) where {T <: Complex, R <: Real}
+    Base.require_one_based_indexing(A, B, w)
     n = _gvd_check(itype, jobz, uplo, A, B)
     length(w) >= n || throw(DimensionMismatch("hegvd!: length(w) < n"))
     potrf!(B; uplo = uplo)

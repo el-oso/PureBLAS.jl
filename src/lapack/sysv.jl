@@ -242,6 +242,7 @@ Overwrite A with the inverse of the symmetric (or complex-symmetric) matrix whos
 A⁻¹ is written (the inverse is symmetric). Generic over T<:Number. Mirrors LAPACK `dsytri`/`zsytri`.
 """
 function sytri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char = 'L')
+    Base.require_one_based_indexing(A, ipiv)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("sytri!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("sytri!: length(ipiv) must equal size(A,1)"))
@@ -262,6 +263,7 @@ the `uplo` triangle with pivots `ipiv`. For real `eltype(A)` this is identical t
 `uplo` triangle of A⁻¹ is written. Mirrors LAPACK `zhetri` (real diagonal, conjugated off-diagonals).
 """
 function hetri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char = 'L')
+    Base.require_one_based_indexing(A, ipiv)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("hetri!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("hetri!: length(ipiv) must equal size(A,1)"))
@@ -295,6 +297,7 @@ The 4-argument form writes the pivots into the caller's `ipiv` (length `size(A,1
 and allocates nothing.
 """
 function sysv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat, ipiv::AbstractVector{<:Integer})
+    Base.require_one_based_indexing(A, B, ipiv)
     sytrf!(A, ipiv; uplo = uplo)
     sytrs!(A, ipiv, B; uplo = uplo)
     return A, ipiv, B
@@ -311,6 +314,7 @@ Solve the Hermitian system A·X = B in place via the Hermitian Bunch-Kaufman fac
 caller's `ipiv` and allocates nothing.
 """
 function hesv!(uplo::Char, A::AbstractMatrix, B::AbstractVecOrMat, ipiv::AbstractVector{<:Integer})
+    Base.require_one_based_indexing(A, B, ipiv)
     hetrf!(A, ipiv; uplo = uplo)
     hetrs!(A, ipiv, B; uplo = uplo)
     return A, ipiv, B

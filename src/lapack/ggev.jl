@@ -315,10 +315,12 @@ complex) and allocates nothing; `vl` is accepted and ignored. It throws if `vl`/
 each other.
 """
 function ggev!(jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Real}
+    Base.require_one_based_indexing(A, B)
     alphar, alphai, beta, VR = _ggev_run!(Char(jobvl), Char(jobvr), A, B)
     return alphar, alphai, beta, Matrix{T}(undef, size(A, 1), 0), VR
 end
 function ggev!(jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Complex}
+    Base.require_one_based_indexing(A, B)
     alpha, beta, VR = _ggev_run!(Char(jobvl), Char(jobvr), A, B)
     return alpha, beta, Matrix{T}(undef, size(A, 1), 0), VR
 end
@@ -328,6 +330,7 @@ function ggev!(
         alphar::AbstractVector{T}, alphai::AbstractVector{T}, beta::AbstractVector{T},
         vl::AbstractMatrix{T}, vr::AbstractMatrix{T}
     ) where {T <: Real}
+    Base.require_one_based_indexing(A, B, alphar, alphai, beta, vl, vr)
     _ggev_check_alias(A, B, vl, vr, "ggev!", "vl", "vr")
     n = size(A, 1)
     (length(alphar) == n && length(alphai) == n && length(beta) == n) ||
@@ -340,6 +343,7 @@ function ggev!(
         alpha::AbstractVector{T}, beta::AbstractVector{T},
         vl::AbstractMatrix{T}, vr::AbstractMatrix{T}
     ) where {T <: Complex}
+    Base.require_one_based_indexing(A, B, alpha, beta, vl, vr)
     _ggev_check_alias(A, B, vl, vr, "ggev!", "vl", "vr")
     n = size(A, 1)
     (length(alpha) == n && length(beta) == n) ||
@@ -362,10 +366,12 @@ The trailing-buffer form writes into the caller's `alpha`/`beta`/`vsl`/`vsr` and
 throws if `vsl`/`vsr` alias `A`, `B` or each other.
 """
 function gges!(jobvsl::AbstractChar, jobvsr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Real}
+    Base.require_one_based_indexing(A, B)
     S, P, alphaC, beta, VSL, VSR = _gges_run!(A, B)
     return S, P, alphaC, beta, VSL, VSR
 end
 function gges!(jobvsl::AbstractChar, jobvsr::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: Complex}
+    Base.require_one_based_indexing(A, B)
     S, P, alpha, beta, VSL, VSR = _gges_run!(A, B)
     return S, P, alpha, beta, VSL, VSR
 end
@@ -375,6 +381,7 @@ function gges!(
         alpha::AbstractVector{<:Complex}, beta::AbstractVector{T},
         vsl::AbstractMatrix{T}, vsr::AbstractMatrix{T}
     ) where {T <: Real}
+    Base.require_one_based_indexing(A, B, alpha, beta, vsl, vsr)
     _ggev_check_alias(A, B, vsl, vsr, "gges!", "vsl", "vsr")
     n = size(A, 1)
     (length(alpha) == n && length(beta) == n) ||
@@ -387,6 +394,7 @@ function gges!(
         alpha::AbstractVector{T}, beta::AbstractVector{T},
         vsl::AbstractMatrix{T}, vsr::AbstractMatrix{T}
     ) where {T <: Complex}
+    Base.require_one_based_indexing(A, B, alpha, beta, vsl, vsr)
     _ggev_check_alias(A, B, vsl, vsr, "gges!", "vsl", "vsr")
     n = size(A, 1)
     (length(alpha) == n && length(beta) == n) ||

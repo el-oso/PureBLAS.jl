@@ -119,6 +119,7 @@ function gelsd!(
         A::AbstractMatrix{T}, B::AbstractMatrix{T}, rcond::Real,
         s::AbstractVector{<:Real}
     ) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A, B, s)
     m, n = size(A); mn = min(m, n); R = real(T); nrhs = size(B, 2)
     size(B, 1) >= max(m, n) || _throw_brows_mn(:gelsd!, size(B, 1), max(m, n))
     length(s) >= mn || throw(ArgumentError("gelsd!: length(s) must be ≥ min(m,n)"))
@@ -164,6 +165,7 @@ end
 
 # Allocating convenience form — identical behaviour and return value to the pre-workspace gelsd!.
 function gelsd!(A::AbstractMatrix{T}, B::AbstractMatrix{T}, rcond::Real) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A, B)
     s = Vector{real(T)}(undef, min(size(A, 1), size(A, 2)))
     return gelsd!(A, B, rcond, s)
 end
@@ -178,6 +180,7 @@ end
 # then narrowed to its own m×n leading block. The nested Float64 `gelsd!` below opens its OWN scope
 # inside this one — perfectly nested, so its borrows sit above these and rewind first.
 function gelsd!(A::AbstractMatrix{Float32}, B::AbstractMatrix{Float32}, rcond::Real, s::AbstractVector{<:Real})
+    Base.require_one_based_indexing(A, B, s)
     m, n = size(A); mn = min(m, n); nrhs = size(B, 2); mb = max(m, n)
     size(B, 1) >= mb || _throw_brows_mn(:gelsd!, size(B, 1), mb)
     length(s) >= mn || throw(ArgumentError("gelsd!: length(s) must be ≥ min(m,n)"))
@@ -207,6 +210,7 @@ function gelsd!(A::AbstractMatrix{Float32}, B::AbstractMatrix{Float32}, rcond::R
 end
 
 function gelsd!(A::AbstractMatrix{Float32}, B::AbstractMatrix{Float32}, rcond::Real)
+    Base.require_one_based_indexing(A, B)
     s = Vector{Float32}(undef, min(size(A, 1), size(A, 2)))
     return gelsd!(A, B, rcond, s)
 end

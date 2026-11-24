@@ -252,6 +252,7 @@ function gebrd_vals!(
         A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::AbstractVector{Float64};
         b::Int = _band_b(size(A, 1), size(A, 2))
     )
+    Base.require_one_based_indexing(A, d, e)
     m, n = size(A)
     m >= n || _throw_mge_n(:gebrd_vals!, m, n)
     n == 0 && return d, e

@@ -1244,6 +1244,7 @@ function tgsen!(
         select::AbstractVector, S::AbstractMatrix{R}, T::AbstractMatrix{R},
         Q::AbstractMatrix{R}, Z::AbstractMatrix{R}
     ) where {R <: Real}
+    Base.require_one_based_indexing(select, S, T, Q, Z)
     n = _tgsen_dims(select, S, T, Q, Z)
     alpha = Vector{Complex{R}}(undef, n); beta = zeros(R, n)
     return _dtgsen!(select, S, T, Q, Z, alpha, beta)
@@ -1253,6 +1254,7 @@ function tgsen!(
         select::AbstractVector, S::AbstractMatrix{C}, T::AbstractMatrix{C},
         Q::AbstractMatrix{C}, Z::AbstractMatrix{C}
     ) where {C <: Complex}
+    Base.require_one_based_indexing(select, S, T, Q, Z)
     n = _tgsen_dims(select, S, T, Q, Z)
     alpha = Vector{C}(undef, n); beta = Vector{C}(undef, n)
     return _ztgsen!(select, S, T, Q, Z, alpha, beta)
@@ -1266,6 +1268,7 @@ function tgsen!(
         Q::AbstractMatrix{R}, Z::AbstractMatrix{R}, alpha::AbstractVector{<:Complex},
         beta::AbstractVector{R}
     ) where {R <: Real}
+    Base.require_one_based_indexing(select, S, T, Q, Z, alpha, beta)
     n = _tgsen_dims(select, S, T, Q, Z)
     (length(alpha) == n && length(beta) == n) ||
         throw(DimensionMismatch("tgsen!: alpha and beta must have length n"))
@@ -1277,6 +1280,7 @@ function tgsen!(
         Q::AbstractMatrix{C}, Z::AbstractMatrix{C}, alpha::AbstractVector{C},
         beta::AbstractVector{C}
     ) where {C <: Complex}
+    Base.require_one_based_indexing(select, S, T, Q, Z, alpha, beta)
     n = _tgsen_dims(select, S, T, Q, Z)
     (length(alpha) == n && length(beta) == n) ||
         throw(DimensionMismatch("tgsen!: alpha and beta must have length n"))

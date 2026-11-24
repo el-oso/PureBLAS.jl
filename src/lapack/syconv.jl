@@ -37,6 +37,7 @@ function syconv!(
         uplo::AbstractChar, A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer},
         work::AbstractVector{T}
     ) where {T}
+    Base.require_one_based_indexing(A, ipiv, work)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("syconv!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("syconv!: length(ipiv) must equal size(A,1)"))

@@ -1513,6 +1513,7 @@ function trmm!(
         B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Char = 'U',
         transA::Char = 'N', diag::Char = 'N', alpha::Number = true
     )
+    Base.require_one_based_indexing(B, A)
     sl = side == 'L'
     k = sl ? size(B, 1) : size(B, 2)
     (size(A, 1) == size(A, 2) == k) || _throw_square(:trmm!, k)
@@ -5551,6 +5552,7 @@ function trsm!(
         B::AbstractMatrix, A::AbstractMatrix; side::Char = 'L', uplo::Char = 'U',
         transA::Char = 'N', diag::Char = 'N', alpha::Number = true
     )
+    Base.require_one_based_indexing(B, A)
     sl = side == 'L'
     k = sl ? size(B, 1) : size(B, 2)
     (size(A, 1) == size(A, 2) == k) || _throw_square(:trsm!, k)
@@ -7502,6 +7504,7 @@ function syrk!(
         C::AbstractMatrix, A::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N',
         alpha::Number = true, beta::Number = false
     )
+    Base.require_one_based_indexing(C, A)
     # syrk is SYMMETRIC: its vocabulary is 'N'/'T', a plain transpose. So `transpose(A)` folds, and so
     # does a REAL `A'` (adjoint == transpose there) -- but a COMPLEX `A'` means the conjugate transpose,
     # which 'T' does not express, so it must stay wrapped and take the generic path. `_lazyop` returns
@@ -7561,6 +7564,7 @@ function herk!(
         C::AbstractMatrix, A::AbstractMatrix; uplo::Char = 'U', trans::Char = 'N',
         alpha::Real = true, beta::Real = false
     )
+    Base.require_one_based_indexing(C, A)
     # herk is HERMITIAN: its vocabulary is 'N'/'C', the conjugate transpose. The mirror of syrk above --
     # `A'` folds at either eltype, while a COMPLEX `transpose(A)` does not (it means 'T', which herk
     # does not express) and stays wrapped.
@@ -8132,6 +8136,7 @@ function symm!(
         C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; side::Char = 'L',
         uplo::Char = 'U', alpha::Number = true, beta::Number = false
     )
+    Base.require_one_based_indexing(C, A, B)
     _symm_check(side == 'L', A, B, C); _symm!(side == 'L', uplo == 'U', false, alpha, beta, A, B, C)
     return C
 end
@@ -8139,6 +8144,7 @@ function hemm!(
         C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix; side::Char = 'L',
         uplo::Char = 'U', alpha::Number = true, beta::Number = false
     )
+    Base.require_one_based_indexing(C, A, B)
     _symm_check(side == 'L', A, B, C); _symm!(side == 'L', uplo == 'U', true, alpha, beta, A, B, C)
     return C
 end
@@ -8275,6 +8281,7 @@ function syr2k!(
         C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Number = false
     )
+    Base.require_one_based_indexing(C, A, Bm)
     # Both operands share ONE trans char, so they fold together or not at all. Vocabulary as syrk.
     if trans == 'N' && _lazyop(A) == 'T' && _lazyop(Bm) == 'T'
         return syr2k!(C, parent(A), parent(Bm); uplo, trans = 'T', alpha, beta)
@@ -8341,6 +8348,7 @@ function her2k!(
         C::AbstractMatrix, A::AbstractMatrix, Bm::AbstractMatrix; uplo::Char = 'U',
         trans::Char = 'N', alpha::Number = true, beta::Real = false
     )
+    Base.require_one_based_indexing(C, A, Bm)
     # Both operands share ONE trans char, so they fold together or not at all. Vocabulary as herk.
     if trans == 'N' && _lazyop(A) == 'C' && _lazyop(Bm) == 'C'
         return her2k!(C, parent(A), parent(Bm); uplo, trans = 'C', alpha, beta)

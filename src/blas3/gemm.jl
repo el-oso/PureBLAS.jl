@@ -8207,6 +8207,7 @@ function gemm!(
         C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix;
         alpha = one(eltype(C)), beta = zero(eltype(C)), transA::Char = 'N', transB::Char = 'N'
     )
+    Base.require_one_based_indexing(C, A, B)
     # Fold a lazy `A'` / `transpose(A)` operand into the trans char. gemm accepts 'N'/'T'/'C', so every
     # wrapper is expressible here (unlike syrk/herk -- see `_lazyop`). Only when the caller's own flag
     # is 'N': composing a wrapper with an explicit flag is left alone rather than guessed at.
@@ -8306,6 +8307,7 @@ end
 Allocating GEMM: returns `op(A)·op(B)`.
 """
 function gemm(A::AbstractMatrix, B::AbstractMatrix; transA::Char = 'N', transB::Char = 'N')
+    Base.require_one_based_indexing(A, B)
     T = promote_type(eltype(A), eltype(B))
     m = transA != 'N' ? size(A, 2) : size(A, 1)
     n = transB != 'N' ? size(B, 1) : size(B, 2)

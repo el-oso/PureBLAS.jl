@@ -88,6 +88,7 @@ function stebz!(
         abstol::Real, d::AbstractVector{T}, e::AbstractVector{T},
         w::AbstractVector{T}, iblock::AbstractVector{<:Integer}, isplit::AbstractVector{<:Integer}
     ) where {T <: Real}
+    Base.require_one_based_indexing(d, e, w, iblock, isplit)
     (range in ('A', 'V', 'I')) || throw(ArgumentError("stebz!: range must be 'A','V','I'"))
     (order in ('B', 'E')) || throw(ArgumentError("stebz!: order must be 'B' or 'E'"))
     n = length(d)
@@ -241,6 +242,7 @@ function stebz!(
         range::AbstractChar, order::AbstractChar, vl::T, vu::T, il::Integer, iu::Integer,
         abstol::Real, d::AbstractVector{T}, e::AbstractVector{T}
     ) where {T <: Real}
+    Base.require_one_based_indexing(d, e)
     n = length(d)
     w = Vector{T}(undef, n); iblock = Vector{Int}(undef, n); isplit = Vector{Int}(undef, n)
     m, ns, info = stebz!(range, order, vl, vu, il, iu, abstol, d, e, w, iblock, isplit)
@@ -398,6 +400,7 @@ function stein!(
         iblock::AbstractVector{<:Integer}, isplit::AbstractVector{<:Integer},
         Z::AbstractMatrix{T}
     ) where {T <: Real}
+    Base.require_one_based_indexing(d, e, w, iblock, isplit, Z)
     n = length(d)
     m = length(w)
     length(e) >= n - 1 || throw(DimensionMismatch("stein!: e must have length ≥ n-1"))

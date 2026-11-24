@@ -148,6 +148,7 @@ function geqp3!(
         A::AbstractMatrix{T}, jpvt::AbstractVector{<:Integer},
         tau::AbstractVector{T}
     ) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A, jpvt, tau)
     m, n = size(A); k = min(m, n); R = real(T)
     length(jpvt) >= n || _throw_len_jpvt(:geqp3!, n)
     length(tau) >= k || _throw_len_tau_mn(:geqp3!, k)
@@ -272,6 +273,7 @@ end
 
 # Convenience: allocate jpvt + tau, return (A overwritten, jpvt, tau).
 function geqp3!(A::AbstractMatrix{T}) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A)
     m, n = size(A)
     jpvt = Vector{Int}(undef, n); tau = Vector{T}(undef, min(m, n))
     geqp3!(A, jpvt, tau)

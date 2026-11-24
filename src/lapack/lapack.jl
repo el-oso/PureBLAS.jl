@@ -1361,6 +1361,7 @@ end
 # not positive definite. Float64 lower → faer fast path; complex lower → right-looking blocked; else the
 # generic AD-traceable recursion.
 function potrf!(A::AbstractMatrix; uplo::Char = 'L')
+    Base.require_one_based_indexing(A)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("potrf!: A must be square"))
     if uplo == 'L' && _strided1(A)

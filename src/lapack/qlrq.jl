@@ -67,6 +67,7 @@ subdiagonal of that corner, `tau[i]` (standard convention) the coefficients. `A 
 Q = H(k)…H(1), k = min(m,n). Reflectors are generated bottom-up.
 """
 function geqlf!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A); k = min(m, n)
     length(tau) >= k || throw(DimensionMismatch("geqlf!: length(tau) < min(size(A))"))
     @inbounds for i in k:-1:1
@@ -81,6 +82,7 @@ function geqlf!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T}
     return A
 end
 function geqlf!(A::AbstractMatrix{T}) where {T}
+    Base.require_one_based_indexing(A)
     tau = Vector{T}(undef, min(size(A)...)); geqlf!(A, tau); return A, tau
 end
 
@@ -92,6 +94,7 @@ Form Q (LAPACK dorgql/zungql, unblocked dorg2l/zung2l). On entry A (m×n, m≥n)
 reflectors; on exit A holds the m×n matrix Q with orthonormal columns. `k = length(tau)` reflectors.
 """
 function orgql!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A); k = length(tau)
     n <= m || throw(DimensionMismatch("orgql!: cols(A) > rows(A)"))
     k <= n || throw(DimensionMismatch("orgql!: length(tau) > cols(A)"))
@@ -130,6 +133,7 @@ function ormql!(
         side::Char, trans::Char, A::AbstractMatrix{T}, tau::AbstractVector{T},
         C::AbstractMatrix{T}
     ) where {T}
+    Base.require_one_based_indexing(A, tau, C)
     m, n = size(C); k = length(tau)
     left = side == 'L'; notran = trans == 'N'
     nq = left ? m : n
@@ -164,6 +168,7 @@ triangle of the top-right m×m block holds R; the essential ROW reflectors sit t
 the coefficients. `A = R·Q`, Q = H(1)…H(k) (real) / H(1)ᴴ…H(k)ᴴ (complex), k = min(m,n).
 """
 function gerqf!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A); k = min(m, n)
     length(tau) >= k || throw(DimensionMismatch("gerqf!: length(tau) < min(size(A))"))
     @inbounds for i in k:-1:1
@@ -182,6 +187,7 @@ function gerqf!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T}
     return A
 end
 function gerqf!(A::AbstractMatrix{T}) where {T}
+    Base.require_one_based_indexing(A)
     tau = Vector{T}(undef, min(size(A)...)); gerqf!(A, tau); return A, tau
 end
 
@@ -193,6 +199,7 @@ Form Q (LAPACK dorgrq/zungrq, unblocked dorgr2/zungr2). On entry A (m×n, m≤n)
 reflectors in its rows; on exit A holds the m×n matrix Q with orthonormal rows. `k = length(tau)`.
 """
 function orgrq!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A); k = length(tau)
     m <= n || throw(DimensionMismatch("orgrq!: rows(A) > cols(A)"))
     k <= m || throw(DimensionMismatch("orgrq!: length(tau) > rows(A)"))
@@ -240,6 +247,7 @@ function ormrq!(
         side::Char, trans::Char, A::AbstractMatrix{T}, tau::AbstractVector{T},
         C::AbstractMatrix{T}
     ) where {T}
+    Base.require_one_based_indexing(A, tau, C)
     m, n = size(C); k = length(tau)
     left = side == 'L'; notran = trans == 'N'
     nq = left ? m : n

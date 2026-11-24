@@ -199,6 +199,7 @@ function gesvx!(
         C::AbstractVector{Tr}, B::AbstractMatrix{T}, X::AbstractMatrix{T},
         ferr::AbstractVector{Tr}, berr::AbstractVector{Tr}
     ) where {T <: BlasFloat, Tr <: Real}
+    Base.require_one_based_indexing(A, AF, ipiv, R, C, B, X, ferr, berr)
     n = size(A, 1); nrhs = size(B, 2)
     size(X) == (n, nrhs) || throw(DimensionMismatch("gesvx!: size(X) ≠ (size(A,1), size(B,2))"))
     length(ferr) >= nrhs || throw(DimensionMismatch("gesvx!: length(ferr) < size(B,2)"))
@@ -284,6 +285,7 @@ function gesvx!(
         ipiv::AbstractVector{<:Integer}, equed::Char, R::AbstractVector{Tr},
         C::AbstractVector{Tr}, B::AbstractMatrix{T}
     ) where {T <: BlasFloat, Tr <: Real}
+    Base.require_one_based_indexing(A, AF, ipiv, R, C, B)
     n = size(A, 1); nrhs = size(B, 2)
     return gesvx!(
         fact, trans, A, AF, ipiv, equed, R, C, B, Matrix{T}(undef, n, nrhs),

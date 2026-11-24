@@ -277,6 +277,7 @@ function _pptrf_upper_blocked!(AP::AbstractVector{T}, n::Int, nb::Int, R, V) whe
 end
 
 function pptrf!(AP::AbstractVector; uplo::AbstractChar = 'L')
+    Base.require_one_based_indexing(AP)
     n = _pp_order(length(AP))
     if uplo == 'U'
         Tu = eltype(AP)
@@ -414,6 +415,7 @@ end
 
 # ── pptrs!: solve A·X = B with the pptrf! factor (dpptrs.f) ────────────────────────────────────────
 function pptrs!(AP::AbstractVector, B::AbstractVecOrMat; uplo::AbstractChar = 'L')
+    Base.require_one_based_indexing(AP, B)
     n = _pp_order(length(AP))
     Bm = _gt_asmat(B); size(Bm, 1) == n || throw(DimensionMismatch("pptrs!: size(B,1) must equal n"))
     nrhs = size(Bm, 2)

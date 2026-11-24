@@ -125,6 +125,7 @@ function gglse!(
         A::AbstractMatrix{T}, c::AbstractVector{T}, B::AbstractMatrix{T},
         d::AbstractVector{T}, x::AbstractVector{T}
     ) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A, c, B, d, x)
     m, n = size(A); p = size(B, 1)
     size(B, 2) == n || throw(DimensionMismatch("gglse!: A and B must have the same number of columns"))
     length(c) == m || throw(DimensionMismatch("gglse!: length(c) ≠ rows(A)"))
@@ -204,5 +205,6 @@ function gglse!(
         A::AbstractMatrix{T}, c::AbstractVector{T}, B::AbstractMatrix{T},
         d::AbstractVector{T}
     ) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A, c, B, d)
     return gglse!(A, c, B, d, Vector{T}(undef, size(A, 2)))
 end

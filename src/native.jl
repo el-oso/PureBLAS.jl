@@ -55,6 +55,7 @@
 Allocating matrix-vector product `op(A)·x`.
 """
 function gemv(A::AbstractMatrix, x::AbstractVector; trans::Char = 'N')
+    Base.require_one_based_indexing(A, x)
     T = promote_type(eltype(A), eltype(x))
     y = zeros(T, trans == 'N' ? size(A, 1) : size(A, 2))
     return gemv!(y, A, x; alpha = one(T), beta = zero(T), trans)

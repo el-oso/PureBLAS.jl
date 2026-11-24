@@ -20,6 +20,7 @@ function gebak!(
         job::AbstractChar, side::AbstractChar, ilo::Integer, ihi::Integer,
         scale::AbstractVector{<:Real}, V::AbstractMatrix{T}
     ) where {T <: Number}
+    Base.require_one_based_indexing(scale, V)
     (job === 'N' || job === 'P' || job === 'S' || job === 'B') ||
         throw(ArgumentError("gebak!: job must be one of N/P/S/B"))
     (side === 'R' || side === 'L') || throw(ArgumentError("gebak!: side must be 'R' or 'L'"))
@@ -389,10 +390,12 @@ The long forms take every output as a caller buffer (`VR` n×n for `jobvr='V'`, 
 `scale` real, length n) and allocate nothing. `VR` MUST NOT be `A`.
 """
 function geev!(jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T}) where {T <: Real}
+    Base.require_one_based_indexing(A)
     wr, wi, VL, VR = _geev_run!('B', Char(jobvl), Char(jobvr), A)
     return wr, wi, VL, VR
 end
 function geev!(jobvl::AbstractChar, jobvr::AbstractChar, A::AbstractMatrix{T}) where {T <: Complex}
+    Base.require_one_based_indexing(A)
     w, VL, VR = _geev_run!('B', Char(jobvl), Char(jobvr), A)
     return w, VL, VR
 end
@@ -401,6 +404,7 @@ function geev!(
         wr::AbstractVector{T}, wi::AbstractVector{T}, VL::AbstractMatrix{T},
         VR::AbstractMatrix{T}, scale::AbstractVector{<:Real}
     ) where {T <: Real}
+    Base.require_one_based_indexing(A, wr, wi, VL, VR, scale)
     _geev_run!('B', Char(jobvl), Char(jobvr), A, wr, wi, VL, VR, scale)
     return wr, wi, VL, VR
 end
@@ -409,6 +413,7 @@ function geev!(
         w::AbstractVector{T}, VL::AbstractMatrix{T}, VR::AbstractMatrix{T},
         scale::AbstractVector{<:Real}
     ) where {T <: Complex}
+    Base.require_one_based_indexing(A, w, VL, VR, scale)
     _geev_run!('B', Char(jobvl), Char(jobvr), A, w, VL, VR, scale)
     return w, VL, VR
 end
@@ -425,11 +430,13 @@ The 5-argument form takes the caller's `w` (complex, length n), `VS` (n×n for `
 `scale` (real, length n) and allocates nothing. `VS` MUST NOT be `A`.
 """
 function gees!(jobvs::AbstractChar, A::AbstractMatrix{T}) where {T <: Real}
+    Base.require_one_based_indexing(A)
     n = size(A, 1)
     return gees!(jobvs, A, Vector{Complex{T}}(undef, n),
                  Matrix{T}(undef, n, Char(jobvs) === 'V' ? n : 0), Vector{T}(undef, n))
 end
 function gees!(jobvs::AbstractChar, A::AbstractMatrix{T}) where {T <: Complex}
+    Base.require_one_based_indexing(A)
     n = size(A, 1)
     return gees!(jobvs, A, zeros(T, n),
                  Matrix{T}(undef, n, Char(jobvs) === 'V' ? n : 0), Vector{real(T)}(undef, n))
@@ -438,6 +445,7 @@ function gees!(
         jobvs::AbstractChar, A::AbstractMatrix{T}, w::AbstractVector{<:Complex},
         VS::AbstractMatrix{T}, scale::AbstractVector{<:Real}
     ) where {T <: Number}
+    Base.require_one_based_indexing(A, w, VS, scale)
     _gees_run!(Char(jobvs), A, w, VS, scale)
     return A, VS, w
 end

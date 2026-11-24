@@ -122,6 +122,7 @@ all-ones.
 function gebal!(
         A::AbstractMatrix{T}, scale::AbstractVector{<:Real}; job::Char = 'B'
     ) where {T <: Number}
+    Base.require_one_based_indexing(A, scale)
     R = real(T)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("gebal!: A must be square"))
@@ -231,6 +232,7 @@ end
 
 # Allocating convenience form — unchanged behaviour and return value.
 function gebal!(A::AbstractMatrix{T}; job::Char = 'B') where {T <: Number}
+    Base.require_one_based_indexing(A)
     scale = Vector{real(T)}(undef, size(A, 1))
     k, l = gebal!(A, scale; job = job)
     return k, l, scale
@@ -252,6 +254,7 @@ function gehrd!(
         A::AbstractMatrix{T}, ilo::Integer, ihi::Integer,
         tau::AbstractVector{T}
     ) where {T <: Number}
+    Base.require_one_based_indexing(A, tau)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("gehrd!: A must be square"))
     length(tau) >= max(n - 1, 0) || throw(DimensionMismatch("gehrd!: length(tau) < n-1"))
@@ -609,6 +612,7 @@ end
 
 # Convenience: whole-matrix reduction (ilo=1, ihi=n), allocate tau, return (A, tau) — mirrors LAPACK.gehrd!.
 function gehrd!(A::AbstractMatrix{T}) where {T <: Number}
+    Base.require_one_based_indexing(A)
     n = size(A, 1)
     tau = Vector{T}(undef, max(n - 1, 0))
     gehrd!(A, 1, n, tau)
@@ -631,6 +635,7 @@ function orghr!(
         A::AbstractMatrix{T}, ilo::Integer, ihi::Integer,
         tau::AbstractVector{T}
     ) where {T <: Number}
+    Base.require_one_based_indexing(A, tau)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("orghr!: A must be square"))
     # Arena borrow (arena.jl), not the old owned `orghrq` field: the n×n accumulation target. Exact ld (= n)
@@ -707,6 +712,7 @@ function ormhr!(
         side::Char, trans::Char, ilo::Integer, ihi::Integer, A::AbstractMatrix{T},
         tau::AbstractVector{T}, C::AbstractMatrix{T}
     ) where {T <: Number}
+    Base.require_one_based_indexing(A, tau, C)
     n = size(A, 1)
     # Arena borrows (arena.jl), replacing the owned `mhrq`/`mhrc` pair: ormhr!'s OWN Q — distinct from
     # orghr!'s because ormhr! NESTS `_orghr_into!`, which under the arena is automatic — and the gemm!

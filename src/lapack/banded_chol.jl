@@ -41,6 +41,7 @@
 #       rank-1 streams with zero reuse while blocked is compute-bound — if blocked hasn't won by
 #       16W the harness returns typemax (never block; keep the proven kernel).
 function pbtrf!(AB::AbstractMatrix; uplo::AbstractChar = 'L', kd::Integer = size(AB, 1) - 1)
+    Base.require_one_based_indexing(AB)
     n = size(AB, 2)
     size(AB, 1) >= kd + 1 || throw(DimensionMismatch("pbtrf!: size(AB,1) must be ≥ kd+1"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("pbtrf!: uplo must be 'L' or 'U'"))
@@ -606,6 +607,7 @@ function pbtrs!(
         AB::AbstractMatrix, B::AbstractVecOrMat; uplo::AbstractChar = 'L',
         kd::Integer = size(AB, 1) - 1
     )
+    Base.require_one_based_indexing(AB, B)
     n = size(AB, 2)
     Bm = _gt_asmat(B); size(Bm, 1) == n || throw(DimensionMismatch("pbtrs!: size(B,1) must equal n"))
     nrhs = size(Bm, 2)

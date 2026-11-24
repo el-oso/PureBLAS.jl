@@ -137,6 +137,7 @@ function gebd2!(
         A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::AbstractVector{Float64},
         tauq::AbstractVector{Float64}, taup::AbstractVector{Float64}
     )
+    Base.require_one_based_indexing(A, d, e, tauq, taup)
     m, n = size(A)
     m >= n || _throw_mge_n(:gebd2!, m, n)
     @inbounds for i in 1:n
@@ -233,6 +234,7 @@ function gebd2!(
         A::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R},
         tauq::AbstractVector{T}, taup::AbstractVector{T}
     ) where {T <: Complex, R <: Real}
+    Base.require_one_based_indexing(A, d, e, tauq, taup)
     m, n = size(A)
     m >= n || _throw_mge_n(:gebd2!, m, n)
     @inbounds for i in 1:n
@@ -707,6 +709,7 @@ function gebrd!(
         A::AbstractMatrix{T}, d::AbstractVector, e::AbstractVector,
         tauq::AbstractVector, taup::AbstractVector; nb::Int = _brd_nb()
     ) where {T <: Number}
+    Base.require_one_based_indexing(A, d, e, tauq, taup)
     m, n = size(A)
     ws = _svdws(T)
     _svd_grow_bidiag!(ws, m, n)
@@ -766,6 +769,7 @@ function gebrd!(
         tauq::AbstractVector{Float64}, taup::AbstractVector{Float64}, ws::SVDWorkspace{Float64};
         nb::Int = _brd_nb()
     )
+    Base.require_one_based_indexing(A, d, e, tauq, taup)
     m, n = size(A)
     m >= n || _throw_mge_n(:gebrd!, m, n)
     if _gebrd_needs_pad(A, m, n)
@@ -819,6 +823,7 @@ function gebrd!(
         A::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R}, tauq::AbstractVector{T},
         taup::AbstractVector{T}, ws::SVDWorkspace{T}; nb::Int = _brd_nb()
     ) where {T <: Complex, R <: Real}
+    Base.require_one_based_indexing(A, d, e, tauq, taup)
     m, n = size(A)
     m >= n || _throw_mge_n(:gebrd!, m, n)
     k = n; nx = nb
@@ -969,6 +974,9 @@ function bdsqr!(
         d::AbstractVector{T}, e::AbstractVector{T}, U::Union{Nothing, AbstractMatrix{T}},
         V::Union{Nothing, AbstractMatrix{T}}
     ) where {T <: Real}
+    Base.require_one_based_indexing(d, e)
+    isnothing(U) || Base.require_one_based_indexing(U)
+    isnothing(V) || Base.require_one_based_indexing(V)
     n = length(d)
     n == 0 && return d
     mx = zero(T)                                      # scale the bidiagonal to O(1) so _givens is fast+safe
@@ -1101,6 +1109,7 @@ function bdsqr!(
         Vt::AbstractMatrix{Complex{R}}, U::AbstractMatrix{Complex{R}},
         C::AbstractMatrix{Complex{R}}
     ) where {R <: AbstractFloat}
+    Base.require_one_based_indexing(d, e, Vt, U, C)
     n = length(d)
     (uplo == 'U' || uplo == 'L') || throw(ArgumentError("bdsqr!: uplo must be 'U' or 'L'"))
     length(e) >= n - 1 || throw(DimensionMismatch("bdsqr!: e must have length >= n-1"))
@@ -1565,6 +1574,7 @@ function gesvd!(
         A::AbstractMatrix{Float64}, U::AbstractMatrix{Float64}, S::AbstractVector{Float64},
         Vt::AbstractMatrix{Float64}; full_u::Bool = false, full_v::Bool = false
     )
+    Base.require_one_based_indexing(A, U, S, Vt)
     m, n = size(A)
     ws = _svdws()
     if m < n
@@ -1613,6 +1623,7 @@ function _gebrd_unblocked!(
 end
 
 function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{T}) where {T <: Real}
+    Base.require_one_based_indexing(A, S)
     m, n = size(A)
     min(m, n) == 0 && return S
     if m < n                                                    # σ(A) = σ(Aᵀ) — reduce to the tall case
@@ -1633,6 +1644,7 @@ function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{T}) where {T <: Rea
 end
 
 function gesvd!(A::AbstractMatrix{T}; want_vectors::Bool = true) where {T <: Real}
+    Base.require_one_based_indexing(A)
     # Singular VECTORS for the generic path would need a generic orgbr (accumulate the bidiagonalisation
     # reflectors into U and Vᵀ) plus vector-carrying bdsqr rotations. Not implemented — and an explicit
     # error is the honest outcome, since silently returning values where vectors were asked for is the
@@ -1646,6 +1658,7 @@ function gesvd!(A::AbstractMatrix{T}; want_vectors::Bool = true) where {T <: Rea
 end
 
 function gesvd_vals!(A::AbstractMatrix{Float64}, S::AbstractVector{Float64})
+    Base.require_one_based_indexing(A, S)
     m, n = size(A)
     ws = _svdws()
     if m < n                                      # σ(A) = σ(Aᵀ)
@@ -1659,6 +1672,7 @@ end
 # Full SVD of A (Float64), convenience allocating form. want_vectors=false → (S,); true → (U, S, Vᵀ),
 # economy (U m×min, Vᵀ min×n). Allocates the outputs, then calls the 0-alloc in-place entry.
 function gesvd!(A::AbstractMatrix{Float64}; want_vectors::Bool = true)
+    Base.require_one_based_indexing(A)
     m, n = size(A); mn = min(m, n)
     if !want_vectors
         S = Vector{Float64}(undef, mn)
@@ -1677,6 +1691,7 @@ end
 # (the complex back-transform of Q,P onto the real bidiagonal vectors) are the follow-up. ponytail: local
 # d,e,τ scratch (values path only); the SVDWorkspace real/complex split lands with the vectors path.
 function gesvd_vals!(A::AbstractMatrix{T}, S::AbstractVector{<:Real}) where {T <: BlasComplex}
+    Base.require_one_based_indexing(A, S)
     m, n = size(A)
     if m < n                                                  # tall via transpose (σ preserved). Explicit copy
         At = Matrix{T}(undef, n, m)                            # into a concrete Matrix — permutedims on a PtrMatrix
@@ -1801,6 +1816,7 @@ function gesvd!(
         A::AbstractMatrix{T}, U::AbstractMatrix{T}, S::AbstractVector{<:Real},
         Vt::AbstractMatrix{T}; full_u::Bool = false, full_v::Bool = false
     ) where {T <: Complex}
+    Base.require_one_based_indexing(A, U, S, Vt)
     m, n = size(A)
     ws = _svdws(T)
     if m < n
@@ -1819,6 +1835,7 @@ end
 # Complex full SVD (zgesvd), convenience allocating form. want_vectors=false → (S,); true → (U, S, Vᴴ),
 # economy (U m×min, Vᴴ min×n). Mirrors the Float64 convenience entry.
 function gesvd!(A::AbstractMatrix{T}; want_vectors::Bool = true) where {T <: BlasComplex}
+    Base.require_one_based_indexing(A)
     m, n = size(A); mn = min(m, n)
     if !want_vectors
         S = Vector{real(T)}(undef, mn)

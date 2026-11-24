@@ -723,6 +723,7 @@ function trsyl!(
         transa::AbstractChar, transb::AbstractChar, isgn::Integer,
         A::AbstractMatrix{T}, B::AbstractMatrix{T}, C::AbstractMatrix{T}
     ) where {T}
+    Base.require_one_based_indexing(A, B, C)
     (transa === 'N' || transa === 'T' || transa === 'C') ||
         throw(ArgumentError("trsyl!: transa must be 'N', 'T' or 'C'"))
     (transb === 'N' || transb === 'T' || transb === 'C') ||
