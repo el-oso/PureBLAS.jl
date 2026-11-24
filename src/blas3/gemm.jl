@@ -733,6 +733,9 @@ end
 # ragged panel are exact zeros.
 @inline function _pack_B_simd!(Bp::AbstractVector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nrv, boff::Int) where {T}
     W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T); ldb = stride(B, 2); nr = _nrval(nrv)
+    # Nothing to pack. Without this, `kce = 0` leaves the op(B)=B column-block loop with an empty body
+    # that LLVM cannot delete, because `c0 += W` may overflow.
+    kce > 0 || return
     np = cld(nce, nr); ov = V(one(T))
     tB && iszero((ldb * sz) % _L1_WAY_BYTES) && return _pack_B_skew!(Bp, B, pc, jc, kce, nce, nr, boff)
     GC.@preserve B Bp begin
@@ -2350,6 +2353,7 @@ end
         BpR::Vector{T}, BpI::Vector{T}, B, pc::Int, jc::Int, kce::Int, nce::Int, tB::Bool, nr::Int
     ) where {T}
     W = _vwidth(T); sz = sizeof(T); ldb = stride(B, 2); np = cld(nce, nr)
+    kce > 0 || return   # nothing to pack; see `_pack_B_simd!`
     tB && iszero((2 * ldb * sz) % _L1_WAY_BYTES) && return _pack_B_cmplx_skew!(BpR, BpI, B, pc, jc, kce, nce, nr)
     GC.@preserve B BpR BpI begin
         Bptr = Ptr{T}(pointer(B)); PR = pointer(BpR); PI = pointer(BpI)

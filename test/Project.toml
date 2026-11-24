@@ -44,7 +44,10 @@ TrimCheck = "f940d764-e397-4179-96e0-76ce55cfe39b"
 # against 245 pass / 0 errored on 0.4.9.
 # Each StrictModeTest release bounds StrictMode to its own minor series (0.5.0 declares
 # `StrictMode = "0.5.0"`), so the two move together and the main Project.toml bound must agree.
-StrictModeTest = "0.5.17"
+# 0.5.18 (with StrictMode 0.5.20) also audits the keyword-call methods of registered signatures, and
+# `test/registered_proof_baseline.txt` lists the ones that do not pass; an older release reports them
+# as fixed.
+StrictModeTest = "0.5.18"
 TrimCheck = "0.1.5"
 Chairmarks = "1"
 
