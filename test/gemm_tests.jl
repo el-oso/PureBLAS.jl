@@ -1485,3 +1485,86 @@ end
         end
     end
 end
+
+# A caller that loses the pool claim runs `_gemm_threaded!`'s serial fallback, which must compute the
+# same operation as the job kind it was asked for. The first item checks that every kind is named in
+# the fallback block, so a new kind cannot fall through to another kind's serial path. The second runs
+# copy, swap and side-L symm threaded and then with the claim held, and requires the serial bits both
+# times.
+@testitem "lost-claim fallback: every job kind has its own branch" tags = [:checks] begin
+    using PureBLAS
+    const P = PureBLAS
+    src = read(joinpath(pkgdir(PureBLAS), "src", "blas3", "gemm.jl"), String)
+    i0 = findfirst("    if !won\n", src)
+    @test !isnothing(i0)
+    i1 = findnext("        return zero(T)\n    end", src, last(i0))
+    @test !isnothing(i1)
+    block = src[first(i0):last(i1)]
+    for k in instances(P._MTKind)
+        @test occursin(Regex("\\b" * string(k) * "\\b"), block)
+    end
+end
+
+@testitem "lost-claim fallback: copy, swap and symm give the serial bits" tags = [:checks] begin
+    # liveness-ok: each case asserts that the job was published with its own kind before the forced
+    # loss, so the fallback comparison cannot pass on a call that never reached the pool.
+    using PureBLAS, Random
+    using Base.Threads: nthreads
+    const P = PureBLAS
+    bitsame(X, Y) = reinterpret(UInt8, vec(X)) == reinterpret(UInt8, vec(Y))
+    if nthreads() < 2
+        @test_skip "needs >= 2 julia threads"
+    else
+        old = P.get_num_threads(); oldfloor = P._MT_FLOOR[]
+        try
+            for T in (Float64, Float32)
+                rng = MersenneTwister(3)
+                n = 100_000
+                x0 = randn(rng, T, n); y0 = randn(rng, T, n)
+                m = 128
+                S = randn(rng, T, m, m); B = randn(rng, T, m, 200); C0 = randn(rng, T, m, 200)
+                docopy(nw) = (y = copy(y0); P._copy_threaded!(n, x0, y, nw); (y,))
+                doswap(nw) = (x = copy(x0); y = copy(y0); P._swap_threaded!(n, x, y, nw); (x, y))
+                dosymm() = (C = copy(C0); P.symm!(C, S, B; side = 'L', uplo = 'U', alpha = T(1.3), beta = T(0.7)); (C,))
+                P.set_num_threads(1)
+                want_symm = dosymm()
+                want_copy = (copy(x0),)
+                want_swap = (copy(y0), copy(x0))
+                for t in unique((2, nthreads()))
+                    P.set_num_threads(t)
+                    P._MT_FLOOR[] = 1
+                    p = P._gemm_pool(T)
+                    cases = Any[
+                        ("copy", P._MT_KIND_COPY, () -> docopy(t), want_copy),
+                        ("swap", P._MT_KIND_SWAP, () -> doswap(t), want_swap),
+                    ]
+                    sme = (T === Float64 && P._SME_F64) || (T === Float32 && P._SME_F32)
+                    sme || push!(cases, ("symm", P._MT_KIND_SYMM, dosymm, want_symm))
+                    for (name, kind, f, want) in cases
+                        @testset "$T $name t=$t" begin
+                            g0 = @atomic p.gen
+                            got = f()
+                            @test (@atomic p.gen) != g0
+                            @test p.kind == kind
+                            @test all(map(bitsame, got, want))
+                            lost0 = P._MT_LOST[]
+                            held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
+                            @test held
+                            local lost
+                            held && try
+                                lost = f()
+                            finally
+                                P._MT_CLAIM[] = false
+                            end
+                            @test P._MT_LOST[] == lost0 + 1
+                            @test all(map(bitsame, lost, want))
+                        end
+                    end
+                end
+            end
+        finally
+            P.set_num_threads(old)
+            P._MT_FLOOR[] = oldfloor
+        end
+    end
+end

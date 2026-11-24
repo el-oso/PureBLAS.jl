@@ -6975,9 +6975,25 @@ end
         elseif T <: BlasReal && kind == _MT_KIND_ROWSPLIT
             # The whole split, serially: the same blocks the bands run.
             _rows_split_serial!(C, A, B, alpha, beta, false, lup.m, A.n, lup.nb, 2)
-        else
+        elseif kind == _MT_KIND_COPY
+            # Pure data movement over the whole vector, as the chunks do over their slices.
+            _copy_simd!(C.m, A.ptr, C.ptr)
+        elseif kind == _MT_KIND_SWAP
+            _swap_simd!(C.m, A.ptr, C.ptr)
+        elseif kind == _MT_KIND_SYMM
+            # Side L, real: expand A into this task's own twin and multiply the whole of B, with the
+            # undivided extents and the Strassen mode `_symm_run_chunk` passes, so a loser runs the
+            # arithmetic each band runs.
+            Ad = view(_symm_scr_mt(T, C.m), 1:C.m, 1:C.m)
+            _symm_materialize!(Ad, up, false, A, C.m)
+            _gemm_core!(C, Ad, B, alpha, beta, false, false, false, false, (C.m, C.n, C.m), _STR_FLOOR, 1)
+        elseif kind == _MT_KIND_GEMM
             # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
             _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
+        else
+            # Every kind needs its own branch above: running another kind's serial path computes a
+            # different operation. `test/gemm_tests.jl` checks that each kind is named in this block.
+            throw(ArgumentError("_gemm_threaded!: the lost-claim fallback has no branch for this job kind"))
         end
         return zero(T)
     end
