@@ -7,22 +7,55 @@
 # (Cholesky helpers _CVF/_CHOLW/_clidx/_cvptr from lapack.jl) is Float64, every other real gets the dgeqr2
 # panel and rides the same blocked trailing update (a Dual through the planar dual L3 route).
 
-# Compute the Householder reflector of column `col` in place (faer convention: H=I−τ·v·vᵀ, v[col]=1
-# implicit + essential below, R diagonal = β on output). Returns tinv (=τ), or Inf for a trivial reflector.
-@inline function _qr_reflect_f64!(p::Ptr{Float64}, m::Int, col::Int, ld::Int)
-    tn = 0.0; i = col + 1
-    acc = _CVF(0.0)                                                # vector accumulator: one horizontal reduction
+# ‖A[col+1:m, col]‖₂. The SIMD sum of squares is exact unless it under- or overflows: entries below
+# √floatmin (≈1.5e-154) square into the subnormal range or to zero, entries above √floatmax square to Inf.
+# Either case takes the scaled recompute, as `_larfg!` (svd.jl) does. NaN and Inf propagate.
+@inline function _qr_tailnorm_f64(p::Ptr{Float64}, m::Int, col::Int, ld::Int)
+    i = col + 1; acc = _CVF(0.0)                                   # vector accumulator: one horizontal reduction
     @inbounds while i + _CHOLW - 1 <= m
         x = vload(_CVF, _cvptr(p, i, col, ld)); acc = muladd(x, x, acc); i += _CHOLW
     end
-    tn = sum(acc)                                                  # (was `tn += sum(x*x)` PER iter — a serial
+    tn = sum(acc)
     @inbounds while i <= m
         x = unsafe_load(p, _clidx(i, col, ld)); tn = muladd(x, x, tn); i += 1
-    end  # shuffle/add
-    # on the reflector dependency chain at every column; Fable 2026-07-15)
-    tail = sqrt(tn); @inbounds head = unsafe_load(p, _clidx(col, col, ld))
-    tail < floatmin(Float64) && return Inf
-    nrm = hypot(abs(head), tail); sn = head >= 0.0 ? nrm : -nrm; hwb = head + sn; hi = 1.0 / hwb; vi = _CVF(hi)
+    end
+    floatmin(Float64) <= tn < Inf && return sqrt(tn)
+    return _qr_tailnorm_scaled_f64(p, m, col, ld)
+end
+@noinline function _qr_tailnorm_scaled_f64(p::Ptr{Float64}, m::Int, col::Int, ld::Int)
+    scale = 0.0
+    @inbounds for i in (col + 1):m
+        scale = max(scale, abs(unsafe_load(p, _clidx(i, col, ld))))
+    end
+    (iszero(scale) || !isfinite(scale)) && return scale
+    ss = 0.0
+    @inbounds for i in (col + 1):m
+        t = unsafe_load(p, _clidx(i, col, ld)) / scale; ss = muladd(t, t, ss)
+    end
+    return scale * sqrt(ss)
+end
+# Multiply A[col:m, col] by 2^k, which is exact. A column whose norm is below floatmin needs this before
+# its reflector is formed: 1/(head ± ‖x‖) overflows there. v and τ do not change under the scaling; only β
+# does, and the caller scales it back. The caller recomputes ‖x‖ from the scaled column: the norm computed
+# before scaling was rounded to the subnormal grid, and τ formed from it no longer matches v.
+@noinline function _qr_rescale_col!(p::Ptr{Float64}, m::Int, col::Int, ld::Int, nrm::Float64)
+    k = -exponent(nrm)
+    @inbounds for i in col:m
+        unsafe_store!(p, ldexp(unsafe_load(p, _clidx(i, col, ld)), k), _clidx(i, col, ld))
+    end
+    return k
+end
+# Compute the Householder reflector of column `col` in place (faer convention: H=I−τ·v·vᵀ, v[col]=1
+# implicit + essential below, R diagonal = β on output). Returns tinv (=τ), or Inf for a trivial reflector.
+@inline function _qr_reflect_f64!(p::Ptr{Float64}, m::Int, col::Int, ld::Int)
+    tail = _qr_tailnorm_f64(p, m, col, ld); @inbounds head = unsafe_load(p, _clidx(col, col, ld))
+    iszero(tail) && return Inf
+    nrm = hypot(abs(head), tail); k = 0
+    if nrm < floatmin(Float64)
+        k = _qr_rescale_col!(p, m, col, ld, nrm)
+        head = ldexp(head, k); tail = _qr_tailnorm_f64(p, m, col, ld); nrm = hypot(abs(head), tail)
+    end
+    sn = head >= 0.0 ? nrm : -nrm; hwb = head + sn; hi = 1.0 / hwb; vi = _CVF(hi)
     i = col + 1
     @inbounds while i + _CHOLW - 1 <= m
         b = _cvptr(p, i, col, ld); vstore(vload(_CVF, b) * vi, b); i += _CHOLW
@@ -30,7 +63,7 @@
     @inbounds while i <= m
         unsafe_store!(p, unsafe_load(p, _clidx(i, col, ld)) * hi, _clidx(i, col, ld)); i += 1
     end
-    @inbounds unsafe_store!(p, -sn, _clidx(col, col, ld))
+    @inbounds unsafe_store!(p, iszero(k) ? -sn : ldexp(-sn, -k), _clidx(col, col, ld))
     return 1.0 / (0.5 * (1.0 + (tail * abs(hi))^2))              # tinv = 1/τ
 end
 # Apply a single reflector H_col (rank-1) to trailing column j: A[:,j] += (−tinv·v_colᵀA[:,j])·v_col.
@@ -59,18 +92,15 @@ end
 # in the PAIR path; singles keep _qr_reflect_f64! (which scales). Returns (hi, tinv); tinv=Inf ⇒ trivial (NO
 # scale done — column untouched, caller must treat as a trivial reflector, exactly as _qr_reflect_f64! does).
 @inline function _qr_norm_head_f64!(p::Ptr{Float64}, m::Int, col::Int, ld::Int)
-    i = col + 1; acc = _CVF(0.0)
-    @inbounds while i + _CHOLW - 1 <= m
-        x = vload(_CVF, _cvptr(p, i, col, ld)); acc = muladd(x, x, acc); i += _CHOLW
+    tail = _qr_tailnorm_f64(p, m, col, ld); @inbounds head = unsafe_load(p, _clidx(col, col, ld))
+    iszero(tail) && return (0.0, Inf)
+    nrm = hypot(abs(head), tail); k = 0
+    if nrm < floatmin(Float64)
+        k = _qr_rescale_col!(p, m, col, ld, nrm)
+        head = ldexp(head, k); tail = _qr_tailnorm_f64(p, m, col, ld); nrm = hypot(abs(head), tail)
     end
-    tn = sum(acc)
-    @inbounds while i <= m
-        x = unsafe_load(p, _clidx(i, col, ld)); tn = muladd(x, x, tn); i += 1
-    end
-    tail = sqrt(tn); @inbounds head = unsafe_load(p, _clidx(col, col, ld))
-    tail < floatmin(Float64) && return (0.0, Inf)
-    nrm = hypot(abs(head), tail); sn = head >= 0.0 ? nrm : -nrm; hi = 1.0 / (head + sn)
-    @inbounds unsafe_store!(p, -sn, _clidx(col, col, ld))
+    sn = head >= 0.0 ? nrm : -nrm; hi = 1.0 / (head + sn)
+    @inbounds unsafe_store!(p, iszero(k) ? -sn : ldexp(-sn, -k), _clidx(col, col, ld))
     return (hi, 1.0 / (0.5 * (1.0 + (tail * abs(hi))^2)))
 end
 # Fused SCALE(col by hi) + DOT(v0ᵀ·A[:,j]): one pass over col+1:m — scale each v0_i = A[i,col]·hi (store) AND
@@ -182,10 +212,28 @@ end
     @inbounds alpha = unsafe_load(p, _clidx(col, col, ld))
     (xnorm == 0 && imag(alpha) == 0) && return zero(Complex{R})    # trivial reflector
     beta = -copysign(hypot(abs(alpha), xnorm), real(alpha))
+    vp = p + ((col - 1) * ld + col) * csz                          # &A[col+1, col]
+    knt = 0                                                        # zlarfg's rescale, as in `_larfg!` (svd.jl)
+    if abs(beta) < _larfg_safmin(R)
+        rs = inv(_larfg_safmin(R))
+        while true
+            knt += 1
+            @inbounds for i in col:m
+                unsafe_store!(p, unsafe_load(p, _clidx(i, col, ld)) * rs, _clidx(i, col, ld))
+            end
+            beta *= rs
+            (abs(beta) < _larfg_safmin(R) && knt < 20) || break
+        end
+        xnorm = mt0 > 0 ? _nrm2(mt0, vp, 1) : zero(R)
+        @inbounds alpha = unsafe_load(p, _clidx(col, col, ld))
+        beta = -copysign(hypot(abs(alpha), xnorm), real(alpha))
+    end
     tau = complex((beta - real(alpha)) / beta, -imag(alpha) / beta)
     sc = one(Complex{R}) / (alpha - beta)                          # v_essential = tail / (α − β)
-    vp = p + ((col - 1) * ld + col) * csz                          # &A[col+1, col]
     mt0 > 0 && _scal_cmplx_simd!(mt0, real(sc), imag(sc), vp)
+    for _ in 1:knt
+        beta *= _larfg_safmin(R)
+    end
     @inbounds unsafe_store!(p, complex(beta, zero(R)), _clidx(col, col, ld))
     return tau
 end
