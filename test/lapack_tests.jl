@@ -1010,6 +1010,30 @@ end
     @test_throws ArgumentError PureBLAS.geev!('V', 'N', randn(4, 4))   # left vectors not implemented
 end
 
+@testitem "trevc! — clustered eigenvalues: back-substitution does not overflow" begin
+    using PureBLAS, LinearAlgebra, Random
+    # Diagonal entries 1 + δ·i·cis(0.3i) make the unscaled back-substitution grow like (1/δ)^n.
+    resid(T, V, A) = maximum(norm(A * V[:, k] - T[k, k] * V[:, k]) / (opnorm(A, 1) * norm(V[:, k])) for k in axes(T, 1)) /
+        eps(real(eltype(T)))
+    for C in (ComplexF64, ComplexF32, Float64, Float32), (n, δ) in ((40, 1.0e-3), (200, 1.0e-6))
+        Random.seed!(1)
+        T = triu(randn(C, n, n))
+        for i in 1:n
+            T[i, i] = C(1 + δ * i * (C <: Complex ? cis(0.3i) : 1))
+        end
+        V = Matrix{C}(undef, n, n)
+        PureBLAS.trevc!('R', 'A', T, nothing, V)
+        Vl = LAPACK.trevc!('R', 'A', Int[], copy(T))
+        @test all(isfinite, V)
+        @test resid(T, V, T) <= max(100, 4 * resid(T, Vl, T))
+        Z = Matrix(qr(randn(C, n, n)).Q)
+        VB = copy(Z)
+        PureBLAS.trevc!('R', 'B', T, nothing, VB)
+        @test all(isfinite, VB)
+        @test resid(T, VB, Z * T * Z') <= 100
+    end
+end
+
 @testitem "gees (Schur) vs LAPACK — Z·T·Zᴴ=A reconstruction, Z orthonormal, real+complex" begin
     using PureBLAS, LinearAlgebra, Random
     Random.seed!(0x5C)
