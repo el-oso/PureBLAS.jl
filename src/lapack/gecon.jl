@@ -168,6 +168,7 @@ function gecon!(
         normA::Real, A_lu::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer};
         norm::Char = '1'
     ) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A_lu, ipiv)
     n = size(A_lu, 1)
     size(A_lu, 2) == n || throw(DimensionMismatch("gecon!: A_lu must be square"))
     (n == 0 || normA <= 0) && return zero(real(T))
@@ -226,6 +227,7 @@ diagonal if `diag='U'`). `‖A‖` is computed directly; `‖A⁻¹‖` via the 
 `trsv!` solves. Generic over s/d/c/z.
 """
 function trcon!(A::AbstractMatrix{T}; uplo::Char = 'U', diag::Char = 'N', norm::Char = '1') where {T <: BlasFloat}
+    Base.require_one_based_indexing(A)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("trcon!: A must be square"))
     n == 0 && return one(real(T))
@@ -249,6 +251,7 @@ factor (`A_chol`: `A = L·Lᴴ` if `uplo='L'`, `A = Uᴴ·U` if `uplo='U'`). `no
 (equal for Hermitian). `A⁻¹` is Hermitian, so op = opᴴ and norm='1'/'I' coincide. Generic s/d/c/z.
 """
 function pocon!(normA::Real, A_chol::AbstractMatrix{T}; uplo::Char = 'L', norm::Char = '1') where {T <: BlasFloat}
+    Base.require_one_based_indexing(A_chol)
     n = size(A_chol, 1)
     size(A_chol, 2) == n || throw(DimensionMismatch("pocon!: A_chol must be square"))
     (n == 0 || normA <= 0) && return zero(real(T))

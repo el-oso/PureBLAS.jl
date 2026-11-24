@@ -59,6 +59,7 @@ trapezoid holds L (m×min), the strict upper part of each row holds the essentia
 H(k)ᴴ…H(1)ᴴ (complex), k = min(m,n).
 """
 function gelqf!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A); k = min(m, n)
     length(tau) >= k || throw(DimensionMismatch("gelqf!: length(tau) < min(size(A))"))
     @inbounds for i in 1:k
@@ -82,6 +83,7 @@ end
 
 # Convenience: allocate tau, return (A overwritten, tau).
 function gelqf!(A::AbstractMatrix{T}) where {T}
+    Base.require_one_based_indexing(A)
     tau = Vector{T}(undef, min(size(A)...))
     gelqf!(A, tau)
     return A, tau
@@ -96,6 +98,7 @@ reflectors in its rows; on exit A holds the mq×n matrix Q with orthonormal rows
 reflectors are used (mq ≥ k).
 """
 function orglq!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T}
+    Base.require_one_based_indexing(A, tau)
     mq, n = size(A); k = length(tau)
     mq <= n || throw(DimensionMismatch("orglq!: rows(A) > cols(A)"))
     k <= mq || throw(DimensionMismatch("orglq!: length(tau) > rows(A)"))
@@ -144,6 +147,7 @@ function ormlq!(
         side::Char, trans::Char, A::AbstractMatrix{T}, tau::AbstractVector{T},
         C::AbstractMatrix{T}
     ) where {T}
+    Base.require_one_based_indexing(A, tau, C)
     m, n = size(C); k = length(tau)
     left = side == 'L'
     notran = trans == 'N'

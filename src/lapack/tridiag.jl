@@ -39,6 +39,7 @@ Base.@propagate_inbounds _gt_set!(X::AbstractMatrix, i, j, v) = (X[i, j] = v)
 # the U back-solve). Overwrites dl, d, du (the factor) and B (← X). Throws SingularException on a zero
 # pivot. Returns B.
 function gtsv!(dl::AbstractVector, d::AbstractVector, du::AbstractVector, B::AbstractVecOrMat)
+    Base.require_one_based_indexing(dl, d, du, B)
     n = length(d)
     (length(dl) == n - 1 && length(du) == n - 1) ||
         throw(DimensionMismatch("gtsv!: expected length(dl)=length(du)=n-1"))
@@ -146,6 +147,7 @@ function gttrf!(
         dl::AbstractVector, d::AbstractVector, du::AbstractVector,
         du2::AbstractVector, ipiv::AbstractVector{<:Integer}
     )
+    Base.require_one_based_indexing(dl, d, du, du2, ipiv)
     n = length(d)
     (length(dl) == n - 1 && length(du) == n - 1 && length(du2) == max(n - 2, 0) && length(ipiv) == n) ||
         throw(DimensionMismatch("gttrf!: dl,du length n-1; du2 length n-2; ipiv length n"))
@@ -230,6 +232,7 @@ function gttrs!(
         trans::AbstractChar, dl::AbstractVector, d::AbstractVector, du::AbstractVector,
         du2::AbstractVector, ipiv::AbstractVector{<:Integer}, B::AbstractVecOrMat
     )
+    Base.require_one_based_indexing(dl, d, du, du2, ipiv, B)
     n = length(d)
     Bm = _gt_asmat(B); size(Bm, 1) == n || throw(DimensionMismatch("gttrs!: size(B,1) must equal n"))
     nrhs = size(Bm, 2)

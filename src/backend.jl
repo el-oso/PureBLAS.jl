@@ -16,45 +16,54 @@ const DEFAULT_BACKEND = SIMDBackend()
 end
 
 @inline function axpy!(::SIMDBackend, y::AbstractVector, a::Number, x::AbstractVector)::AbstractVector
+    Base.require_one_based_indexing(y, x)
     _axpy!(_eqlen(x, y), a, x, 1, y, 1)
     return y
 end
 
 @inline function scal!(::SIMDBackend, a::Number, x::AbstractVector)::AbstractVector
+    Base.require_one_based_indexing(x)
     _scal!(length(x), a, x, 1)
     return x
 end
 
 # Copy src `x` into dest `y` (`y .= x`).
 @inline function blascopy!(::SIMDBackend, y::AbstractVector, x::AbstractVector)::AbstractVector
+    Base.require_one_based_indexing(y, x)
     _copy!(_eqlen(x, y), x, 1, y, 1)
     return y
 end
 
 @inline function swap!(::SIMDBackend, x::AbstractVector, y::AbstractVector)::Nothing
+    Base.require_one_based_indexing(x, y)
     _swap!(_eqlen(x, y), x, 1, y, 1)
     return nothing
 end
 
 # Conjugated inner product conj(x)·y (matches LinearAlgebra.dot for complex).
 @inline function dot(::SIMDBackend, x::AbstractVector, y::AbstractVector)::Number
+    Base.require_one_based_indexing(x, y)
     return _dotc(_eqlen(x, y), x, 1, y, 1)
 end
 
 # Unconjugated inner product x·y (BLAS ?dotu).
 @inline function dotu(::SIMDBackend, x::AbstractVector, y::AbstractVector)::Number
+    Base.require_one_based_indexing(x, y)
     return _dotu(_eqlen(x, y), x, 1, y, 1)
 end
 
 @inline function nrm2(::SIMDBackend, x::AbstractVector)::Real
+    Base.require_one_based_indexing(x)
     return _nrm2(length(x), x, 1)
 end
 
 @inline function asum(::SIMDBackend, x::AbstractVector)::Real
+    Base.require_one_based_indexing(x)
     return _asum(length(x), x, 1)
 end
 
 @inline function iamax(::SIMDBackend, x::AbstractVector)::Integer
+    Base.require_one_based_indexing(x)
     return _iamax(length(x), x, 1)
 end
 
@@ -64,6 +73,7 @@ end
         ::SIMDBackend, y::AbstractVector, A::AbstractMatrix, x::AbstractVector;
         alpha = one(eltype(A)), beta = zero(eltype(A)), trans::Char = 'N'
     )::AbstractVector
+    Base.require_one_based_indexing(y, A, x)
     tA = trans != 'N'; cj = trans == 'C'
     m, n = size(A)
     if tA
@@ -83,6 +93,7 @@ end
         ::SIMDBackend, alpha::Number, x::AbstractVector, y::AbstractVector,
         A::AbstractMatrix; conj::Bool = false
     )::AbstractMatrix
+    Base.require_one_based_indexing(x, y, A)
     m, n = size(A)
     length(x) == m || throw(DimensionMismatch(lazy"ger!: length(x)=$(length(x)) ≠ size(A,1)=$m"))
     length(y) == n || throw(DimensionMismatch(lazy"ger!: length(y)=$(length(y)) ≠ size(A,2)=$n"))
@@ -104,6 +115,7 @@ end
         ::SIMDBackend, y::AbstractVector, A::AbstractMatrix, x::AbstractVector;
         uplo::Char = 'U', alpha = one(eltype(A)), beta = zero(eltype(A))
     )::AbstractVector
+    Base.require_one_based_indexing(y, A, x)
     n = _symhemv_dims(A, x, y, "symv!")
     _advise_huge!(A)                      # DRAM-resident A: 2 MiB pages, +38.6% (see core.jl)
     _symv!(uplo == Char(85), n, alpha, A, x, 1, beta, y, 1)
@@ -115,6 +127,7 @@ end
         ::SIMDBackend, y::AbstractVector, A::AbstractMatrix, x::AbstractVector;
         uplo::Char = 'U', alpha = one(eltype(A)), beta = zero(eltype(A))
     )::AbstractVector
+    Base.require_one_based_indexing(y, A, x)
     n = _symhemv_dims(A, x, y, "hemv!")
     _hemv!(uplo == 'U', n, alpha, A, x, 1, beta, y, 1)
     return y
@@ -145,6 +158,7 @@ end
         ::SIMDBackend, A::AbstractMatrix, x::AbstractVector;
         uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N'
     )::AbstractVector
+    Base.require_one_based_indexing(A, x)
     n = _tri_dims(A, x, "trmv!")
     _trmv!(uplo == 'U', trans != 'N', trans == 'C', diag == 'U', n, A, x, 1)
     return x
@@ -155,6 +169,7 @@ end
         ::SIMDBackend, A::AbstractMatrix, x::AbstractVector;
         uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N'
     )::AbstractVector
+    Base.require_one_based_indexing(A, x)
     n = _tri_dims(A, x, "trsv!")
     _trsv!(uplo == 'U', trans != 'N', trans == 'C', diag == 'U', n, A, x, 1)
     return x
@@ -171,6 +186,7 @@ end
         ::SIMDBackend, y::AbstractVector, AP::AbstractVector, x::AbstractVector;
         uplo::Char = 'U', alpha = one(eltype(AP)), beta = zero(eltype(AP))
     )::AbstractVector
+    Base.require_one_based_indexing(y, AP, x)
     n = length(y); _pkvec_dims(AP, x, n, "spmv!")
     _spmv!(uplo == 'U', n, alpha, AP, x, 1, beta, y, 1)
     return y
@@ -179,6 +195,7 @@ end
         ::SIMDBackend, y::AbstractVector, AP::AbstractVector, x::AbstractVector;
         uplo::Char = 'U', alpha = one(eltype(AP)), beta = zero(eltype(AP))
     )::AbstractVector
+    Base.require_one_based_indexing(y, AP, x)
     n = length(y); _pkvec_dims(AP, x, n, "hpmv!")
     _hpmv!(uplo == 'U', n, alpha, AP, x, 1, beta, y, 1)
     return y
@@ -187,6 +204,7 @@ end
         ::SIMDBackend, AP::AbstractVector, x::AbstractVector;
         uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N'
     )::AbstractVector
+    Base.require_one_based_indexing(AP, x)
     n = length(x); _pkvec_dims(AP, x, n, "tpmv!")
     _tpmv!(uplo == 'U', trans != 'N', trans == 'C', diag == 'U', n, AP, x, 1)
     return x
@@ -195,6 +213,7 @@ end
         ::SIMDBackend, AP::AbstractVector, x::AbstractVector;
         uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N'
     )::AbstractVector
+    Base.require_one_based_indexing(AP, x)
     n = length(x); _pkvec_dims(AP, x, n, "tpsv!")
     _tpsv!(uplo == 'U', trans != 'N', trans == 'C', diag == 'U', n, AP, x, 1)
     return x
@@ -204,12 +223,14 @@ end
         ::SIMDBackend, alpha::Number, x::AbstractVector, AP::AbstractVector;
         uplo::Char = 'U'
     )::AbstractVector
+    Base.require_one_based_indexing(x, AP)
     n = length(x); _pkvec_dims(AP, x, n, "spr!"); _spr!(uplo == 'U', n, alpha, x, 1, AP); return AP
 end
 @inline function spr2!(
         ::SIMDBackend, alpha::Number, x::AbstractVector, y::AbstractVector,
         AP::AbstractVector; uplo::Char = 'U'
     )::AbstractVector
+    Base.require_one_based_indexing(x, y, AP)
     n = length(x); _pkvec_dims(AP, x, n, "spr2!")
     length(y) == n || throw(DimensionMismatch(lazy"spr2!: length(y)=$(length(y)) ≠ n=$n"))
     _spr2!(uplo == 'U', n, alpha, x, 1, y, 1, AP); return AP
@@ -218,12 +239,14 @@ end
         ::SIMDBackend, alpha::Number, x::AbstractVector, AP::AbstractVector;
         uplo::Char = 'U'
     )::AbstractVector
+    Base.require_one_based_indexing(x, AP)
     n = length(x); _pkvec_dims(AP, x, n, "hpr!"); _hpr!(uplo == 'U', n, alpha, x, 1, AP); return AP
 end
 @inline function hpr2!(
         ::SIMDBackend, alpha::Number, x::AbstractVector, y::AbstractVector,
         AP::AbstractVector; uplo::Char = 'U'
     )::AbstractVector
+    Base.require_one_based_indexing(x, y, AP)
     n = length(x); _pkvec_dims(AP, x, n, "hpr2!")
     length(y) == n || throw(DimensionMismatch(lazy"hpr2!: length(y)=$(length(y)) ≠ n=$n"))
     _hpr2!(uplo == 'U', n, alpha, x, 1, y, 1, AP); return AP
@@ -235,6 +258,7 @@ end
         m::Integer, kl::Integer, ku::Integer; trans::Char = 'N',
         alpha = one(eltype(AB)), beta = zero(eltype(AB))
     )::AbstractVector
+    Base.require_one_based_indexing(y, AB, x)
     n = size(AB, 2); tA = trans != 'N'
     size(AB, 1) >= kl + ku + 1 || throw(DimensionMismatch(lazy"gbmv!: size(AB,1)=$(size(AB, 1)) < kl+ku+1=$(kl + ku + 1)"))
     length(x) == (tA ? m : n) || throw(DimensionMismatch(lazy"gbmv!('$trans'): length(x)=$(length(x)) ≠ $(tA ? m : n)"))
@@ -252,6 +276,7 @@ end
         ::SIMDBackend, y::AbstractVector, AB::AbstractMatrix, x::AbstractVector;
         uplo::Char = 'U', alpha = one(eltype(AB)), beta = zero(eltype(AB))
     )::AbstractVector
+    Base.require_one_based_indexing(y, AB, x)
     n, k = _sbvec_dims(AB, x, y, "sbmv!")
     _sbmv!(uplo == 'U', n, k, alpha, AB, x, 1, beta, y, 1)
     return y
@@ -260,6 +285,7 @@ end
         ::SIMDBackend, y::AbstractVector, AB::AbstractMatrix, x::AbstractVector;
         uplo::Char = 'U', alpha = one(eltype(AB)), beta = zero(eltype(AB))
     )::AbstractVector
+    Base.require_one_based_indexing(y, AB, x)
     n, k = _sbvec_dims(AB, x, y, "hbmv!")
     _hbmv!(uplo == 'U', n, k, alpha, AB, x, 1, beta, y, 1)
     return y
@@ -268,6 +294,7 @@ end
         ::SIMDBackend, AB::AbstractMatrix, x::AbstractVector;
         uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N'
     )::AbstractVector
+    Base.require_one_based_indexing(AB, x)
     n = size(AB, 2); length(x) == n || throw(DimensionMismatch(lazy"tbmv!: length(x)=$(length(x)) ≠ n=$n"))
     _tbmv!(uplo == 'U', trans != 'N', trans == 'C', diag == 'U', n, size(AB, 1) - 1, AB, x, 1)
     return x
@@ -276,6 +303,7 @@ end
         ::SIMDBackend, AB::AbstractMatrix, x::AbstractVector;
         uplo::Char = 'U', trans::Char = 'N', diag::Char = 'N'
     )::AbstractVector
+    Base.require_one_based_indexing(AB, x)
     n = size(AB, 2); length(x) == n || throw(DimensionMismatch(lazy"tbsv!: length(x)=$(length(x)) ≠ n=$n"))
     _tbsv!(uplo == 'U', trans != 'N', trans == 'C', diag == 'U', n, size(AB, 1) - 1, AB, x, 1)
     return x

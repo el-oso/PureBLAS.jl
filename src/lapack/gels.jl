@@ -72,6 +72,7 @@ function _apply_Q!(M::AbstractMatrix{T}, tau::AbstractVector{T}, B::AbstractMatr
 end
 
 function gels!(trans::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A, B)
     trans === 'N' || trans === 'T' || trans === 'C' ||
         _throw_trans_ntc(:gels!, trans)
     (T <: Complex && trans === 'T') &&

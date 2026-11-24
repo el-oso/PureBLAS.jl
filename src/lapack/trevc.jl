@@ -623,6 +623,7 @@ function trevc!(
         side::AbstractChar, howmny::AbstractChar, T::AbstractMatrix,
         VL, VR::AbstractMatrix
     )
+    Base.require_one_based_indexing(T, VR)
     side === 'R' || throw(ArgumentError("trevc!: only side='R' (right eigenvectors) is implemented"))
     (howmny === 'A' || howmny === 'B') ||
         throw(ArgumentError("trevc!: howmny must be 'A' (vectors of T) or 'B' (back-transform)"))

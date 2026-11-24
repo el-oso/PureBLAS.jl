@@ -1268,6 +1268,7 @@ in place in the `uplo` triangle. `ipiv` (length n) receives the LAPACK pivot enc
 `info` (0, or the index of the first zero pivot block). Generic over T<:Number.
 """
 function sytrf!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char = 'L')
+    Base.require_one_based_indexing(A, ipiv)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("sytrf!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("sytrf!: length(ipiv) must equal size(A,1)"))
@@ -1283,6 +1284,7 @@ identical to `sytrf!` (real symmetric). Otherwise the Hermitian variant (real di
 off-diagonals) is used, mirroring LAPACK `zhetf2`.
 """
 function hetrf!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}; uplo::Char = 'L')
+    Base.require_one_based_indexing(A, ipiv)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("hetrf!: A must be square"))
     length(ipiv) == n || throw(DimensionMismatch("hetrf!: length(ipiv) must equal size(A,1)"))
@@ -1487,6 +1489,7 @@ end
 Solve A·X = B in place (B overwritten by X) using the symmetric Bunch-Kaufman factors from `sytrf!`.
 """
 function sytrs!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}, B::AbstractVecOrMat; uplo::Char = 'L')
+    Base.require_one_based_indexing(A, ipiv, B)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("sytrs!: A must be square"))
     size(B, 1) == n || throw(DimensionMismatch("sytrs!: size(B,1) must equal size(A,1)"))
@@ -1506,6 +1509,7 @@ end
 Solve A·X = B in place using the Hermitian Bunch-Kaufman factors from `hetrf!` (real ⇒ same as `sytrs!`).
 """
 function hetrs!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}, B::AbstractVecOrMat; uplo::Char = 'L')
+    Base.require_one_based_indexing(A, ipiv, B)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("hetrs!: A must be square"))
     size(B, 1) == n || throw(DimensionMismatch("hetrs!: size(B,1) must equal size(A,1)"))

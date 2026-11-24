@@ -323,6 +323,7 @@ full-rank else 1. `tol < 0` ⇒ default LAPACK stop = n·eps·max_diagonal.
 with P defined by `piv`.
 """
 function pstrf!(A::AbstractMatrix{T}, piv::AbstractVector{<:Integer}, tol::Real; uplo::Char = 'L') where {T}
+    Base.require_one_based_indexing(A, piv)
     R = real(T); n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("pstrf!: A must be square"))
     length(piv) >= n || throw(DimensionMismatch("pstrf!: length(piv) < n"))
@@ -463,6 +464,7 @@ end
 
 # Convenience: allocate piv (LinearAlgebra.LAPACK.pstrf!-style return).
 function pstrf!(A::AbstractMatrix, tol::Real; uplo::Char = 'L')
+    Base.require_one_based_indexing(A)
     piv = Vector{Int}(undef, size(A, 1))
     return pstrf!(A, piv, tol; uplo = uplo)
 end

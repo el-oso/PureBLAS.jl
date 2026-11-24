@@ -402,6 +402,7 @@ Move the diagonal block of the (quasi-)upper-triangular Schur form `T` at positi
 (conjugate-pair) blocks are swapped by `dlaexc`; `ifst`/`ilst` snap to block boundaries as in LAPACK.
 """
 function trexc!(compq::AbstractChar, T::AbstractMatrix, Q::AbstractMatrix, ifst::Integer, ilst::Integer)
+    Base.require_one_based_indexing(T, Q)
     (compq === 'V' || compq === 'N') || throw(ArgumentError("trexc!: compq must be 'V' or 'N'"))
     n = size(T, 1)
     size(T, 2) == n || throw(DimensionMismatch("trexc!: T must be square"))
@@ -773,6 +774,7 @@ function trsen!(
         job::AbstractChar, compq::AbstractChar, select::AbstractVector,
         T::AbstractMatrix, Q::AbstractMatrix, w::AbstractVector{<:Complex}
     )
+    Base.require_one_based_indexing(select, T, Q, w)
     (job === 'N' || job === 'E' || job === 'V' || job === 'B') ||
         throw(ArgumentError("trsen!: job must be 'N', 'E', 'V' or 'B'"))
     (compq === 'V' || compq === 'N') || throw(ArgumentError("trsen!: compq must be 'V' or 'N'"))
@@ -792,6 +794,7 @@ function trsen!(
         job::AbstractChar, compq::AbstractChar, select::AbstractVector,
         T::AbstractMatrix, Q::AbstractMatrix
     )
+    Base.require_one_based_indexing(select, T, Q)
     w = Vector{Complex{real(eltype(T))}}(undef, size(T, 1))
     return trsen!(job, compq, select, T, Q, w)
 end

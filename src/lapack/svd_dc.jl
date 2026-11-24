@@ -884,6 +884,7 @@ function bdsdc!(
         d::AbstractVector{Float64}, e::AbstractVector{Float64},
         Lvec::AbstractMatrix{Float64}, Rvec::AbstractMatrix{Float64}
     )
+    Base.require_one_based_indexing(d, e, Lvec, Rvec)
     ws = _svdws()
     _svd_grow_dc!(ws, length(d))
     bdsdc!(d, e, Lvec, Rvec, ws)
@@ -894,6 +895,7 @@ function bdsdc!(
         d::AbstractVector{Float64}, e::AbstractVector{Float64},
         Lvec::AbstractMatrix{Float64}, Rvec::AbstractMatrix{Float64}, ws::SVDWorkspace{Float64}
     )
+    Base.require_one_based_indexing(d, e, Lvec, Rvec)
     n = length(d)
     diag = view(ws.dc_diag, 1:n); subdiag = view(ws.dc_subdiag, 1:n)
     @inbounds for i in 1:n

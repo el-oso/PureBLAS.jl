@@ -228,6 +228,7 @@ function gghrd!(
         compq::AbstractChar, compz::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T},
         Q::AbstractMatrix{T}, Z::AbstractMatrix{T}; ilo::Integer = 1, ihi::Integer = size(A, 1)
     ) where {T <: Real}
+    Base.require_one_based_indexing(A, B, Q, Z)
     n = size(A, 1)
     ilq = compq !== 'N'; ilz = compz !== 'N'
     ilo = Int(ilo); ihi = Int(ihi)
@@ -259,6 +260,7 @@ function gghrd!(
         compq::AbstractChar, compz::AbstractChar, A::AbstractMatrix{T}, B::AbstractMatrix{T},
         Q::AbstractMatrix{T}, Z::AbstractMatrix{T}; ilo::Integer = 1, ihi::Integer = size(A, 1)
     ) where {T <: Complex}
+    Base.require_one_based_indexing(A, B, Q, Z)
     n = size(A, 1)
     ilq = compq !== 'N'; ilz = compz !== 'N'
     ilo = Int(ilo); ihi = Int(ihi)
@@ -996,6 +998,7 @@ function hgeqz!(
         T::AbstractMatrix{R}, alpha::AbstractVector{<:Complex}, beta::AbstractVector{R},
         Q::AbstractMatrix{R}, Z::AbstractMatrix{R}; ilo::Integer = 1, ihi::Integer = size(H, 1)
     ) where {R <: Real}
+    Base.require_one_based_indexing(H, T, alpha, beta, Q, Z)
     n = size(H, 1)
     wantt = job === 'S'; wantq = compq !== 'N'; wantz = compz !== 'N'
     _qz_init_qz!(compq, Q, n); _qz_init_qz!(compz, Z, n)
@@ -1313,6 +1316,7 @@ function hgeqz!(
         T::AbstractMatrix{C}, alpha::AbstractVector{C}, beta::AbstractVector{C},
         Q::AbstractMatrix{C}, Z::AbstractMatrix{C}; ilo::Integer = 1, ihi::Integer = size(H, 1)
     ) where {C <: Complex}
+    Base.require_one_based_indexing(H, T, alpha, beta, Q, Z)
     n = size(H, 1)
     wantt = job === 'S'; wantq = compq !== 'N'; wantz = compz !== 'N'
     _qz_init_qz!(compq, Q, n); _qz_init_qz!(compz, Z, n)

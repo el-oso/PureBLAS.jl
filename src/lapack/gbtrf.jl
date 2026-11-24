@@ -141,6 +141,7 @@ function gbtrf!(
         kl::Integer, ku::Integer, m::Integer,
         AB::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}
     ) where {T}
+    Base.require_one_based_indexing(AB, ipiv)
     _, n = size(AB)
     length(ipiv) >= min(Int(m), n) || throw(DimensionMismatch("gbtrf!: length(ipiv) < min(m, size(AB,2))"))
     nb = _gbtrf_nb(T, Int(kl))
@@ -162,6 +163,7 @@ end
 # Convenience: allocate ipiv, return (AB overwritten with L\U, ipiv, info). The arity and the 3-tuple
 # are load-bearing (the C-ABI wrapper destructures them).
 function gbtrf!(kl::Integer, ku::Integer, m::Integer, AB::AbstractMatrix{T}) where {T}
+    Base.require_one_based_indexing(AB)
     _, n = size(AB)
     return gbtrf!(kl, ku, m, AB, Vector{Int}(undef, min(Int(m), n)))
 end
@@ -523,6 +525,7 @@ function gbtrs!(
         AB::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer},
         B::AbstractVecOrMat{T}
     ) where {T}
+    Base.require_one_based_indexing(AB, ipiv, B)
     ldab, n = size(AB)
     kv = ku + kl
     kd = kv + 1                                           # diagonal row; multipliers at rows kd+1..

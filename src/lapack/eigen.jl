@@ -863,6 +863,7 @@ end
 # free-choice style matter, NOT a requirement — the earlier "do not hoist it back" note was true only
 # while the scanner was broken. Fixing the lint also deleted seven phantom self-edges from its baseline.
 function orgtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}, Q::AbstractMatrix{T}) where {T <: Real}
+    Base.require_one_based_indexing(A, tau, Q)
     uplo === 'L' || throw(ArgumentError("orgtr!: only uplo='L' is implemented"))
     n = size(A, 1)
     size(Q) == (n, n) || throw(DimensionMismatch("orgtr!: size(Q) ≠ (size(A,1), size(A,1))"))
@@ -883,6 +884,7 @@ function orgtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}, Q::Abs
     return Q
 end
 function ungtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}, Q::AbstractMatrix{T}) where {T <: Complex}
+    Base.require_one_based_indexing(A, tau, Q)
     uplo === 'L' || throw(ArgumentError("ungtr!: only uplo='L' is implemented"))
     n = size(A, 1)
     size(Q) == (n, n) || throw(DimensionMismatch("ungtr!: size(Q) ≠ (size(A,1), size(A,1))"))
@@ -915,10 +917,12 @@ are irrelevant. `A` is NOT overwritten (unlike Netlib dorgtr/zungtr) — the 3-a
 the returned `Q` and is otherwise identical; the 4-argument form allocates nothing at all.
 """
 function orgtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: Real}
+    Base.require_one_based_indexing(A, tau)
     n = size(A, 1)
     return orgtr!(uplo, A, tau, Matrix{T}(undef, n, n))
 end
 function ungtr!(uplo::Char, A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: Complex}
+    Base.require_one_based_indexing(A, tau)
     n = size(A, 1)
     return ungtr!(uplo, A, tau, Matrix{T}(undef, n, n))
 end

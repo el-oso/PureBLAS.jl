@@ -555,6 +555,7 @@ function tgevc!(
         side::AbstractChar, howmny::AbstractChar, S::AbstractMatrix{T}, P::AbstractMatrix{T},
         VL::AbstractMatrix{T}, VR::AbstractMatrix{T}
     ) where {T <: Number}
+    Base.require_one_based_indexing(S, P, VL, VR)
     side === 'R' || throw(ArgumentError("tgevc!: only side='R' (right eigenvectors) is implemented"))
     (howmny === 'A' || howmny === 'B') || throw(ArgumentError("tgevc!: howmny must be 'A' or 'B'"))
     ilback = howmny === 'B'

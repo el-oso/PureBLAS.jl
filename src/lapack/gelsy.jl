@@ -108,6 +108,7 @@ end
 # A[i, m+1:n] holds the essential part of the i-th right reflector Z_i (τ in `tau`, LAPACK convention).
 # Numerics identical to dtzrzf (its blocked trailing update is only a perf refinement of this core).
 function tzrzf!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A)
     m <= n || _throw_mle_n(:tzrzf!, m, n)
     length(tau) >= m || _throw_len_m(:tzrzf!, m)
@@ -163,6 +164,7 @@ function ormrz!(
         side::Char, trans::Char, A::AbstractMatrix{T}, tau::AbstractVector{T},
         C::AbstractMatrix{T}
     ) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A, tau, C)
     k = length(tau); L = size(A, 2) - k
     return _ormrz_v!(side, trans, view(A, :, (k + 1):(k + L)), tau, C)
 end
@@ -230,6 +232,7 @@ function gelsy!(
         A::AbstractMatrix{T}, B::AbstractMatrix{T}, jpvt::AbstractVector{<:Integer},
         rcond::Real
     ) where {T <: BlasFloat}
+    Base.require_one_based_indexing(A, B, jpvt)
     m, n = size(A); mn = min(m, n); R = real(T); nrhs = size(B, 2)
     size(B, 1) >= max(m, n) || _throw_brows_mn(:gelsy!, size(B, 1), max(m, n))
     length(jpvt) >= n || _throw_len_jpvt(:gelsy!, n)

@@ -393,6 +393,7 @@ const _LU_PAD = Base.OncePerTask{Base.RefValue{Matrix{Float64}}}(() -> Ref(Matri
 # factorisation and the row swaps are shared verbatim. Float64 keeps every fast path it had: with
 # `T === Float64` the guard below is a compile-time constant and folds away.
 function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _lu_nb(min(size(A)...))) where {T <: Real}
+    Base.require_one_based_indexing(A, ipiv)
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
@@ -841,6 +842,7 @@ end
 # Flat on a de-aliased ld=n+pad copy would win a further ~17% there — add it if 64/96 ever matter.
 
 function getrf!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}; nb::Int = _clu_nb(min(size(A)...), T)) where {T <: BlasComplex}
+    Base.require_one_based_indexing(A, ipiv)
     m, n = size(A); k = min(m, n)
     k == 0 && return A, ipiv, 0
     length(ipiv) >= k || throw(DimensionMismatch("getrf!: length(ipiv) < min(size(A))"))
@@ -876,10 +878,12 @@ end
 # `AbstractMatrix{<:Real}` to match the two-argument method — a Dual/BigFloat caller should not have to
 # hand-allocate ipiv just because its element type is not Float64.
 function getrf!(A::AbstractMatrix{<:Real})
+    Base.require_one_based_indexing(A)
     ipiv = Vector{Int}(undef, min(size(A)...))
     return getrf!(A, ipiv)
 end
 function getrf!(A::StridedMatrix{T}) where {T <: BlasComplex}
+    Base.require_one_based_indexing(A)
     ipiv = Vector{Int}(undef, min(size(A)...))
     return getrf!(A, ipiv)
 end

@@ -1049,6 +1049,7 @@ function ggsvd!(
         V::AbstractMatrix{T}, Q::AbstractMatrix{T}, alpha::AbstractVector,
         beta::AbstractVector, R::AbstractMatrix{T}
     ) where {T}
+    Base.require_one_based_indexing(A, B, U, V, Q, alpha, beta, R)
     _ggsvd_checkargs(jobu, jobv, jobq, A, B)
     m, n = size(A)
     p = size(B, 1)
@@ -1099,6 +1100,7 @@ function ggsvd!(
         jobu::AbstractChar, jobv::AbstractChar, jobq::AbstractChar,
         A::AbstractMatrix{T}, B::AbstractMatrix{T}
     ) where {T}
+    Base.require_one_based_indexing(A, B)
     _ggsvd_checkargs(jobu, jobv, jobq, A, B)
     m, n = size(A)
     p = size(B, 1)

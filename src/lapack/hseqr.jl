@@ -725,6 +725,7 @@ function hseqr!(
         job::AbstractChar, compz::AbstractChar, H::AbstractMatrix{T}, ilo::Integer,
         ihi::Integer, w::AbstractVector, Z::AbstractMatrix{T}
     ) where {T <: Real}
+    Base.require_one_based_indexing(H, w, Z)
     n = size(H, 1)
     size(H, 2) == n || throw(DimensionMismatch("hseqr!: H must be square"))
     (job === 'E' || job === 'S') || throw(ArgumentError("hseqr!: job must be 'E' or 'S'"))
@@ -782,6 +783,7 @@ function hseqr!(
         job::AbstractChar, compz::AbstractChar, H::AbstractMatrix{T}, ilo::Integer,
         ihi::Integer, w::AbstractVector{T}, Z::AbstractMatrix{T}
     ) where {T <: Complex}
+    Base.require_one_based_indexing(H, w, Z)
     n = size(H, 1)
     size(H, 2) == n || throw(DimensionMismatch("hseqr!: H must be square"))
     (job === 'E' || job === 'S') || throw(ArgumentError("hseqr!: job must be 'E' or 'S'"))

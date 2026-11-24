@@ -96,6 +96,7 @@ end
 # Routes to `_trtri_ip!` — no scratch. See the table above it for why the out-of-place `_trtri!`, which
 # trsm needs for its own reasons, is the wrong kernel to reach for here.
 function trtri!(A::AbstractMatrix{T}; uplo::AbstractChar = 'L', diag::AbstractChar = 'N') where {T}
+    Base.require_one_based_indexing(A)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("trtri!: A must be square"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("trtri!: uplo must be 'L' or 'U'"))
@@ -203,6 +204,7 @@ end
 # flop ratio is the whole story. `_lauum!` above does the triangular product properly, which brings the
 # total to trtri + lauum = 2n³/3 — LAPACK's own count.
 function potri!(A::AbstractMatrix{T}; uplo::AbstractChar = 'L') where {T}
+    Base.require_one_based_indexing(A)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("potri!: A must be square"))
     (uplo == 'L' || uplo == 'U') || throw(ArgumentError("potri!: uplo must be 'L' or 'U'"))
@@ -257,7 +259,10 @@ end
 # keyword on this method — at n=8 the whole call is ~400 ns, so a keyword-sorting frame on the public
 # path is a measurable fraction of it, and `getri@8` is already the routine's worst cell (0.68-0.81
 # across the fleet). A probe knob must not cost the shipped path anything.
-getri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer}) = _getri!(A, ipiv, 0)
+function getri!(A::AbstractMatrix, ipiv::AbstractVector{<:Integer})
+    Base.require_one_based_indexing(A, ipiv)
+    return _getri!(A, ipiv, 0)
+end
 
 function _getri!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, nb::Int) where {T}
     n = size(A, 1)

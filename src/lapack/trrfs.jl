@@ -26,6 +26,7 @@ function trrfs!(
         Ferr::AbstractVector{<:Real} = Vector{real(T)}(undef, size(B, 2)),
         Berr::AbstractVector{<:Real} = Vector{real(T)}(undef, size(B, 2))
     ) where {T}
+    Base.require_one_based_indexing(A, B, X, Ferr, Berr)
     R = real(T)
     n = size(A, 2)
     size(A, 1) == n || throw(DimensionMismatch("trrfs!: A must be square"))

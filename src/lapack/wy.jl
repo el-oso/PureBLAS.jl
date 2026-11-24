@@ -62,6 +62,7 @@ function wy_t!(
         Tm::AbstractMatrix{T}, Apanel::AbstractMatrix{T}, tau::AbstractVector{T},
         G::AbstractMatrix{T}
     ) where {T}
+    Base.require_one_based_indexing(Tm, Apanel, tau, G)
     bs = length(tau)
     bs == 0 && return Tm
     m = size(Apanel, 1)
@@ -98,6 +99,7 @@ function wy_apply!(
         trans::Char, C::AbstractMatrix{T}, Apanel::AbstractMatrix{T},
         Tm::AbstractMatrix{T}, ws::WYApplyWorkspace{T}
     ) where {T}
+    Base.require_one_based_indexing(C, Apanel, Tm)
     trans === 'N' || trans === 'T' || _throw_trans_nt(:wy_apply!, trans)
     m = size(Apanel, 1)
     bs = size(Apanel, 2)

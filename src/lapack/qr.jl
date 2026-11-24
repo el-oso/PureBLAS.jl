@@ -109,6 +109,7 @@ end
 # level-2 trailing traffic. g=v0ᵀv1 (once/pair) decouples the 2nd dot. Measured Zen3 panel +57-74% (18→31
 # GFlops), bit-identical to rank-1. Odd tail column / trivial reflectors fall back to rank-1.
 function qr_unblocked!(A::AbstractMatrix{Float64}, tau::AbstractVector{Float64})
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A); ld = stride(A, 2); k = min(m, n)
     GC.@preserve A begin
         p = pointer(A); col = 1
@@ -205,6 +206,7 @@ end
 # Apply uses CONJ(τ) (the zgeqr2 convention — the τ-vs-conj(τ) placement is the bug magnet). Odd tail column /
 # trivial reflectors fall back to rank-1. Matches LinearAlgebra.qr reconstruction.
 function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: BlasComplex}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A); R = real(T); ld = stride(A, 2); csz = sizeof(T); k = min(m, n)
     GC.@preserve A begin
         p = pointer(A); col = 1                                   # Ptr{Complex{R}}; SIMD helpers take complex Ptr
@@ -346,6 +348,7 @@ end
 # T (zlarft: T[c,c]=τ, T[1:c-1,c] = T[1:c-1,1:c-1]·(−τ·G[1:c-1,c]), G=VᴴV), then apply the block Qᴴ to the
 # trailing: C −= V·(Tᴴ·(Vᴴ·C)) — the two big products via complex gemm ('C' = compile-time conj signs).
 function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where {T <: BlasComplex}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A); k = min(m, n)
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
@@ -410,6 +413,7 @@ function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where
     return A
 end
 function geqrf!(A::StridedMatrix{T}) where {T <: BlasComplex}
+    Base.require_one_based_indexing(A)
     tau = Vector{T}(undef, min(size(A)...))
     geqrf!(A, tau)
     return A, tau
@@ -467,6 +471,7 @@ end
 # `4b5454c`. So: APPLY with τ_L (what `_house_left!` wants) and STORE 1/τ_L (what every geqrf consumer
 # in this repo reads).
 function qr_unblocked!(A::AbstractMatrix{T}, tau::AbstractVector{T}) where {T <: Real}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A); k = min(m, n)
     @inbounds for i in 1:k
         β, τL = _larfg!(view(A, i:m, i))
@@ -482,6 +487,7 @@ end
 # trailing update goes through `syrk!`/`trmm!`/`gemm!` — which on a `Dual` are the planar real-kernel
 # compositions of dual_l3.md, so a dual QR rides the same BLAS-3 amortisation as potrf/getrf.
 function geqrf!(A::AbstractMatrix{T}, tau::AbstractVector{T}; nb::Int = 0) where {T <: Real}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A); k = min(m, n)
     k == 0 && return A
     length(tau) >= k || throw(DimensionMismatch("geqrf!: length(tau) < min(size(A))"))
@@ -570,6 +576,7 @@ end
 
 # Convenience: allocate tau, return (A overwritten with R + reflectors, tau).
 function geqrf!(A::AbstractMatrix{T}) where {T <: Real}
+    Base.require_one_based_indexing(A)
     tau = Vector{T}(undef, min(size(A)...))
     geqrf!(A, tau)
     return A, tau
@@ -583,13 +590,17 @@ LAPACK's (`H = I − τ·v·vᵀ`, `0` ⇒ identity), which is what [`orgqr!`] a
 are reciprocals. A no-op on complex τ, which `geqrf!` already stores in LAPACK form.
 """
 function geqrf_tau_lapack!(tau::AbstractVector{T}) where {T <: Real}
+    Base.require_one_based_indexing(tau)
     @inbounds for i in eachindex(tau)
         t = tau[i]
         tau[i] = (isfinite(t) && !iszero(t)) ? one(T) / t : zero(T)
     end
     return tau
 end
-geqrf_tau_lapack!(tau::AbstractVector{<:Complex}) = tau
+function geqrf_tau_lapack!(tau::AbstractVector{<:Complex})
+    Base.require_one_based_indexing(tau)
+    return tau
+end
 
 # ── orgqr / ungqr — form Q from geqrf reflectors (LAPACK dorg2r/zung2r, unblocked) ─────────────────────
 # A (m×n, m≥n on entry) holds the geqrf reflectors (standard LAPACK τ — the C-ABI dgeqrf_64_ shim already
@@ -607,6 +618,7 @@ Form `Q` (LAPACK dorgqr/zungqr, unblocked dorg2r/zung2r) from the `k` geqrf refl
 first. Complex `geqrf!` already returns LAPACK τ and needs no conversion.
 """
 function orgqr!(A::AbstractMatrix{T}, tau::AbstractVector{T}, k::Int = length(tau)) where {T}
+    Base.require_one_based_indexing(A, tau)
     m, n = size(A)
     (0 <= k <= n <= m) || throw(DimensionMismatch("orgqr!: requires k ≤ n ≤ m"))
     # Fail fast on faer's τ rather than returning a NaN Q: LAPACK τ is always finite (0 ⇒ identity),
@@ -654,6 +666,7 @@ function ormqr!(
         side::Char, trans::Char, A::AbstractMatrix{T}, tau::AbstractVector{T},
         C::AbstractMatrix{T}
     ) where {T}
+    Base.require_one_based_indexing(A, tau, C)
     mA = size(A, 1); k = length(tau)
     left = side == 'L'; notran = trans == 'N'
     if (left && !notran) || (!left && notran)

@@ -15,6 +15,7 @@
 # uplo='L': A = L·Lᴴ ⇒ solve L·Y = B then Lᴴ·X = Y.  uplo='U': A = Uᴴ·U ⇒ Uᴴ·Y = B then U·X = Y.
 # Overwrites B with X.
 function potrs!(A::AbstractMatrix{T}, B::AbstractVecOrMat; uplo::AbstractChar = 'L') where {T}
+    Base.require_one_based_indexing(A, B)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("potrs!: A must be square"))
     Bm = _gt_asmat(B)
@@ -36,6 +37,7 @@ function trtrs!(
         A::AbstractMatrix{T}, B::AbstractVecOrMat;
         uplo::AbstractChar = 'U', trans::AbstractChar = 'N', diag::AbstractChar = 'N'
     ) where {T}
+    Base.require_one_based_indexing(A, B)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("trtrs!: A must be square"))
     Bm = _gt_asmat(B)
@@ -77,6 +79,7 @@ function getrs!(
         A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, B::AbstractVecOrMat;
         trans::AbstractChar = 'N'
     ) where {T}
+    Base.require_one_based_indexing(A, ipiv, B)
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatch("getrs!: A must be square"))
     length(ipiv) >= n || throw(DimensionMismatch("getrs!: length(ipiv) < n"))

@@ -43,6 +43,7 @@
 # for info > 0 is "the factorization could not be completed" and promises nothing about the contents, and
 # ptsv! below skips the solve, so nothing downstream reads them.
 function pttrf!(D::AbstractVector{Tr}, E::AbstractVector{T}) where {Tr <: Real, T <: Number}
+    Base.require_one_based_indexing(D, E)
     n = length(D)
     length(E) >= max(n - 1, 0) || throw(DimensionMismatch("pttrf!: length(E) < n-1"))
     blk = _pt_blk(Tr, T)
@@ -107,6 +108,7 @@ function pttrs!(
         D::AbstractVector{<:Real}, E::AbstractVector{T},
         B::AbstractVecOrMat{T}; uplo::AbstractChar = 'L'
     ) where {T <: Number}
+    Base.require_one_based_indexing(D, E, B)
     length(D) == size(B isa AbstractVector ? reshape(B, :, 1) : B, 1) ||
         throw(DimensionMismatch("pttrs!: size(B,1) ≠ length(D)"))
     Bm = B isa AbstractVector ? reshape(B, :, 1) : B
@@ -119,6 +121,7 @@ function ptsv!(
         D::AbstractVector{<:Real}, E::AbstractVector{T},
         B::AbstractVecOrMat{T}; uplo::AbstractChar = 'L'
     ) where {T <: Number}
+    Base.require_one_based_indexing(D, E, B)
     _, _, info = pttrf!(D, E)
     info == 0 && pttrs!(D, E, B; uplo = uplo)
     return D, E, B, info
