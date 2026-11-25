@@ -334,6 +334,21 @@ end
     @test steady(PureBLAS.wy_apply!, 'N', C, V, Tm, ws) == 0
 end
 
+@testitem "getrf: subnormal pivot gives finite multipliers" begin
+    using PureBLAS, LinearAlgebra
+    # 1/pivot overflows for a subnormal pivot; the multipliers A[i,1]/pivot are ≤ 1 and must stay finite.
+    @testset "$T n=$n" for T in (Float64, Float32, ComplexF64, ComplexF32), n in (4, 40, 200)
+        R = real(T); tiny = floatmin(R) / 64
+        A = randn(T, n, n) + n * I; A[:, 1] = T.(range(R(1), R(2); length = n)) .* (T <: Complex ? (1 + im) * tiny : tiny)
+        A[1, 1] *= -1                                       # the pivot is the last row, |2 tiny|
+        F = copy(A); ip = zeros(Int, n); PureBLAS.getrf!(F, ip)
+        @test ip[1] == n
+        col = A[:, 1]; col[1], col[n] = col[n], col[1]
+        @test all(isfinite, F)
+        @test F[2:n, 1] ≈ col[2:n] ./ col[1] rtol = 4eps(R)
+    end
+end
+
 @testitem "getrf (LU) vs LAPACK — square/tall/wide, factor + ipiv + P·A=L·U" begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.LAPACK

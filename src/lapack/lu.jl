@@ -70,6 +70,13 @@ end
 # update that replaces pb1 rank-1 passes), factor the right half, then propagate its pivots to the left
 # half. Net result is bit-identical to the flat sweep; only the store traffic is halved. Pivoting is a
 # correctness boundary — the two _laswp_local! calls carry the interchanges the flat sweep applied inline.
+# dgetf2 scales a column by 1/pivot only when |pivot| ≥ sfmin (floatmin); below that 1/pivot overflows
+# and the column is divided instead. The pivot is the column's largest entry, so the quotients stay ≤ 1.
+# Complex callers pass |re|+|im| (`_l1v`) rather than the modulus: it costs no hypot, and |re|+|im| ≥
+# floatmin still bounds 1/|pivot| by √2/floatmin < floatmax.
+@inline _piv_recip_ok(a::AbstractFloat) = a >= floatmin(a)
+@inline _piv_recip_ok(a) = true
+
 function _getf2_blocked!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
     _base = eltype(A) <: BlasComplex ? _CGETF2_BASE : _GETF2_BASE      # complex base is wider (flat rank-2)
     pb <= _base && return _getf2!(A, mp, pb, roff, ipiv, ioff)         # base: flat rank-1/rank-2 sweep
@@ -130,10 +137,16 @@ function _getf2!(A, mp::Int, pb::Int, roff::Int, ipiv, ioff::Int)
             end
             # `one(eltype(A))`, not `1.0` — this tail is the path a Dual/BigFloat matrix takes, and a
             # Float64 literal here would silently narrow the reciprocal before the multiply below.
-            d = one(eltype(A)) / A[jl, jl]
-            for il in (jl + 1):mp
-                A[il, jl] *= d
-            end     # scale column below the diagonal
+            if _piv_recip_ok(_l1v(A[jl, jl]))
+                d = one(eltype(A)) / A[jl, jl]
+                for il in (jl + 1):mp
+                    A[il, jl] *= d
+                end     # scale column below the diagonal
+            else
+                for il in (jl + 1):mp
+                    A[il, jl] /= A[jl, jl]
+                end
+            end
         elseif info == 0
             info = roff + jl
         end
@@ -177,7 +190,12 @@ end
             unsafe_store!(p, unsafe_load(p, _clidx(piv, c, ld)), _clidx(jl, c, ld)); unsafe_store!(p, a, _clidx(piv, c, ld))
         end
     end
-    @inbounds if !zero_piv
+    @inbounds if !zero_piv && !_piv_recip_ok(abs(unsafe_load(p, _clidx(jl, jl, ld))))
+        d = unsafe_load(p, _clidx(jl, jl, ld))
+        for i in (jl + 1):mp
+            unsafe_store!(p, unsafe_load(p, _clidx(i, jl, ld)) / d, _clidx(i, jl, ld))
+        end
+    elseif !zero_piv
         invd = 1.0 / unsafe_load(p, _clidx(jl, jl, ld)); vinv = _CVF(invd); i = jl + 1
         while i + _CHOLW - 1 <= mp
             b = _cvptr(p, i, jl, ld); vstore(vload(_CVF, b) * vinv, b); i += _CHOLW
@@ -275,7 +293,12 @@ end
             unsafe_store!(p, unsafe_load(p, lidx(piv, jc)), lidx(jl, jc)); unsafe_store!(p, a, lidx(piv, jc))
         end
     end
-    @inbounds if !zero_piv
+    @inbounds if !zero_piv && !_piv_recip_ok(_l1v(unsafe_load(p, lidx(jl, jl))))
+        d = unsafe_load(p, lidx(jl, jl))
+        for i in (jl + 1):mp
+            unsafe_store!(p, unsafe_load(p, lidx(i, jl)) / d, lidx(i, jl))
+        end
+    elseif !zero_piv
         mt = mp - jl
         r = _crecip(unsafe_load(p, lidx(jl, jl)))                   # 1/pivot; scale column below the diagonal
         mt > 0 && _scal_cmplx_simd!(mt, real(r), imag(r), cptr(jl + 1, jl))
