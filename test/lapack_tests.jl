@@ -708,6 +708,27 @@ end
 # update (one length-(k−1) gemv reduction vs k−1 successive axpys), so near-ties can rank
 # differently, and PureBLAS's nb differs from OpenBLAS's ILAENV value regardless. It would be a flaky
 # test on the one routine whose entire point is pivot selection.
+@testitem "sytrf/hetrf: a NaN pivot is a 1×1 singular step, as in LAPACK" begin
+    using PureBLAS, LinearAlgebra, Random
+    import LinearAlgebra.LAPACK as LA
+    # A NaN diagonal makes every pivot comparison false; the last (lower) or first (upper) column must
+    # still take a 1×1 step and report info, never a 2×2 step past the matrix edge.
+    @testset "$T $ul n=$n" for T in (Float64, ComplexF64), ul in ('L', 'U'), n in (1, 2, 5, 200)
+        Random.seed!(n); A = randn(T, n, n); A = A + A' + 2n * I
+        j = ul == 'L' ? n : 1                                    # column reached last
+        A[j, j] = NaN
+        for (pb!, la!) in ((PureBLAS.sytrf!, LA.sytrf!), (PureBLAS.hetrf!, LA.hetrf!))
+            T <: Real && pb! === PureBLAS.hetrf! && continue
+            Ap = copy(A); ip = zeros(Int, n + 1)                 # one spare slot: an overrun lands there
+            info = pb!(Ap, view(ip, 1:n); uplo = ul)
+            _, ipl, infol = la!(ul, copy(A))
+            @test ip[n + 1] == 0
+            @test ip[1:n] == ipl
+            @test info == infol
+        end
+    end
+end
+
 @testitem "bunchkaufman (sytrf/hetrf) — cross-solve vs LAPACK, growth bound, hollow + rank-deficient" begin
     using PureBLAS, LinearAlgebra, Random
     import LinearAlgebra.LAPACK
