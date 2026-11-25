@@ -69,7 +69,7 @@ function _sytf2_lower!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
             imax = k; colmax = zero(Tr)
         end
         kp = k
-        if max(absakk, colmax) == 0
+        if max(absakk, colmax) == 0 || isnan(absakk)     # dsytf2: a NaN pivot is singular, step 1×1
             info == 0 && (info = k)
             kp = k
             herm && (A[k, k] = real(A[k, k]))
@@ -213,7 +213,7 @@ function _sytf2_upper!(A::AbstractMatrix{T}, ipiv::AbstractVector{<:Integer}, he
             imax = k; colmax = zero(Tr)
         end
         kp = k
-        if max(absakk, colmax) == 0
+        if max(absakk, colmax) == 0 || isnan(absakk)     # dsytf2: a NaN pivot is singular, step 1×1
             info == 0 && (info = k)
             kp = k
             herm && (A[k, k] = real(A[k, k]))
@@ -389,7 +389,7 @@ function _lasyf_lower!(
             imax = k; colmax = zero(Tr)
         end
 
-        if max(absakk, colmax) == zero(Tr)
+        if max(absakk, colmax) == zero(Tr) || isnan(absakk)     # dlasyf: a NaN pivot is singular, 1×1
             info == 0 && (info = k)
             kp = k
             # Column k of A still holds its values from before this panel's update; the updated
@@ -594,7 +594,7 @@ function _lahef_lower!(
             imax = k; colmax = zero(Tr)
         end
 
-        if max(absakk, colmax) == zero(Tr)
+        if max(absakk, colmax) == zero(Tr) || isnan(absakk)     # dlasyf: a NaN pivot is singular, 1×1
             info == 0 && (info = k)
             kp = k
             # Store the updated (zero) column from W, as in the symmetric panel.
@@ -768,7 +768,7 @@ function _lasyf_upper!(
             imax = k; colmax = zero(Tr)
         end
 
-        if max(absakk, colmax) == zero(Tr)
+        if max(absakk, colmax) == zero(Tr) || isnan(absakk)     # dlasyf: a NaN pivot is singular, 1×1
             info == 0 && (info = k)
             kp = k
             # Column k of A still holds its values from before this panel's update; the updated
@@ -990,7 +990,7 @@ function _lahef_upper!(
             imax = k; colmax = zero(Tr)
         end
 
-        if max(absakk, colmax) == zero(Tr)
+        if max(absakk, colmax) == zero(Tr) || isnan(absakk)     # dlasyf: a NaN pivot is singular, 1×1
             info == 0 && (info = k)
             kp = k
             # Store the updated (zero) column from W, as in the symmetric panel.
