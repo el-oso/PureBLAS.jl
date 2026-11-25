@@ -1996,3 +1996,41 @@ end
         @test_throws ArgumentError fn('L', A, tau, A)              # the aliased one must THROW
     end
 end
+
+# A = F·D·Fᵀ (or F·D·Fᴴ) with dyadic entries, so every product is exact, and D[k] = 0 with column k of
+# A nonzero: column k becomes exactly zero only after the panel's update. k sits inside the first panel
+# the blocked driver factors (from the top for 'L', from the bottom for 'U'), and the factor must then
+# reproduce A exactly, with D[k,k] == 0 where `info` points.
+@testitem "sytrf/hetrf blocked: a column zeroed by the panel update reconstructs A" begin
+    using PureBLAS, LinearAlgebra, Random
+    n = 200
+    for T in (Float64, ComplexF64), herm in (false, true), uplo in ('L', 'U')
+        (herm && T <: Real) && continue
+        @test PureBLAS._sytrf_nb(T, n) < n                      # the blocked path runs
+        k = uplo == 'L' ? 3 : n - 2
+        rng = MersenneTwister(1)
+        q() = T <: Real ? T(rand(rng, (-0.25, 0.0, 0.25))) :
+            T(rand(rng, (-0.25, 0.0, 0.25)), rand(rng, (-0.25, 0.0, 0.25)))
+        L = Matrix{T}(I, n, n)
+        for j in 1:n, i in (j + 1):n
+            L[i, j] = q()
+        end
+        L[k, 1] = 1 / 4; L[k, 2] = -1 / 4                         # column k of A is nonzero
+        uplo == 'U' && (L[n, k] = 1 / 4; L[n - 1, k] = -1 / 4)   # same, through Fᵀ
+        d = fill(8.0, n); d[k] = 0.0
+        Fm = uplo == 'L' ? L : Matrix(transpose(L))
+        A0 = herm ? Fm * Diagonal(d) * Fm' : Fm * Diagonal(d) * transpose(Fm)
+        @test !iszero(A0[k, k])
+        A = copy(A0); ipiv = zeros(Int, n)
+        info = herm ? PureBLAS.hetrf!(A, ipiv; uplo) : PureBLAS.sytrf!(A, ipiv; uplo)
+        @test info == k
+        @test iszero(A[k, k])
+        @test all(iszero, uplo == 'L' ? A[(k + 1):n, k] : A[1:(k - 1), k])
+        # LinearAlgebra's `Matrix(::BunchKaufman)` misassembles a complex symmetric factor (it does so
+        # for reference LAPACK's nonsingular factor too), so reconstruct only where it is reliable.
+        if !(T <: Complex && !herm)
+            F = BunchKaufman(A, ipiv, uplo, !herm, false, info)
+            @test iszero(opnorm(Matrix(F) - A0, 1))
+        end
+    end
+end
