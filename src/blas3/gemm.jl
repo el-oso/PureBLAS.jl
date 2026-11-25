@@ -5272,7 +5272,7 @@ end
 # would arrive a different number of times: `_strassen_workers` caps the worker count at the number of
 # whole `_NR` blocks of base indices, so no worker gets an empty range and every worker walks the
 # identical recursion. And a worker that throws would leave the rest here forever: the wait watches
-# `failed`, which the worker loop sets before it stops.
+# `failed`, which the worker loop and the driver both set when their chunk throws.
 @inline function _pool_barrier(p::GemmPool{T}, nw::Int) where {T}
     nw <= 1 && return true
     # A MONOTONIC COUNTER, NOT A COUNTER THAT RESETS. Resetting it and then flipping a sense is the
@@ -5873,6 +5873,33 @@ const _MT_KEEPAWAKE_HOST = Threads.Atomic{Int}(_MT_KEEPAWAKE_NS)
 end
 
 @noinline _throw_gemm_worker() = error("PureBLAS: a threaded gemm worker failed; C is undefined")
+
+# Wait until all `nwk` woken workers have bumped `p.done`.
+#
+# `@noinline` IS REQUIRED. The caller runs this from a `finally`, and when the driver's chunk threw,
+# that `finally` runs while the exception unwinds. Julia miscompiles a loop written directly in such a
+# `finally`: a loop over a local never exits (1.12.7 and 1.13.4), and a loop reading a field segfaults
+# (1.13.4). The same loop behind a call boundary runs correctly on both.
+#
+# The DRIVER spins; only idle WORKERS have to be polite. Two reasons this is not the same trade as the
+# worker loop. It has nothing else to do — it is inside a blocking BLAS call — so spinning costs the
+# host nothing it was going to get back. And `wait` on an event can allocate, which `gemm!` may not do
+# (req#10, and test/strictmode_tests.jl's static proof). The yield after a span of polling is NOT
+# optional: a driver can run on the thread a sticky worker is bound to (any task that is not the pool's
+# creator may), and a bare spin here then waits on a worker that can never be scheduled — a deadlock,
+# once seen at 399% CPU. With `skip` that worker only bumps `done`, and it still needs this thread to
+# do it.
+@noinline function _mt_driver_join!(p::GemmPool, nwk::Int)
+    while (@atomic p.done) < nwk
+        span = _mt_poll_span(); t0 = time_ns()
+        while (@atomic p.done) < nwk
+            Base.Threads.atomic_fence()
+            time_ns() - t0 >= span && break
+        end
+        (@atomic p.done) < nwk && yield()
+    end
+    return nothing
+end
 
 # A worker lives for the process (see `set_num_threads`): there is no shutdown path, and the negative-
 # generation "shutdown" branch an earlier version carried was dead code — nothing ever set it — so it
@@ -7145,25 +7172,16 @@ end
         # happen even when THIS chunk throws: the workers hold raw pointers into C, and the caller's
         # `GC.@preserve` ends the moment this function returns. Unwinding past a live worker would let
         # it write into memory the caller is free to release.
+        #
+        # A throw from THIS chunk must also set `failed`, or a worker waiting for the driver in
+        # `_pool_barrier` never leaves it and the join below never completes.
+        ran = false
         try
             _gemm_run_chunk(p, nc, nc)
+            ran = true
         finally
-            # The DRIVER spins; only idle WORKERS have to be polite. Two reasons this is not the same
-            # trade as the worker loop. It has nothing else to do — it is inside a blocking BLAS call —
-            # so spinning costs the host nothing it was going to get back. And `wait` on an event can
-            # allocate, which `gemm!` may not do (req#10, and test/strictmode_tests.jl's static proof).
-            # The yield after a span of polling is NOT optional: a driver can run on the thread a sticky
-            # worker is bound to (any task that is not the pool's creator may), and a bare spin here then
-            # waits on a worker that can never be scheduled — a deadlock, once seen at 399% CPU. With
-            # `skip` that worker only bumps `done`, and it still needs this thread to do it.
-            while (@atomic p.done) < nwk
-                span = _mt_poll_span(); t0 = time_ns()
-                while (@atomic p.done) < nwk
-                    Base.Threads.atomic_fence()
-                    time_ns() - t0 >= span && break
-                end
-                (@atomic p.done) < nwk && yield()
-            end
+            ran || (@atomic p.failed = true)
+            _mt_driver_join!(p, nwk)
             joined = true
         end
         (@atomic p.failed) && _throw_gemm_worker()
