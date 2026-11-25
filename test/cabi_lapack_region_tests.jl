@@ -226,3 +226,26 @@ end
     Xf, if_ = gesvx('F', AF, ipiv)
     @test if_ == 0 && isapprox(Xf, Xref; rtol = 1e-4)
 end
+
+@testitem "C-ABI gels rejects lda/ldb below LAPACK's minimum instead of writing past B" setup = [CabiRegion] begin
+    using .CabiRegion: refsym, fcall, boxer, pre, sentinel
+    import PureBLAS as P
+    # Underdetermined A (2×5): B is read and written as 5 rows, so ldb = 2 must be info = -8, as in dgels.
+    for T in (Float32, Float64, ComplexF32, ComplexF64), (lda, ldb, want) in ((2, 2, -8), (1, 5, -6), (2, 5, 0))
+        name = pre(T) * "gels"; pb = getfield(P, Symbol(name, "_64_")); M, N, R = 2, 5, 1
+        A0 = randn(T, lda * N + 8); B0 = fill(sentinel(T), 16); B0[1:2] = randn(T, 2)
+        function run(f)
+            A = copy(A0); B = copy(B0); work = zeros(T, 256); keep, box = boxer(); info = [Int64(99)]
+            GC.@preserve keep A B work info f(box(UInt8('N')), box(Int64(M)), box(Int64(N)), box(Int64(R)),
+                pointer(A), box(Int64(lda)), pointer(B), box(Int64(ldb)), pointer(work), box(Int64(256)),
+                pointer(info), Clong(1))
+            return info[1], B
+        end
+        ipb, Bpb = run(pb)
+        iref, _ = run((args...) -> fcall(refsym(name), args...))
+        @test iref == want
+        @test ipb == want
+        want < 0 && @test Bpb == B0                      # nothing written, inside or past B
+        want < 0 || @test all(==(sentinel(T)), Bpb[6:end])
+    end
+end
