@@ -392,6 +392,11 @@ function _lasyf_lower!(
         if max(absakk, colmax) == zero(Tr)
             info == 0 && (info = k)
             kp = k
+            # Column k of A still holds its values from before this panel's update; the updated
+            # (zero) column is in W. Store it, so D[k,k] is the zero that `info` reports.
+            for i in k:n
+                A[i, k] = W[i, k]
+            end
         else
             if absakk >= alpha * colmax
                 kp = k
@@ -592,7 +597,11 @@ function _lahef_lower!(
         if max(absakk, colmax) == zero(Tr)
             info == 0 && (info = k)
             kp = k
-            A[k, k] = real(A[k, k])
+            # Store the updated (zero) column from W, as in the symmetric panel.
+            for i in k:n
+                A[i, k] = W[i, k]
+            end
+            A[k, k] = real(W[k, k])
         else
             if absakk >= alpha * colmax
                 kp = k
@@ -762,6 +771,11 @@ function _lasyf_upper!(
         if max(absakk, colmax) == zero(Tr)
             info == 0 && (info = k)
             kp = k
+            # Column k of A still holds its values from before this panel's update; the updated
+            # (zero) column is in W. Store it, so D[k,k] is the zero that `info` reports.
+            for i in 1:k
+                A[i, k] = W[i, kw]
+            end
         else
             if absakk >= alpha * colmax
                 kp = k
@@ -979,7 +993,11 @@ function _lahef_upper!(
         if max(absakk, colmax) == zero(Tr)
             info == 0 && (info = k)
             kp = k
-            A[k, k] = real(A[k, k])
+            # Store the updated (zero) column from W, as in the symmetric panel.
+            for i in 1:k
+                A[i, k] = W[i, kw]
+            end
+            A[k, k] = real(W[k, kw])
         else
             if absakk >= alpha * colmax
                 kp = k
