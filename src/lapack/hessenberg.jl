@@ -111,7 +111,8 @@ Balance a general square matrix `A` in place (LAPACK dgebal/zgebal). `job`:
 `'N'` none, `'P'` permute-only, `'S'` scale-only, `'B'` both (default). Returns the isolated-eigenvalue
 range `ilo:ihi` and the `scale` vector (permutation indices outside `ilo:ihi`, diagonal scaling factors
 within). The scaling loop copies dgebal exactly: radix `SCLFAC=2`, convergence `FACTOR=0.95`. Generic over
-`T<:Number`; `scale` is `real(T)`.
+`T<:Number`; `scale` is `real(T)`. Throws `ArgumentError` when scaling meets a NaN row or column norm
+(dgebal's info = -3).
 
 The 2-argument form takes the caller's `scale` (length ≥ n, `real(T)`-valued) — the `getrf!(A, ipiv)`
 treatment — and allocates nothing; the 1-argument form is the allocating convenience wrapper.
@@ -195,6 +196,8 @@ function gebal!(
             ca = _bal_colamax(A, i, 1, l)
             ra = _bal_rowamax(A, i, k, n)
             (iszero(c) || iszero(r)) && continue    # guard against underflow-zero C or R
+            # A NaN norm makes every exit test of the loops below false. dgebal returns info = -3 here.
+            isnan(c + ca + r + ra) && throw(ArgumentError("gebal!: A contains NaN"))
             g = r / sclfac
             f = one(R)
             s = c + r

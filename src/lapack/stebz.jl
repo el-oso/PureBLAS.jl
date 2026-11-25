@@ -40,6 +40,8 @@ end
         tol = max(atoli, pivmin, rtoli * max(abs(low), abs(high)))
         (high - low <= tol) && break
         mid = (low + high) / 2
+        # A NaN bracket (NaN in d or e) fails every test here; dstebz reports it as not converged.
+        isnan(mid) && return mid, false
         (mid <= low || mid >= high) && break          # bracket collapsed to adjacent floats
         if _sturm_negcount(d, e2, i1, i2, mid, pivmin) >= kloc
             high = mid
@@ -47,7 +49,7 @@ end
             low = mid
         end
     end
-    return (low + high) / 2
+    return (low + high) / 2, true
 end
 
 # Gather `out[t] = v[idx[t]]` elementwise. A non-scalar `getindex` with a Vector{Int} index routes
@@ -74,7 +76,8 @@ Eigenvalues of the real symmetric tridiagonal matrix with diagonal `d` (length n
 the half-open interval `(vl, vu]`, `'I'` those with index `il:iu` in ascending order. `order`: `'B'`
 groups eigenvalues by split block (ascending within block); `'E'` returns them globally ascending.
 `abstol ≤ 0` selects the default tolerance `eps·‖T‖`. Returns eigenvalues `w`, their block index
-`iblock`, the block boundaries `isplit`, and `info` (0 on success).
+`iblock`, the block boundaries `isplit`, and `info`: 0 on success, 1 when some eigenvalue did not
+converge (a NaN in `d` or `e`); those carry a negative `iblock`, as in `dstebz`.
 
 The twelve-argument form is Reference-LAPACK dstebz's own signature: it writes into the caller's
 `w`, `iblock` and `isplit` (each length ≥ n) and allocates nothing, returning the COUNTS instead —
@@ -128,7 +131,7 @@ function stebz!(
     # comment gave: "the first is dead by the time the second is built" is the never-overlap reasoning
     # that has been wrong here before. `sort!(p, QuickSort, Perm(...))` over a pointer-backed vector is
     # fine — it is fully in-place, so it never needs `similar`.
-    # ESCAPE AUDIT: `stebz!` returns `(mc, ns, 0)`; every borrow is written and read inside this scope,
+    # ESCAPE AUDIT: `stebz!` returns `(mc, ns, info)`; every borrow is written and read inside this scope,
     # and the results are copied out into the caller's `w`/`iblock`/`isplit`.
     @scope arn begin
         e2 = borrow!(arn, T, max(n - 1, 1))
@@ -169,6 +172,7 @@ function stebz!(
         # then sliced to the global index band il:iu below (robust under clustering, where value-boundary
         # bisection can miscount). Blocks emerge in natural order, ascending within block.
         mc = 0
+        ncnvrg = false
         ibegin = 1
         @inbounds for jb in 1:ns
             i1 = ibegin; i2 = Int(isplit[jb]); ibegin = i2 + 1
@@ -179,8 +183,9 @@ function stebz!(
                 nlo = 0; nhi = i2 - i1 + 1
             end
             for kloc in (nlo + 1):nhi
-                λ = _sturm_bisect(d, e2, i1, i2, kloc, gl, gu, pivmin, atoli, rtoli)
-                mc += 1; w[mc] = λ; iblock[mc] = jb
+                λ, ok = _sturm_bisect(d, e2, i1, i2, kloc, gl, gu, pivmin, atoli, rtoli)
+                mc += 1; w[mc] = λ; iblock[mc] = ok ? jb : -jb   # dstebz flags it with -iblock
+                ncnvrg |= !ok
             end
         end
 
@@ -232,7 +237,7 @@ function stebz!(
                 w[t] = gw[t]; iblock[t] = gi[t]
             end
         end
-        return mc, ns, 0
+        return mc, ns, ncnvrg ? 1 : 0
     end
 end
 

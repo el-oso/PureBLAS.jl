@@ -1397,7 +1397,12 @@ for (p, T, Tr) in (
         )::Cvoid
         N = Int(unsafe_load(n))
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
-        k, l, scl = gebal!(Am; job = _cabi_char(job))
+        k, l, scl = try
+            gebal!(Am; job = _cabi_char(job))
+        catch e
+            e isa ArgumentError || rethrow()
+            unsafe_store!(info, Int64(-3)); return             # dgebal: NaN in A
+        end
         sm = PtrVector(scale, N)
         @inbounds for i in 1:N
             sm[i] = scl[i]
