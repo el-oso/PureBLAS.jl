@@ -621,6 +621,10 @@ end
 # first column, so no column changes kernel. The next panel is factored after every local worker has
 # finished its columns, the precondition the look-ahead has always had.
 #
+# ONE CACHE GROUP: every worker is local and there is no remote band. The job-by-job step makes three
+# passes over the trailing block (swaps, solve, update); this one makes one pass per column band, so a
+# band's swapped rows are solved and updated by the worker that just swapped them.
+#
 # MEASURED on Zen3, clock locked, threads pinned one per core, ms, job-by-job step -> this one:
 #   3 + 3 workers       n=512 1.131 -> 0.951   1024 5.160 -> 4.653   1000 4.578 -> 3.997   2048 29.16 -> 26.95
 #   5 + 1 workers       n=512 1.075 -> 0.869   1024 5.070 -> 4.321   1000 4.459 -> 3.827   2048 29.93 -> 27.36
@@ -703,6 +707,8 @@ end
 # and is slower (Zen3, three workers in each of two groups, ms): n=512 1.028 against 0.956, n=1024
 # 4.862 against 4.676, n=1000 4.137 against 3.977.
 @inline function _lustep_local(wid::Int, pb2::Int, nw::Int, g0::Int)
+    # All workers local: there is no remote band to take the columns a whole-`_NR` snap leaves over.
+    g0 >= nw && return wid - pb2
     Lw = max(0, (((g0 * (2 * wid + pb2)) ÷ (2 * nw) - (3 * pb2) ÷ 2) ÷ _NR) * _NR)
     return wid - pb2 - Lw >= (nw - g0) * _NR ? Lw : -1
 end
@@ -738,15 +744,18 @@ end
 # when the step is not eligible and the caller must run it job by job.
 function _lustep_try!(A, ipiv, m::Int, n::Int, k::Int, pc::Int, pb::Int, jt0::Int, nb::Int)
     T = eltype(A)
-    g0 = _MT_G0[]
-    (T <: BlasReal && _MT_NTHREADS[] > g0 && pc + pb <= m && jt0 <= k) || return -2
+    (T <: BlasReal && _MT_NTHREADS[] > 1 && pc + pb <= m && jt0 <= k) || return -2
     wid = n - jt0 + 1
     pb2 = _lu_pb(k - jt0 + 1, nb, T)
     (wid > pb2 && iszero(pb2 % _NR) && jt0 + pb2 <= n) || return -2
     (_strided1(A) && _lu_ipiv_ok(ipiv) && _trsm_plain_L(pb, wid, T)) || return -2
     # The worker count the look-ahead's wide half would use, so the two forms engage together.
     nw = _gemm_workers(m - pc - pb + 1, wid - pb2, pb)
-    (nw > g0 && _lustep_local(wid, pb2, nw, g0) >= 0) || return -2
+    # Every worker is local when the pool has one cache group (`_MT_G0` is then `typemax`) or when
+    # the driver's group holds them all. The step is the same job with no remote band: one pass per
+    # column band (swap, solve, update) instead of three passes over the whole trailing block.
+    g0 = min(_MT_G0[], nw)
+    (nw > 1 && _lustep_local(wid, pb2, nw, g0) >= 0) || return -2
     # `g0` and the chunk roles are true for a driver on the pool creator's thread only.
     Threads.threadid() == _MT_HOME[] || return -2
     r = _root(A)
