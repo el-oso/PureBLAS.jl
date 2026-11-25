@@ -171,6 +171,38 @@ function _geev_normalize_cmplx!(VR::AbstractMatrix{C}, n::Int) where {C <: Compl
     return VR
 end
 
+# ── Range scaling (dgeev/dgees/dggev/dgges) ──────────────────────────────────────────────────────────────
+# The Hessenberg/QZ reductions lose the eigenvalues when every entry of A is near underflow (the
+# Householder and Givens arithmetic flushes to zero) or near overflow (it reaches Inf). As LAPACK does, a
+# matrix whose largest |entry| lies outside [√safmin/ε, ε/√safmin] is scaled into that band first, and the
+# caller multiplies the eigenvalues — and any Schur form it returns — by the factor this returns. The
+# factor is a power of two, so neither the scaling nor the unscaling rounds; it lands the largest entry
+# within a factor of 2 of the band edge, which is all the band is for. Element types without
+# `floatmin` (e.g. ForwardDiff.Dual) are left as they are.
+function _eig_scale!(A::AbstractMatrix{T}) where {T <: Union{AbstractFloat, Complex{<:AbstractFloat}}}
+    R = real(T)
+    anrm = maximum(abs, A; init = zero(R))
+    lo = sqrt(floatmin(R)) / eps(R)     # dgeev SMLNUM (req8-ok: LAPACK algorithm constant, not a tuning knob)
+    hi = inv(lo)
+    (iszero(anrm) || !isfinite(anrm) || lo <= anrm <= hi) && return one(R)
+    e = exponent(anrm < lo ? lo : hi) - exponent(anrm)
+    s = ldexp(one(R), e)
+    @inbounds for j in axes(A, 2), i in axes(A, 1)
+        A[i, j] *= s
+    end
+    return ldexp(one(R), -e)
+end
+_eig_scale!(A::AbstractMatrix) = one(real(eltype(A)))
+
+# Multiply every entry by `f`, skipped when f == 1 (the common case).
+function _eig_unscale!(x::AbstractArray, f)
+    isone(f) && return x
+    @inbounds for i in eachindex(x)
+        x[i] *= f
+    end
+    return x
+end
+
 # ── geev core (REAL), IN-PLACE — every output is the caller's buffer. Returns (ilo, ihi, abnrm). ────────
 # A is overwritten (Schur form). `VR` MUST NOT alias `A`: the reflectors are read out of A into VR and A is
 # then destructively reduced (the orgtr!('L',A,tau,A) failure class). Nothing here allocates: `tau`, the
@@ -188,8 +220,9 @@ function _geev_run!(
     Base.mightalias(VR, A) && throw(ArgumentError("geev!: VR must not alias A (A is reduced destructively after Q is formed into VR)"))
     wantvr = jobvr === 'V'
     n == 0 && return 1, 0, zero(T)
+    back = _eig_scale!(A)
     ilo, ihi = gebal!(A, scale; job = balanc)
-    abnrm = _geev_lange1(A)
+    abnrm = _geev_lange1(A) * back
     # Arena borrows (arena.jl), replacing the `geevtau`/`geevw`/`geevz0` fields. All three are taken at
     # ENTRY and live to the end of the pipeline: `tau` is live ACROSS the gehrd!→_orghr_into! pair, and `w`
     # across hseqr!→the wr/wi split. Exact `ld` on all three — none of these fields carried an anti-aliasing
@@ -223,6 +256,7 @@ function _geev_run!(
             end
         end
     end
+    _eig_unscale!(wr, back); _eig_unscale!(wi, back)
     return ilo, ihi, abnrm
 end
 
@@ -251,8 +285,9 @@ function _geev_run!(
     R = real(T)
     wantvr = jobvr === 'V'
     n == 0 && return 1, 0, zero(R)
+    back = _eig_scale!(A)
     ilo, ihi = gebal!(A, scale; job = balanc)
-    abnrm = _geev_lange1(A)
+    abnrm = _geev_lange1(A) * back
     # Arena borrows, same contract as the real method above — no `w` here, the caller owns it (T is already
     # complex). `tau` is live across gehrd!→_orghr_into!; `Z0` is the n×0 placeholder hseqr! ignores under
     # compz='N'. ESCAPE AUDIT: `tau` reaches gehrd! and _orghr_into!, `Z0` reaches hseqr!/_zlahqr!; each
@@ -274,6 +309,7 @@ function _geev_run!(
             hseqr!('E', 'N', A, ilo, ihi, w, Z0)
         end
     end
+    _eig_unscale!(w, back)
     return ilo, ihi, abnrm
 end
 
@@ -302,6 +338,7 @@ function _gees_run!(
     Base.mightalias(VS, A) && throw(ArgumentError("gees!: VS must not alias A (A is reduced destructively after Q is formed into VS)"))
     wantvs = jobvs === 'V'
     n == 0 && return w, VS
+    back = _eig_scale!(A)
     ilo, ihi = gebal!(A, scale; job = 'P')
     # Arena borrows, as in `_geev_run!`. `w` is the CALLER's (complex for a real T), so only the gehrd τ and
     # the n×0 Z placeholder are borrowed. ESCAPE AUDIT: `tau` reaches gehrd! and _orghr_into!, `Z0` reaches
@@ -321,6 +358,7 @@ function _gees_run!(
             hseqr!('S', 'N', A, ilo, ihi, w, Z0)
         end
     end
+    _eig_unscale!(A, back); _eig_unscale!(w, back)           # the Schur form and its eigenvalues
     return w, VS
 end
 
@@ -347,6 +385,7 @@ function _gees_run!(
     Base.mightalias(VS, A) && throw(ArgumentError("gees!: VS must not alias A (A is reduced destructively after Q is formed into VS)"))
     wantvs = jobvs === 'V'
     n == 0 && return w, VS
+    back = _eig_scale!(A)
     ilo, ihi = gebal!(A, scale; job = 'P')
     # Same borrows and the same escape audit as the real `_gees_run!` above: `tau` is live across
     # gehrd!→_orghr_into!, `Z0` is the n×0 Z that hseqr!('S','N', …) never touches, and neither handle is
@@ -365,6 +404,7 @@ function _gees_run!(
             hseqr!('S', 'N', A, ilo, ihi, w, Z0)
         end
     end
+    _eig_unscale!(A, back); _eig_unscale!(w, back)           # the Schur form and its eigenvalues
     return w, VS
 end
 

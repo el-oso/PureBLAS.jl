@@ -154,6 +154,7 @@ function _ggev_core!(
     (jobvr === 'N' || jobvr === 'V') || throw(ArgumentError("ggev!: jobvr must be 'N' or 'V'"))
     wantvr = jobvr === 'V'
     n == 0 && return nothing
+    backA = _eig_scale!(A); backB = _eig_scale!(B)          # range scaling, as dggev (geev.jl)
     # `alphaC` is the COMPLEX eigenvalue staging a REAL pencil still needs (hgeqz! reports α complex for
     # both types), so the borrow is `Complex{T}` — the arena's answer to the field that had to live on
     # `_l3ws(Complex{T})`. No fill!: hgeqz! assigns alpha[i] for every i in 1:n on every exit, before the
@@ -177,6 +178,7 @@ function _ggev_core!(
             alphar[i] = real(alphaC[i]); alphai[i] = imag(alphaC[i])
         end
     end
+    _eig_unscale!(alphar, backA); _eig_unscale!(alphai, backA); _eig_unscale!(beta, backB)
     wantvr && _ggev_normalize_real!(VR, alphai, n)
     return nothing
 end
@@ -208,6 +210,7 @@ function _ggev_core!(
     (jobvr === 'N' || jobvr === 'V') || throw(ArgumentError("ggev!: jobvr must be 'N' or 'V'"))
     wantvr = jobvr === 'V'
     n == 0 && return nothing
+    backA = _eig_scale!(A); backB = _eig_scale!(B)          # range scaling, as zggev (geev.jl)
     _ggev_qrB!(A, B, n, 'C')
     if wantvr
         gghrd!('N', 'I', A, B, VR, VR)
@@ -218,6 +221,7 @@ function _ggev_core!(
         gghrd!('N', 'N', A, B, VR, VR)
         hgeqz!('E', 'N', 'N', A, B, alpha, beta, VR, VR)
     end
+    _eig_unscale!(alpha, backA); _eig_unscale!(beta, backB)
     return nothing
 end
 
@@ -243,9 +247,12 @@ function _gges_core!(
     size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
         throw(DimensionMismatch("gges!: A and B must be square and the same size"))
     n == 0 && return nothing
+    backA = _eig_scale!(A); backB = _eig_scale!(B)          # range scaling, as dgges (geev.jl)
     _ggev_qrB!(A, B, n, 'T', VSL)                          # VSL starts as Q_B, gghrd/hgeqz post-multiply Q
     gghrd!('V', 'I', A, B, VSL, VSR)
     hgeqz!('S', 'V', 'V', A, B, alpha, beta, VSL, VSR)
+    _eig_unscale!(A, backA); _eig_unscale!(B, backB)         # the generalized Schur forms S and P
+    _eig_unscale!(alpha, backA); _eig_unscale!(beta, backB)
     return nothing
 end
 
@@ -257,9 +264,12 @@ function _gges_core!(
     size(A, 2) == n && size(B, 1) == n && size(B, 2) == n ||
         throw(DimensionMismatch("gges!: A and B must be square and the same size"))
     n == 0 && return nothing
+    backA = _eig_scale!(A); backB = _eig_scale!(B)          # range scaling, as zgges (geev.jl)
     _ggev_qrB!(A, B, n, 'C', VSL)                          # VSL starts as Q_B (see the real method above)
     gghrd!('V', 'I', A, B, VSL, VSR)
     hgeqz!('S', 'V', 'V', A, B, alpha, beta, VSL, VSR)
+    _eig_unscale!(A, backA); _eig_unscale!(B, backB)         # the generalized Schur forms S and P
+    _eig_unscale!(alpha, backA); _eig_unscale!(beta, backB)
     return nothing
 end
 
