@@ -1268,12 +1268,17 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
             n::Ptr{Int64}, nrhs::Ptr{Int64}, A::Ptr{$T}, lda::Ptr{Int64}, B::Ptr{$T}, ldb::Ptr{Int64},
             work::Ptr{$T}, lwork::Ptr{Int64}, info::Ptr{Int64}, lt::Clong
         )::Cvoid
+        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs))
+        LDA = Int(unsafe_load(lda)); LDB = Int(unsafe_load(ldb))
+        # dgels's argument checks, before the workspace query as there. B is read and written as
+        # max(M,N) rows, so LDB < max(M,N) would put those rows past the caller's buffer.
+        bad = M < 0 ? -2 : N < 0 ? -3 : R < 0 ? -4 : LDA < max(1, M) ? -6 : LDB < max(1, M, N) ? -8 : 0
+        bad != 0 && (unsafe_store!(info, Int64(bad)); return)
         if unsafe_load(lwork) == Int64(-1)
             unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
         end
-        M = Int(unsafe_load(m)); N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs))
-        Am = PtrMatrix(A, M, N, Int(unsafe_load(lda)))
-        Bm = PtrMatrix(B, max(M, N), R, Int(unsafe_load(ldb)))
+        Am = PtrMatrix(A, M, N, LDA)
+        Bm = PtrMatrix(B, max(M, N), R, LDB)
         gels!(_cabi_char(trans), Am, Bm)
         unsafe_store!(info, Int64(0)); return
     end
