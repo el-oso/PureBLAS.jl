@@ -297,6 +297,39 @@ end
     end
 end
 
+@testitem "complex trsv/trsm: diagonal whose |d|² is outside the float range" begin
+    using PureBLAS, LinearAlgebra
+    # 1/d is representable but |d|² underflows (tiny) or overflows (huge), so conj(d)/|d|² gives NaN.
+    @testset "$T n=$n" for T in (ComplexF32, ComplexF64), n in (4, 40)
+        R = real(T); e = R === Float32 ? 20 : 160
+        tiny = T(3 * R(10)^-e, -2 * R(10)^-e); huge = T(3 * R(10)^e, 2 * R(10)^e)
+        d = [isodd(j) ? tiny : huge for j in 1:n]
+        A = Matrix(Diagonal(d))
+        b = T.(1:n) .+ im
+        expect = b ./ d
+        @testset "trsv $ul$tr" for ul in ('U', 'L'), tr in ('N', 'T', 'C')
+            x = copy(b); PureBLAS.trsv!(A, x; uplo = ul, trans = tr, diag = 'N')
+            want = tr == 'C' ? b ./ conj.(d) : expect
+            @test all(isfinite, x)
+            @test maximum(abs.(x .- want) ./ abs.(want)) < 8eps(R)
+        end
+        @testset "trsm $sd$ul$tr nrhs=$k" for sd in ('L', 'R'), ul in ('U', 'L'), tr in ('N', 'C'), k in (3, 40)
+            Bm = sd == 'L' ? repeat(b, 1, k) : repeat(transpose(b), k, 1)
+            PureBLAS.trsm!(Bm, A; side = sd, uplo = ul, transA = tr, diag = 'N', alpha = one(T))
+            want = tr == 'C' ? b ./ conj.(d) : expect
+            W = sd == 'L' ? repeat(want, 1, k) : repeat(transpose(want), k, 1)
+            @test all(isfinite, Bm)
+            @test maximum(abs.(Bm .- W) ./ abs.(W)) < 8eps(R)
+        end
+    end
+    @testset "gesvx rcond with a 1e-30 pivot, $T" for T in (ComplexF32, ComplexF64)
+        n = 6; R = real(T)
+        H = Matrix{T}(I, n, n); H[n, n] = T(1.0e-30)
+        res = PureBLAS.gesvx!('N', 'N', H, similar(H), zeros(Int64, n), 'N', zeros(R, n), zeros(R, n), ones(T, n, 1))
+        @test isfinite(res[3]) && res[3] < eps(R) / 2
+    end
+end
+
 @testitem "trmv/trsv blocked (large n) vs OpenBLAS" setup = [L2Oracle] begin
     using PureBLAS, LinearAlgebra
     import LinearAlgebra.BLAS as B   # n > _TRI_NB(=64) exercises the blocked diagonal+gemv path

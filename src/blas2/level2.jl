@@ -4921,18 +4921,36 @@ end
 # in-loop complex DIVIDE sits on the sequential substitution CRITICAL PATH (each x[j] feeds the next
 # column's axpy/dot) — Julia's Complex `/` (Smith's robust algorithm) latency is fully exposed and
 # dominates small n (ztrsv n≤256 was 0.65–0.96 vs OB; ztrmv, SAME axpy but NO divide, gates). Precompute
-# r[j]=1/diag up front (all independent → pipelined, throughput-bound) with a NAIVE reciprocal (the trsv
-# diagonal is well-conditioned; BLAS doesn't overflow-guard the inner divide), then MULTIPLY in the loop.
+# r[j]=1/diag up front (all independent → pipelined, throughput-bound) with `_crecip`, then MULTIPLY in
+# the loop.
 # n ≤ _TRI_C_BLK_MIN (256) unblocked / 64-block ⇒ 512 covers it (else fall back to the divide).
 const _TRSV_RCP64 = Base.OncePerThread{Vector{ComplexF64}}(() -> Vector{ComplexF64}(undef, 512))
 const _TRSV_RCP32 = Base.OncePerThread{Vector{ComplexF32}}(() -> Vector{ComplexF32}(undef, 512))
 @inline _trsv_rcpbuf(::Type{Float64}) = _TRSV_RCP64()
 @inline _trsv_rcpbuf(::Type{Float32}) = _TRSV_RCP32()
-@inline _crecip(d::Complex) = (r = real(d); i = imag(d); s = inv(muladd(r, r, i * i)); Complex(r * s, -i * s))
+# 1/d as conj(d)/|d|². |d|² underflows or overflows long before 1/d does (ComplexF32: |d| < 1e-19 or
+# > 1e19), and 0·Inf then gives NaN, so outside the normal range of |d|² this falls back to Julia's
+# scaled `inv`. One compare pair per diagonal element; the multiply-only solve loop is unchanged.
+@inline _crecip_fast(d::Complex) = (r = real(d); i = imag(d); s = inv(muladd(r, r, i * i)); Complex(r * s, -i * s))
+@inline _crecip_inrange(d::Complex) = (r = real(d); i = imag(d); t = muladd(r, r, i * i); floatmin(t) <= t <= floatmax(t))
+@inline _crecip(d::Complex) = _crecip_inrange(d) ? _crecip_fast(d) : inv(d)
+# rcp[j] = 1/dj(j) for j in 1:n. The loop runs the fast form and only records whether any |d|² left the
+# range; the rare out-of-range entries are redone after it. A per-element branch to `inv` in the loop
+# measured 2.5x slower than this (ComplexF32, n=512: 1475 ns against 636).
+@inline function _crecip_fill!(rcp, n::Int, dj::F) where {F}
+    ok = true
+    @inbounds for j in 1:n
+        d = dj(j); rcp[j] = _crecip_fast(d); ok &= _crecip_inrange(d)
+    end
+    ok && return rcp
+    @inbounds for j in 1:n
+        d = dj(j); _crecip_inrange(d) || (rcp[j] = inv(d))
+    end
+    return rcp
+end
 # The DUAL diagonal reciprocal shares the complex buffer as raw pair storage (dual_l2.md §4.1): 1/(c + dε) =
 # 1/c − (d/c²)ε is stored as the two reals (r, −d·r²) in a Complex slot and read back with `_mkpair` — no complex
 # arithmetic ever touches it. `_rcp_mul` is `x * rcp` for complex (unchanged) and the pair product for dual.
-@inline _pair_rcp(::Type{Complex{T}}, d) where {T} = _crecip(d)
 @inline function _pair_rcp(::Type{P}, d) where {P}
     v, p = _parts(d); r = inv(v)
     return Complex(r, -p * r * r)
@@ -4950,7 +4968,9 @@ function _trsv_cmplx!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Int, A, x) wh
         djj(j) = (a = unsafe_load(Ap, (j - 1) * ldc + j); cj ? conj(a) : a)
         colp(r, j) = Ap + ((j - 1) * ldc + (r - 1)) * csz
         rcp = _trsv_rcpbuf(T)
-        if userc                                             # r[j] = 1/diag (naive, pipelined)
+        if userc && P <: Complex                             # r[j] = 1/diag, pipelined
+            tr ? _crecip_fill!(rcp, n, djj) : _crecip_fill!(rcp, n, j -> unsafe_load(Ap, (j - 1) * ldc + j))
+        elseif userc
             if !tr
                 @inbounds for j in 1:n
                     rcp[j] = _pair_rcp(P, unsafe_load(Ap, (j - 1) * ldc + j))
