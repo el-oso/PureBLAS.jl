@@ -1300,7 +1300,7 @@ end
 `_dot_simd`, so the same argument applies: a split changes the grouping, therefore one grid at every
 worker count.
 
-`_nrm2`'s overflow guard (`isfinite(ss) && !iszero(ss)`) is unaffected: a fold of finite partials that
+`_nrm2`'s range guard (`_sumsq_ok(ss)`) is unaffected: a fold of finite partials that
 reaches Inf is still caught, and a block being smaller than the whole vector can only make the fast path
 survive where one long accumulator overflowed — a better answer under the same contract. The grid is
 fixed, so WHICH path runs cannot vary with the worker count.

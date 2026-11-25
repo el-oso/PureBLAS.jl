@@ -65,6 +65,26 @@ end
     end
 end
 
+@testitem "nrm2: subnormal squares and several Infs vs OpenBLAS" begin
+    using PureBLAS
+    import LinearAlgebra.BLAS as B
+    # Squares in the subnormal range are finite and nonzero but lose bits; two Infs must not make Inf/Inf.
+    @testset "$T" for T in (Float32, Float64, ComplexF32, ComplexF64)
+        R = real(T); s = R === Float32 ? R(1.0f-20) : R(1.0e-160)
+        small = (fill(T(s), 16), fill(T(s), 3000), T.(s .* (1:40)))
+        special = (T[Inf, Inf], T[-Inf, Inf, 2], T[Inf, 1], T[Inf, NaN], T[NaN, Inf], T[NaN, 1])
+        special = T <: Complex ? (special..., T[complex(R(Inf), R(Inf))], T[complex(R(1), R(-Inf)), R(Inf)]) : special
+        for x in (small..., special...), v in (x, view(repeat(x; inner = 2), 1:2:(2length(x))))
+            pb = PureBLAS.nrm2(v); ob = B.nrm2(collect(v))
+            if isfinite(ob)
+                @test pb ≈ ob rtol = 8eps(R)
+            else
+                @test isequal(pb, ob)
+            end
+        end
+    end
+end
+
 @testitem "Level-1 strided two-vector vs OpenBLAS" setup = [Oracle] begin
     using PureBLAS
     import LinearAlgebra.BLAS as B
