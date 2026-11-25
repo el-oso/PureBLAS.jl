@@ -1064,11 +1064,11 @@ end
     end
 end
 
-# getrf runs a panel step as ONE job when the pool's workers span cache groups (`_lustep_try!`), and
-# the pool only reports that on a host that has more than one group and pinned threads — which is
-# neither the CI runner nor most development machines. So the item above never reaches that path
-# there. This one declares a split by hand (`_MT_G0`, the number of participants in the driver's
-# group) so the grouped step runs on any host with three threads, and asserts that it did.
+# getrf runs a panel step as ONE job (`_lustep_try!`). The split into local and remote workers comes
+# from the pool's cache groups, which it reports only on a host with more than one group and pinned
+# threads — neither the CI runner nor most development machines. This item declares each split by
+# hand (`_MT_G0`, the number of participants in the driver's group), including the all-local one a
+# single-group host runs, so every form runs on any host with three threads, and asserts that it did.
 #
 # Shapes: a 512-aliased leading dimension (the pad path) and one that is not, a size that is not a
 # multiple of the panel width, and a tall and a wide matrix, because the step's column layout is
@@ -1091,14 +1091,15 @@ end
                 P.set_num_threads(1)
                 r = copy(B0); ipr = Vector{Int}(undef, k); P.getrf!(view(r, 1:m, 1:n), ipr)
                 P.set_num_threads(nthreads())
-                # Every split of the participants into a local and a remote set.
-                for g0 in 1:(nthreads() - 1)
+                # Every split of the participants into a local and a remote set, then every worker
+                # local: the driver's group holds the pool, or the pool has one group (`typemax`).
+                for g0 in (1:(nthreads() - 1)..., nthreads(), typemax(Int))
                     P._MT_G0[] = g0
                     g = copy(B0); ipg = Vector{Int}(undef, k)
                     s0 = P._MT_LUSTEPS[]
                     P.getrf!(view(g, 1:m, 1:n), ipg)
-                    # All but one participant local is the split every size here admits.
-                    g0 == nthreads() - 1 && @test P._MT_LUSTEPS[] > s0
+                    # All but one participant local, and all local, are splits every size here admits.
+                    g0 >= nthreads() - 1 && @test P._MT_LUSTEPS[] > s0
                     @test bitsame(g, r)
                     @test ipg == ipr
                 end
