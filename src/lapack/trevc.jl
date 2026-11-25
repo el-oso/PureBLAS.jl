@@ -526,6 +526,25 @@ function _dtrevc_right!(over::Bool, T::AbstractMatrix{R}, VR::AbstractMatrix{R})
     return VR
 end
 
+# x[1:ki] *= s. Out of line: it runs only when the back-substitution nears overflow.
+@noinline function _ztrevc_rescale!(x::AbstractVector, ki::Int, s::Real)
+    for k in 1:ki
+        x[k] *= s
+    end
+    return nothing
+end
+
+# x[1:j-1] -= xj·T[1:j-1, j]. `@noinline` is measured, not style: inlined into the guarded j-loop,
+# this loop is 1.47× (ComplexF64) and 1.11× (ComplexF32) slower at n=1024 on Zen4, and the
+# library's complex `_axpy!` is slower than this form too. The only caller passes j < ki ≤ n with
+# `x` of length n and `T` n×n, which is what the `@inbounds` relies on.
+@noinline function _ztrevc_update!(x::AbstractVector, xj, T::AbstractMatrix, j::Int)
+    @inbounds for k in 1:(j - 1)
+        x[k] -= xj * T[k, j]
+    end
+    return nothing
+end
+
 # ── ZTREVC right eigenvectors, COMPLEX triangular T ───────────────────────────────────────────────────
 # Guarded back-substitution of (T(1:ki-1,1:ki-1) − T(ki,ki))·x = −T(1:ki-1,ki), with the diagonal
 # perturbed to SMIN when a difference underflows (the ztrevc correctness guard for clustered spectra).
@@ -537,16 +556,25 @@ function _ztrevc_right!(over::Bool, T::AbstractMatrix{C}, VR::AbstractMatrix{C})
     unfl = _dtrevc_safmin(R)
     ulp = eps(R)
     smlnum = unfl * (R(n) / ulp)
-    # Arena borrow (arena.jl), not an owned field. Hoisted above the `ki` loop: it is a loop-invariant
-    # length-n buffer, and `@scope` rejects a borrow inside the loop anyway. No fill! — exactly as the
-    # accessor it replaces documented: x[1:ki-1] and x[ki] are written before any read and reads never
-    # exceed 1:ki, so undefined arena bytes are never observed. Exact `ld` (the field carried no
-    # anti-aliasing stride requirement).
-    # NOTHING ESCAPES this scope: `x` is read and written only inside the loop below and never passed to
-    # any callee at all — the only calls here are `cabs1`, a local closure over scalars. The return value
-    # is `VR`, the caller's own matrix; no field, global or closure retains a handle.
+    bignum = (one(R) - ulp) / smlnum
+    # Arena borrows (arena.jl), not owned fields. Hoisted above the `ki` loop: they are loop-invariant
+    # length-n buffers, and `@scope` rejects a borrow inside the loop anyway. `x` needs no fill!:
+    # x[1:ki-1] and x[ki] are written before any read and reads never exceed 1:ki, so undefined arena
+    # bytes are never observed. `cnorm` is written in full below before the loop. Exact `ld` (the
+    # buffers carry no anti-aliasing stride requirement).
+    # NOTHING ESCAPES this scope: `cnorm` never leaves it, and `x` goes only to `_ztrevc_rescale!` and
+    # `_ztrevc_update!`, which write it in place and keep no handle. The return value is `VR`, the
+    # caller's own matrix; no field, global or closure retains a handle.
     @scope arn begin
         x = borrow!(arn, C, n)
+        cnorm = borrow!(arn, R, n)                  # cnorm[j] = Σ_{i<j} cabs1(T[i,j])
+        @inbounds for j in 1:n
+            s = zero(R)
+            for i in 1:(j - 1)
+                s += cabs1(T[i, j])
+            end
+            cnorm[j] = s
+        end
         is = n
         @inbounds for ki in n:-1:1
             smin = max(ulp * cabs1(T[ki, ki]), smlnum)
@@ -555,15 +583,26 @@ function _ztrevc_right!(over::Bool, T::AbstractMatrix{C}, VR::AbstractMatrix{C})
             end
             x[ki] = one(C)
             λ = T[ki, ki]
-            # back-substitution: (T[1:ki-1,1:ki-1] − λ)·x = rhs
+            # back-substitution: (T[1:ki-1,1:ki-1] − λ)·x = rhs. Clustered eigenvalues make the
+            # growth up to (1/smin)^ki, so x[1:ki] is rescaled whenever the quotient or the column
+            # update would pass `bignum` (the dtrevc/dlaln2 guards). The common scale factor drops
+            # out in the normalization below.
             for j in (ki - 1):-1:1
                 djj = T[j, j] - λ
                 cabs1(djj) < smin && (djj = Complex(smin, zero(R)))
-                xj = x[j] / djj
-                x[j] = xj
-                for k in 1:(j - 1)
-                    x[k] -= xj * T[k, j]
+                dabs = cabs1(djj); bnorm = cabs1(x[j])
+                if dabs < one(R) && bnorm > one(R) && bnorm > bignum * dabs
+                    _ztrevc_rescale!(x, ki, one(R) / bnorm)
                 end
+                xj = x[j] / djj
+                xa = cabs1(xj)
+                if xa > one(R) && cnorm[j] > bignum / xa
+                    s = one(R) / xa
+                    _ztrevc_rescale!(x, ki, s)
+                    xj *= s
+                end
+                x[j] = xj
+                _ztrevc_update!(x, xj, T, j)
             end
             if !over
                 for k in 1:ki
