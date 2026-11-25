@@ -2314,9 +2314,7 @@ function _trsm_cmplx_dLN!(up::Bool, unit::Bool, k::Int, A, B)
         # `rcp[j]` unconditionally, so skipping the fill would hand it stale reciprocals rather than
         # fall back, and the BLAS-2 kernels only get away with a `userc` flag because they thread it
         # into every consumer (`userc ? t * rcp[j] : t / …`, level2.jl:2779-2803).
-        unit || @inbounds @simd for j in 1:k
-            rcp[j] = _crecip(unsafe_load(Ap, (j - 1) * lda + j))
-        end
+        unit || _crecip_fill!(rcp, k, j -> unsafe_load(Ap, (j - 1) * lda + j))
         pc = 0
         while pc < nrhs
             pw = min(nc, nrhs - pc)
