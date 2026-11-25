@@ -469,6 +469,22 @@ end
     return _heev!(jobz, uplo, Aw)                    # (w::Vector{Float64}, Z::Matrix{ComplexF64}, info)
 end
 
+# dsyevr/zheevr's argument checks and info numbering (both share the argument order up to ldz). il:iu
+# index w and Z, so an index outside the spectrum must be rejected rather than read or written; at N = 0
+# the only valid index range is il = 1, iu = 0.
+function _syevr_argcheck(jz, rg, ul, N, ld, VL, VU, IL, IU, ldz)
+    (jz != 'N' && jz != 'V') && return -1
+    (rg != 'A' && rg != 'V' && rg != 'I') && return -2
+    (ul != 'U' && ul != 'L') && return -3
+    N < 0 && return -4
+    ld < max(1, N) && return -6
+    rg == 'V' && N > 0 && VU <= VL && return -8
+    rg == 'I' && !(1 <= IL <= max(1, N)) && return -9
+    rg == 'I' && !(min(N, IL) <= IU <= N) && return -10
+    (ldz < 1 || (jz == 'V' && ldz < N)) && return -15
+    return 0
+end
+
 # ── REAL syev/syevd/syevr (Float32 native + Float64) ──────────────────────────────────────────────────
 # All three drivers share the _syev! engine (sytrd → stedc/sterf → ormtr): identical contract (eigenpairs
 # to O(eps·‖A‖), orthonormal vectors, ascending). Julia's DEFAULT eigen(Symmetric)/eigvals(Symmetric) →
@@ -540,23 +556,21 @@ for (p, T) in (("s", Float32), ("d", Float64))
                 isuppz::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64}, iwork::Ptr{Int64}, liwork::Ptr{Int64},
                 info::Ptr{Int64}, len_jobz::Clong, len_range::Clong, len_uplo::Clong
             )::Cvoid
-            if unsafe_load(lwork) == Int64(-1)                 # workspace query
-                unsafe_store!(work, one($T)); unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
-            end
             jz = _cabi_char(jobz); rg = _cabi_char(range); ul = _cabi_char(uplo)
             N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); ldzz = Int(unsafe_load(ldz))
+            IL = Int(unsafe_load(il)); IU = Int(unsafe_load(iu))
             wantz = jz == 'V'
-            bad = (jz != 'N' && jz != 'V') ? -1 :
-                (rg != 'A' && rg != 'V' && rg != 'I') ? -2 :
-                (ul != 'U' && ul != 'L') ? -3 : (N < 0) ? -4 :
-                (rg == 'I' && N > 0 && !(1 <= Int(unsafe_load(il)) <= Int(unsafe_load(iu)) <= N)) ? -8 : 0
+            bad = _syevr_argcheck(jz, rg, ul, N, ld, unsafe_load(vl), unsafe_load(vu), IL, IU, ldzz)
             if !iszero(bad)
                 unsafe_store!(m, Int64(0)); unsafe_store!(info, Int64(bad)); return
+            end
+            if unsafe_load(lwork) == Int64(-1)                 # workspace query
+                unsafe_store!(work, one($T)); unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
             end
             wv, Z, inf = _syev_compute(jz, ul, N, A, ld)       # full spectrum (ascending) + vectors if wantz
             lo = 1; hi = N
             if rg == 'I'
-                lo = Int(unsafe_load(il)); hi = Int(unsafe_load(iu))
+                lo = IL; hi = IU
             elseif rg == 'V'
                 vlo = unsafe_load(vl); vhi = unsafe_load(vu)
                 lo = N + 1; hi = 0
@@ -659,24 +673,22 @@ for (p, Tc, Tr) in (("z", ComplexF64, Float64), ("c", ComplexF32, Float32))
                 iwork::Ptr{Int64}, liwork::Ptr{Int64}, info::Ptr{Int64},
                 len_jobz::Clong, len_range::Clong, len_uplo::Clong
             )::Cvoid
+            jz = _cabi_char(jobz); rg = _cabi_char(range); ul = _cabi_char(uplo)
+            N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); ldzz = Int(unsafe_load(ldz))
+            IL = Int(unsafe_load(il)); IU = Int(unsafe_load(iu))
+            wantz = jz == 'V'
+            bad = _syevr_argcheck(jz, rg, ul, N, ld, unsafe_load(vl), unsafe_load(vu), IL, IU, ldzz)
+            if !iszero(bad)
+                unsafe_store!(m, Int64(0)); unsafe_store!(info, Int64(bad)); return
+            end
             if unsafe_load(lwork) == Int64(-1)                 # workspace query (work + rwork + iwork sizes)
                 unsafe_store!(work, one($Tc)); unsafe_store!(rwork, one($Tr))
                 unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
             end
-            jz = _cabi_char(jobz); rg = _cabi_char(range); ul = _cabi_char(uplo)
-            N = Int(unsafe_load(n)); ld = Int(unsafe_load(lda)); ldzz = Int(unsafe_load(ldz))
-            wantz = jz == 'V'
-            bad = (jz != 'N' && jz != 'V') ? -1 :
-                (rg != 'A' && rg != 'V' && rg != 'I') ? -2 :
-                (ul != 'U' && ul != 'L') ? -3 : (N < 0) ? -4 :
-                (rg == 'I' && N > 0 && !(1 <= Int(unsafe_load(il)) <= Int(unsafe_load(iu)) <= N)) ? -10 : 0
-            if !iszero(bad)
-                unsafe_store!(m, Int64(0)); unsafe_store!(info, Int64(bad)); return
-            end
             wv, Z, inf = _heev_solve(jz, ul, N, A, ld)         # full spectrum (ascending) + vectors if wantz
             lo = 1; hi = N
             if rg == 'I'
-                lo = Int(unsafe_load(il)); hi = Int(unsafe_load(iu))
+                lo = IL; hi = IU
             elseif rg == 'V'
                 vlo = unsafe_load(vl); vhi = unsafe_load(vu)
                 lo = N + 1; hi = 0
@@ -1776,10 +1788,19 @@ for (p, T) in (("s", Float32), ("d", Float64))
             isuppz::Ptr{Int64}, work::Ptr{$T}, lwork::Ptr{Int64}, iwork::Ptr{Int64}, liwork::Ptr{Int64},
             info::Ptr{Int64}, l_jobz::Clong, l_range::Clong
         )::Cvoid
+        jz = _cabi_char(jobz); rg = _cabi_char(range); N = Int(unsafe_load(n)); wantz = jz == 'V'
+        # dstemr's argument checks, before the workspace query as there. il:iu index d, w and Z
+        # below, so an index outside 1:N must be rejected here rather than read or written.
+        IL = Int(unsafe_load(il)); IU = Int(unsafe_load(iu)); LDZ = Int(unsafe_load(ldz))
+        bad = N < 0 ? -3 :
+            rg == 'V' && N > 0 && unsafe_load(vu) <= unsafe_load(vl) ? -7 :
+            rg == 'I' && !(1 <= IL <= N) ? -8 :
+            rg == 'I' && !(IL <= IU <= N) ? -9 :
+            (LDZ < 1 || (wantz && LDZ < N)) ? -13 : 0          # dstemr's numbering, which dstegr returns
+        bad != 0 && (unsafe_store!(info, Int64(bad)); return)
         if unsafe_load(lwork) == Int64(-1)
             unsafe_store!(work, one($T)); unsafe_store!(iwork, Int64(1)); unsafe_store!(info, Int64(0)); return
         end
-        jz = _cabi_char(jobz); rg = _cabi_char(range); N = Int(unsafe_load(n)); wantz = jz == 'V'
         dvv = PtrVector(dv, N); evv = PtrVector(ev, max(N - 1, 0))
         d = Vector{$T}(undef, N); e = Vector{$T}(undef, max(N - 1, 0))
         @inbounds for i in 1:N
@@ -1799,7 +1820,7 @@ for (p, T) in (("s", Float32), ("d", Float64))
         end
         lo = 1; hi = N
         if rg == 'I'
-            lo = Int(unsafe_load(il)); hi = Int(unsafe_load(iu))
+            lo = IL; hi = IU
         elseif rg == 'V'
             vlo = unsafe_load(vl); vhi = unsafe_load(vu); lo = N + 1; hi = 0
             @inbounds for i in 1:N

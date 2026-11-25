@@ -249,3 +249,47 @@ end
         want < 0 || @test all(==(sentinel(T)), Bpb[6:end])
     end
 end
+
+@testitem "C-ABI stegr/syevr/heevr: il, iu, vl, vu and ldz checked as in LAPACK" setup = [CabiRegion] begin
+    using .CabiRegion: refsym, fcall, boxer
+    using LinearAlgebra: SymTridiagonal
+    import PureBLAS as P
+    # Every argument combination below is run through PureBLAS and the reference library; info must
+    # agree, and so must the eigenvalue count m when the call is valid.
+    function cases(N)
+        idx = unique(((0, 0), (1, 0), (1, 1), (1, N), (2, 1), (N, N), (N + 1, N + 1), (1, N + 1)))
+        c = Any[('A', 0.0, 0.0, 1, 1)]
+        append!(c, [('I', 0.0, 0.0, il, iu) for (il, iu) in idx])
+        append!(c, [('V', 1.0, 0.0, 1, 1), ('V', -10.0, 10.0, 1, 1)])
+        return c
+    end
+    for name in ("dstegr", "dsyevr", "zheevr"), N in (0, 1, 4), jz in ('N', 'V'),
+            (rg, vl, vu, il, iu) in cases(N), ldz in unique((max(1, N), max(1, N - 1)))
+        T = name == "zheevr" ? ComplexF64 : Float64
+        pb = getfield(P, Symbol(name, "_64_"))
+        d0 = collect(1.0:max(N, 1)); e0 = fill(0.5, max(N, 1)); A0 = Matrix{T}(SymTridiagonal(d0, e0[1:end-1]))
+        function run(f)
+            keep, box = boxer(); d = copy(d0); e = copy(e0); A = copy(A0)
+            w = fill(-7.25, N + 8); Z = zeros(T, ldz * max(N, 1) + 8); isuppz = zeros(Int64, 2N + 8)
+            work = zeros(T, 64N + 64); rwork = zeros(64N + 64); iwork = zeros(Int64, 32N + 32)
+            m = [Int64(-1)]; info = [Int64(99)]
+            GC.@preserve keep d e A w Z isuppz work rwork iwork m info begin
+                head = name == "dstegr" ?
+                    (box(UInt8(jz)), box(UInt8(rg)), box(Int64(N)), pointer(d), pointer(e)) :
+                    (box(UInt8(jz)), box(UInt8(rg)), box(UInt8('L')), box(Int64(N)), pointer(A), box(Int64(max(N, 1))))
+                mid = (box(vl), box(vu), box(Int64(il)), box(Int64(iu)), box(0.0), pointer(m), pointer(w),
+                    pointer(Z), box(Int64(ldz)), pointer(isuppz), pointer(work), box(Int64(length(work))))
+                tail = name == "zheevr" ?
+                    (pointer(rwork), box(Int64(length(rwork))), pointer(iwork), box(Int64(length(iwork))), pointer(info)) :
+                    (pointer(iwork), box(Int64(length(iwork))), pointer(info))
+                lens = name == "dstegr" ? (Clong(1), Clong(1)) : (Clong(1), Clong(1), Clong(1))
+                f(head..., mid..., tail..., lens...)
+            end
+            return info[1], m[1]
+        end
+        ipb, mpb = run(pb)
+        iref, mref = run((args...) -> fcall(refsym(name), args...))
+        @test ipb == iref
+        iref == 0 && @test mpb == mref
+    end
+end
