@@ -1073,6 +1073,78 @@ end
 # Shapes: a 512-aliased leading dimension (the pad path) and one that is not, a size that is not a
 # multiple of the panel width, and a tall and a wide matrix, because the step's column layout is
 # computed from the trailing width and the next panel's width and those differ in each.
+@testitem "getrf look-ahead: concurrent calls each report their own singular panel" tags = [:checks] begin
+    using PureBLAS, Random
+    # The look-ahead factors the next panel inside a threaded job. Its `info` must reach the call that
+    # owns the panel, whether that call won the pool claim or ran the fallback after losing it.
+    if Threads.nthreads() < 2
+        @test_skip "needs JULIA_NUM_THREADS ≥ 2"
+    else
+        n = 400; nb = PureBLAS._lu_nb(n)
+        zc = PureBLAS._lu_pb(n, nb, Float64) + 3              # a zero column inside the second panel
+        mats = map(1:24) do t
+            Random.seed!(t); A = randn(n, n)
+            isodd(t) && (A[:, zc] .= 0)
+            A
+        end
+        wrong = zeros(Int, length(mats))                       # runs whose info was not the matrix's own
+        old = PureBLAS.get_num_threads()
+        try
+            PureBLAS.set_num_threads(min(4, Threads.nthreads()))
+            # Witness: the look-ahead's wide half is threaded at this size, so the job kind runs.
+            @test PureBLAS._gemm_workers(n - zc + 3, n - 2(zc - 3), zc - 3) > 1
+            @sync for t in eachindex(mats)
+                Threads.@spawn begin
+                    want = isodd(t) ? zc : 0
+                    for _ in 1:8
+                        F = copy(mats[t]); ip = zeros(Int, n)
+                        PureBLAS.getrf!(F, ip)[3] == want || (wrong[t] += 1)
+                    end
+                end
+            end
+        finally
+            PureBLAS.set_num_threads(old)
+        end
+        @test all(iszero, wrong)
+    end
+end
+
+@testitem "getrf look-ahead: a lost claim computes the bits one thread computes" tags = [:checks] begin
+    using PureBLAS, Random
+    const P = PureBLAS
+    # The look-ahead splits the trailing update into a narrow and a wide call routed from the whole
+    # width. Holding the claim sends every one of them to the serial fallback, which must route the
+    # same way, so the factorization is bit-identical to the one-thread result.
+    if Threads.nthreads() < 2
+        @test_skip "needs JULIA_NUM_THREADS ≥ 2"
+    else
+        bits(x) = reinterpret(UInt64, x)
+        old = P.get_num_threads()
+        try
+            for (m, n) in ((400, 400), (96, 2000), (200, 1500))
+                Random.seed!(m + n); A = randn(m, n)
+                P.set_num_threads(1)
+                F1 = copy(A); ip1 = zeros(Int, min(m, n)); P.getrf!(F1, ip1)
+                P.set_num_threads(min(4, Threads.nthreads()))
+                held = !Threads.atomic_cas!(P._MT_CLAIM, false, true)
+                @test held
+                lost0 = P._MT_LOST[]
+                Fl = copy(A); ipl = zeros(Int, min(m, n))
+                held && try
+                    P.getrf!(Fl, ipl)
+                finally
+                    P._MT_CLAIM[] = false
+                end
+                @test P._MT_LOST[] > lost0                       # witness: the fallback ran
+                @test ipl == ip1
+                @test bits(Fl) == bits(F1)
+            end
+        finally
+            P.set_num_threads(old)
+        end
+    end
+end
+
 @testitem "getrf grouped panel step: bit-identical to serial, taken, 0 B" tags = [:checks] begin
     using PureBLAS, LinearAlgebra, Random
     using Base.Threads: nthreads

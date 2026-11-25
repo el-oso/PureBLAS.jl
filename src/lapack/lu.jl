@@ -561,10 +561,12 @@ function _getrf_lookahead!(A, ipiv, m::Int, n::Int, k::Int, pc::Int, pb::Int, jt
     GC.@preserve rA rU rC rP ipiv begin
         lup = LuPanel{T}(pointer(Pn), stride(Pn, 2), m - jt0 + 1, pb2,
             pointer(ipiv), jt0 - 1, jt0 - 1, wid)
-        _gemm_threaded!(_pm(Cw), _pm(L21), _pm(Uw), mo, bo, false, false, false, false,
+        # The panel's `info` is the return value, read inside the claim (or by a loser from its own
+        # panel); the pool field belongs to the next job once the claim is released.
+        pinfo = _gemm_threaded!(_pm(Cw), _pm(L21), _pm(Uw), mo, bo, false, false, false, false,
             nw, _MT_KIND_LUAHEAD, false, false, false, lup)
     end
-    return _gemm_pool(T).lainfo
+    return Int(pinfo)
 end
 
 # ── ONE PANEL STEP AS ONE JOB, SPLIT BY CACHE GROUP ──────────────────────────────────────────────

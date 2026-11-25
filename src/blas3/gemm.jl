@@ -6867,12 +6867,16 @@ end
         elseif kind == _MT_KIND_LUAHEAD
             # Both halves, serially, in this order. They write disjoint memory so the order cannot
             # change the bits; doing the panel first matches the worker numbering, which is what a
-            # reader comparing the two paths will expect.
-            _getf2!(
+            # reader comparing the two paths will expect. The panel's `info` comes back in the return
+            # value: the pool's `lainfo` belongs to whichever job holds the claim.
+            pinfo = _getf2!(
                 PtrMatrix{T}(lup.ptr, lup.m, lup.nb, lup.ld), lup.m, lup.nb, lup.roff,
                 PtrVector{Int}(lup.ipiv, lup.ioff + lup.nb), lup.ioff
             )
-            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
+            # Route from the whole trailing width, as the chunks do (`lanroute`): this job is one half of
+            # a split update, and its own width is not the width that chose the route.
+            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, (-1, lup.nroute, -1))
+            return T(pinfo)
         elseif kind == _MT_KIND_LASWP
             # A loser swaps the whole column range itself; pure data movement, so the band split it
             # did not get changes nothing but who does the work.
@@ -7015,8 +7019,9 @@ end
             _symm_materialize!(Ad, up, false, A, C.m)
             _gemm_core!(C, Ad, B, alpha, beta, false, false, false, false, (C.m, C.n, C.m), _STR_FLOOR, 1)
         elseif kind == _MT_KIND_GEMM
-            # `nroute` stays -1: a loser computes the whole matrix, so its own `n` IS the routing width.
-            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, _RT_NONE)
+            # A loser computes the whole of C. Its own `n` is the routing width unless the caller is one
+            # half of a split update (getrf's look-ahead), which passes the whole width as `nroute`.
+            _gemm_core!(C, A, B, alpha, beta, tA, tB, cA, cB, lup.nroute >= 0 ? (-1, lup.nroute, -1) : _RT_NONE)
         else
             # Every kind needs its own branch above: running another kind's serial path computes a
             # different operation. `test/gemm_tests.jl` checks that each kind is named in this block.
@@ -7187,7 +7192,7 @@ end
         (@atomic p.failed) && _throw_gemm_worker()
         # The next panel's `info`, read inside the claim for the reason the folds below are: once
         # the claim is released the next job's publish clears the field.
-        kind == _MT_KIND_LUSTEP && (red = T(p.lainfo))
+        (kind == _MT_KIND_LUSTEP || kind == _MT_KIND_LUAHEAD) && (red = T(p.lainfo))
         # FOLD A REDUCTION HERE, INSIDE THE CLAIM. It cannot wait until after the `finally` below: that
         # releases the claim, and the next caller's driver resizes and rewrites the very slots this fold
         # reads. Here the job is joined (no worker is writing) and the claim is still held (no other
