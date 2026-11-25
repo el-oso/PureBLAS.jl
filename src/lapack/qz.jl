@@ -455,11 +455,8 @@ end
 @inline function _qz_larfg!(v::AbstractVector{R}, nr::Int) where {R <: Real}
     nr <= 1 && return zero(R)
     @inbounds begin
-        α = v[1]; ss = zero(R)
-        for i in 2:nr
-            ss = muladd(v[i], v[i], ss)
-        end
-        xnorm = sqrt(ss)
+        α = v[1]
+        xnorm = _hqr_xnorm(v, 2:nr)                       # DNRM2-safe (hseqr.jl)
         xnorm == zero(R) && return zero(R)
         β = -copysign(hypot(α, xnorm), α)
         safmn = _qz_safmin(R) / (eps(R) / 2)
@@ -474,11 +471,7 @@ end
                 β *= rsafmn; α *= rsafmn
                 (abs(β) < safmn && knt < 20) || break
             end
-            ss = zero(R)
-            for i in 2:nr
-                ss = muladd(v[i], v[i], ss)
-            end
-            xnorm = sqrt(ss); β = -copysign(hypot(α, xnorm), α)
+            xnorm = _hqr_xnorm(v, 2:nr); β = -copysign(hypot(α, xnorm), α)
         end
         τ = (β - α) / β
         s = one(R) / (α - β)

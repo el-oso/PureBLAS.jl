@@ -42,6 +42,25 @@ Base.size(::_Vec3) = (3,)
     return v
 end
 
+# ‖v[idx]‖₂ as DNRM2 gives it, for the short reflector generators here, in qz.jl and in trsen.jl. The
+# plain sum of squares is exact enough whenever it lies in [floatmin/eps, floatmax]; outside that band
+# the squares have underflowed or overflowed (entries below ~1e-154 or above ~1e154 — the converging
+# subdiagonals of a matrix scaled to LAPACK's 1e-139 band are such entries), and the norm is recomputed
+# with `hypot`, which does not square. `idx` must lie in `eachindex(v)`; every caller passes `2:nr` with
+# nr ≤ length(v), or `eachindex(v)`.
+@inline function _hqr_xnorm(v::AbstractVector{R}, idx) where {R <: Real}
+    ss = zero(R)
+    @inbounds for i in idx
+        ss = muladd(v[i], v[i], ss)
+    end
+    floatmin(R) / eps(R) <= ss <= floatmax(R) && return sqrt(ss)
+    xnorm = zero(R)
+    @inbounds for i in idx
+        xnorm = hypot(xnorm, v[i])
+    end
+    return xnorm
+end
+
 # ── DLARFG on a short (nr = 2 or 3) vector, REAL — the bulge-chase reflector generator ────────────────
 # Mirrors Reference-LAPACK DLARFG including the KNT rescale for a below-safmin β. On return v[1]=β,
 # v[2:nr] hold the essential reflector, and τ is returned (H = I − τ·v·vᵀ, v[1]≡1).
@@ -49,11 +68,7 @@ end
     nr <= 1 && return zero(R)
     @inbounds begin
         α = v[1]
-        ss = zero(R)
-        for i in 2:nr
-            ss = muladd(v[i], v[i], ss)
-        end
-        xnorm = sqrt(ss)
+        xnorm = _hqr_xnorm(v, 2:nr)
         if xnorm == zero(R)
             return zero(R)                       # β = α, τ = 0, v unchanged
         end
@@ -70,11 +85,7 @@ end
                 β *= rsafmn; α *= rsafmn
                 (abs(β) < safmn && knt < 20) || break
             end
-            ss = zero(R)
-            for i in 2:nr
-                ss = muladd(v[i], v[i], ss)
-            end
-            xnorm = sqrt(ss)
+            xnorm = _hqr_xnorm(v, 2:nr)
             β = -copysign(hypot(α, xnorm), α)
         end
         τ = (β - α) / β
@@ -90,6 +101,13 @@ end
     end
 end
 
+# √(a² + b² + c²) as DLAPY3 gives it, with the same in-band fast path as `_hqr_xnorm`.
+@inline function _hqr_lapy3(a::R, b::R, c::R) where {R <: Real}
+    ss = muladd(a, a, muladd(b, b, c * c))
+    floatmin(R) / eps(R) <= ss <= floatmax(R) && return sqrt(ss)
+    return hypot(a, b, c)
+end
+
 # ── DLARFG on a 2-vector, COMPLEX (scalar form) — zlahqr single-shift reflector ───────────────────────
 # Returns (β::real, τ::Complex, v2::Complex essential). β is real by the zlarfg phase convention.
 @inline function _zlarfg2(α::T, x2::T) where {T <: Complex}
@@ -99,7 +117,7 @@ end
     if xnorm == zero(R) && αi == zero(R)
         return αr, zero(T), zero(T)             # τ = 0, β = αr
     end
-    β = -copysign(sqrt(αr * αr + αi * αi + xnorm * xnorm), αr)
+    β = -copysign(_hqr_lapy3(αr, αi, xnorm), αr)
     safmn = _hqr_safmin(R) / (eps(R) / 2)
     knt = 0
     if abs(β) < safmn
@@ -111,7 +129,7 @@ end
             (abs(β) < safmn && knt < 20) || break
         end
         xnorm = abs(x2)
-        β = -copysign(sqrt(αr * αr + αi * αi + xnorm * xnorm), αr)
+        β = -copysign(_hqr_lapy3(αr, αi, xnorm), αr)
     end
     τ = Complex((β - αr) / β, -αi / β)
     v2 = x2 / Complex(αr - β, αi)               # x2 * 1/(α−β)  with the rescaled α

@@ -2034,3 +2034,42 @@ end
         end
     end
 end
+
+# Every entry near underflow (2^-1018 ≈ 4·floatmin) or near overflow (2^1000 ≈ 1e301): the eigenvalue
+# drivers scale A (and B) into LAPACK's safe band first, so σ·λ(A) must come back as λ(σA). Compared
+# against the same driver at scale 1. A Schur form must come back at the input's scale too.
+@testitem "geev/gees/ggev/gges: eigenvalues survive near-underflow and near-overflow scaling" begin
+    using PureBLAS, LinearAlgebra, Random
+    P = PureBLAS
+    key(z) = (round(real(z), sigdigits = 8), round(imag(z), sigdigits = 8))
+    rel(a, b) = norm(sort(collect(a), by = key) - sort(collect(b), by = key)) / norm(b)
+    n = 40
+    for T in (Float64, ComplexF64)
+        rng = MersenneTwister(5)
+        A1 = T <: Real ? randn(rng, n, n) : randn(rng, T, n, n)
+        B1 = T <: Real ? randn(rng, n, n) : randn(rng, T, n, n)
+        ev(A) = (r = P.geev!('N', 'N', copy(A)); T <: Real ? complex.(r[1], r[2]) : r[1])
+        sv(A) = (r = P.gees!('V', copy(A)); (r[3], r[1], r[2]))
+        gv(A, B) = (r = P.ggev!('N', 'N', copy(A), copy(B)); T <: Real ? complex.(r[1], r[2]) ./ r[3] : r[1] ./ r[2])
+        gs(A, B) = (r = P.gges!('V', 'V', copy(A), copy(B)); (r[3] ./ r[4], r[1], r[2], r[5], r[6]))
+        # At 2^-1018 many entries of A1·s are subnormal and have already lost bits, so the reference is the
+        # matrix the driver actually receives, brought back by the same power of two (exact).
+        for s in (2.0^-1018, 2.0^1000)
+            As = A1 .* s
+            λ = ev(As ./ s)
+            @test rel(ev(As) ./ s, λ) < 1e-12
+            w, S, Z = sv(As)
+            @test rel(w ./ s, λ) < 1e-12
+            @test norm(Z * S * Z' - As) / (norm(A1) * s) < 1e-12              # Schur form at the input's scale
+            for t in (1.0, s)                                                # A and B scaled independently
+                Bt = B1 .* t
+                μ = gv(As ./ s, Bt ./ t)
+                @test rel(gv(As, Bt) .* (t / s), μ) < 1e-12
+                ν, Sg, Pg, Q, Zg = gs(As, Bt)
+                @test rel(ν .* (t / s), μ) < 1e-12
+                @test norm(Q * Sg * Zg' - As) / (norm(A1) * s) < 1e-12
+                @test norm(Q * Pg * Zg' - Bt) / (norm(B1) * t) < 1e-12
+            end
+        end
+    end
+end

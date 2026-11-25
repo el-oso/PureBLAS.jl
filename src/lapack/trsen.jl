@@ -93,10 +93,7 @@ end
 
 # ── DLARFG on a short real vector: alpha (scalar) over x (essential tail, mutated to v) ────────────────
 function _exc_larfg!(alpha::R, x::AbstractVector{R}) where {R <: Real}
-    xnorm = zero(R); @inbounds for xi in x
-        xnorm += xi * xi
-    end
-    xnorm = sqrt(xnorm)
+    xnorm = _hqr_xnorm(x, eachindex(x))                 # DNRM2-safe (hseqr.jl)
     xnorm == zero(R) && return alpha, zero(R)          # tau = 0
     beta = -copysign(hypot(alpha, xnorm), alpha)
     safmn = _syl_safmin(R) / (eps(R) / 2)
@@ -111,10 +108,7 @@ function _exc_larfg!(alpha::R, x::AbstractVector{R}) where {R <: Real}
             beta *= rsafmn; alpha *= rsafmn
             (abs(beta) < safmn && knt < 20) || break
         end
-        xnorm = zero(R); @inbounds for xi in x
-            xnorm += xi * xi
-        end
-        xnorm = sqrt(xnorm)
+        xnorm = _hqr_xnorm(x, eachindex(x))
         beta = -copysign(hypot(alpha, xnorm), alpha)
     end
     tau = (beta - alpha) / beta
