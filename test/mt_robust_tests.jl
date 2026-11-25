@@ -242,3 +242,60 @@ end
     @test length(cases) == 2 * 9 * 2
     @test all(endswith(" true"), cases)
 end
+
+# The driver runs the last chunk itself. When that chunk throws, the workers already waiting for it in
+# the cooperative A-pack barrier must be released, and the driver's own exception must reach the caller.
+# A more specific `_gemm_run_chunk` method makes only the driver's chunk (`i == nw`) throw; workers always
+# get `i < nw`. A hang is the failure mode, so the case runs in a child process with a SIGKILL deadline.
+@testitem "threaded gemm: a throw in the driver's chunk reaches the caller" begin
+    script = """
+    using PureBLAS, Random
+    rng = MersenneTwister(3)
+    n = 1000
+    A = randn(rng, n, n); B = randn(rng, n, n)
+    # Defined after `set_num_threads`, which times a Float64 pool job of its own.
+    PureBLAS.set_num_threads(4) == 4 || error("no pool")
+    PureBLAS._gemm_run_chunk(p::PureBLAS.GemmPool{Float64}, nw::Int, i::Int) =
+        i == nw ? error("injected") :
+        invoke(PureBLAS._gemm_run_chunk, Tuple{PureBLAS.GemmPool, Int, Int}, p, nw, i)
+    msg = try
+        PureBLAS.gemm!(zeros(n, n), A, B); "returned"
+    catch e
+        e isa ErrorException ? e.msg : string(typeof(e))
+    end
+    println("THROWN ", msg)
+    println("COOP ", PureBLAS._EXPINT[13])
+    # The pool must be released and reusable: Float32 takes the unmodified method.
+    A32 = Float32.(A); B32 = Float32.(B)
+    C4 = PureBLAS.gemm!(zeros(Float32, n, n), A32, B32)
+    PureBLAS.set_num_threads(1)
+    C1 = PureBLAS.gemm!(zeros(Float32, n, n), A32, B32)
+    println("REUSE ", C4 == C1)
+    println("DONE")
+    """
+    env = copy(ENV)
+    env["PUREBLAS_MT_ALL_THREADS"] = "1"
+    proc = open(pipeline(setenv(`$(Base.julia_cmd()) -t 4 --project=$(Base.active_project()) -e $script`, env); stderr = devnull))
+    lines = String[]
+    reader = @async for l in eachline(proc)
+        push!(lines, l)
+    end
+    t0 = time()
+    finished = true
+    while !process_exited(proc)
+        sleep(1)
+        if time() - t0 > 600
+            finished = false
+            kill(proc, Base.SIGKILL)
+            break
+        end
+    end
+    wait(proc)
+    wait(reader)
+    @test finished
+    @test success(proc)
+    @test "THROWN injected" in lines
+    @test "COOP 1" in lines        # the barrier branch ran, so the old code would have hung here
+    @test "REUSE true" in lines
+    @test "DONE" in lines
+end
