@@ -204,16 +204,21 @@ end
     return _dot_generic(n, x, incx, y, incy, true)
 end
 
-# Euclidean norm. Fast path: SIMD sum-of-squares (real, unit-stride dense). If that overflows to
-# Inf or underflows to 0 with a nonzero input, fall back to the overflow/underflow-safe scaled
-# accumulation (LAPACK lassq) — the correctness boundary. Returns a real scalar.
+# The unscaled Σxᵢ² is exact to working precision only when it lies in [floatmin/eps, floatmax]. A
+# square below floatmin is subnormal and carries an absolute error up to floatmin·eps/2; with the sum
+# at least floatmin/eps that error is at most eps²·ss/2 per term. Below that bound, or on Inf/NaN, the
+# scaled lassq path runs.
+@inline _sumsq_ok(ss::R) where {R} = floatmin(R) / eps(R) <= ss <= floatmax(R)
+
+# Euclidean norm. Fast path: SIMD sum-of-squares (real, unit-stride dense). If that sum is outside
+# `_sumsq_ok`'s range, fall back to the overflow/underflow-safe scaled accumulation (LAPACK lassq) —
+# the correctness boundary. Returns a real scalar.
 @inline function _nrm2(n::Integer, x, incx::Integer)
     R = real(_et(x))
     n <= 0 && return zero(R)
     if incx == 1 && _simd1(x)
         ss = _sumsq_blocked(Int(n), x, _et(x))
-        (isfinite(ss) && !iszero(ss)) && return sqrt(ss)
-        # ss is Inf (overflow) or 0 (all-zero, or underflow of tiny values) → use safe path
+        _sumsq_ok(ss) && return sqrt(ss)
     elseif incx == 1 && _cplx_re(x)
         GC.@preserve x begin                               # Σ|xᵢ|² over the interleaved 2n-real buffer
             # THE BLOCKED FORM, as the real branch above takes. Reinterpreting to 2n reals makes this an
@@ -223,15 +228,15 @@ end
             # tail land on a complex element boundary; and the fold is over block INDEX, so it depends
             # on (2n, R) alone and never on the worker count (req #11).
             ss = _sumsq_blocked(2 * Int(n), _reptr(x), R)
-            (isfinite(ss) && !iszero(ss)) && return sqrt(ss)
-        end                                                # non-finite/zero → complex lassq fallback below
+            _sumsq_ok(ss) && return sqrt(ss)
+        end                                                # out of range → complex lassq fallback below
     elseif incx == 1 && _pairalg(x)
         # Dual: ‖x‖ = √(Σ x_v²) with partial Σ x_v·x_p / ‖x‖ — one `dupEven` FMA kernel gives both sums
         # (simd_kernels.jl). Guarded on BOTH sums: overflow/underflow of either takes the scaled slow path.
         GC.@preserve x begin
             xp = _pairreal(x)
             ss, sp = _sumsq_dual_simd(Int(n), xp)
-            if isfinite(ss) && !iszero(ss) && isfinite(sp)
+            if _sumsq_ok(ss) && isfinite(sp)
                 r = sqrt(ss)
                 return _mkpair(_et(x), r, sp / r)
             end

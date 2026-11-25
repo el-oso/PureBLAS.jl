@@ -247,8 +247,8 @@ end
         if scale < absa
             ssq = one(R) + ssq * (scale / absa)^2
             scale = absa
-        else
-            ssq = ssq + (absa / scale)^2
+        else                                       # absa ≤ scale, so isinf(absa) means both are Inf
+            ssq = ssq + (isinf(absa) ? one(R) : (absa / scale)^2)
         end
     end
     return scale, ssq
