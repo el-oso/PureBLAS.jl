@@ -293,3 +293,38 @@ end
         iref == 0 && @test mpb == mref
     end
 end
+
+@testitem "NaN input ends gebal/stebz instead of looping: native and C-ABI vs LAPACK" setup = [CabiRegion] begin
+    using .CabiRegion: refsym, fcall, boxer
+    import PureBLAS as P
+    # gebal's scaling loop and stebz's bisection both test conditions that are all false on NaN.
+    A = [NaN 1.0; 1.0 1.0]
+    @test_throws ArgumentError P.gebal!(copy(A))
+    @test_throws ArgumentError P.geev!('N', 'V', copy(A))
+    function gebal_info(f)
+        keep, box = boxer(); B = copy(A); sc = zeros(2); ilo = [Int64(0)]; ihi = [Int64(0)]; info = [Int64(99)]
+        GC.@preserve keep B sc ilo ihi info f(box(UInt8('B')), box(Int64(2)), pointer(B), box(Int64(2)),
+            pointer(ilo), pointer(ihi), pointer(sc), pointer(info), Clong(1))
+        return info[1]
+    end
+    @test gebal_info(P.dgebal_64_) == gebal_info((a...) -> fcall(refsym("dgebal"), a...))
+
+    for (d, e) in (([1.0, NaN, 3.0], [0.5, 0.5]), ([1.0, 2.0, 3.0], [NaN, 0.5]))
+        w, iblock, _, info = P.stebz!('A', 'E', 0.0, 0.0, 1, 3, 0.0, copy(d), copy(e))
+        @test info == 1
+        @test any(<(0), iblock)
+        function stebz_info(f)
+            keep, box = boxer(); dd = copy(d); ee = copy(e); m = [Int64(0)]; ns = [Int64(0)]
+            ww = zeros(3); ib = zeros(Int64, 3); isp = zeros(Int64, 3); wk = zeros(12); iw = zeros(Int64, 9)
+            info = [Int64(99)]
+            GC.@preserve keep dd ee m ns ww ib isp wk iw info f(box(UInt8('A')), box(UInt8('E')), box(Int64(3)),
+                box(0.0), box(0.0), box(Int64(1)), box(Int64(3)), box(0.0), pointer(dd), pointer(ee),
+                pointer(m), pointer(ns), pointer(ww), pointer(ib), pointer(isp), pointer(wk), pointer(iw),
+                pointer(info), Clong(1), Clong(1))
+            return info[1]
+        end
+        # The reference is not a usable oracle here: on these inputs it returns m = 0 with info = 0
+        # (all-NaN d gives info = 1). The C ABI must end and report the non-convergence.
+        @test stebz_info(P.dstebz_64_) == 1
+    end
+end
