@@ -202,7 +202,7 @@
     alpha(T) = T <: Complex ? T(0.7, -0.4) : T(0.7)
     beta(T) = T <: Complex ? T(-0.3, 0.2) : T(-0.3)
 
-    # name => (level, builder). A builder takes an RNG and returns that symbol's cases; the level
+    # name => (level, builder). A builder takes an RNG and pushes that symbol's cases into `sink()`; the level
     # items run the builders of their level and the completeness item checks the key set against
     # every forwarded symbol.
     const BUILDERS = Dict{String, Tuple{Int, Function}}()
@@ -286,7 +286,7 @@
         p = pre(T)
         reg!(
             1, p * "axpy_", rng -> begin
-                fp = fptr(p * "axpy_"); cs = Case[]
+                fp = fptr(p * "axpy_"); cs = sink()
                 for (n, ix, iy) in l1_layouts2(T; l3 = true), a in l1_alphas(T)
                     x = vbuf(rng, T, n, ix); y0 = vbuf(rng, T, n, iy)
                     push!(
@@ -301,7 +301,7 @@
         )
         reg!(
             1, p * "scal_", rng -> begin
-                fp = fptr(p * "scal_"); cs = Case[]
+                fp = fptr(p * "scal_"); cs = sink()
                 for (n, ix) in l1_layouts1(T), a in l1_alphas(T)
                     x0 = vbuf(rng, T, n, ix)
                     push!(
@@ -317,7 +317,7 @@
         for op in ("copy_", "swap_")
             reg!(
                 1, p * op, rng -> begin
-                    fp = fptr(p * op); cs = Case[]
+                    fp = fptr(p * op); cs = sink()
                     for (n, ix, iy) in l1_layouts2(T)
                         x0 = vbuf(rng, T, n, ix); y0 = vbuf(rng, T, n, iy)
                         push!(
@@ -335,7 +335,7 @@
         for op in (T <: Complex ? ("dotu_", "dotc_") : ("dot_",))
             reg!(
                 1, p * op, rng -> begin
-                    fp = fptr(p * op); cs = Case[]
+                    fp = fptr(p * op); cs = sink()
                     for (n, ix, iy) in l1_layouts2(T)
                         x = vbuf(rng, T, n, ix); y = vbuf(rng, T, n, iy)
                         push!(
@@ -356,7 +356,7 @@
         for (op, f) in ((rp * "nrm2_", l1_real), (rp * "asum_", l1_real), (ip * "amax_", l1_iamax))
             reg!(
                 1, op, rng -> begin
-                    fp = fptr(op); cs = Case[]
+                    fp = fptr(op); cs = sink()
                     big = sqrt(floatmax(real(T))); tiny = floatmin(real(T))
                     scales = startswith(op, rp * "nrm2") ? (1, big, tiny, 0) : (1,)
                     for (n, ix) in l1_layouts1(T), s in scales
@@ -436,7 +436,7 @@
     # a closure captures a variable, not its value, so a name the function assigns again after the
     # loop would hand every case the last operands.
     function gemv_cases(rng, T, fp, shapes)
-        cs = Case[]
+        cs = sink()
         for (m, n, small) in shapes, t in "NTC", (ix, iy, pad) in l2_layouts(small)
             lda = m + pad; lx, ly = t == 'N' ? (n, m) : (m, n)
             A = randn(rng, T, lda, n); x = vbuf(rng, T, lx, ix); y0 = vbuf(rng, T, ly, iy)
@@ -470,7 +470,7 @@
     end
 
     function ger_cases(rng, T, fp, shapes)
-        cs = Case[]
+        cs = sink()
         for (m, n, small) in shapes, (ix, iy, pad) in l2_layouts(small)
             lda = m + pad
             A0 = randn(rng, T, lda, n); x = vbuf(rng, T, m, ix); y = vbuf(rng, T, n, iy)
@@ -488,7 +488,7 @@
     # symv/hemv. The full matrix is random, so the unreferenced triangle and (for hemv) the
     # imaginary part of the diagonal differ from what the referenced half implies.
     function symv_cases(rng, T, fp, ns)
-        cs = Case[]
+        cs = sink()
         for (n, small) in ns, u in "UL", (ix, iy, pad) in l2_layouts(small)
             lda = n + pad
             A = randn(rng, T, lda, n); x = vbuf(rng, T, n, ix); y0 = vbuf(rng, T, n, iy)
@@ -519,7 +519,7 @@
 
     # trmv/trsv; trans 'C' on a real type means 'T'.
     function tr_cases(rng, T, fp, ns)
-        cs = Case[]
+        cs = sink()
         for (n, small) in ns, u in "UL"
             for (ix, _, pad) in l2_layouts(small)
                 lda = n + pad; A = trimat(rng, T, n, lda, u); x0 = vbuf(rng, T, n, ix)
@@ -538,7 +538,7 @@
     end
 
     function tp_cases(rng, T, fp, ns)
-        cs = Case[]
+        cs = sink()
         for (n, small) in ns, u in "UL", ix in (small ? (1, 2) : (1,))
             AP = tripacked(rng, T, n, u); x0 = vbuf(rng, T, n, ix)
             for t in "NTC", d in "NU"
@@ -554,7 +554,7 @@
     end
 
     function spmv_cases(rng, T, fp, ns)
-        cs = Case[]
+        cs = sink()
         for (n, small) in ns, u in "UL", (ix, iy, _) in l2_layouts(small)
             AP = randn(rng, T, n * (n + 1) ÷ 2); x = vbuf(rng, T, n, ix); y0 = vbuf(rng, T, n, iy)
             push!(
@@ -584,7 +584,7 @@
 
     # spr/hpr (α real for hpr) and spr2/hpr2.
     function spr_cases(rng, T, fp, ns; two::Bool)
-        cs = Case[]
+        cs = sink()
         a = two ? alpha(T) : real(alpha(T))
         for (n, small) in ns, u in "UL", (ix, iy, _) in l2_layouts(small)
             AP0 = randn(rng, T, n * (n + 1) ÷ 2); x = vbuf(rng, T, n, ix); y = vbuf(rng, T, n, iy)
@@ -597,7 +597,7 @@
 
     # gbmv over (m, n, kl, ku); the band storage has kl+ku+1 referenced rows.
     function gbmv_cases(rng, T, fp, shapes)
-        cs = Case[]
+        cs = sink()
         for (m, n, kl, ku, small) in shapes, t in "NTC", (ix, iy, pad) in l2_layouts(small)
             lda = kl + ku + 1 + pad; lx, ly = t == 'N' ? (n, m) : (m, n)
             AB = randn(rng, T, lda, n); x = vbuf(rng, T, lx, ix); y0 = vbuf(rng, T, ly, iy)
@@ -628,7 +628,7 @@
     end
 
     function sbmv_cases(rng, T, fp, shapes)
-        cs = Case[]
+        cs = sink()
         for (n, k, small) in shapes, u in "UL", (ix, iy, pad) in l2_layouts(small)
             lda = k + 1 + pad
             AB = randn(rng, T, lda, n); x = vbuf(rng, T, n, ix); y0 = vbuf(rng, T, n, iy)
@@ -659,7 +659,7 @@
     end
 
     function tb_cases(rng, T, fp, shapes)
-        cs = Case[]
+        cs = sink()
         for (n, k, small) in shapes, u in "UL"
             for (ix, _, pad) in l2_layouts(small)
                 lda = k + 1 + pad; AB = triband(rng, T, n, k, lda, u); x0 = vbuf(rng, T, n, ix)
@@ -824,7 +824,7 @@
     const T3 = [('N', 'N'), ('T', 'N'), ('N', 'T')]
 
     function gemm_cases(rng, T, fp, shapes)
-        cs = Case[]
+        cs = sink()
         for ((m, n, k), fl, pads, bs, as) in shapes, (ta, tb) in fl, pad in pads, b in bs, a in as
             ar, ac = ta == 'N' ? (m, k) : (k, m); br, bc = tb == 'N' ? (k, n) : (n, k)
             lda, ldb, ldc = max(ar + pad, 1), max(br + pad, 1), max(m + pad, 1)
@@ -911,7 +911,7 @@
 
     # (m, n, α): α = 1 reaches trsm's direct small-k base, α = 0 the quick return.
     function trxm_cases(rng, T, fp, shapes)
-        cs = Case[]
+        cs = sink()
         for (m, n, as, ldp) in shapes, s in "LR", u in "UL"
             ka = s == 'L' ? m : n
             lda = ka + PAD; ldb = isnothing(ldp) ? m + PAD : ldp
@@ -964,7 +964,7 @@
     end
 
     function symm_cases(rng, T, fp, shapes)
-        cs = Case[]
+        cs = sink()
         for (m, n, sides) in shapes, s in sides, u in "UL", b in (beta(T), zero(T))
             ka = s == 'L' ? m : n
             A = randn(rng, T, ka + PAD, ka); B = randn(rng, T, m + PAD, n)
@@ -1000,7 +1000,7 @@
     # three for real types, where C means T. herk/her2k take a real β (and herk a real α). β = 0
     # with α ≠ 0 is a separate real syrk route.
     function rk_cases(rng, T, fp, shapes; herm::Bool, two::Bool)
-        cs = Case[]
+        cs = sink()
         flags = T <: Real ? "NTC" : herm ? "NC" : "NT"
         a = herm && !two ? real(alpha(T)) : alpha(T)
         b0 = herm ? real(beta(T)) : beta(T)
@@ -1063,21 +1063,55 @@
         end
     end
 
+    # Builders push into the current `Sink`, which runs its cases through `conform` at every thread
+    # count whenever the operands it holds pass `SINK_BYTES`, then drops them. Operand sizes follow
+    # the detected cache sizes, so on a part with a large L3 one symbol's cases would otherwise hold
+    # several GB at once.
+    const SINK_BYTES = 256 * 2^20
+    mutable struct Sink
+        const name::String
+        const nts::Vector{Int}
+        const cases::Vector{Case}
+        const bad::Vector{String}
+        bytes::Int
+        n::Int
+    end
+    const SINK = Ref{Sink}()
+    sink() = SINK[]
+
+    function Base.push!(s::Sink, c::Case)
+        push!(s.cases, c)
+        s.n += 1
+        s.bytes += Base.summarysize(c)
+        s.bytes > SINK_BYTES && flush!(s)
+        return s
+    end
+
+    function flush!(s::Sink)
+        isempty(s.cases) && return s
+        for nt in s.nts
+            old = PureBLAS.get_num_threads(); oldfloor = PureBLAS._MT_FLOOR[]
+            PureBLAS.set_num_threads(nt)
+            try
+                append!(s.bad, ("$nt thread(s): " * b for b in conform(s.name, s.cases)))
+            finally
+                PureBLAS.set_num_threads(old)
+                PureBLAS._MT_FLOOR[] = oldfloor     # items that run later see the floor they would without this one
+            end
+        end
+        empty!(s.cases)
+        s.bytes = 0
+        return s
+    end
+
     function run_level(level)
         nts = unique!([1, Threads.nthreads()])
         for name in sort!([k for (k, (l, _)) in BUILDERS if l == level])
-            cases = BUILDERS[name][2](Xoshiro(hash(name)))
-            for nt in nts
-                old = PureBLAS.get_num_threads(); oldfloor = PureBLAS._MT_FLOOR[]
-                PureBLAS.set_num_threads(nt)
-                try
-                    @testset "$name, $(length(cases)) cases, $nt thread(s)" begin
-                        @test isempty(conform(name, cases))
-                    end
-                finally
-                    PureBLAS.set_num_threads(old)
-                    PureBLAS._MT_FLOOR[] = oldfloor     # items that run later see the floor they would without this one
-                end
+            s = SINK[] = Sink(name, nts, Case[], String[], 0, 0)
+            BUILDERS[name][2](Xoshiro(hash(name)))
+            flush!(s)
+            @testset "$name, $(s.n) cases, $nts thread(s)" begin
+                @test isempty(s.bad)
             end
         end
     end
