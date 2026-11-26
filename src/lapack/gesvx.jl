@@ -188,6 +188,8 @@ Expert general solver (LAPACK `gesvx`). `fact ∈ {'F','N','E'}` (factored/notye
 `trans ∈ {'N','T','C'}`. Optionally equilibrates (`equed`), LU-factors into `AF`/`ipiv`, solves,
 iteratively refines, and returns error bounds + reciprocal condition number `rcond` and reciprocal
 pivot growth `rpgf`. `A`, `AF`, `ipiv`, `R`, `C`, `B` may be modified in place. Generic over s/d/c/z.
+Throws `SingularException(i)` if the factor U has U(i,i) exactly zero. A tiny `rcond` (below
+`eps/2`, LAPACK's info = n+1) is not an error: X is computed and `rcond` reports it.
 
 The first form is the IN-PLACE one, mirroring `getrf!(A, ipiv)` / `gbtrf!(kl, ku, m, AB, ipiv)`: the
 caller supplies X (n×nrhs), ferr and berr — Netlib's `DGESVX` OUT arguments — so the driver honours
@@ -200,11 +202,27 @@ function gesvx!(
         ferr::AbstractVector{Tr}, berr::AbstractVector{Tr}
     ) where {T <: BlasFloat, Tr <: Real}
     Base.require_one_based_indexing(A, AF, ipiv, R, C, B, X, ferr, berr)
+    X, equed, rcond, ferr, berr, rpgf, info =
+        _gesvx_info!(fact, trans, A, AF, ipiv, equed, R, C, B, X, ferr, berr)
+    info > 0 && throw(SingularException(info))
+    return X, equed, rcond, ferr, berr, rpgf
+end
+
+# gesvx! plus dgesvx's `info` for an exact zero pivot U(i,i): info = i, with X, ferr and berr left
+# unset, rcond = 0 and rpgf the reciprocal pivot growth of the first i columns, as in dgesvx. The
+# C-ABI shims read it here so they can still return equed/R/C/AF/ipiv on that path.
+function _gesvx_info!(
+        fact::Char, trans::Char, A::AbstractMatrix{T}, AF::AbstractMatrix{T},
+        ipiv::AbstractVector{<:Integer}, equed::Char, R::AbstractVector{Tr},
+        C::AbstractVector{Tr}, B::AbstractMatrix{T}, X::AbstractMatrix{T},
+        ferr::AbstractVector{Tr}, berr::AbstractVector{Tr}
+    ) where {T <: BlasFloat, Tr <: Real}
+    Base.require_one_based_indexing(A, AF, ipiv, R, C, B, X, ferr, berr)
     n = size(A, 1); nrhs = size(B, 2)
     size(X) == (n, nrhs) || throw(DimensionMismatch("gesvx!: size(X) ≠ (size(A,1), size(B,2))"))
     length(ferr) >= nrhs || throw(DimensionMismatch("gesvx!: length(ferr) < size(B,2)"))
     length(berr) >= nrhs || throw(DimensionMismatch("gesvx!: length(berr) < size(B,2)"))
-    n == 0 && return X, equed, one(Tr), ferr, berr, one(Tr)
+    n == 0 && return X, equed, one(Tr), ferr, berr, one(Tr), 0
 
     # 1) equilibrate (fact='E'): compute R,C, scale A, choose equed.
     if fact == 'E'
@@ -221,7 +239,15 @@ function gesvx!(
             AF[i, j] = A[i, j]
         end
         _, _, info = getrf!(AF, ipiv)
-        info != 0 && return X, equed, zero(Tr), ferr, berr, zero(Tr)   # singular
+        if info != 0                                   # dgesvx: U(info,info) is exactly zero
+            umax = zero(Tr); @inbounds for j in 1:info, i in 1:j
+                umax = max(umax, abs(AF[i, j]))
+            end
+            amx = zero(Tr); @inbounds for j in 1:info, i in 1:n
+                amx = max(amx, abs(A[i, j]))
+            end
+            return X, equed, zero(Tr), ferr, berr, (iszero(umax) ? one(Tr) : amx / umax), info
+        end
     end
     umax = zero(Tr); @inbounds for j in 1:n, i in 1:j
         umax = max(umax, abs(AF[i, j]))
@@ -275,7 +301,7 @@ function gesvx!(
             X[i, j] *= f[i]
         end
     end
-    return X, equed, rcond, ferr, berr, rpgf
+    return X, equed, rcond, ferr, berr, rpgf, 0
 end
 
 # Convenience: allocate X/ferr/berr and delegate. The arity and the 6-tuple are load-bearing (the

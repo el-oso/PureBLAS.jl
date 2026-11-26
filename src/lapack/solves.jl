@@ -42,6 +42,9 @@ function trtrs!(
     size(A, 2) == n || throw(DimensionMismatch("trtrs!: A must be square"))
     Bm = _gt_asmat(B)
     size(Bm, 1) == n || throw(DimensionMismatch("trtrs!: size(B,1) must equal n"))
+    # dtrtrs: an exact zero on a non-unit diagonal is reported as SingularException(i), the first such
+    # i, before any solve, so B is left untouched. The C-ABI shim turns it into info = i.
+    diag != 'U' && _throw_if_zero_diag(A, n)
     # SINGLE RHS -> trsv, and hand it the VECTOR rather than `view(Bm, :, 1)`. Both halves matter and
     # both were measured separately on getrs: `trsm!`'s own `nrhs == 1 -> trsv!` path is nested inside
     # its `k <= _trsm_dbase()` tiny-k bypass so it never fires above k~32, and passing a SubArray of

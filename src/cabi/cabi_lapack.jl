@@ -734,8 +734,14 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         N = Int(unsafe_load(n)); R = Int(unsafe_load(nrhs))
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
         Bm = PtrMatrix(B, N, R, Int(unsafe_load(ldb)))
-        trtrs!(Am, Bm; uplo = _cabi_char(uplo), trans = _cabi_char(trans), diag = _cabi_char(diag))
-        unsafe_store!(info, Int64(0)); return
+        try
+            trtrs!(Am, Bm; uplo = _cabi_char(uplo), trans = _cabi_char(trans), diag = _cabi_char(diag))
+            unsafe_store!(info, Int64(0))
+        catch e
+            e isa SingularException || rethrow()
+            unsafe_store!(info, Int64(e.info))
+        end
+        return
     end
 end
 
@@ -789,8 +795,14 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
             unsafe_store!(work, one($T)); unsafe_store!(info, Int64(0)); return
         end
         N = Int(unsafe_load(n)); Am = PtrMatrix(A, N, N, Int(unsafe_load(lda))); ip = PtrVector(ipiv, N)
-        getri!(Am, ip)                 # ONE implementation, in lapack/inverses.jl
-        unsafe_store!(info, Int64(0)); return
+        try
+            getri!(Am, ip)             # ONE implementation, in lapack/inverses.jl
+            unsafe_store!(info, Int64(0))
+        catch e
+            e isa SingularException || rethrow()
+            unsafe_store!(info, Int64(e.info))
+        end
+        return
     end
 end
 
@@ -818,8 +830,14 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         # dense operand is CORRECT; it costs n³ rather than lauum's n³/3, which is why this lands at
         # 4n³/3 rather than the textbook 2n³/3 — still 1.5× less work than before, with no new kernel.
         # A real `lauum` would take the remaining 2×; that is a separate piece of work.
-        potri!(Am; uplo = ul)          # ONE implementation, in lapack/inverses.jl
-        unsafe_store!(info, Int64(0)); return
+        try
+            potri!(Am; uplo = ul)      # ONE implementation, in lapack/inverses.jl
+            unsafe_store!(info, Int64(0))
+        catch e
+            e isa SingularException || rethrow()
+            unsafe_store!(info, Int64(e.info))
+        end
+        return
     end
 end
 
@@ -840,8 +858,14 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         )::Cvoid
         N = Int(unsafe_load(n)); ul = _cabi_char(uplo); dg = _cabi_char(diag)
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
-        trtri!(Am; uplo = ul, diag = dg)   # ONE implementation, in lapack/inverses.jl
-        unsafe_store!(info, Int64(0)); return
+        try
+            trtri!(Am; uplo = ul, diag = dg)   # ONE implementation, in lapack/inverses.jl
+            unsafe_store!(info, Int64(0))
+        catch e
+            e isa SingularException || rethrow()
+            unsafe_store!(info, Int64(e.info))
+        end
+        return
     end
 end
 
@@ -1291,8 +1315,14 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         end
         Am = PtrMatrix(A, M, N, LDA)
         Bm = PtrMatrix(B, max(M, N), R, LDB)
-        gels!(_cabi_char(trans), Am, Bm)
-        unsafe_store!(info, Int64(0)); return
+        try
+            gels!(_cabi_char(trans), Am, Bm)
+            unsafe_store!(info, Int64(0))
+        catch e
+            e isa SingularException || rethrow()
+            unsafe_store!(info, Int64(e.info))
+        end
+        return
     end
 end
 
@@ -2507,9 +2537,9 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
         Bm = PtrMatrix(B, N, R, Int(unsafe_load(ldb)))
         ip = PtrVector(ipiv, N)
-        sytrf!(Am, ip; uplo = ul)
-        sytrs!(Am, ip, Bm; uplo = ul)
-        unsafe_store!(info, Int64(0)); return
+        inf = sytrf!(Am, ip; uplo = ul)
+        iszero(inf) && sytrs!(Am, ip, Bm; uplo = ul)    # dsysv: no solve when D is singular
+        unsafe_store!(info, Int64(inf)); return
     end
 end
 # {c,z}hesv_64_ — Hermitian variant (complex only; real Hermitian solve routes through sysv above).
@@ -2526,14 +2556,14 @@ for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
         Bm = PtrMatrix(B, N, R, Int(unsafe_load(ldb)))
         ip = PtrVector(ipiv, N)
-        hetrf!(Am, ip; uplo = ul)
-        hetrs!(Am, ip, Bm; uplo = ul)
-        unsafe_store!(info, Int64(0)); return
+        inf = hetrf!(Am, ip; uplo = ul)
+        iszero(inf) && hetrs!(Am, ip, Bm; uplo = ul)    # zhesv: no solve when D is singular
+        unsafe_store!(info, Int64(inf)); return
     end
 end
 # ── sytri / hetri: symmetric-indefinite / Hermitian matrix inverse from Bunch-Kaufman factors ──────────
-# {s,d,c,z}sytri_64_(uplo, n, A, lda, ipiv, work, info, len_uplo) — 1 char, NO lwork query. NOTE: the
-# pure-Julia kernel never signals a singular D-block via info (unlike reference dsytri) — always 0.
+# {s,d,c,z}sytri_64_(uplo, n, A, lda, ipiv, work, info, len_uplo) — 1 char, NO lwork query. A singular
+# 1×1 D-block arrives as SingularException(k) and leaves as info = k, as in reference dsytri.
 for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF64))
     @eval Base.@ccallable function $(Symbol(p, "sytri_64_"))(
             uplo::Ptr{UInt8}, n::Ptr{Int64}, A::Ptr{$T},
@@ -2541,8 +2571,14 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         )::Cvoid
         N = Int(unsafe_load(n))
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
-        sytri!(Am, PtrVector(ipiv, N); uplo = _cabi_char(uplo))
-        unsafe_store!(info, Int64(0)); return
+        try
+            sytri!(Am, PtrVector(ipiv, N); uplo = _cabi_char(uplo))
+            unsafe_store!(info, Int64(0))
+        catch e
+            e isa SingularException || rethrow()
+            unsafe_store!(info, Int64(e.info))
+        end
+        return
     end
 end
 # {c,z}hetri_64_ — Hermitian variant (complex only).
@@ -2553,8 +2589,14 @@ for (p, T) in (("c", ComplexF32), ("z", ComplexF64))
         )::Cvoid
         N = Int(unsafe_load(n))
         Am = PtrMatrix(A, N, N, Int(unsafe_load(lda)))
-        hetri!(Am, PtrVector(ipiv, N); uplo = _cabi_char(uplo))
-        unsafe_store!(info, Int64(0)); return
+        try
+            hetri!(Am, PtrVector(ipiv, N); uplo = _cabi_char(uplo))
+            unsafe_store!(info, Int64(0))
+        catch e
+            e isa SingularException || rethrow()
+            unsafe_store!(info, Int64(e.info))
+        end
+        return
     end
 end
 
@@ -2575,8 +2617,8 @@ for (p, T, Tr) in (
         Am = PtrMatrix(A, M, M, Int(unsafe_load(lda)))
         Bm = PtrMatrix(B, N, N, Int(unsafe_load(ldb)))
         Cm = PtrMatrix(C, M, N, Int(unsafe_load(ldc)))
-        _, sc = trsyl!(_cabi_char(transa), _cabi_char(transb), ig, Am, Bm, Cm)
-        unsafe_store!(scale, $Tr(sc)); unsafe_store!(info, Int64(0)); return
+        _, sc, inf = _trsyl_info!(_cabi_char(transa), _cabi_char(transb), ig, Am, Bm, Cm)
+        unsafe_store!(scale, $Tr(sc)); unsafe_store!(info, Int64(inf)); return
     end
 end
 
@@ -2685,11 +2727,17 @@ for (p, T) in (("s", Float32), ("d", Float64), ("c", ComplexF32), ("z", ComplexF
         Am = PtrMatrix(A, M, N, Int(unsafe_load(lda)))
         Bm = PtrMatrix(B, P, N, Int(unsafe_load(ldb)))
         cv = PtrVector(cc, M); dv = PtrVector(dd, P)
-        x, _ = gglse!(Am, cv, Bm, dv)
-        Xv = PtrVector(X, N); @inbounds for i in 1:N
-            Xv[i] = x[i]
+        try
+            x, _ = gglse!(Am, cv, Bm, dv)
+            Xv = PtrVector(X, N); @inbounds for i in 1:N
+                Xv[i] = x[i]
+            end
+            unsafe_store!(info, Int64(0))
+        catch e
+            e isa LAPACKException || rethrow()
+            unsafe_store!(info, Int64(e.info))
         end
-        unsafe_store!(info, Int64(0)); return
+        return
     end
 end
 

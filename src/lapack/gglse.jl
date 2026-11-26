@@ -107,6 +107,15 @@ function _ggl_gerq2_accumG!(B::AbstractMatrix{T}, G::AbstractMatrix{T}) where {T
     return B, G
 end
 
+# dgglse reports a rank-deficient problem as info = 1 (B) or 2 ([A; B]), a code and not a position, so it
+# travels as LAPACKException(code), as from `LinearAlgebra.LAPACK.gglse!`, rather than SingularException.
+function _gglse_check_rank(R::AbstractMatrix, r::Int, code::Int)
+    for i in 1:r
+        iszero(_l1v(R[i, i])) && throw(LAPACKException(code))
+    end
+    return nothing
+end
+
 """
     gglse!(A, c, B, d) -> (x, res)
     gglse!(A, c, B, d, x) -> (x, res)
@@ -114,7 +123,8 @@ end
 Solve the equality-constrained least-squares problem  minimize ‖A·x − c‖₂  subject to  B·x = d.
 `A` is m×n, `B` is p×n, `c` length m, `d` length p, requiring `p ≤ n ≤ m+p`. Returns the solution
 `x` (length n) and the residual norm `res = ‖A·x − c‖₂`. `A`, `B`, `c`, `d` are overwritten (LAPACK
-dgglse convention). Matches `LinearAlgebra.LAPACK.gglse!`.
+dgglse convention). Matches `LinearAlgebra.LAPACK.gglse!`, including its errors: `LAPACKException(1)`
+if B does not have full row rank, `LAPACKException(2)` if `[A; B]` does not have full column rank.
 
 The five-argument form writes the solution into the caller-provided `x` (length ≥ n) and allocates
 nothing. `x` must not alias `A` or `c`: both are read AFTER `x` is formed, to compute the returned
@@ -163,6 +173,9 @@ function gglse!(
         end
         _ggl_apply_Zh!(Atil, tauz, ĉ, min(m, n))
 
+        # dgglse info=1: R has an exact zero on its diagonal, so B does not have full row rank.
+        _gglse_check_rank(view(B, 1:p, (np + 1):n), p, 1)
+
         # 4) y₂ = R⁻¹·d   (R = B[1:p, np+1:n], p×p upper-tri).  y[np+1:n] = y₂.
         @inbounds for i in 1:p
             y[np + i] = d[i]
@@ -180,6 +193,8 @@ function gglse!(
 
         # 6) y₁ = T₁₁⁻¹·ĉ₁   (T₁₁ = Ã[1:np,1:np] upper-tri).  y[1:np] = y₁.
         if np > 0
+            # dgglse info=2: T₁₁ has an exact zero on its diagonal, so [A; B] does not have full column rank.
+            _gglse_check_rank(Atil, np, 2)
             @inbounds for i in 1:np
                 y[i] = ĉ[i, 1]
             end

@@ -724,6 +724,18 @@ function trsyl!(
         A::AbstractMatrix{T}, B::AbstractMatrix{T}, C::AbstractMatrix{T}
     ) where {T}
     Base.require_one_based_indexing(A, B, C)
+    C, scale, _ = _trsyl_info!(transa, transb, isgn, A, B, C)
+    return C, scale
+end
+
+# trsyl! plus dtrsyl's `info`: 1 when A and B have close or common eigenvalues and a perturbed value was
+# used, 0 otherwise. Either way C holds a solution, which is why the public entry returns it without
+# throwing; the C-ABI shim reports this `info`.
+function _trsyl_info!(
+        transa::AbstractChar, transb::AbstractChar, isgn::Integer,
+        A::AbstractMatrix{T}, B::AbstractMatrix{T}, C::AbstractMatrix{T}
+    ) where {T}
+    Base.require_one_based_indexing(A, B, C)
     (transa === 'N' || transa === 'T' || transa === 'C') ||
         throw(ArgumentError("trsyl!: transa must be 'N', 'T' or 'C'"))
     (transb === 'N' || transb === 'T' || transb === 'C') ||
@@ -732,8 +744,7 @@ function trsyl!(
     m = size(A, 1); n = size(B, 1)
     (size(A, 2) == m && size(B, 2) == n) || throw(DimensionMismatch("trsyl!: A, B must be square"))
     (size(C, 1) == m && size(C, 2) == n) || throw(DimensionMismatch("trsyl!: C must be m×n"))
-    C, scale, _ = _trsyl_dispatch!(transa, transb, Int(isgn), A, B, C)
-    return C, scale
+    return _trsyl_dispatch!(transa, transb, Int(isgn), A, B, C)
 end
 
 _trsyl_dispatch!(ta, tb, isgn, A::AbstractMatrix{<:Real}, B, C) = _dtrsyl!(ta, tb, isgn, A, B, C)

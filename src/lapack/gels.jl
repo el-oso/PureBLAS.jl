@@ -111,6 +111,7 @@ function gels!(trans::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T
         if p >= q
             # overdetermined:  x = R⁻¹·(Qᴴ·b)[1:q]
             _gels_factor!(M, tau)
+            _throw_if_zero_diag(M, q)                      # dgels: rank-deficient R, before B is touched
             _apply_Qh!(M, tau, view(B, 1:p, :), k)
             trsm!(view(B, 1:q, :), view(M, 1:q, 1:q); side = 'L', uplo = 'U', transA = 'N', diag = 'N')
         else
@@ -120,6 +121,7 @@ function gels!(trans::Char, A::AbstractMatrix{T}, B::AbstractMatrix{T}) where {T
                 Mh[i, j] = conj(M[j, i])
             end
             _gels_factor!(Mh, tau)                         # R_r = Mh[1:p,1:p] upper
+            _throw_if_zero_diag(Mh, p)                     # dgels: rank-deficient R_r, before B is touched
             tc = T <: Complex ? 'C' : 'T'
             trsm!(view(B, 1:p, :), view(Mh, 1:p, 1:p); side = 'L', uplo = 'U', transA = tc, diag = 'N')  # w = R_r⁻ᴴ·b
             @inbounds for j in 1:nrhs, r in (p + 1):q

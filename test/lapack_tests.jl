@@ -129,6 +129,183 @@ end
     end
 end
 
+@testitem "trtrs: zero diagonal is singular (native throws, C ABI sets info)" begin
+    using PureBLAS, LinearAlgebra, Random
+    @testset "$T $u nrhs=$nrhs" for T in (Float64, Float32, ComplexF64, ComplexF32),
+            u in ('U', 'L'), nrhs in (1, 3)
+
+        Random.seed!("trtrs singular $T $u $nrhs")
+        n = 9
+        A = randn(T, n, n) + n * I
+        A = u == 'U' ? triu(A) : tril(A)
+        A[4, 4] = 0; A[7, 7] = 0                       # the first zero is the one reported
+        B = randn(T, n, nrhs); B0 = copy(B)
+        @test_throws SingularException(4) LinearAlgebra.LAPACK.trtrs!(u, 'N', 'N', copy(A), copy(B))
+        @test_throws SingularException(4) PureBLAS.trtrs!(A, B; uplo = u, diag = 'N')
+        @test B == B0                                   # rejected before any solve
+        # diag='U' never reads the diagonal, so the same matrix solves, as in LAPACK.
+        x1 = PureBLAS.trtrs!(copy(A), copy(B); uplo = u, diag = 'U')
+        x2 = LinearAlgebra.LAPACK.trtrs!(u, 'N', 'U', copy(A), copy(B))
+        @test x1 ≈ x2
+
+        # The C-ABI shim reports the same index as reference LAPACK, through `info`.
+        p = T === Float64 ? "d" : T === Float32 ? "s" : T === ComplexF64 ? "z" : "c"
+        f = getfield(PureBLAS, Symbol(p, "trtrs_64_"))
+        cu, cn, ni, ri, info = [UInt8(u)], [UInt8('N')], [Int64(n)], [Int64(nrhs)], [Int64(-1)]
+        Bc = copy(B)
+        GC.@preserve A Bc cu cn ni ri info f(
+            pointer(cu), pointer(cn), pointer(cn), pointer(ni), pointer(ri),
+            pointer(A), pointer(ni), pointer(Bc), pointer(ni), pointer(info), 1, 1, 1
+        )
+        @test info[1] == 4
+        @test Bc == B0
+    end
+end
+
+@testitem "singular inputs: native throws SingularException, C ABI sets info (trtri/getri/potri/sytri/sysv/gels)" begin
+    using PureBLAS, LinearAlgebra, Random
+    pre(T) = T === Float64 ? "d" : T === Float32 ? "s" : T === ComplexF64 ? "z" : "c"
+    # Call a C-ABI shim as Fortran would: every array argument goes by pointer (a scalar is boxed in a
+    # 1-vector with `r`), a trailing hidden string length goes by value. All are kept alive for the call.
+    r(x) = [x]
+    function call(T, name, args...)
+        f = getfield(PureBLAS, Symbol(pre(T), name, "_64_"))
+        return GC.@preserve args f(map(a -> a isa AbstractArray ? pointer(a) : a, args)...)
+    end
+    n = 9
+    @testset "$T" for T in (Float64, Float32, ComplexF64, ComplexF32)
+        Random.seed!("singular $T")
+        # trtri, and potri (which inverts its triangular factor first): first zero on the diagonal.
+        for u in ('U', 'L')
+            A = randn(T, n, n) + n * I; A = u == 'U' ? triu(A) : tril(A)
+            A[4, 4] = 0; A[7, 7] = 0; A0 = copy(A)
+            @test_throws SingularException(4) PureBLAS.trtri!(A; uplo = u, diag = 'N')
+            @test A == A0
+            @test_throws SingularException(4) PureBLAS.potri!(A; uplo = u)
+            @test A == A0
+            @test PureBLAS.trtri!(copy(A); uplo = u, diag = 'U') ≈ LinearAlgebra.LAPACK.trtri!(u, 'U', copy(A))
+            info = r(Int64(-1)); Ac = copy(A)
+            call(T, "trtri", r(UInt8(u)), r(UInt8('N')), r(Int64(n)), Ac, r(Int64(n)), info, 1, 1)
+            @test info[1] == 4 && Ac == A0
+            info[1] = -1
+            call(T, "potri", r(UInt8(u)), r(Int64(n)), Ac, r(Int64(n)), info, 1)
+            @test info[1] == 4 && Ac == A0
+        end
+        # getri: LU factors with U(4,4) exactly zero.
+        F = triu(randn(T, n, n) + n * I) + tril(randn(T, n, n), -1); F[4, 4] = 0
+        ipiv = collect(Int64, 1:n); F0 = copy(F)
+        @test_throws SingularException(4) PureBLAS.getri!(F, ipiv)
+        @test F == F0
+        info = r(Int64(-1)); work = zeros(T, n)
+        call(T, "getri", r(Int64(n)), F, r(Int64(n)), ipiv, work, r(Int64(n)), info)
+        @test info[1] == 4 && F == F0
+        # sytri/hetri with all-1×1 pivots: 'L' reports the first zero D(k,k), 'U' the last (dsytri scan order).
+        for (u, k) in (('L', 3), ('U', 6)), (fn, nm) in ((PureBLAS.sytri!, "sytri"), (PureBLAS.hetri!, "hetri"))
+            T <: Real && nm == "hetri" && continue
+            S = randn(T, n, n) + n * I; S = u == 'U' ? triu(S) : tril(S)
+            S[3, 3] = 0; S[6, 6] = 0; S0 = copy(S)
+            @test_throws SingularException(k) fn(S, ipiv; uplo = u)
+            @test S == S0
+            info = r(Int64(-1))
+            call(T, nm, r(UInt8(u)), r(Int64(n)), S, r(Int64(n)), ipiv, work, info, 1)
+            @test info[1] == k && S == S0
+        end
+        # sysv/hesv: a zero first row/column makes D(1,1) exactly zero; info must equal LAPACK's sytrf info.
+        for (fn, nm, fac) in ((PureBLAS.sysv!, "sysv", LinearAlgebra.LAPACK.sytrf!),
+                              (PureBLAS.hesv!, "hesv", LinearAlgebra.LAPACK.hetrf!))
+            T <: Real && nm == "hesv" && continue
+            S = randn(T, n, n); S = nm == "sysv" ? S + transpose(S) : S + S'
+            S[1, :] .= 0; S[:, 1] .= 0
+            kref = fac('L', copy(S))[3]
+            @test kref > 0
+            B = randn(T, n, 2); B0 = copy(B)
+            @test_throws SingularException(kref) fn('L', copy(S), B, zeros(Int64, n))
+            @test B == B0
+            info = r(Int64(-1))
+            call(T, nm, r(UInt8('L')), r(Int64(n)), r(Int64(2)), copy(S), r(Int64(n)), zeros(Int64, n), B,
+                r(Int64(n)), work, r(Int64(n)), info, 1)
+            @test info[1] == kref && B == B0
+        end
+        # gels: a zero column (overdetermined) or zero row (underdetermined) gives R(2,2) exactly zero.
+        for (m, k) in ((12, 7), (5, 11))
+            A = randn(T, m, k)
+            m >= k ? (A[:, 2] .= 0) : (A[2, :] .= 0)
+            B = randn(T, max(m, k), 2); B0 = copy(B)
+            @test_throws SingularException(2) PureBLAS.gels!('N', A, B)
+            @test B == B0
+            info = r(Int64(-1))
+            call(T, "gels", r(UInt8('N')), r(Int64(m)), r(Int64(k)), r(Int64(2)), copy(A), r(Int64(m)), B,
+                r(Int64(max(m, k))), work, r(Int64(1)), info, 1)
+            @test info[1] == 2 && B == B0
+        end
+    end
+end
+
+@testitem "singular inputs: gesvx/gglse/trsyl report LAPACK's info, and Dual pivots are judged on the value" begin
+    using PureBLAS, LinearAlgebra, Random, ForwardDiff
+    LA = LinearAlgebra.LAPACK
+    pre(T) = T === Float64 ? "d" : T === Float32 ? "s" : T === ComplexF64 ? "z" : "c"
+    r(x) = [x]
+    function call(T, name, args...)
+        f = getfield(PureBLAS, Symbol(pre(T), name, "_64_"))
+        return GC.@preserve args f(map(a -> a isa AbstractArray ? pointer(a) : a, args)...)
+    end
+    # Reference info from LinearAlgebra.LAPACK, which raises LAPACKException(info) for these three.
+    refinfo(f) = try f(); 0 catch e; e isa LAPACKException ? e.info : rethrow() end
+    n = 6
+    @testset "$T" for T in (Float64, Float32, ComplexF64, ComplexF32)
+        Random.seed!("singular2 $T"); Tr = real(T)
+        # gesvx: a zero column 3 makes U(3,3) exactly zero (info = 3); a 1e-30 pivot makes rcond < eps/2
+        # with no zero pivot (info = n+1, X still computed).
+        Bv = randn(T, n, 2)
+        for (A, want) in ((begin G = randn(T, n, n) + n * I; G[:, 3] .= 0; G end, 3),
+                          (begin H = Matrix{T}(I, n, n); H[n, n] = T(1.0e-30); H end, n + 1))
+            mk() = (copy(A), similar(A), zeros(Int64, n), 'N', zeros(Tr, n), zeros(Tr, n), copy(Bv))
+            @test refinfo(() -> LA.gesvx!('N', 'N', mk()...)) == want
+            if want <= n
+                @test_throws SingularException(want) PureBLAS.gesvx!('N', 'N', mk()...)
+            else
+                res = PureBLAS.gesvx!('N', 'N', mk()...)
+                @test res[3] < eps(Tr) / 2
+            end
+            Ac, AF, ip, _, Rv, Cv, Bc = mk()
+            X = zeros(T, n, 2); rc = zeros(Tr, 1); fe = zeros(Tr, 2); be = zeros(Tr, 2); eq = r(UInt8('N'))
+            info = r(Int64(-1)); wk = zeros(T, 4n); iw = zeros(Int64, n); rw = zeros(Tr, 2n)
+            common = (r(UInt8('N')), r(UInt8('N')), r(Int64(n)), r(Int64(2)), Ac, r(Int64(n)), AF, r(Int64(n)),
+                ip, eq, Rv, Cv, Bc, r(Int64(n)), X, r(Int64(n)), rc, fe, be)
+            T <: Real ? call(T, "gesvx", common..., wk, iw, info, 1, 1, 1) :
+                call(T, "gesvx", common..., wk, rw, info, 1, 1, 1)
+            @test info[1] == want
+            want <= n && @test rc[1] == 0
+        end
+        # gglse: parallel rows in B (info = 1); a column that is zero in both A and B (info = 2).
+        A = T[1 2 3 4; 5 6 7 9; 2 1 0 3; 1 1 1 1; 0 2 5 1]; c = T[1, 2, 3, 4, 5]; d = T[1, 2]
+        A2 = copy(A); A2[:, 1] .= 0
+        for (Aa, B, want) in ((A, T[1 0 0 0; 2 0 0 0], 1), (A2, T[0 1 0 0; 0 0 1 0], 2))
+            @test refinfo(() -> LA.gglse!(copy(Aa), copy(c), copy(B), copy(d))) == want
+            @test_throws LAPACKException(want) PureBLAS.gglse!(copy(Aa), copy(c), copy(B), copy(d))
+            info = r(Int64(-1))
+            call(T, "gglse", r(Int64(5)), r(Int64(4)), r(Int64(2)), copy(Aa), r(Int64(5)), copy(B), r(Int64(2)),
+                copy(c), copy(d), zeros(T, 4), zeros(T, 64), r(Int64(64)), info)
+            @test info[1] == want
+        end
+        # trsyl: A and B share the eigenvalue 1 with isgn = -1, so dtrsyl perturbs and reports info = 1.
+        @test refinfo(() -> LA.trsyl!('N', 'N', T[1;;], T[1;;], T[2;;], -1)) == 1
+        C, sc = PureBLAS.trsyl!('N', 'N', -1, T[1;;], T[1;;], T[2;;])  # returns a solution, no throw
+        @test all(isfinite, C)
+        info = r(Int64(-1)); sco = zeros(Tr, 1)
+        call(T, "trsyl", r(UInt8('N')), r(UInt8('N')), r(Int64(-1)), r(Int64(1)), r(Int64(1)), T[1;;], r(Int64(1)),
+            T[1;;], r(Int64(1)), T[2;;], r(Int64(1)), sco, info, 1, 1)
+        @test info[1] == 1
+    end
+    # A Dual pivot with value 0 and nonzero partial is not `iszero`, but it is a zero pivot.
+    D = ForwardDiff.Dual
+    U = [D(2.0, 1.0) D(1.0, 0.0); D(0.0, 0.0) D(0.0, 1.0)]
+    @test !iszero(U[2, 2])
+    @test_throws SingularException(2) PureBLAS.trtri!(copy(U); uplo = 'U')
+    @test_throws SingularException(2) PureBLAS.trtrs!(copy(U), [D(1.0, 0.0), D(1.0, 0.0)]; uplo = 'U')
+end
+
 @testitem "pptrf/pptrs (packed Cholesky) — both triangles, s/d/c/z" begin
     using PureBLAS, LinearAlgebra, Random
     # Same coverage hole pbtrf had: pptrf's only test was a StrictMode trim check at uplo='L', so
