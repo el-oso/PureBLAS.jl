@@ -393,6 +393,9 @@ end
 # essential v is stored back conjugated (matching zgebrd's 'N','C' trailing gemm). mode 0=N,1=T,2=C.
 @inline _lgc!(yv, Av, xv, α::T, β::T, mode::Int) where {T <: Complex} =
     _gemv!(mode != 0, mode == 2, size(Av, 1), size(Av, 2), α, Av, xv, 1, β, yv, 1)
+# Real operands: 'C' is 'T'.
+@inline _lgc!(yv, Av, xv, α::T, β::T, mode::Int) where {T <: Real} =
+    _gemv!(mode != 0, false, size(Av, 1), size(Av, 2), α, Av, xv, 1, β, yv, 1)
 
 # Sequential reference (the fused `_labrd!` below falls back here for legacy nb-sized tmp, and it is
 # the entrywise A/B oracle). Body is the faithful zlabrd port; only the name differs from the fused method.
@@ -477,6 +480,15 @@ function _labrd!(
         nb::Int, arow::AbstractVector{T}, tmp::AbstractVector{T}
     ) where {T <: Complex, R <: Real}
     length(tmp) >= 4 * nb || return _labrd_seq!(As, d, e, tauq, taup, X, Y, nb, arow, tmp)
+    return _labrd_fused!(As, d, e, tauq, taup, X, Y, nb, arow, tmp)
+end
+
+# The fused panel itself, for real and complex `T` alike: on a real `T` every `conj` is the identity
+# and gemv-'C' is gemv-'T'. `tmp` must hold 4·nb elements.
+function _labrd_fused!(
+        As::AbstractMatrix{T}, d::AbstractVector{R}, e::AbstractVector{R}, tauq, taup, X, Y,
+        nb::Int, arow::AbstractVector{T}, tmp::AbstractVector{T}
+    ) where {T <: Number, R <: Real}
     mm, nn = size(As)
     o = one(T); z = zero(T)
     # tmp carve — four disjoint nb-slots held simultaneously per column (the ref serializes w1/w2 through
@@ -831,6 +843,16 @@ function gebrd!(
     return _gebrd_run!(A, d, e, tauq, taup, ws, nb)
 end
 
+# Which real panel runs. `_labrd!` sweeps the trailing block twice per panel column (the gemv-'T' that
+# builds Y, then the gemv-'N' that builds X); `_labrd_fused!` sweeps it once, in column groups that stay
+# L2-resident between the two uses, and pays for that with scalar per-column corrections. So the fused
+# panel is worth its corrections exactly when the second sweep would otherwise leave L2: when the
+# smallest trailing block this panel sweeps, (mm-nb)×(nn-nb), does not fit there.
+# `_EXPFLAG[_EXP15]` set true restores the two-sweep panel at every size (A/B arm).
+# PDM: Derived — L2 residency of the trailing block the panel re-sweeps; `_L2_BYTES` is detected.
+@inline _brd_fuse(mm::Int, nn::Int, nb::Int, ::Type{T}) where {T} =
+    (mm - nb) * (nn - nb) * sizeof(T) > _L2_BYTES && !(@inbounds _EXPFLAG[_EXP15])
+
 # The reduction itself, on storage whose `lda` is already alias-free (or on the caller's A when it was).
 function _gebrd_run!(
         A::AbstractMatrix{Float64}, d::AbstractVector{Float64}, e::AbstractVector{Float64},
@@ -848,15 +870,39 @@ function _gebrd_run!(
         mm = m - i + 1; nn = n - i + 1
         As = view(A, i:m, i:n)
         di = view(d, i:k); ei = view(e, i:(k - 1)); tqi = view(tauq, i:k); tpi = view(taup, i:k)
-        _labrd!(
-            As, di, ei, tqi, tpi, view(X, 1:mm, 1:nb), view(Y, 1:nn, 1:nb), nb,
-            view(ws.labrd_arow, 1:nn), view(ws.labrd_tmp, 1:nb)
-        )
+        fuse = _brd_fuse(mm, nn, nb, Float64)
+        if fuse
+            _labrd_fused!(
+                As, di, ei, tqi, tpi, view(X, 1:mm, 1:nb), view(Y, 1:nn, 1:nb), nb,
+                view(ws.labrd_arow, 1:nn), view(ws.labrd_tmp, 1:(4 * nb))
+            )
+        else
+            _labrd!(
+                As, di, ei, tqi, tpi, view(X, 1:mm, 1:nb), view(Y, 1:nn, 1:nb), nb,
+                view(ws.labrd_arow, 1:nn), view(ws.labrd_tmp, 1:nb)
+            )
+        end
         # trailing update A[i+nb:m, i+nb:n] −= V·Yₜᵀ + Xₜ·Ar
         if i + nb <= k
             tr = view(A, (i + nb):m, (i + nb):n)
-            gemm!(tr, view(A, (i + nb):m, i:(i + nb - 1)), view(Y, (nb + 1):nn, 1:nb); transB = 'T', alpha = -1.0, beta = 1.0)
-            gemm!(tr, view(X, (nb + 1):mm, 1:nb), view(A, i:(i + nb - 1), (i + nb):n); alpha = -1.0, beta = 1.0)
+            if fuse && 2 * nb <= min(size(X, 2), size(Y, 2))
+                # One rank-2nb update, tr −= [Xₜ V]·[Arᵀ Yₜ]ᵀ, so the trailing block is read and
+                # written once per panel instead of twice. V goes beside X; Y moves over and Arᵀ
+                # takes its place (Y is dead after this update).
+                for c in 1:nb
+                    for r in (nb + 1):mm
+                        X[r, nb + c] = A[i + r - 1, i + c - 1]
+                    end
+                    for r in (nb + 1):nn
+                        Y[r, nb + c] = Y[r, c]
+                        Y[r, c] = A[i + c - 1, i + r - 1]
+                    end
+                end
+                gemm!(tr, view(X, (nb + 1):mm, 1:(2 * nb)), view(Y, (nb + 1):nn, 1:(2 * nb)); transB = 'T', alpha = -1.0, beta = 1.0)
+            else
+                gemm!(tr, view(A, (i + nb):m, i:(i + nb - 1)), view(Y, (nb + 1):nn, 1:nb); transB = 'T', alpha = -1.0, beta = 1.0)
+                gemm!(tr, view(X, (nb + 1):mm, 1:nb), view(A, i:(i + nb - 1), (i + nb):n); alpha = -1.0, beta = 1.0)
+            end
         end
         for j in i:(i + nb - 1)                      # restore the panel's diagonal/superdiagonal
             A[j, j] = d[j]

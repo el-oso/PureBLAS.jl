@@ -652,6 +652,42 @@ end
     end
 end
 
+@testitem "gebrd real: the fused panel agrees with the two-sweep panel, and the driver that uses it does not allocate" begin
+    using PureBLAS, LinearAlgebra, Random
+    Random.seed!(21)
+    # Panel level, at a size no residency predicate has to admit: both panels reduce the same block.
+    @testset "panel $mm×$nn" for (mm, nn) in ((60, 50), (37, 37), (9, 9))
+        nb = 8
+        A0 = randn(mm, nn)
+        run(f, tmplen) = begin
+            As = copy(A0); d = zeros(nb); e = zeros(nb); tq = zeros(nb); tp = zeros(nb)
+            X = zeros(mm, nb); Y = zeros(nn, nb)
+            f(As, d, e, tq, tp, X, Y, nb, zeros(nn), zeros(tmplen))
+            # X[r, c] with r <= c is panel scratch that no later step reads; a zero reflector
+            # leaves it unset in the fused panel.
+            (As, d, e, tq, tp, tril(X, -1), Y)
+        end
+        ref = run(PureBLAS._labrd!, nb)
+        fus = run(PureBLAS._labrd_fused!, 4 * nb)
+        for (r, f) in zip(ref, fus)
+            @test isapprox(r, f; rtol = 1.0e-11, atol = 1.0e-12)
+        end
+    end
+    # Driver level, at the smallest order whose first panels take the fused route on this machine.
+    n = isqrt(PureBLAS._L2_BYTES ÷ sizeof(Float64)) + 2 * PureBLAS._brd_nb() + 8
+    if n <= 1024
+        @test PureBLAS._brd_fuse(n, n, PureBLAS._brd_nb(), Float64)
+        A0 = randn(n, n); sref = svdvals(A0)
+        U, S, Vt = PureBLAS.gesvd!(copy(A0))
+        @test maximum(abs, S .- sref) / sref[1] < 1.0e-11
+        @test opnorm(U * Diagonal(S) * Vt - A0, 1) / opnorm(A0, 1) < 1.0e-11
+        d = zeros(n); e = zeros(n); tq = zeros(n); tp = zeros(n); A = copy(A0)
+        brd!(A, d, e, tq, tp) = (PureBLAS.gebrd!(A, d, e, tq, tp); nothing)
+        brd!(A, d, e, tq, tp); copyto!(A, A0)
+        @test (@allocated brd!(A, d, e, tq, tp)) == 0
+    end
+end
+
 @testitem "zgesvd (complex SVD) vs LAPACK — U/S/Vᴴ residual + orthonormality, scaled + rank-deficient" begin
     using PureBLAS, LinearAlgebra, Random
     Random.seed!(202)

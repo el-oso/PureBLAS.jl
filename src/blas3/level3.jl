@@ -3881,7 +3881,8 @@ const _EXP17, _EXP18, _EXP19 = 17, 18, 19
 #          The FUSED driver ships. Kept A/B-able because Zen5 is unmeasured; fused uses the same kernels
 #          with strictly less traffic, so it cannot lose (measured fused/unfused 0.83-1.00, both boxes).
 #          Previously the `_trsm_cgt_L!` witness; stripped when that landed.
-#   _EXP15 free.
+#   _EXP15 LIVE — INVERTED: set true to DISABLE the fused real bidiagonalization panel (`_brd_fuse`,
+#          svd.jl) and run the two-sweep `_labrd!` at every size, so the two compare in one process.
 #   (_EXP13 and _EXP15 were reused for the 3M band campaign — _EXP13 bypassed the unpacked branch,
 #    _EXP15 lowered the rank-k 3M edge — and were freed afterwards. Both were needed at once: with a single
 #    combined flag Zen4 compared 3M-vs-UNPACKED while Zen3 compared 3M-vs-PACKED, so the two apparent
