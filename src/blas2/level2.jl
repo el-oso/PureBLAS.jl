@@ -4533,6 +4533,20 @@ end
 # PDM: Literal — trsv-T fuse factor; the routing bound is expressed as a multiple of it. TUNABLE.
 const _TRSV_T_F = 8
 
+# Which solve the L,T panels use for their 8×8 diagonal block: the register-resident `_trsv_reg!`
+# (x held in registers, reciprocals taken up front, ~9 cycles of dependent latency per column) or the
+# in-memory loop (a divide and a store-to-load hop per column, and each column's sum taking the newest
+# value first, ~30 cycles per column). The block's chain is serial with the panel sweep, so it is
+# most of the call at small n and a shrinking share as the sweep grows.
+#
+# Bound: the triangle must be L3-resident. Measured on Zen4 (register / in-memory, median of 8
+# rounds): n=64 1.99, 128 1.84, 256 1.36, 512 1.20, 1000 1.09, 2104 1.01 — and BELOW 1 once the
+# triangle is several times L3: n=4000 0.977, 4104 0.983. Why the faster block loses there is not
+# established, so the bound is the residency edge on the safe side of the measured loss and
+# nothing finer.
+# PDM: Derived — L3 residency of the n(n+1)/2 triangle; `_L3_BYTES` is detected.
+@inline _trsvt_regtri(::Type{T}, n::Int) where {T} = (n * (n + 1) ÷ 2) * sizeof(T) <= _L3_BYTES
+
 @inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x)
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
@@ -4594,6 +4608,7 @@ const _TRSV_T_F = 8
                 lo = hi + 1
             end
         else                                      # L,T ⇒ Lᵀ upper ⇒ BACKWARD, panels descending
+            reg = _trsvt_regtri(T, n)
             hi = n
             @inbounds while hi > 0
                 lo = max(1, hi - 7)
@@ -4640,13 +4655,23 @@ const _TRSV_T_F = 8
                         end
                     end
                 end
-                for j in hi:-1:lo                 # F×F triangle, backward
-                    cp = Ap + (j - 1) * lda * sz
-                    s = unsafe_load(xp, j)
-                    for i in (j + 1):hi
-                        s -= unsafe_load(cp, i) * unsafe_load(xp, i)
+                if reg && hi - lo + 1 == 8
+                    dblk = PtrMatrix{T}(Ap + ((lo - 1) * lda + lo - 1) * sz, 8, 8, lda)
+                    xo = xp + (lo - 1) * sz
+                    if unit
+                        _trsv_reg!(Val(8), Val(false), Val(true), Val(true), dblk, xo)
+                    else
+                        _trsv_reg!(Val(8), Val(false), Val(true), Val(false), dblk, xo)
                     end
-                    unsafe_store!(xp, unit ? s : s / unsafe_load(cp + (j - 1) * sz), j)
+                else
+                    for j in hi:-1:lo             # F×F triangle, backward
+                        cp = Ap + (j - 1) * lda * sz
+                        s = unsafe_load(xp, j)
+                        for i in (j + 1):hi
+                            s -= unsafe_load(cp, i) * unsafe_load(xp, i)
+                        end
+                        unsafe_store!(xp, unit ? s : s / unsafe_load(cp + (j - 1) * sz), j)
+                    end
                 end
                 hi = lo - 1
             end
