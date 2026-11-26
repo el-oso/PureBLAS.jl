@@ -29,36 +29,46 @@ individual samples inside a round is far wider in the small BLAS-3 cells — 1.1
 is not a usable figure.
 
 **Machine:** Apple M6 (`_vwidth(Float64)=2`, `sme_max_svl_b=64` ⇒ 8 FP64 lanes in a ZA tile), unlocked
-clock. The PureBLAS arm of every cell was measured at commit `11f9f346d` on 2026-11-16; the OpenBLAS
-and Accelerate arms are reused from runs between 2026-09-22 and 2026-09-28. Full provenance:
-[`provenance.md`](assets/apple/provenance.md).
+clock. The PureBLAS arm of `dot`, `nrm2`, `dznrm2`, `gemvT`, `gemvTrect`, `trsvLT`, `geqp3` and `gesvd`
+was measured at commit `5e289bae2` on 2026-11-26, and of every other cell at `11f9f346d` on
+2026-11-16; the OpenBLAS and Accelerate arms are reused from runs between 2026-09-22 and 2026-09-28.
+Full provenance: [`provenance.md`](assets/apple/provenance.md).
 
-⚠ **The two arms of this cache are seven weeks apart.** The OpenBLAS and Accelerate arms date from
-2026-09-22 to 2026-09-28 and the PureBLAS arm from 2026-11-16. The anchor workload — a fixed kernel
-measured once per run, independent of any op here — reads within 1% between the two on the median,
-but 40 of 281 comparison cells carry arm anchors more than 5% apart (worst 6.3%, `gemvT` at n = 50;
-all of them in `asum`, `gemvN`, `gemvT` and `symv`; `bench/check_arm_anchors.sh`), and against the
-gate's own 2% tolerance 11 ops have a binding cell that is not adjudicable at all. **Read any single
-ratio here as carrying a machine-state term of up to about 6%**; only a run that measures all three
-arms in one pass removes it. The box also has no frequency pin, so `bench/check_arm_clocks.sh` has
-nothing to compare against and `bench/check_cache_busy.sh` has no busy field to read — on macOS
-`plots.jl`'s contention guard needs `/proc` and skips.
+⚠ **The two arms of this cache are seven to nine weeks apart.** The OpenBLAS and Accelerate arms date
+from 2026-09-22 to 2026-09-28 and the PureBLAS arm from 2026-11-16 and 2026-11-26. The anchor
+workload — a fixed kernel measured once per run, independent of any op here — reads within 1% between
+the two on the median, but 49 of 281 comparison cells carry arm anchors more than 5% apart (worst
+7.1%, `trsvLT` at n = 50; all of them in `asum`, `gemvN`, `gemvT`, `symv` and `trsvLT`;
+`bench/check_arm_anchors.sh`), and against the gate's own 2% tolerance 11 ops have a binding cell
+that is not adjudicable at all. **Read any single ratio here as carrying a machine-state term of up
+to about 7%**; only a run that measures all three arms in one pass removes it. The box also has no
+frequency pin, so `bench/check_arm_clocks.sh` has nothing to compare against and
+`bench/check_cache_busy.sh` has no busy field to read — on macOS `plots.jl`'s contention guard needs
+`/proc` and skips.
 
 Measured PureBLAS-against-PureBLAS, with no reference involved, the 2026-11-16 run is 8.6% faster
 than the 2026-11-09 one on the median of the 629 cells they share, while the anchor moved 1.2%. Six
 ops gained more than 25%: `potri` 46%, `potrsL` 35%, `pstrfU` 30%, `syrk` 29%, `symm` 28% and
-`trmm` 27%. `nrm2` reads 25% slower only because its 2026-11-09 cells were measured on the kernel
-of #131, which master does not carry. A few single cells moved the other way — `symm` at n = 32
-(0.74x), `trmv` at n = 256 and `gemvNrect` at n = 2880 (0.84x), `syr2k` at n = 32 (0.85x). Those
-are regression candidates, not confirmed regressions, until a re-measure settles them.
+`trmm` 27%. `nrm2` reads 25% slower only because its 2026-11-09 cells were measured with the derived
+FMA chain count that the 2026-11-26 cells use and the 2026-11-16 cells do not. A few single cells
+moved the other way — `symm` at n = 32 (0.74x), `trmv` at n = 256 and `gemvNrect` at n = 2880
+(0.84x), `syr2k` at n = 32 (0.85x). Those are regression candidates, not confirmed regressions,
+until a re-measure settles them.
+
+Between the 2026-11-16 and 2026-11-26 runs the OpenBLAS arm is the same, so the change in the median
+ratio against it is a PureBLAS-against-PureBLAS change: `nrm2` 9.52 → 12.85, `dot` 1.14 → 1.39,
+`gesvd` 1.95 → 2.02, `gemvT` 2.15 → 2.12 and `trsvLT` 2.14 → 1.89. The `trsvLT` loss is not settled:
+its binding cell, n = 2048, has a round-to-round spread of 0.36 in `bench/gate_gaps.jl`, and nine of
+its eleven cells, n = 2048 among them, carry arm anchors 7.1% apart.
 
 ## Headline
 
 **The median and the worst cell tell opposite stories here, and the gate reports the worst cell.**
-On the median PureBLAS beats Accelerate on `nrm2` (2.20x), `symv` (1.63x), `getrf` (1.43x), `gesvd`
-(1.35x), `dot` (1.21x), `axpy` and `iamax` (1.20x), `geqrf` (1.08x), `trsvLT` (1.06x), `spmv`
-(1.05x), `gemm` (1.04x) and `gemvT` (1.01x), ties it on `asum`, and beats OpenBLAS on the median of
-every BLAS-3 and LAPACK op measured. Only `dot` and `nrm2` pass the gate; every other op has at
+On the median PureBLAS beats Accelerate on `nrm2` (2.99x), `symv` (1.63x), `getrf` (1.43x), `gesvd`
+(1.37x), `dot` (1.28x), `axpy` and `iamax` (1.20x), `geqrf` (1.08x), `spmv` (1.05x) and `gemm`
+(1.04x), ties it on `asum`, and beats OpenBLAS on the median of every BLAS-3 and LAPACK op measured.
+`gemvT` (0.99x) and `trsvLT` (0.97x) are within the machine-state term above. Only `dot` and `nrm2`
+pass the gate — `dot` at 0.998, which rounds to 1.0 at two significant digits; every other op has at
 least one size where it does not.
 
 Where the remaining gap lives, by op family:
@@ -174,19 +184,19 @@ FAIL can still have a winning median — true below for every op except `scal` a
 | level | op | vs OpenBLAS | vs Accelerate | gate | verdict |
 |---|---|---|---|---|---|
 | L1 | `axpy` | **1.07** (1.00) | **1.20** (0.68) | 0.685 | FAIL |
-| L1 | `dot` | **1.14** (1.00) | **1.21** (1.01) | 1.000 | **PASS** |
-| L1 | `nrm2` | **9.52** (7.00) | **2.20** (1.67) | 1.672 | **PASS** |
+| L1 | `dot` | **1.39** (1.06) | **1.28** (1.00) | 0.998 | **PASS** |
+| L1 | `nrm2` | **12.85** (11.22) | **2.99** (2.67) | 2.667 | **PASS** |
 | L1 | `asum` | **1.06** (1.00) | 1.00 (0.54) | 0.542 | FAIL |
 | L1 | `scal` | 1.00 (0.99) | 0.98 (0.39) | 0.388 | FAIL |
 | L1 | `iamax` | 0.64 (0.51) | **1.20** (1.00) | 0.506 | FAIL |
 | L2 | `gemvN` | **7.48** (1.90) | 0.89 (0.50) | 0.500 | FAIL |
-| L2 | `gemvT` | **2.15** (1.81) | **1.01** (0.34) | 0.343 | FAIL |
+| L2 | `gemvT` | **2.12** (1.74) | 0.99 (0.35) | 0.345 | FAIL |
 | L2 | `ger` | **2.55** (1.03) | 0.95 (0.66) | 0.657 | FAIL |
 | L2 | `symv` | **1.29** (0.74) | **1.63** (0.94) | 0.742 | FAIL |
 | L2 | `trmv` | **2.49** (1.64) | 0.88 (0.40) | 0.396 | FAIL |
 | L2 | `trsv` | **1.64** (1.36) | 0.94 (0.68) | 0.678 | FAIL |
 | L2 | `trsvLN` | **1.43** (1.29) | 0.85 (0.69) | 0.690 | FAIL |
-| L2 | `trsvLT` | **2.14** (1.41) | **1.06** (0.82) | 0.823 | FAIL |
+| L2 | `trsvLT` | **1.89** (1.20) | 0.97 (0.69) | 0.692 | FAIL |
 | L2 | `spmv` | **1.60** (1.05) | **1.05** (0.68) | 0.677 | FAIL |
 | L2 | `gbmvN` | 0.81 (0.77) | 0.77 (0.66) | 0.657 | FAIL |
 | L2 | `sbmv` | **3.06** (3.02) | 0.77 (0.68) | 0.684 | FAIL |
@@ -201,9 +211,9 @@ FAIL can still have a winning median — true below for every op except `scal` a
 | LP | `potrf` | **2.22** (1.71) | 0.61 (0.42) | 0.420 | FAIL |
 | LP | `getrf` | **2.17** (1.17) | **1.43** (0.75) | 0.746 | FAIL |
 | LP | `geqrf` | **1.34** (1.18) | **1.08** (0.28) | 0.284 | FAIL |
-| LP | `gesvd` | **1.95** (1.07) | **1.35** (0.90) | 0.903 | FAIL |
+| LP | `gesvd` | **2.02** (1.07) | **1.37** (0.93) | 0.929 | FAIL |
 
-179 of 281 measured cells sit below the gate. The worst are `syrk` at n = 32-100 (0.18-0.26),
+184 of 281 measured cells sit below the gate. The worst are `syrk` at n = 32-100 (0.18-0.26),
 `trmmR` at n = 50-100 (0.18-0.23) and `trmm` at n = 50-128 (0.21-0.31). In the two binding cells
 PureBLAS's own q10-q90 sample spread is 1.01x (`syrk` at n = 50) and 1.02x (`trmmR` at n = 100),
 while their Accelerate arms spread 1.15x and 1.10x, so the noise in those ratios, about 10-15%,
@@ -251,6 +261,19 @@ one launch per group because `group=` is an exact match and a comma list matches
 ```
 for g in L1 L2 L3 LP CL1 CL2 CL3 CLP DL1 DL2 DL3 DLP; do
     julia --project=bench bench/plots.jl bench group=$g arms=pb cold nodraw
+done
+julia --project=bench bench/plots.jl outdir=docs/src/assets/apple
+```
+
+The 2026-11-26 refresh re-measured only the eight ops that reach the BLAS-1 reduction kernels, over
+that cache, one op per launch:
+
+```
+for op in dot nrm2 dznrm2 gemvT gemvTrect trsvLT; do
+    julia --project=bench bench/plots.jl bench op=$op arms=pb cold nodraw
+done
+for op in geqp3 gesvd; do
+    julia --project=bench bench/plots.jl bench op=$op arms=pb maxsize=2048 cold nodraw
 done
 julia --project=bench bench/plots.jl outdir=docs/src/assets/apple
 ```
