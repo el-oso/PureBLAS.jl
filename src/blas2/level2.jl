@@ -4548,8 +4548,10 @@ const _TRSV_T_F = 8
 @inline _trsvt_regtri(::Type{T}, n::Int) where {T} = (n * (n + 1) ÷ 2) * sizeof(T) <= _L3_BYTES
 
 # `REG` selects the diagonal-block solve and is a type parameter, not a runtime flag, so the in-memory
-# specialization compiles without the inlined register block. In one shared body the in-memory path
-# measured 4-10% slower on Zen5 at n=2048-4096, where it is the only path that runs.
+# specialization compiles without the register block. The `REG = true` form is reached only through
+# the `@noinline` `_trsv_fused8_t_reg!`, so the caller that inlines the in-memory form compiles exactly
+# as it does without the register block. Both forms inlined into one caller measured the in-memory
+# path 4-19% slower on Zen5 at n=2048-4096 (trsv L,T and potrs), where it is the only path that runs.
 @inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x, ::Val{REG}) where {REG}
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
@@ -4789,6 +4791,9 @@ end
     return x
 end
 
+@noinline _trsv_fused8_t_reg!(up::Bool, unit::Bool, n::Int, A, x) =
+    _trsv_fused8_t!(up, unit, n, A, x, Val(true))
+
 @inline function _trsv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
     # TINY/SMALL N FORMS. `_trsv_simd!` is dominated by its PER-COLUMN loop, not by arithmetic: a 3-term
@@ -4830,7 +4835,7 @@ end
     # triangle for the fused sweep to amortise it. Measured safe — L wins at n=16 already.
     if tr && !up && n >= 2 * _TRSV_T_F && eltype(A) <: BlasReal && _strided1(A) &&
             _dense1(x)
-        return _trsvt_regtri(eltype(A), n) ? _trsv_fused8_t!(up, unit, n, A, x, Val(true)) :
+        return _trsvt_regtri(eltype(A), n) ? _trsv_fused8_t_reg!(up, unit, n, A, x) :
             _trsv_fused8_t!(up, unit, n, A, x, Val(false))
     end
     # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
