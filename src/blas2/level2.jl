@@ -4547,7 +4547,10 @@ const _TRSV_T_F = 8
 # PDM: Derived — L3 residency of the n(n+1)/2 triangle; `_L3_BYTES` is detected.
 @inline _trsvt_regtri(::Type{T}, n::Int) where {T} = (n * (n + 1) ÷ 2) * sizeof(T) <= _L3_BYTES
 
-@inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x)
+# `REG` selects the diagonal-block solve and is a type parameter, not a runtime flag, so the in-memory
+# specialization compiles without the inlined register block. In one shared body the in-memory path
+# measured 4-10% slower on Zen5 at n=2048-4096, where it is the only path that runs.
+@inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x, ::Val{REG}) where {REG}
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
         Ap = pointer(A); xp = _ptr(x); lda = stride(A, 2)
@@ -4608,7 +4611,6 @@ const _TRSV_T_F = 8
                 lo = hi + 1
             end
         else                                      # L,T ⇒ Lᵀ upper ⇒ BACKWARD, panels descending
-            reg = _trsvt_regtri(T, n)
             hi = n
             @inbounds while hi > 0
                 lo = max(1, hi - 7)
@@ -4655,7 +4657,7 @@ const _TRSV_T_F = 8
                         end
                     end
                 end
-                if reg && hi - lo + 1 == 8
+                if REG && hi - lo + 1 == 8
                     dblk = PtrMatrix{T}(Ap + ((lo - 1) * lda + lo - 1) * sz, 8, 8, lda)
                     xo = xp + (lo - 1) * sz
                     if unit
@@ -4828,7 +4830,8 @@ end
     # triangle for the fused sweep to amortise it. Measured safe — L wins at n=16 already.
     if tr && !up && n >= 2 * _TRSV_T_F && eltype(A) <: BlasReal && _strided1(A) &&
             _dense1(x)
-        return _trsv_fused8_t!(up, unit, n, A, x)
+        return _trsvt_regtri(eltype(A), n) ? _trsv_fused8_t!(up, unit, n, A, x, Val(true)) :
+            _trsv_fused8_t!(up, unit, n, A, x, Val(false))
     end
     # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
     # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
