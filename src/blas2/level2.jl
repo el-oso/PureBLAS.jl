@@ -4547,11 +4547,10 @@ const _TRSV_T_F = 8
 # PDM: Derived — L3 residency of the n(n+1)/2 triangle; `_L3_BYTES` is detected.
 @inline _trsvt_regtri(::Type{T}, n::Int) where {T} = (n * (n + 1) ÷ 2) * sizeof(T) <= _L3_BYTES
 
-# `REG` selects the diagonal-block solve and is a type parameter, not a runtime flag, so the in-memory
-# specialization compiles without the register block. The `REG = true` form is reached only through
-# the `@noinline` `_trsv_fused8_t_reg!`, so the caller that inlines the in-memory form compiles exactly
-# as it does without the register block. Both forms inlined into one caller measured the in-memory
-# path 4-19% slower on Zen5 at n=2048-4096 (trsv L,T and potrs), where it is the only path that runs.
+# `REG` selects the diagonal-block solve and is a type parameter, not a runtime flag, so each form is
+# its own specialization and neither carries the other's code. Both forms compiled into one body
+# measured the in-memory path 4-19% slower on Zen5 at n=2048-4096 (trsv L,T and potrs). `_trsv_blk!`
+# calls each form out of line; see the note there.
 @inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x, ::Val{REG}) where {REG}
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
@@ -4684,7 +4683,10 @@ const _TRSV_T_F = 8
     return x
 end
 
-@inline function _trsv_fused8!(up::Bool, unit::Bool, n::Int, A, x)
+# `UP` is a type parameter so each triangle compiles alone: called out of line with a runtime `up`, both
+# sweeps shared one body and the register allocator spilled a loop bound inside an 8-FMA panel loop.
+@inline function _trsv_fused8!(::Val{UP}, unit::Bool, n::Int, A, x) where {UP}
+    up = UP
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
         Ap = pointer(A); xp = _ptr(x); lda = stride(A, 2)
@@ -4791,9 +4793,6 @@ end
     return x
 end
 
-@noinline _trsv_fused8_t_reg!(up::Bool, unit::Bool, n::Int, A, x) =
-    _trsv_fused8_t!(up, unit, n, A, x, Val(true))
-
 @inline function _trsv_blk!(up::Bool, tr::Bool, unit::Bool, n::Int, A, x)
     NB = _TRI_NB
     # TINY/SMALL N FORMS. `_trsv_simd!` is dominated by its PER-COLUMN loop, not by arithmetic: a 3-term
@@ -4835,8 +4834,8 @@ end
     # triangle for the fused sweep to amortise it. Measured safe — L wins at n=16 already.
     if tr && !up && n >= 2 * _TRSV_T_F && eltype(A) <: BlasReal && _strided1(A) &&
             _dense1(x)
-        return _trsvt_regtri(eltype(A), n) ? _trsv_fused8_t_reg!(up, unit, n, A, x) :
-            _trsv_fused8_t!(up, unit, n, A, x, Val(false))
+        return _trsvt_regtri(eltype(A), n) ? (@noinline _trsv_fused8_t!(up, unit, n, A, x, Val(true))) :
+            (@noinline _trsv_fused8_t!(up, unit, n, A, x, Val(false)))
     end
     # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
     # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
@@ -4845,8 +4844,14 @@ end
     # diagonal-solve + tall-scatter structure entirely. Measured vs the blocked path it supersedes,
     # Zen4 upper/N/non-unit F64: n=256 1.01×, 512 1.06×, 1024 1.14×, 2048 1.07×, 4096 1.00×.
     # Requires unit-stride columns for the vector loads; anything else keeps the blocked path below.
+    # The fused panel kernels (both forms of `_trsv_fused8_t!` above, and `_trsv_fused8!` here) are
+    # called out of line, so each compiles on its own and an edit to one path cannot change the code of
+    # another. Inlined into one `_trsv!` body, a change confined to the L,T path measured trsv L,N
+    # 0.5-2% slower on arm64 with its loop instructions unchanged. One call per solve is the cost,
+    # against a panel sweep of at least 2F columns.
     if !tr && eltype(A) <: BlasReal && _strided1(A) && _dense1(x)
-        return _trsv_fused8!(up, unit, n, A, x)
+        return up ? (@noinline _trsv_fused8!(Val(true), unit, n, A, x)) :
+            (@noinline _trsv_fused8!(Val(false), unit, n, A, x))
     end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N back: J descending; solve diag then tall scatter UP
