@@ -4568,7 +4568,7 @@ const _TRSV_T_F = 8
                         a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
                         a4 = zero(V); a5 = zero(V); a6 = zero(V); a7 = zero(V)
                         i = 0
-                        while i + W <= top
+                        @_line_aligned while i + W <= top
                             o = i * sz; xv = vload(V, xp + o)
                             a0 = muladd(vload(V, c0 + o), xv, a0); a1 = muladd(vload(V, c1 + o), xv, a1)
                             a2 = muladd(vload(V, c2 + o), xv, a2); a3 = muladd(vload(V, c3 + o), xv, a3)
@@ -4625,7 +4625,7 @@ const _TRSV_T_F = 8
                         a0 = zero(V); a1 = zero(V); a2 = zero(V); a3 = zero(V)
                         a4 = zero(V); a5 = zero(V); a6 = zero(V); a7 = zero(V)
                         i = 0
-                        while i + W <= rest
+                        @_line_aligned while i + W <= rest
                             o = i * sz; xv = vload(V, xb + o)
                             a0 = muladd(vload(V, c0 + o), xv, a0); a1 = muladd(vload(V, c1 + o), xv, a1)
                             a2 = muladd(vload(V, c2 + o), xv, a2); a3 = muladd(vload(V, c3 + o), xv, a3)
@@ -4714,7 +4714,7 @@ end
                         b4 = V(-unsafe_load(xp, lo + 4)); b5 = V(-unsafe_load(xp, lo + 5))
                         b6 = V(-unsafe_load(xp, lo + 6)); b7 = V(-unsafe_load(xp, lo + 7))
                         i = 0
-                        while i + W <= top
+                        @_line_aligned while i + W <= top
                             o = i * sz; acc = vload(V, xp + o)
                             acc = muladd(b0, vload(V, c0 + o), acc); acc = muladd(b1, vload(V, c1 + o), acc)
                             acc = muladd(b2, vload(V, c2 + o), acc); acc = muladd(b3, vload(V, c3 + o), acc)
@@ -4762,7 +4762,7 @@ end
                         b6 = V(-unsafe_load(xp, lo + 6)); b7 = V(-unsafe_load(xp, lo + 7))
                         yp = xp + hi * sz
                         i = 0
-                        while i + W <= rest
+                        @_line_aligned while i + W <= rest
                             o = i * sz; acc = vload(V, yp + o)
                             acc = muladd(b0, vload(V, c0 + o), acc); acc = muladd(b1, vload(V, c1 + o), acc)
                             acc = muladd(b2, vload(V, c2 + o), acc); acc = muladd(b3, vload(V, c3 + o), acc)

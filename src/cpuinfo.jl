@@ -151,7 +151,8 @@ end
 # tuned magic number, so it is keyed on the arch rather than probed; a `sysctl` subprocess at
 # precompile time would buy nothing here and could not be validated on this fleet either.
 #
-# Only prefetch density depends on this, so a wrong value costs tuning and never correctness.
+# Only prefetch density and loop alignment (`@_line_aligned` below) depend on this, so a wrong value
+# costs tuning and never correctness.
 # `_L3_BYTES` (no SLC is queryable at all on M-series) and `_L1D_ASSOC` remain approximate on ARM for
 # the same reason — see docs/src/design.md: ARM is untested, not supported.
 const _CACHELINE = let s = try
@@ -166,6 +167,17 @@ const _CACHELINE = let s = try
     else
         64
     end
+end
+
+# `@_line_aligned while …` / `@_line_aligned for …`: start the loop's header at a `_CACHELINE` boundary
+# (LLVM `llvm.loop.align` loop metadata, applied after vectorization to every loop LLVM derives from it).
+# Without it a hot loop's start offset moves whenever unrelated code in the same function or image
+# changes size, and identical loop bodies measured 0.5-2% apart on arm64 with only that offset moved.
+# PDM: Derived — the detected line size; it assumes the instruction-cache line equals `_CACHELINE`.
+macro _line_aligned(ex)
+    ex isa Expr && ex.head in (:while, :for) || error("@_line_aligned expects a `while` or `for` loop")
+    push!(ex.args[2].args, Expr(:loopinfo, (Symbol("llvm.loop.align"), _CACHELINE)))
+    return esc(ex)
 end
 
 # L1d associativity (ways). One way of an L1d indexed by page-offset bits is at most one memory page,
