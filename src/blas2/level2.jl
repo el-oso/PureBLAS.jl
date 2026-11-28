@@ -4549,8 +4549,8 @@ const _TRSV_T_F = 8
 
 # `REG` selects the diagonal-block solve and is a type parameter, not a runtime flag, so each form is
 # its own specialization and neither carries the other's code. Both forms compiled into one body
-# measured the in-memory path 4-19% slower on Zen5 at n=2048-4096 (trsv L,T and potrs). `_trsv_blk!`
-# calls each form out of line, so neither is compiled into `_trsv!` beside the other.
+# measured the in-memory path 4-19% slower on Zen5 at n=2048-4096 (trsv L,T and potrs). `_trsv!`
+# calls each form out of line, so neither is compiled into one body beside the other.
 @inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x, ::Val{REG}) where {REG}
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
@@ -4813,42 +4813,11 @@ end
     # average looked positive while the gate went DOWN on all three boxes at n=32 (1.080→1.025 Zen4,
     # 1.408→1.351 Zen3, 1.091→0.969 Zen5). A per-shape table beats an end-to-end average when the caller
     # uses more than one shape.
-    # `_trsv!` routes those sizes to `_trsv_reg_n!` before calling this body, so they never reach here.
-    # T FORMS: the fused F=8 panel sweep (`_trsv_fused8_t!`) is the transpose of what the N forms have
-    # had all along — 8 independent dot accumulators over the already-solved region instead of 8 fused
-    # axpys. Per-pass measurement showed the T form running at ~half the N form's bandwidth on the same
-    # bytes, which is the whole potrsL miss; blocking was measured at only 1.00-1.05 and is not it.
-    # Needs unit-stride columns for the vector loads; anything else keeps the paths below.
-    # LOWER ONLY, and that restriction is MEASURED, not cautious. Fused-vs-dots by shape (Zen4):
-    #   n            16     32     64    128    256    512   1024   2048
-    #   L,non-unit  1.03   1.48   1.48   1.53   1.39   1.22   1.23   1.82
-    #   L,unit      1.66   1.85   1.86   1.88   1.66   1.27   1.25   1.97
-    #   U,non-unit  0.95   0.76   0.79   0.87   0.99   1.01   1.04   1.43   <-- LOSES below n=512
-    #   U,unit      0.91   0.96   0.97   1.03   1.03   1.00   1.06   1.44
-    # Applying it to BOTH uplo (the first version of this commit) would have shipped a 13.5% regression
-    # on U/non-unit at n=128 — caught only by timing the shape the change was NOT motivated by. Upper
-    # keeps its existing, already-gated routing. `potrs` uses the lower form, which is the cluster this
-    # closes; `getrs(trans='T')` uses the upper form and is deliberately left alone.
-    # Lower bound is 2F (two panels): the tall region must span at least one full panel beyond the 8x8
-    # triangle for the fused sweep to amortise it. Measured safe — L wins at n=16 already.
-    if tr && !up && n >= 2 * _TRSV_T_F && eltype(A) <: BlasReal && _strided1(A) &&
-            _dense1(x)
-        return _trsvt_regtri(eltype(A), n) ? (@noinline _trsv_fused8_t!(up, unit, n, A, x, Val(true))) :
-            (@noinline _trsv_fused8_t!(up, unit, n, A, x, Val(false)))
-    end
+    # `_trsv!` routes those sizes to `_trsv_reg_n!`, and the fused L,T and N panel sweeps to their
+    # kernels, before calling this body; neither reaches here.
     # trsv-T (forward/back substitution by dots): unblocked wins only at small n (n≤_TRI_T_UNB); above
     # that, blocking offloads the O(n²) off-diagonal to gemv-T and wins (fleet-measured). See _TRI_T_UNB.
     (n <= NB || (tr && n <= _fh_tri_t_unb())) && return _trsv_simd!(up, tr, unit, n, A, x)
-    # N forms: the fused F=8 panel sweep (see `_trsv_fused8!`) replaces the blocked
-    # diagonal-solve + tall-scatter structure entirely. Measured vs the blocked path it supersedes,
-    # Zen4 upper/N/non-unit F64: n=256 1.01×, 512 1.06×, 1024 1.14×, 2048 1.07×, 4096 1.00×.
-    # Requires unit-stride columns for the vector loads; anything else keeps the blocked path below.
-    # Inlined: called out of line, the call cost measured trsv U,N n=100 2% slower on Zen4 (1.004 at
-    # n=128, none at 256). Its panel loops are `@_line_aligned`, so edits elsewhere in `_trsv!` do not
-    # move their alignment.
-    if !tr && eltype(A) <: BlasReal && _strided1(A) && _dense1(x)
-        return up ? _trsv_fused8!(Val(true), unit, n, A, x) : _trsv_fused8!(Val(false), unit, n, A, x)
-    end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N back: J descending; solve diag then tall scatter UP
         ib = (cld(n, NB) - 1) * NB
@@ -5194,14 +5163,46 @@ function _trmv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx
 end
 
 # x := op(A)⁻¹·x, A triangular (solve). Same parameterization as `_trmv!`.
-# The register kernel's sizes (n ≤ _TRSV_REG_MAX) are routed here, before the general body, so a solve
-# that costs tens of nanoseconds does not pay that body's prologue (six saved registers and a 1408-byte
-# frame on Zen4) and does not move when code elsewhere in it changes size (potrs U n=8 measured 22% apart
-# on Zen4 between two builds that differed only in that body).
+# A thin router: each kernel family below is called out of line, so every solve pays one light call
+# (this body is a size test and the calls) and no kernel's code or placement depends on another's.
+# Inlined into one general body, edits confined to one path measured other paths 1-5% apart on Zen4
+# and arm64 with their loop instructions unchanged, and potrs U n=8 22% apart; tiny solves also paid
+# that body's prologue (six saved registers and a 1408-byte frame on Zen4).
 function _trsv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx::Integer)
-    if _l2v_simd_ok(A, x, incx) && eltype(A) <: BlasReal && n <= _TRSV_REG_MAX && _strided1(A) && _dense1(x)
+    if _l2v_simd_ok(A, x, incx) && eltype(A) <: BlasReal && _strided1(A) && _dense1(x)
         ni = Int(n)
-        return @noinline _trsv_reg_n!(up, tr, unit, ni, A, x)
+        ni <= _TRSV_REG_MAX && return @noinline _trsv_reg_n!(up, tr, unit, ni, A, x)
+        # T FORMS: the fused F=8 panel sweep (`_trsv_fused8_t!`) is the transpose of what the N forms
+        # have had all along — 8 independent dot accumulators over the already-solved region instead of
+        # 8 fused axpys. Per-pass measurement showed the T form running at ~half the N form's bandwidth
+        # on the same bytes, which is the whole potrsL miss; blocking was measured at only 1.00-1.05 and
+        # is not it. LOWER ONLY, and that restriction is MEASURED, not cautious. Fused-vs-dots by shape
+        # (Zen4):
+        #   n            16     32     64    128    256    512   1024   2048
+        #   L,non-unit  1.03   1.48   1.48   1.53   1.39   1.22   1.23   1.82
+        #   L,unit      1.66   1.85   1.86   1.88   1.66   1.27   1.25   1.97
+        #   U,non-unit  0.95   0.76   0.79   0.87   0.99   1.01   1.04   1.43   <-- LOSES below n=512
+        #   U,unit      0.91   0.96   0.97   1.03   1.03   1.00   1.06   1.44
+        # Applying it to BOTH uplo would have shipped a 13.5% regression on U/non-unit at n=128 — caught
+        # only by timing the shape the change was NOT motivated by. Upper keeps its existing routing.
+        # `potrs` uses the lower form; `getrs(trans='T')` uses the upper form and is left alone.
+        # Lower bound is 2F (two panels): the tall region must span at least one full panel beyond the
+        # 8x8 triangle for the fused sweep to amortise it. Measured safe — L wins at n=16 already.
+        if tr && !up && ni >= 2 * _TRSV_T_F
+            reg = _trsvt_regtri(eltype(A), ni)
+            vt = Val(true); vf = Val(false)
+            return reg ? (@noinline _trsv_fused8_t!(up, unit, ni, A, x, vt)) :
+                (@noinline _trsv_fused8_t!(up, unit, ni, A, x, vf))
+        end
+        # N forms above the per-column size (`_TRI_NB`, where `_trsv_blk!` takes `_trsv_simd!`): the
+        # fused F=8 panel sweep (`_trsv_fused8!`) replaces the blocked diagonal-solve + tall-scatter
+        # structure entirely. Measured vs the blocked path it supersedes, Zen4 upper/N/non-unit F64:
+        # n=256 1.01×, 512 1.06×, 1024 1.14×, 2048 1.07×, 4096 1.00×.
+        if !tr && ni > _TRI_NB
+            vt = Val(true); vf = Val(false)
+            return up ? (@noinline _trsv_fused8!(vt, unit, ni, A, x)) :
+                (@noinline _trsv_fused8!(vf, unit, ni, A, x))
+        end
     end
     return _trsv_any!(up, tr, cj, unit, n, A, x, incx)
 end
