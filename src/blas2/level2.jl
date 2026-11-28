@@ -5200,7 +5200,8 @@ end
 # on Zen4 between two builds that differed only in that body).
 function _trsv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx::Integer)
     if _l2v_simd_ok(A, x, incx) && eltype(A) <: BlasReal && n <= _TRSV_REG_MAX && _strided1(A) && _dense1(x)
-        return _trsv_reg_n!(up, tr, unit, Int(n), A, x)
+        ni = Int(n)
+        return @noinline _trsv_reg_n!(up, tr, unit, ni, A, x)
     end
     return _trsv_any!(up, tr, cj, unit, n, A, x, incx)
 end
