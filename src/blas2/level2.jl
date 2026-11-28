@@ -4550,7 +4550,7 @@ const _TRSV_T_F = 8
 # `REG` selects the diagonal-block solve and is a type parameter, not a runtime flag, so each form is
 # its own specialization and neither carries the other's code. Both forms compiled into one body
 # measured the in-memory path 4-19% slower on Zen5 at n=2048-4096 (trsv L,T and potrs). `_trsv_blk!`
-# calls each form out of line; see the note there.
+# calls each form out of line, so neither is compiled into `_trsv!` beside the other.
 @inline function _trsv_fused8_t!(up::Bool, unit::Bool, n::Int, A, x, ::Val{REG}) where {REG}
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
     GC.@preserve A x begin
@@ -4683,8 +4683,9 @@ const _TRSV_T_F = 8
     return x
 end
 
-# `UP` is a type parameter so each triangle compiles alone: called out of line with a runtime `up`, both
-# sweeps shared one body and the register allocator spilled a loop bound inside an 8-FMA panel loop.
+# `UP` is a type parameter so each triangle compiles as its own body: compiled standalone with a runtime
+# `up`, both sweeps shared one body and the register allocator spilled a loop bound inside an 8-FMA panel
+# loop.
 @inline function _trsv_fused8!(::Val{UP}, unit::Bool, n::Int, A, x) where {UP}
     up = UP
     T = eltype(A); W = _vwidth(T); V = Vec{W, T}; sz = sizeof(T)
@@ -4844,14 +4845,11 @@ end
     # diagonal-solve + tall-scatter structure entirely. Measured vs the blocked path it supersedes,
     # Zen4 upper/N/non-unit F64: n=256 1.01×, 512 1.06×, 1024 1.14×, 2048 1.07×, 4096 1.00×.
     # Requires unit-stride columns for the vector loads; anything else keeps the blocked path below.
-    # The fused panel kernels (both forms of `_trsv_fused8_t!` above, and `_trsv_fused8!` here) are
-    # called out of line, so each compiles on its own and an edit to one path cannot change the code of
-    # another. Inlined into one `_trsv!` body, a change confined to the L,T path measured trsv L,N
-    # 0.5-2% slower on arm64 with its loop instructions unchanged. One call per solve is the cost,
-    # against a panel sweep of at least 2F columns.
+    # Inlined: called out of line, the call cost measured trsv U,N n=100 2% slower on Zen4 (1.004 at
+    # n=128, none at 256). Its panel loops are `@_line_aligned`, so edits elsewhere in `_trsv!` do not
+    # move their alignment.
     if !tr && eltype(A) <: BlasReal && _strided1(A) && _dense1(x)
-        return up ? (@noinline _trsv_fused8!(Val(true), unit, n, A, x)) :
-            (@noinline _trsv_fused8!(Val(false), unit, n, A, x))
+        return up ? _trsv_fused8!(Val(true), unit, n, A, x) : _trsv_fused8!(Val(false), unit, n, A, x)
     end
     # N forms use column-block J so the off-diagonal scatter is a TALL gemv-N (good A locality).
     @inbounds if !tr && up               # U,N back: J descending; solve diag then tall scatter UP
