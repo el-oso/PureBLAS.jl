@@ -4813,9 +4813,7 @@ end
     # average looked positive while the gate went DOWN on all three boxes at n=32 (1.080→1.025 Zen4,
     # 1.408→1.351 Zen3, 1.091→0.969 Zen5). A per-shape table beats an end-to-end average when the caller
     # uses more than one shape.
-    if eltype(A) <: BlasReal && n <= _TRSV_REG_MAX && _strided1(A) && _dense1(x)
-        return _trsv_reg_n!(up, tr, unit, n, A, x)
-    end
+    # `_trsv!` routes those sizes to `_trsv_reg_n!` before calling this body, so they never reach here.
     # T FORMS: the fused F=8 panel sweep (`_trsv_fused8_t!`) is the transpose of what the N forms have
     # had all along — 8 independent dot accumulators over the already-solved region instead of 8 fused
     # axpys. Per-pass measurement showed the T form running at ~half the N form's bandwidth on the same
@@ -5196,7 +5194,18 @@ function _trmv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx
 end
 
 # x := op(A)⁻¹·x, A triangular (solve). Same parameterization as `_trmv!`.
+# The register kernel's sizes (n ≤ _TRSV_REG_MAX) are routed here, before the general body, so a solve
+# that costs tens of nanoseconds does not pay that body's prologue (six saved registers and a 1408-byte
+# frame on Zen4) and does not move when code elsewhere in it changes size (potrs U n=8 measured 22% apart
+# on Zen4 between two builds that differed only in that body).
 function _trsv!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx::Integer)
+    if _l2v_simd_ok(A, x, incx) && eltype(A) <: BlasReal && n <= _TRSV_REG_MAX && _strided1(A) && _dense1(x)
+        return _trsv_reg_n!(up, tr, unit, Int(n), A, x)
+    end
+    return _trsv_any!(up, tr, cj, unit, n, A, x, incx)
+end
+
+@noinline function _trsv_any!(up::Bool, tr::Bool, cj::Bool, unit::Bool, n::Integer, A, x, incx::Integer)
     if _l2v_simd_ok(A, x, incx)
         return _trsv_blk!(up, tr, unit, Int(n), A, x)
     end
